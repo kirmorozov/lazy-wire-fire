@@ -51,7 +51,7 @@ async fn order_rule(db: &Db, mock: &Mock) {
         "search",
         "http",
         &mock.url(),
-        Some("2xx and errors == false"),
+        Some("JSON_CONTAINS(body, 'false', '$.errors')"),
         "{}",
     )
     .await;
@@ -303,6 +303,85 @@ async fn failures_retry_and_hold_the_position() {
     inst.stop().await;
 }
 
+/// `expect` is SQL over the response row: a condition on the body and a header holds the key
+/// (and the rule's position) until the target's answer meets it; a condition naming `status`
+/// replaces the 2xx default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expect_is_sql_over_the_response() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "expect").await;
+    shop(&db).await;
+    let store = Mock::start().await;
+    store.respond(|_| (200, r#"{"state":"busy"}"#.into()));
+    store.headers(|_| vec![("X-Ack".into(), "yes".into())]);
+    let gone = Mock::start().await;
+    gone.respond(|_| (404, r#"{"found":false}"#.into()));
+    db.target(
+        "store",
+        "http",
+        &store.url(),
+        Some(
+            "JSON_UNQUOTE(JSON_EXTRACT(body, '$.state')) = 'stored' \
+             AND JSON_UNQUOTE(JSON_EXTRACT(headers, '$.\"x-ack\"')) = 'yes'",
+        ),
+        "{}",
+    )
+    .await;
+    db.target(
+        "gone",
+        "http",
+        &gone.url(),
+        Some("status IN (200, 404)"),
+        "{}",
+    )
+    .await;
+    for (rule, target) in [("a", "store"), ("b", "gone")] {
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, 'POST /hook HTTP/1.1\n\n{{join keys \",\"}}', 100)",
+            (rule, target),
+        )
+        .await;
+        db.trigger(rule, "orders", Some("{{new.id}}"), None).await;
+    }
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(10), "the 404 accepted", || async {
+        let (f, p, _, _) = db.status("b").await?;
+        ((f, p) >= after).then_some(())
+    })
+    .await;
+    assert_eq!(gone.requests().len(), 1, "an accepted 404 is not retried");
+    wait_for(
+        Duration::from_secs(10),
+        "retries while the body says busy",
+        || async { (store.requests().len() >= 2).then_some(()) },
+    )
+    .await;
+    sleep_ms(1000).await;
+    let (af, ap, _, err) = db.status("a").await.unwrap();
+    assert!((af, ap) < after, "rule a moved past an unmet expect");
+    assert!(
+        err.as_deref()
+            .is_some_and(|e| e.contains("`expect` not met")),
+        "{err:?}"
+    );
+    // Larger than 64 KB: the whole answer reaches the condition.
+    let pad = "x".repeat(100_000);
+    store.respond(move |_| (200, format!(r#"{{"pad":"{pad}","state":"stored"}}"#)));
+    wait_for(
+        Duration::from_secs(30),
+        "rule a past the insert",
+        || async {
+            let (f, p, _, _) = db.status("a").await?;
+            ((f, p) >= after).then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reset_steps_run_in_order() {
     let root = need_db!();
@@ -329,7 +408,7 @@ async fn reset_steps_run_in_order() {
         {"once": true, "template": "DELETE /items/_cache HTTP/1.1\n\n"},
         {"for_each": "snapshot"},
         {"for_each": "stray", "list_template": "GET /items/_ids?after={{reset.next}} HTTP/1.1\n\n",
-         "keys_path": "ids[]", "next_path": "next",
+         "keys": "JSON_EXTRACT(body, '$.ids')", "next": "JSON_EXTRACT(body, '$.next')",
          "template": "POST /items/_strays HTTP/1.1\n\n{{json reset.keys}}"}
     ]);
     db.exec_params(
@@ -420,8 +499,15 @@ async fn redis_rules(
     if let Some(u) = username {
         vars["username"] = json!(u);
     }
-    db.target("cache", "redis", endpoint, None, &vars.to_string())
-        .await;
+    // SET answers OK, DEL a count, EVAL nil: `text` holds the first two, NULL the last.
+    db.target(
+        "cache",
+        "redis",
+        endpoint,
+        Some("text IS NULL OR text = 'OK' OR text REGEXP '^[0-9]+$'"),
+        &vars.to_string(),
+    )
+    .await;
     db.exec(
         "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('docs', 'cache', 'key', \
          'SELECT id AS _key, name, IF(active, NULL, ''delete'') AS _op FROM customers WHERE id IN (:keys)', \
@@ -640,7 +726,7 @@ async fn s3_target() {
         "store",
         "http.s3",
         "",
-        Some("200, 204"),
+        Some("status IN (200, 204)"),
         &json!({"bucket": bucket, "region": "us-east-1", "endpoint": "http://127.0.0.1:34070", "path_style": true,
                 "access_key_ref": "env:LWF_TEST_S3_AK", "secret_key_ref": "env:LWF_TEST_S3_SK"})
         .to_string(),
@@ -1172,7 +1258,7 @@ async fn search_resync(root: &str, e: Search) {
     let n: Vec<u64> = db.query("SELECT COUNT(*) FROM items").await;
     tables(&db).await;
     db.exec_params(
-        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, expect, vars) VALUES ('os', ?, ?, ?, '2xx and errors == false', ?)",
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, expect, vars) VALUES ('os', ?, ?, ?, 'JSON_CONTAINS(body, ''false'', ''$.errors'')', ?)",
         (e.kind, &e.url, e.tls.clone(), e.vars.to_string()),
     )
     .await;
@@ -1182,13 +1268,13 @@ async fn search_resync(root: &str, e: Search) {
         "POST /{{vars.index}}/_search HTTP/1.1\nContent-Type: application/json\n\n{\"size\":1000,\"_source\":false,\"sort\":[{\"_id\":\"asc\"}]{{#if reset.next}},\"search_after\":{{json reset.next}}{{/if}}}"
     };
     let next = if e.scroll {
-        "_scroll_id"
+        "JSON_EXTRACT(body, '$._scroll_id')"
     } else {
-        "hits.hits[-1].sort"
+        "JSON_EXTRACT(body, '$.hits.hits[last].sort')"
     };
     let steps = json!([
         {"for_each": "snapshot"},
-        {"for_each": "stray", "list_template": list, "keys_path": "hits.hits[]._id", "next_path": next}
+        {"for_each": "stray", "list_template": list, "keys": "JSON_EXTRACT(body, '$.hits.hits[*]._id')", "next": next}
     ]);
     let template = "POST /{{vars.index}}/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{{#each docs}}{{#if (eq op \"delete\")}}{\"delete\":{\"_id\":{{json key}}}}\n{{else}}{\"update\":{\"_id\":{{json key}}}}\n{\"doc\":{{json doc}},\"doc_as_upsert\":true}\n{{/if}}{{/each}}";
     db.exec_params(

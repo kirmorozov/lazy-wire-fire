@@ -25,7 +25,7 @@ object.
 | `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database`. `http.s3`: optional, the service URL; derived from `vars` when empty. An action goes to every endpoint |
 | `tls` | empty (TLS for `https://` / `rediss://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` |
 | `timeout_ms` | per action and endpoint, default 10000 |
-| `expect` | success criterion, below |
+| `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
 
 A credential in `vars` is a literal or a reference: `env:NAME`, or `file:/path` (trailing newline
@@ -41,15 +41,42 @@ Identity), EC2 instance metadata. The template renders paths inside the bucket
 (`PUT /products/1.json`); the tool adds `Host`, `x-amz-date`, `x-amz-content-sha256`,
 `Authorization` (and `x-amz-security-token`), and the bucket for path style.
 
-**`expect`**: parts separated by `,`, `;`, `and` or `&&`.
+**`expect`**: a SQL condition the source database evaluates over the response, as the row `r`
+of a derived table (`SELECT 1 FROM (SELECT … ) AS r WHERE (<expect>)`). The action succeeded
+when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` functions, `CASE`, …
 
-* status codes (http only): `200`, `2xx`, `200-299`. Default `2xx`;
-* predicates on the JSON response body (http) or on the reply (redis): `<path> == <value>`,
-  `<path> != <value>`, e.g. `errors == false`. `<value>` is JSON or a bare word. A missing path
-  is `null`. `$` is the whole reply: `$ == OK`.
+| column | http | redis | mysql / pgsql |
+|---|---|---|---|
+| `status` | status code | NULL | NULL |
+| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL |
+| `body` | the body when it is JSON, else NULL | the reply as JSON | NULL |
+| `text` | the body as text | a string or integer reply as text, else NULL | NULL |
+| `affected_rows` | NULL | NULL | rows the statement changed |
 
-Redis error replies always fail. Examples: `2xx and errors == false`, `200, 204`. SQL targets
-check `affected_rows`: `affected_rows != 0`.
+* Empty: http needs a 2xx status, redis any reply but an error, a SQL target a statement that
+  ran. A condition that does not name `status` keeps the 2xx rule; one that does replaces it.
+* Redis error replies always fail. An unmet condition on an http 5xx, 408 or 429 is transient
+  (retried); on any other answer it is a refusal.
+* Comparisons follow SQL: NULL is not met (a missing JSON field gives NULL), text compares in
+  the connection's collation. `JSON_VALUE` of a JSON boolean differs between MySQL (`true`) and
+  MariaDB (`1`); `JSON_CONTAINS` and `JSON_UNQUOTE(JSON_EXTRACT(…))` behave alike on both.
+* Checked when rules load (run once against an empty answer), so syntax errors, unknown columns
+  and (on MySQL) invalid JSON paths show up as the rule's error (log, `/status`, and
+  `last_error` once it fires). A condition that cannot be evaluated
+  later (the database unreachable) is a transient failure, never a refusal.
+* Only the columns the condition names are sent. A condition that reads nothing but `r` (no
+  subquery, variable or function outside the `JSON_*` and common string / number functions) is
+  cached per distinct answer up to 1 KB, so repeated answers cost no query.
+
+| target | `expect` |
+|---|---|
+| search `_bulk` | `JSON_CONTAINS(body, 'false', '$.errors')` |
+| S3 `PUT` / `DELETE` | `status IN (200, 204)` |
+| a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
+| an API that answers 200 with a state | `JSON_UNQUOTE(JSON_EXTRACT(body, '$.state')) = 'stored'` |
+| a header | `JSON_UNQUOTE(JSON_EXTRACT(headers, '$."x-ack"')) = 'yes'` |
+| redis `SET` | `text = 'OK'` |
+| SQL targets | `affected_rows > 0` |
 
 ### SQL targets
 
@@ -183,8 +210,8 @@ background while streaming continues. An interrupted reset starts over after a r
 [
   {"once": true, "template": "PURGE / HTTP/1.1\nX-Tags-Pattern: .*\n"},
   {"for_each": "snapshot"},
-  {"for_each": "stray", "list_template": "…", "keys_path": "hits.hits[]._id",
-   "next_path": "hits.hits[-1].sort", "template": "…"}
+  {"for_each": "stray", "list_template": "…", "keys": "JSON_EXTRACT(body, '$.hits.hits[*]._id')",
+   "next": "JSON_EXTRACT(body, '$.hits.hits[last].sort')", "template": "…"}
 ]
 ```
 
@@ -192,15 +219,22 @@ background while streaming continues. An interrupted reset starts over after a r
 * `for_each: snapshot`: every key of `snapshot_keys_sql`, in batches, through the rule's selects
   and its template (or the step's `template`).
 * `for_each: stray`: pages through the target's keys with `list_template` (context
-  `reset.next`: the previous page's `next_path` value, `null` first; `reset.page`). `keys_path`
-  picks the keys of a page, `next_path` the cursor. Paging stops when the cursor is missing,
-  `null` or `0` / `"0"` (Redis `SCAN`), when an http page brings no new keys, or when a Redis
-  cursor repeats. The keys missing from
-  the snapshot, read after the listing, are rendered with op `delete` (`reset.keys` holds them),
-  per endpoint. Keys marked while the step runs are never treated as strays.
+  `reset.next`: the previous page's `next` value, `null` first; `reset.page`). `keys` and
+  `next` are SQL expressions over the listing response, the row `r` of [`expect`](#targets)
+  (a SQL target's listing gives its rows as a JSON array in `body`): `keys` the page's keys (a
+  JSON array, one value, or NULL for none), `next` the cursor. JSON results (`JSON_EXTRACT`) are
+  read as JSON, other text as a string. Paging stops when the cursor is NULL, `null` or `0` /
+  `"0"` (Redis `SCAN`), when an http page brings no new keys, or when a Redis cursor repeats.
+  The keys missing from the snapshot, read after the listing, are rendered with op `delete`
+  (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
+  strays.
 
-Paths (`keys_path`, `next_path`, `expect`) are dotted fields with `[n]` (negative from the end) and
-`[]` (every element); `$` is the root.
+| listing | `keys` | `next` |
+|---|---|---|
+| OpenSearch / Elasticsearch 7, `search_after` by `_id` | `JSON_EXTRACT(body, '$.hits.hits[*]._id')` | `JSON_EXTRACT(body, '$.hits.hits[last].sort')` |
+| Elasticsearch 8, scroll | `JSON_EXTRACT(body, '$.hits.hits[*]._id')` | `JSON_EXTRACT(body, '$._scroll_id')` |
+| Redis `SCAN` | `JSON_EXTRACT(body, '$[1]')` | `JSON_EXTRACT(body, '$[0]')` |
+| a SQL target, `SELECT id … ORDER BY id LIMIT 1000` | `JSON_EXTRACT(body, '$[*].id')` | `JSON_EXTRACT(body, '$[last].id')` |
 
 ## Status
 
@@ -236,8 +270,8 @@ What the tool enforces on its own:
 * **Interpolated values hold no control characters**: `{{x}}` turns them into spaces, so data
   never starts a new header, request, NDJSON line or command (`{{{x}}}` opts out). A request line
   or header with a control character is refused.
-* **A refused key does not stall its rule.** An action the target refuses (4xx, an `expect`
-  predicate, a Redis error) is split until the refused keys stand alone; the others go through.
+* **A refused key does not stall its rule.** An action the target refuses (4xx, an unmet
+  `expect`, a Redis error) is split until the refused keys stand alone; the others go through.
   A key refused 5 times while others went through is dropped and named in `last_error`. When
   everything is refused, nothing is dropped (the template or the target is at fault). Transient
   failures (connection, timeout, 5xx, 429, Redis `LOADING`/`READONLY`/…) only wait.
@@ -283,7 +317,7 @@ INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template) VALU
 **JSON objects in S3**, kept in sync (a `PUT` overwrites, a `DELETE` of a missing object succeeds):
 
 ```sql
-INSERT INTO lazy_wire_fire_target (name, kind, expect, vars) VALUES ('export', 'http.s3', '200, 204',
+INSERT INTO lazy_wire_fire_target (name, kind, expect, vars) VALUES ('export', 'http.s3', 'status IN (200, 204)',
  '{"bucket": "exports", "region": "eu-west-1", "access_key_ref": "env:AWS_ACCESS_KEY_ID", "secret_key_ref": "env:AWS_SECRET_ACCESS_KEY"}');
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, snapshot_keys_sql, template, reset_steps) VALUES
  ('customers_json', 'export', 'key',
@@ -309,7 +343,7 @@ what the index has and the database does not.
   {"for_each": "snapshot"},
   {"for_each": "stray",
    "list_template": "POST /{{vars.alias}}/_search HTTP/1.1\nContent-Type: application/json\n\n{\"size\":1000,\"_source\":false,\"sort\":[{\"_id\":\"asc\"}]{{#if reset.next}},\"search_after\":{{json reset.next}}{{/if}}}",
-   "keys_path": "hits.hits[]._id", "next_path": "hits.hits[-1].sort"}
+   "keys": "JSON_EXTRACT(body, '$.hits.hits[*]._id')", "next": "JSON_EXTRACT(body, '$.hits.hits[last].sort')"}
 ]
 ```
 

@@ -745,7 +745,7 @@ impl Engine {
                 .map_err(|e| format!("{e:#}"))
                 .and_then(|def| match self.targets.get(&def.name) {
                     Some(old) if old.def == def => Ok(old.clone()),
-                    _ => Target::new(def).map_err(|e| format!("{e:#}")),
+                    _ => Target::new(def, self.env.pool.clone()).map_err(|e| format!("{e:#}")),
                 });
             if let Err(e) = &r {
                 warn!(target = %t.name, "invalid target: {e}");

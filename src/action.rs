@@ -702,35 +702,43 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeyS
     let s = rule
         .step(step)
         .ok_or_else(|| anyhow!("no reset step {step}"))?;
-    let StepKind::Stray {
-        keys_path,
-        next_path,
-        ..
-    } = &s.kind
-    else {
+    let StepKind::Stray { keys, next, .. } = &s.kind else {
         bail!("reset step {step} is not a stray step");
     };
+    let mut exprs = vec![keys.as_str()];
+    exprs.extend(next.as_deref());
+    let read = crate::response::Values::new(&exprs)?;
     let mut listed: Vec<KeySet> = Vec::new();
     for (i, ep) in target.endpoints.iter().enumerate() {
-        let mut keys = KeySet::new();
-        let mut next = Value::Null;
+        let mut listed_keys = KeySet::new();
+        let mut cursor = Value::Null;
         for page in 0..MAX_PAGES {
-            let reset = json!({"step": s.name, "keys": [], "next": next, "page": page});
+            let reset = json!({"step": s.name, "keys": [], "next": cursor, "page": page});
             let ctx = context(rule, &target, &[], &[], &ep.ctx, &reset);
             let req = rule.templates.render(&rule::list_template(step), &ctx)?;
             let resp = target
-                .fetch(i, &req)
+                .fetch(i, &req, read.uses)
                 .await
                 .with_context(|| format!("listing page {page}"))?;
-            let page_keys: Vec<String> = keys_path
-                .get(&resp)
-                .into_iter()
-                .map(crate::template::text)
+            let mut got = read
+                .eval(&env.pool, &resp)
+                .await
+                .with_context(|| format!("listing page {page}: `keys` / `next`"))?
+                .into_iter();
+            let page_keys: Vec<String> = match got.next().unwrap_or(Value::Null) {
+                Value::Array(a) => a.iter().map(crate::template::text).collect(),
+                Value::Null => Vec::new(),
+                one => vec![crate::template::text(&one)],
+            };
+            let fresh = page_keys
+                .iter()
                 .filter(|k| crate::template::valid_key(k))
-                .collect();
-            let fresh = page_keys.iter().filter(|k| keys.insert(k)).count();
-            let Some(np) = next_path else { break };
-            let nv = np.get_one(&resp).cloned().unwrap_or(Value::Null);
+                .filter(|k| listed_keys.insert(k))
+                .count();
+            if next.is_none() {
+                break;
+            }
+            let nv = got.next().unwrap_or(Value::Null);
             // HTTP: a page without new keys ends the listing (a scroll keeps its cursor, so an
             // unchanged cursor proves nothing). Redis SCAN pages may be empty mid-way: there the
             // cursor decides (`0` ends it).
@@ -740,14 +748,14 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeyS
                 || if target.is_http() {
                     fresh == 0
                 } else {
-                    nv == next
+                    nv == cursor
                 };
             if done {
                 break;
             }
-            next = nv;
+            cursor = nv;
         }
-        listed.push(keys);
+        listed.push(listed_keys);
     }
     // Read after the listing: a key created meanwhile is in the snapshot, not a stray.
     let snapshot = snapshot_keys(env, rule).await?;

@@ -260,6 +260,22 @@ pub async fn compile(
         if t.endpoints.is_empty() {
             errors.push(format!("target `{}` has no endpoints", def.target));
         }
+        if let Err(e) = t.expect.validate(conn).await {
+            errors.push(format!("target `{}` `expect`: {e:#}", def.target));
+        }
+    }
+    for (i, s) in def.reset_steps.iter().enumerate() {
+        if let StepKind::Stray { keys, next, .. } = &s.kind {
+            let mut exprs = vec![keys.as_str()];
+            exprs.extend(next.as_deref());
+            let checked = match crate::response::Values::new(&exprs) {
+                Ok(v) => v.validate(conn).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = checked {
+                errors.push(format!("`reset_steps[{i}]` `keys` / `next`: {e:#}"));
+            }
+        }
     }
     let mut compiled = Vec::new();
     let mut trigger_errors = Vec::new();

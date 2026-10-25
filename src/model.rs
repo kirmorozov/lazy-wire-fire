@@ -13,8 +13,6 @@ use mysql_async::prelude::*;
 use mysql_async::{Conn, Row};
 use serde_json::{Map, Value};
 
-use crate::expect::Expect;
-use crate::path::Path;
 use crate::sql;
 use crate::tls::TlsSpec;
 
@@ -170,7 +168,8 @@ pub struct TargetDef {
     pub endpoints: Vec<String>,
     pub tls: TlsSpec,
     pub timeout: Duration,
-    pub expect: Expect,
+    /// SQL condition over the response row (see [`crate::response`]); `None`: the default.
+    pub expect: Option<String>,
     pub vars: Map<String, Value>,
 }
 
@@ -267,7 +266,13 @@ impl TargetDef {
             endpoints,
             tls: TlsSpec::parse(r.tls.as_deref()).context("`tls`")?,
             timeout,
-            expect: Expect::parse(r.expect.as_deref(), kind.is_http()).context("`expect`")?,
+            expect: match r.expect.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => {
+                    crate::response::check(s).context("`expect`")?;
+                    Some(s.to_string())
+                }
+                None => None,
+            },
             vars,
         })
     }
@@ -303,8 +308,9 @@ pub enum StepKind {
     Snapshot,
     Stray {
         list_template: String,
-        keys_path: Path,
-        next_path: Option<Path>,
+        /// SQL expressions over the listing response (see [`crate::response`]).
+        keys: String,
+        next: Option<String>,
     },
 }
 
@@ -402,19 +408,25 @@ pub fn parse_reset_steps(s: Option<&str>) -> Result<Vec<ResetStep>> {
                     StepKind::Once
                 }
                 "snapshot" => StepKind::Snapshot,
-                "stray" => StepKind::Stray {
-                    list_template: get("list_template")
-                        .ok_or_else(|| anyhow!("`reset_steps[{i}]` (stray) needs `list_template`"))?,
-                    keys_path: Path::parse(
-                        &get("keys_path").ok_or_else(|| anyhow!("`reset_steps[{i}]` (stray) needs `keys_path`"))?,
-                    )
-                    .with_context(|| format!("`reset_steps[{i}].keys_path`"))?,
-                    next_path: get("next_path")
-                        .filter(|p| !p.trim().is_empty())
-                        .map(|p| Path::parse(&p))
-                        .transpose()
-                        .with_context(|| format!("`reset_steps[{i}].next_path`"))?,
-                },
+                "stray" => {
+                    let expr = |name: &str| -> Result<Option<String>> {
+                        match get(name).filter(|e| !e.trim().is_empty()) {
+                            Some(e) => {
+                                crate::response::check(&e)
+                                    .with_context(|| format!("`reset_steps[{i}].{name}`"))?;
+                                Ok(Some(e))
+                            }
+                            None => Ok(None),
+                        }
+                    };
+                    StepKind::Stray {
+                        list_template: get("list_template")
+                            .ok_or_else(|| anyhow!("`reset_steps[{i}]` (stray) needs `list_template`"))?,
+                        keys: expr("keys")?
+                            .ok_or_else(|| anyhow!("`reset_steps[{i}]` (stray) needs `keys`"))?,
+                        next: expr("next")?,
+                    }
+                }
                 other => bail!("`reset_steps[{i}]`: unknown kind `{other}`"),
             };
             Ok(ResetStep { name: get("name").unwrap_or_else(|| format!("step {}", i + 1)), kind, template })
@@ -777,20 +789,22 @@ mod tests {
         let s = parse_reset_steps(Some(
             r#"[{"once": true, "template": "FLUSHDB"},
                 {"for_each": "snapshot"},
-                {"for_each": "stray", "list_template": "GET /", "keys_path": "hits.hits[]._id", "next_path": "hits.hits[-1].sort"}]"#,
+                {"for_each": "stray", "list_template": "GET /", "keys": "JSON_EXTRACT(body, '$.hits.hits[*]._id')",
+                 "next": "JSON_EXTRACT(body, '$.hits.hits[last].sort')"}]"#,
         ))
         .unwrap();
         assert_eq!(s[0].kind, StepKind::Once);
         assert_eq!(s[1].kind, StepKind::Snapshot);
         assert!(matches!(
             &s[2].kind,
-            StepKind::Stray {
-                next_path: Some(_),
-                ..
-            }
+            StepKind::Stray { keys, next: Some(_), .. } if keys.starts_with("JSON_EXTRACT")
         ));
         assert!(parse_reset_steps(Some(r#"[{"once": true}]"#)).is_err());
         assert!(parse_reset_steps(Some(r#"[{"for_each": "stray"}]"#)).is_err());
+        assert!(parse_reset_steps(Some(
+            r#"[{"for_each": "stray", "list_template": "GET /", "keys": "JSON_EXTRACT(body, '$.ids'); DROP TABLE t"}]"#
+        ))
+        .is_err());
         assert!(parse_reset_steps(Some(r#"[{"template": "x"}]"#)).is_err());
     }
 

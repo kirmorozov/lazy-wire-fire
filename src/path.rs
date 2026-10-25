@@ -1,6 +1,5 @@
-//! JSON paths: column names that place a value in a document (`price.final`, `array[1].value`,
-//! `category_ids[]`), and paths that read from a response (`hits.hits[]._id`,
-//! `hits.hits[-1].sort`, `errors`).
+//! JSON paths in column names that place a value in a document: `price.final`,
+//! `array[1].value`, `category_ids[]`.
 
 use std::fmt;
 
@@ -14,10 +13,9 @@ pub const MAX_INDEX: i64 = 10_000;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Step {
     Field(String),
-    /// Array element. Negative indexes count from the end (read paths only).
+    /// Array element.
     Index(i64),
-    /// `[]` (or `[*]`): in a column name, collect the values of all rows; in a read path, every
-    /// element.
+    /// `[]` (or `[*]`): collect the values of all rows.
     Each,
 }
 
@@ -39,15 +37,9 @@ impl fmt::Display for Path {
 }
 
 impl Path {
-    /// Parses `a.b[2].c`, `ids[]`, `$.hits.hits[-1]`, `[0]` (a leading `$` or `$.` is the root;
-    /// `$` or `.` alone is the root itself).
+    /// Parses `a.b[2].c`, `ids[]`, `[0]`.
     pub fn parse(s: &str) -> Result<Path> {
-        let mut rest = s.trim();
-        if let Some(r) = rest.strip_prefix('$') {
-            rest = r.strip_prefix('.').unwrap_or(r);
-        } else if rest == "." {
-            rest = "";
-        }
+        let rest = s.trim();
         let mut steps = Vec::new();
         let b = rest.as_bytes();
         let mut i = 0;
@@ -63,7 +55,8 @@ impl Path {
                         steps.push(Step::Each);
                     } else {
                         match inner.parse::<i64>() {
-                            Ok(n) if n.abs() <= MAX_INDEX => steps.push(Step::Index(n)),
+                            Ok(n) if n < 0 => bail!("path `{s}`: negative index"),
+                            Ok(n) if n <= MAX_INDEX => steps.push(Step::Index(n)),
                             Ok(_) => bail!("path `{s}`: index above {MAX_INDEX}"),
                             Err(_) => bail!("path `{s}`: `[{inner}]` is not an index"),
                         }
@@ -120,38 +113,18 @@ impl Path {
         self.0.iter().position(|s| *s == Step::Each)
     }
 
-    /// Reads every value the path designates (`[]` fans out; missing parts yield nothing).
-    pub fn get<'a>(&self, v: &'a Value) -> Vec<&'a Value> {
-        let mut cur = vec![v];
-        for step in &self.0 {
-            let mut next = Vec::new();
-            for v in cur {
-                match (step, v) {
-                    (Step::Field(n), Value::Object(m)) => next.extend(m.get(n)),
-                    (Step::Index(i), Value::Array(a)) => {
-                        let idx = if *i < 0 { a.len() as i64 + i } else { *i };
-                        if idx >= 0 {
-                            next.extend(a.get(idx as usize));
-                        }
-                    }
-                    (Step::Each, Value::Array(a)) => next.extend(a.iter()),
-                    (Step::Each, Value::Object(m)) => next.extend(m.values()),
-                    _ => {}
-                }
-            }
-            cur = next;
-        }
-        cur
-    }
-
-    /// The single value at the path (first match), if any.
-    pub fn get_one<'a>(&self, v: &'a Value) -> Option<&'a Value> {
-        self.get(v).into_iter().next()
+    /// The value at a path without `[]` steps, if any.
+    fn lookup<'a>(&self, v: &'a Value) -> Option<&'a Value> {
+        self.0.iter().try_fold(v, |v, step| match (step, v) {
+            (Step::Field(n), Value::Object(m)) => m.get(n),
+            (Step::Index(i), Value::Array(a)) => a.get(*i as usize),
+            _ => None,
+        })
     }
 
     /// Writes `value` at the path inside `doc`, creating objects and arrays on the way
     /// (missing array elements become `null`). A value already in the way is replaced. A `[]`
-    /// step appends a new element. Negative indexes are not allowed here.
+    /// step appends a new element.
     pub fn set(&self, doc: &mut Value, value: Value) {
         let mut cur = doc;
         let n = self.0.len();
@@ -174,7 +147,7 @@ impl Path {
                     cur = m.entry(name.clone()).or_insert(Value::Null);
                 }
                 Step::Index(idx) => {
-                    let idx = (*idx).max(0) as usize;
+                    let idx = *idx as usize;
                     if !cur.is_array() {
                         *cur = Value::Array(Vec::new());
                     }
@@ -207,7 +180,7 @@ impl Path {
     /// Makes sure an array exists at this path (no `[]` steps), so an empty collection reads
     /// as `[]`.
     pub fn ensure_array(&self, doc: &mut Value) {
-        let present = matches!(self.get_one(doc), Some(Value::Array(_)));
+        let present = matches!(self.lookup(doc), Some(Value::Array(_)));
         if !present {
             self.set(doc, Value::Array(Vec::new()));
         }
@@ -246,10 +219,9 @@ mod tests {
             p("category_ids[]").0,
             vec![Step::Field("category_ids".into()), Step::Each]
         );
-        assert_eq!(p("$.hits.hits[-1].sort").to_string(), "hits.hits[-1].sort");
         assert_eq!(p("[0]").0, vec![Step::Index(0)]);
-        assert!(p("$").is_root() && p(".").is_root());
-        for bad in ["a..b", "a.", "a[x]", "a[1", "a]b", "a[0]b"] {
+        assert!(p("").is_root());
+        for bad in ["a..b", "a.", "a[x]", "a[1", "a]b", "a[0]b", "a[-1]", "."] {
             assert!(Path::parse(bad).is_err(), "{bad}");
         }
     }
@@ -263,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn set_and_get() {
+    fn set() {
         let mut d = json!({});
         p("price.final").set(&mut d, json!(9.5));
         p("array[1].value").set(&mut d, json!("x"));
@@ -273,14 +245,9 @@ mod tests {
             d,
             json!({"price": {"final": 9.5}, "array": [null, {"value": "x"}], "ids": [1, 2]})
         );
-        let r =
-            json!({"hits": {"hits": [{"_id": "1", "sort": ["1"]}, {"_id": "2", "sort": ["2"]}]}});
-        let ids: Vec<_> = p("hits.hits[]._id").get(&r).into_iter().cloned().collect();
-        assert_eq!(ids, vec![json!("1"), json!("2")]);
-        assert_eq!(p("hits.hits[-1].sort").get_one(&r), Some(&json!(["2"])));
-        assert!(p("hits.missing").get_one(&r).is_none());
-        let mut e = json!({});
+        let mut e = json!({"list": {"tags": [1]}});
         p("tags").ensure_array(&mut e);
-        assert_eq!(e, json!({"tags": []}));
+        p("list.tags").ensure_array(&mut e);
+        assert_eq!(e, json!({"list": {"tags": [1]}, "tags": []}));
     }
 }

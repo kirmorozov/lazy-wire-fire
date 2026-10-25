@@ -73,9 +73,6 @@ impl Plan {
                     if p.is_root() {
                         bail!("column `{name}` names no field");
                     }
-                    if p.0.iter().any(|s| matches!(s, Step::Index(i) if *i < 0)) {
-                        bail!("column `{name}`: negative indexes cannot be written");
-                    }
                     match p.each_at() {
                         None => Role::Set(p),
                         Some(0) => bail!("column `{name}`: `[]` must follow a field name"),

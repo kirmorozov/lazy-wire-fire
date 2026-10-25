@@ -261,6 +261,65 @@ pub fn expand(sql: &str, count: impl Fn(&str) -> usize) -> (String, Vec<String>)
     (out, names)
 }
 
+/// A SQL expression as far as lexing tells: the names in it and the functions it calls.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Expression {
+    /// Words (keywords and identifiers, quoted ones unquoted) in text order.
+    pub words: Vec<String>,
+    /// Words directly followed by `(`: function calls (and `IN (`, `AND (`, …).
+    pub calls: Vec<String>,
+    /// Uses `@variables`.
+    pub variables: bool,
+}
+
+/// Lexes `sql` as one expression to be embedded in a statement: not empty, parentheses
+/// balanced, no `;`, no `,` outside parentheses, no `?` or `:name` placeholders (the caller
+/// binds its own parameters around it).
+pub fn expression(sql: &str) -> Result<Expression, String> {
+    let toks = lex(sql);
+    if toks.is_empty() {
+        return Err("empty".into());
+    }
+    let mut e = Expression::default();
+    let mut depth = 0usize;
+    for (i, l) in toks.iter().enumerate() {
+        let next = toks.get(i + 1);
+        match &l.tok {
+            Tok::Semi => return Err("`;`: one expression, not statements".into()),
+            Tok::LParen => depth += 1,
+            Tok::RParen => {
+                depth = depth.checked_sub(1).ok_or("unbalanced `)`")?;
+            }
+            Tok::Comma if depth == 0 => {
+                return Err(
+                    "`,` outside parentheses: one expression (combine conditions with AND / OR)"
+                        .into(),
+                )
+            }
+            Tok::Param(p) => return Err(format!("placeholder `:{p}`")),
+            Tok::Word(w) | Tok::Quoted(w) => {
+                e.words.push(w.clone());
+                if next.is_some_and(|n| n.tok == Tok::LParen) {
+                    e.calls.push(w.clone());
+                }
+            }
+            Tok::Other => match &sql[l.start..l.end] {
+                "?" => return Err("placeholder `?`".into()),
+                "@" => e.variables = true,
+                "=" if next.is_some_and(|n| n.start == l.end && &sql[n.start..n.end] == "=") => {
+                    return Err("`==`: SQL compares with `=`".into())
+                }
+                _ => {}
+            },
+            Tok::Dot | Tok::Comma => {}
+        }
+    }
+    if depth != 0 {
+        return Err("unbalanced `(`".into());
+    }
+    Ok(e)
+}
+
 /// Splits `text` into statements at `;` outside literals and comments. Empty statements are
 /// dropped and each one is trimmed.
 pub fn split_statements(text: &str) -> Vec<String> {
@@ -605,5 +664,34 @@ mod tests {
         );
         assert!(d("GRANT SELECT ON *.* TO u").is_empty());
         assert!(d("CREATE DATABASE x").is_empty());
+    }
+
+    #[test]
+    fn expressions() {
+        let e = expression(
+            "status IN (200, 204) AND JSON_CONTAINS(body, 'false', '$.errors') -- ; ?\n/* , */",
+        )
+        .unwrap();
+        assert_eq!(
+            e.words,
+            ["status", "IN", "200", "204", "AND", "JSON_CONTAINS", "body"].map(String::from)
+        );
+        assert_eq!(e.calls, ["IN", "JSON_CONTAINS"].map(String::from));
+        assert!(!e.variables);
+        assert!(expression("`text` = 'a;b' AND @x = 1").unwrap().variables);
+        for bad in [
+            "",
+            " -- nothing",
+            "1; DROP TABLE t",
+            "status = ?",
+            "status = :x",
+            "errors == false",
+            "200, 204",
+            "1) OR (1",
+            "(1",
+        ] {
+            assert!(expression(bad).is_err(), "{bad}");
+        }
+        assert!(expression("a != 1 AND b <= 2 AND c <=> NULL").is_ok());
     }
 }

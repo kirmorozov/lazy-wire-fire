@@ -1,16 +1,18 @@
 //! A target at runtime: its endpoints, how a rendered action reaches each of them, and whether
-//! the answer meets `expect`.
+//! the answer meets `expect` (a SQL condition the source database evaluates).
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use mysql_async::Pool;
 use serde_json::{json, Value};
 
 use crate::aws;
 use crate::http::{BaseUrl, Client as HttpClient, RawRequest};
 use crate::model::{Kind, TargetDef};
 use crate::redis::{self, Client as RedisClient, RedisAddr, Reply};
+use crate::response::{Expect, Row, Uses};
 use crate::s3::{self, S3Spec};
 use crate::secrets;
 
@@ -39,7 +41,10 @@ pub struct Target {
     /// `target` in the template context: `name` and `vars` without credentials.
     pub ctx: Value,
     pub endpoints: Vec<Endpoint>,
+    pub expect: Expect,
     s3: Option<(S3Spec, aws::Provider)>,
+    /// The source database, which evaluates `expect`.
+    pool: Pool,
 }
 
 /// The target refused an action; sending it again would not help.
@@ -71,7 +76,8 @@ fn var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
 }
 
 impl Target {
-    pub fn new(def: TargetDef) -> Result<Arc<Target>> {
+    pub fn new(def: TargetDef, pool: Pool) -> Result<Arc<Target>> {
+        let expect = Expect::new(def.expect.as_deref()).context("`expect`")?;
         let mut endpoints = Vec::new();
         let mut s3_rt = None;
         match def.kind {
@@ -182,7 +188,9 @@ impl Target {
             def,
             ctx,
             endpoints,
+            expect,
             s3: s3_rt,
+            pool,
         }))
     }
 
@@ -190,8 +198,6 @@ impl Target {
         self.def.kind.is_http()
     }
 
-    /// Sends one rendered action to endpoint `ep` and checks `expect`. `Err` holds why it
-    /// failed (transport, status, body predicate or Redis error).
     /// Sends one rendered action to endpoint `ep` and checks `expect`. An error wrapping
     /// [`Rejected`] means the target refused this action (it would refuse it again); any
     /// other error is transient (the target or the way to it is unwell).
@@ -215,7 +221,14 @@ impl Target {
                     .send(&req, self.def.timeout)
                     .await
                     .with_context(|| format!("{} {}", req.method, client.base.url()))?;
-                if let Err(e) = self.def.expect.check_http(resp.status, &resp.body) {
+                let verdict = self
+                    .expect
+                    .http(&self.pool, resp.status, &resp.headers, &resp.body)
+                    .await
+                    .with_context(|| {
+                        format!("{} {}{}", req.method, client.base.url(), req.target)
+                    })?;
+                if let Err(e) = verdict {
                     let msg = format!(
                         "{} {}{}: {e}: {}",
                         req.method,
@@ -252,9 +265,10 @@ impl Target {
                         rejected(msg)
                     });
                 }
-                self.def
-                    .expect
-                    .check_value(&reply.to_json())
+                self.expect
+                    .row(&self.pool, |u| Row::reply(u, &reply))
+                    .await
+                    .with_context(|| format!("{name} on {}", client.addr.url()))?
                     .map_err(|e| rejected(format!("{name} on {}: {e}", client.addr.url())))?;
                 Ok(Sent::Ok)
             }
@@ -275,18 +289,20 @@ impl Target {
                     ),
                     _ => unreachable!(),
                 };
-                self.def
-                    .expect
-                    .check_value(&serde_json::json!({"affected_rows": affected}))
+                self.expect
+                    .row(&self.pool, |u| Row::affected(u, affected))
+                    .await
+                    .with_context(|| at.clone())?
                     .map_err(|e| rejected(format!("{at}: {e}")))?;
                 Ok(Sent::Ok)
             }
         }
     }
 
-    /// Sends a listing request (stray reset steps) and returns the response as JSON: the parsed
-    /// body (http, which must answer 2xx) or the reply (redis).
-    pub async fn fetch(&self, ep: usize, rendered: &str) -> Result<Value> {
+    /// Sends a listing request (stray reset steps) and returns the response as the row `r`
+    /// with the columns in `uses`: http must answer 2xx (and JSON when `body` is read), redis
+    /// any reply but an error, SQL targets give their rows as `body`.
+    pub async fn fetch(&self, ep: usize, rendered: &str, uses: Uses) -> Result<Row> {
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
@@ -310,9 +326,10 @@ impl Target {
                         resp.body_snippet()
                     );
                 }
-                serde_json::from_slice(&resp.body).map_err(|_| {
-                    anyhow!("the listing response is not JSON: {}", resp.body_snippet())
-                })
+                if uses.body && serde_json::from_slice::<Value>(&resp.body).is_err() {
+                    bail!("the listing response is not JSON: {}", resp.body_snippet());
+                }
+                Ok(Row::http(uses, resp.status, &resp.headers, &resp.body))
             }
             Transport::Redis(client) => {
                 let args = redis::tokenize(rendered)?;
@@ -323,17 +340,17 @@ impl Target {
                 if let Some(e) = reply.error() {
                     bail!("{e}");
                 }
-                Ok(reply.to_json())
+                Ok(Row::reply(uses, &reply))
             }
             Transport::MySql(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
-                c.rows(sql, self.def.timeout).await
+                Ok(Row::json(uses, &c.rows(sql, self.def.timeout).await?))
             }
             Transport::Pg(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
-                c.rows(&sql, self.def.timeout).await
+                Ok(Row::json(uses, &c.rows(&sql, self.def.timeout).await?))
             }
         }
     }

@@ -35,7 +35,7 @@ Keep a search index of orders in sync. A target, a rule, and the triggers that m
 
 ```sql
 INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect)
-VALUES ('search', 'http', 'http://opensearch:9200', '2xx and errors == false');
+VALUES ('search', 'http', 'http://opensearch:9200', 'JSON_CONTAINS(body, ''false'', ''$.errors'')');
 
 INSERT INTO lazy_wire_fire_rule (name, target, selects, template) VALUES ('orders_index', 'search',
  'SELECT o.id AS _key, o.status AS status, o.total AS `amount.total`, c.name AS `customer.name`,
