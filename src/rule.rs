@@ -32,8 +32,9 @@ pub fn list_template(i: usize) -> String {
 pub enum KeyTemplate {
     /// Literal text and column references per line.
     Simple(Vec<Vec<Seg>>),
-    /// A Handlebars template registered under this name.
-    Full(String),
+    /// One Handlebars template per line of the source (registered under these names), so a
+    /// value holding a newline cannot add keys.
+    Full(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -152,11 +153,24 @@ async fn compile_trigger(
         Some(src) => Some(match template::simple_key_template(src) {
             Some(lines) => KeyTemplate::Simple(lines),
             None => {
-                let name = format!("key{}", t.id);
-                templates
-                    .add(&name, src, KEY_ROOTS)
-                    .with_context(|| format!("trigger {} `key`", t.id))?;
-                KeyTemplate::Full(name)
+                let mut names = Vec::new();
+                for (n, line) in src
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .enumerate()
+                {
+                    let name = format!("key{}_{n}", t.id);
+                    templates.add(&name, line, KEY_ROOTS).with_context(|| {
+                        format!(
+                            "trigger {} `key`, line {} (each line is a template of its own)",
+                            t.id,
+                            n + 1
+                        )
+                    })?;
+                    names.push(name);
+                }
+                KeyTemplate::Full(names)
             }
         }),
     };

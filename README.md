@@ -41,8 +41,8 @@ INSERT INTO lazy_wire_fire_rule (name, target, selects, template) VALUES ('order
  'POST /orders/_bulk HTTP/1.1
 Content-Type: application/x-ndjson
 
-{{#each docs}}{{#if (eq op "delete")}}{"delete":{"_id":"{{key}}"}}
-{{else}}{"update":{"_id":"{{key}}"}}
+{{#each docs}}{{#if (eq op "delete")}}{"delete":{"_id":{{json key}}}}
+{{else}}{"update":{"_id":{{json key}}}}
 {"doc":{{json doc}},"doc_as_upsert":true}
 {{/if}}{{/each}}');
 
@@ -56,8 +56,10 @@ Thirty updates of order 42 within a second become one `_bulk` line for `42`, ren
 state after the last of them. Renaming a customer re-sends that customer's orders. A cancelled or
 deleted order becomes a `delete`. Changes take effect without a restart.
 
-More examples: a cache purge, a Redis command, an S3 export, reset steps, in
-[docs/reference.md](docs/reference.md#examples).
+Values from rows go into templates through the helper of the place they land in (`json`,
+`url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
+[security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
+export, reset steps, in [docs/reference.md](docs/reference.md#examples).
 
 ## How it behaves
 
@@ -96,6 +98,7 @@ Environment variables:
 | `LAZYWF_CONFIG_POLL_MS` | `30000` | rules are re-read this often besides on their own binlog events |
 | `LAZYWF_MAX_BACKOFF_MS` | `60000` | longest retry wait |
 | `LAZYWF_STOP_GRACE_MS` | `10000` | on SIGTERM, how long running actions may finish |
+| `LAZYWF_SECRET_DIRS` | `/run/secrets:/var/run/secrets` | where `file:` secret references may point |
 | `RUST_LOG`, `LAZYWF_LOG_FORMAT` | `info`, `text` | log level, `json` |
 
 Rules, triggers and targets: [docs/reference.md](docs/reference.md).

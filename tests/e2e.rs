@@ -866,11 +866,12 @@ async fn targets_add_their_authentication() {
     shop(&db).await;
     let mock = Mock::start().await;
     std::env::set_var("LWF_TEST_TOKEN", "t0ken");
-    let secret = std::env::current_dir()
-        .unwrap()
-        .join("tmp/out/lwf-test-secret");
-    std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+    let dir = std::env::current_dir().unwrap().join("tmp/out/secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("basic-pw");
     std::fs::write(&secret, "s3cret\n").unwrap();
+    // `file:` references must lie in a secret directory.
+    std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
     let file_ref = format!("file:{}", secret.display());
     let url = format!("{}/base", mock.url());
     db.target(
@@ -1186,4 +1187,98 @@ async fn search_elasticsearch8() {
         },
     )
     .await;
+}
+
+/// Row values written by an attacker: quotes and newlines in string keys, CR-LF in values that
+/// land in a header, a document the target refuses. Nothing breaks out, the refused key is
+/// isolated and dropped after STRIKES refusals, the rest goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_values_stay_contained() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "hostile").await;
+    db.exec("CREATE TABLE notes (id VARCHAR(64) PRIMARY KEY, title VARCHAR(200))")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|r| {
+        if r.body.contains("poison") {
+            (400, r#"{"error":"bad document"}"#.into())
+        } else {
+            (200, "{}".into())
+        }
+    });
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let template = "POST /notes/_bulk HTTP/1.1\nX-Titles: {{#each docs}}{{doc.title}};{{/each}}\nContent-Type: application/x-ndjson\n\n{{#each docs}}{\"update\":{\"_id\":{{json key}}}}\n{\"doc\":{{json doc}}}\n{{/each}}";
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms) \
+         VALUES ('n', 'hook', 'SELECT id AS _key, title FROM notes WHERE id IN (:keys)', ?, 100)",
+        (template,),
+    )
+    .await;
+    db.trigger("n", "notes", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec_params(
+        "INSERT INTO notes VALUES (?, 'quote'), (?, 'newline in the key'), ('ok1', ?), ('poison', 'refused'), ('ok2', 'fine')",
+        ("a\"b\"}},{\"delete\":{\"_id\":\"ok2\"}}", "line\nbreak", "x\r\nX-Evil: 1"),
+    )
+    .await;
+    let start = binlog_end(&db).await;
+    let ids = wait_for(Duration::from_secs(15), "the harmless keys", || async {
+        let mut ids = std::collections::BTreeSet::new();
+        for r in mock
+            .requests()
+            .iter()
+            .filter(|r| !r.body.contains("poison"))
+        {
+            for line in r.ndjson() {
+                if let Some(id) = line["update"]["_id"].as_str() {
+                    ids.insert(id.to_string());
+                }
+                assert!(
+                    line.get("delete").is_none(),
+                    "a key broke out of its JSON string: {line}"
+                );
+            }
+        }
+        (ids.len() >= 3).then_some(ids)
+    })
+    .await;
+    let expected: std::collections::BTreeSet<String> =
+        ["a\"b\"}},{\"delete\":{\"_id\":\"ok2\"}}", "ok1", "ok2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    assert_eq!(ids, expected, "keys reached the target intact and alone");
+    for r in mock.requests() {
+        assert!(
+            r.header("x-evil").is_none(),
+            "a value added a header: {r:?}"
+        );
+    }
+    // The refused key is dropped after its strikes, the position moves on.
+    let err = wait_for(
+        Duration::from_secs(30),
+        "the poison key dropped",
+        || async {
+            let (f, p, _, err) = db.status("n").await?;
+            let err = err?;
+            (err.contains("`poison` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(err.contains("bad document"), "{err}");
+    let poison_tries = mock
+        .requests()
+        .iter()
+        .filter(|r| r.body.contains("poison"))
+        .count();
+    assert!(
+        (5..=7).contains(&poison_tries),
+        "poison sent {poison_tries} times"
+    );
+    assert!(
+        !mock.requests().iter().any(|r| r.body.contains("line")),
+        "a key with a newline was sent"
+    );
+    inst.stop().await;
 }

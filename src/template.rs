@@ -1,17 +1,18 @@
 //! Handlebars templates: actions (HTTP requests, Redis commands) and trigger keys.
 //!
-//! Output is never HTML-escaped. Helpers beyond the built-ins (`if`, `unless`, `each`, `with`,
+//! Output is never HTML-escaped; control characters in interpolated values become spaces (see
+//! [`neutralize`]). Helpers beyond the built-ins (`if`, `unless`, `each`, `with`,
 //! `lookup`, `eq`, `ne`, `gt`, `lt`, `and`, `or`, `not`, `len`):
 //!
 //! * `join list sep` (default `,`), `upper s`, `lower s`;
 //! * `regex_escape s`, `url_encode s` (RFC 3986 unreserved kept), `json v` (compact JSON);
-//! * `replace s regex replacement` (all matches, `$1` groups), `redis_quote s` (a double-quoted
-//!   redis-cli argument).
+//! * `replace s regex replacement` (all matches, `$1` groups), `redis_quote s…` (its arguments,
+//!   concatenated, as one double-quoted redis-cli argument).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use handlebars::{
     Context, Handlebars, Helper, HelperDef, RenderContext, RenderError, RenderErrorReason,
     ScopedJson,
@@ -104,11 +105,10 @@ fn h_json(h: &Helper<'_>) -> Result<Value, RenderError> {
 }
 
 fn h_redis_quote(h: &Helper<'_>) -> Result<Value, RenderError> {
-    Ok(Value::String(redis_quote(&text(param(
-        h,
-        0,
-        "redis_quote",
-    )?))))
+    // All parameters, concatenated, as one argument: `{{redis_quote target.vars.prefix key}}`.
+    param(h, 0, "redis_quote")?;
+    let joined: String = h.params().iter().map(|p| text(p.value())).collect();
+    Ok(Value::String(redis_quote(&joined)))
 }
 
 /// Percent-encodes everything but RFC 3986 unreserved characters.
@@ -194,25 +194,32 @@ pub const KEY_ROOTS: &[&str] = &["old", "new", "row", "op", "table"];
 /// way Handlebars.js does in compat mode (which handlebars-rust lacks): `{{target.vars.prefix}}`
 /// inside `{{#each keys}}` becomes `{{@root.target.vars.prefix}}`. A field of the current
 /// element with one of these names stays reachable as `this.<name>`.
+#[allow(clippy::manual_strip)] // offsets into `tag` are what the scan needs
 pub fn resolve_roots(source: &str, roots: &[&str]) -> String {
     let mut out = String::with_capacity(source.len() + 32);
-    let mut stack: Vec<String> = Vec::new();
+    // Open blocks: helper name and block parameters (`as |a b|`).
+    let mut stack: Vec<(String, Vec<String>)> = Vec::new();
     let mut rest = source;
     while let Some(open) = rest.find("{{") {
         out.push_str(&rest[..open]);
         let tag = &rest[open..];
-        // Comments and raw blocks pass through untouched.
-        if tag.starts_with("{{!--") || tag.starts_with("{{!") || tag.starts_with("{{{{") {
-            let end_pat = if tag.starts_with("{{!--") {
-                "--}}"
-            } else if tag.starts_with("{{{{") {
-                "}}}}"
-            } else {
-                "}}"
-            };
-            let end = tag[3..]
-                .find(end_pat)
-                .map_or(tag.len(), |n| 3 + n + end_pat.len());
+        // Comments and raw blocks (with their content) pass through untouched.
+        let skip_to = if tag.starts_with("{{!--") {
+            Some(tag[5..].find("--}}").map_or(tag.len(), |n| 5 + n + 4))
+        } else if tag.starts_with("{{!") {
+            Some(tag[3..].find("}}").map_or(tag.len(), |n| 3 + n + 2))
+        } else if tag.starts_with("{{{{") {
+            // `{{{{raw}}}} … {{{{/raw}}}}`
+            Some(
+                tag[4..]
+                    .find("{{{{/")
+                    .and_then(|n| tag[4 + n..].find("}}}}").map(|m| 4 + n + m + 4))
+                    .unwrap_or(tag.len()),
+            )
+        } else {
+            None
+        };
+        if let Some(end) = skip_to {
             out.push_str(&tag[..end]);
             rest = &tag[end..];
             continue;
@@ -228,19 +235,26 @@ pub fn resolve_roots(source: &str, roots: &[&str]) -> String {
         }
         let inner = &tag[2..close - 2];
         let body = inner.trim_start_matches(['{', '~']).trim_start();
-        let scoped = stack.iter().any(|h| h == "each" || h == "with");
+        let scoped = stack.iter().any(|(h, _)| h == "each" || h == "with");
+        let params: Vec<String> = stack.iter().flat_map(|(_, p)| p.iter().cloned()).collect();
         let rewritten = if scoped {
-            rewrite_tag(inner, roots)
+            rewrite_tag(inner, roots, &params)
         } else {
             inner.to_string()
         };
+        // `{{^}}` is `else` (handlebars-rust has no `{{^name}}` sections): no new block.
         if let Some(b) = body.strip_prefix('#') {
             let name = b
                 .trim_start_matches(['*', '>'])
                 .split(|c: char| c.is_whitespace() || c == '~' || c == '}')
                 .next()
                 .unwrap_or("");
-            stack.push(name.to_string());
+            let block_params = b
+                .split_once(" as |")
+                .and_then(|(_, p)| p.split_once('|'))
+                .map(|(p, _)| p.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default();
+            stack.push((name.to_string(), block_params));
         } else if body.starts_with('/') {
             stack.pop();
         }
@@ -253,12 +267,31 @@ pub fn resolve_roots(source: &str, roots: &[&str]) -> String {
     out
 }
 
+/// Partials are not supported: templates of a rule share one registry, and partials that
+/// include each other recurse until the stack overflows.
+pub fn check_no_partials(source: &str) -> Result<()> {
+    let mut rest = source;
+    while let Some(open) = rest.find("{{") {
+        let body = rest[open + 2..].trim_start_matches(['{', '~']).trim_start();
+        let body = body.strip_prefix('#').map_or(body, str::trim_start);
+        if body.starts_with('>') || body.starts_with("*inline") {
+            bail!("partials (`{{{{> …}}}}`, `{{{{#*inline}}}}`) are not supported");
+        }
+        rest = &rest[open + 2..];
+    }
+    Ok(())
+}
+
 /// Prefixes path expressions whose first segment is one of `roots` with `@root.`.
-fn rewrite_tag(inner: &str, roots: &[&str]) -> String {
+fn rewrite_tag(inner: &str, roots: &[&str], params: &[String]) -> String {
     let b = inner.as_bytes();
     let mut out = String::with_capacity(inner.len() + 8);
     let mut i = 0;
     let mut in_params = false; // inside `as |a b|`
+                               // The name of a block (`{{#x}}`, `{{^x}}`, `{{/x}}`) stays as written: handlebars-rust
+                               // takes no `@root.` path there, and an opening and its closing must keep matching.
+    let block = inner.trim_start_matches(['{', '~']).trim_start();
+    let mut skip_name = block.starts_with(['#', '^', '/']);
     while i < b.len() {
         let c = b[i];
         match c {
@@ -290,7 +323,14 @@ fn rewrite_tag(inner: &str, roots: &[&str]) -> String {
                 // parameters (`as |x|`) are left alone.
                 let is_hash_key = b.get(j) == Some(&b'=');
                 let head = tok.split(['.', '/', '[']).next().unwrap_or("");
-                if !in_params && !is_hash_key && roots.contains(&head) {
+                let name = std::mem::take(&mut skip_name);
+                // A block parameter with a root's name (`as |rule|`) is the parameter.
+                if !name
+                    && !in_params
+                    && !is_hash_key
+                    && roots.contains(&head)
+                    && !params.iter().any(|p| p == head)
+                {
                     out.push_str("@root.");
                 }
                 out.push_str(tok);
@@ -299,6 +339,19 @@ fn rewrite_tag(inner: &str, roots: &[&str]) -> String {
         }
     }
     out
+}
+
+/// The escape function: no HTML escaping, but control characters in an interpolated value
+/// (`{{x}}`) become spaces, so data never starts a new header, request, NDJSON line or
+/// command line. `{{{x}}}` opts out; `json`, `redis_quote` and `url_encode` never emit them.
+pub fn neutralize(s: &str) -> String {
+    if s.chars().any(char::is_control) {
+        s.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    } else {
+        s.to_string()
+    }
 }
 
 /// A set of named templates sharing the helpers.
@@ -321,7 +374,7 @@ impl Default for Templates {
 impl Templates {
     pub fn new() -> Templates {
         let mut hb = Handlebars::new();
-        hb.register_escape_fn(handlebars::no_escape);
+        hb.register_escape_fn(neutralize);
         hb.set_strict_mode(false);
         hb.set_prevent_indent(true);
         let simple: [(&str, HelperFn); 7] = [
@@ -343,6 +396,7 @@ impl Templates {
     /// Compiles `source` under `name` (top-level `roots` resolved inside blocks, see
     /// [`resolve_roots`]); the error names the template.
     pub fn add(&mut self, name: &str, source: &str, roots: &[&str]) -> Result<()> {
+        check_no_partials(source).with_context(|| format!("template `{name}`"))?;
         self.hb
             .register_template_string(name, resolve_roots(source, roots))
             .map_err(|e| anyhow!("{e}"))
@@ -407,6 +461,12 @@ pub fn simple_key_template(source: &str) -> Option<Vec<Vec<Seg>>> {
         lines.push(segs);
     }
     Some(lines)
+}
+
+/// A key is one line of text: not empty, no control characters. Keys built from data that
+/// break this are refused rather than passed on into requests and commands.
+pub fn valid_key(k: &str) -> bool {
+    !k.is_empty() && !k.bytes().any(|c| c < b' ' || c == 0x7f)
 }
 
 /// Keys from rendered key-template output: one per non-empty line, trimmed.
@@ -543,6 +603,77 @@ mod tests {
         assert_eq!(
             r("{{#with target}}{{x k=vars}}{{/with}}{{vars}}"),
             "{{#with target}}{{x k=@root.vars}}{{/with}}{{vars}}"
+        );
+    }
+
+    #[test]
+    fn root_resolution_edge_cases() {
+        let r = |s: &str| resolve_roots(s, ACTION_ROOTS);
+        // An inverse section is a block of its own: closing it does not end the `each`.
+        // `{{^}}` (else) keeps the `each` open.
+        assert_eq!(
+            r("{{#each keys}}{{this}}{{^}}{{rule}}{{/each}}{{rule}}"),
+            "{{#each keys}}{{this}}{{^}}{{@root.rule}}{{/each}}{{rule}}"
+        );
+        assert_eq!(
+            render(
+                "{{#each keys}}{{this}}{{^}}none of {{rule}}{{/each}}",
+                json!({"keys": [], "rule": "r"})
+            ),
+            "none of r"
+        );
+        // A block helper's parameters still resolve.
+        assert_eq!(
+            r("{{#each docs}}{{#each target.vars.list}}{{/each}}{{/each}}"),
+            "{{#each docs}}{{#each @root.target.vars.list}}{{/each}}{{/each}}"
+        );
+        // Block parameters named like roots stay parameters.
+        assert_eq!(
+            r("{{#each docs as |rule|}}{{rule.key}}{{/each}}"),
+            "{{#each docs as |rule|}}{{rule.key}}{{/each}}"
+        );
+        // Raw blocks are left alone, content included.
+        assert_eq!(
+            r("{{#each keys}}{{{{raw}}}}{{vars}}{{{{/raw}}}}{{/each}}"),
+            "{{#each keys}}{{{{raw}}}}{{vars}}{{{{/raw}}}}{{/each}}"
+        );
+    }
+
+    #[test]
+    fn interpolated_control_characters_are_neutralized() {
+        let ctx = json!({"t": "x\r\nX-Evil: 1", "doc": {"a": "l1\nl2"}});
+        assert_eq!(
+            render("X-Title: {{t}}\n", ctx.clone()),
+            "X-Title: x  X-Evil: 1\n"
+        );
+        assert_eq!(render("{{json doc}}", ctx.clone()), "{\"a\":\"l1\\nl2\"}");
+        assert_eq!(render("{{{t}}}", ctx), "x\r\nX-Evil: 1");
+    }
+
+    #[test]
+    fn partials_are_refused() {
+        for src in [
+            "{{> action}}",
+            "{{~> step0}}",
+            "{{#> layout}}x{{/layout}}",
+            "{{#*inline \"p\"}}x{{/inline}}",
+            "{{ > x }}",
+        ] {
+            assert!(
+                Templates::new().add("t", src, ACTION_ROOTS).is_err(),
+                "{src}"
+            );
+        }
+        Templates::new()
+            .add("t", "{{#each keys}}{{this}}{{/each}} a > b", ACTION_ROOTS)
+            .unwrap();
+    }
+
+    #[test]
+    fn redis_quote_joins_its_arguments() {
+        assert_eq!(
+            render("{{redis_quote p k}}", json!({"p": "cust:", "k": "a \"b"})),
+            "\"cust:a \\\"b\""
         );
     }
 

@@ -7,6 +7,7 @@
 * [Templates](#templates): context, helpers, what to render
 * [Reset steps](#reset-steps): when continuity is lost, or on request
 * [Status](#status)
+* [Security](#security)
 * [Examples](#examples)
 
 The tables are created on start in the DSN's schema. Text columns holding lists accept a JSON
@@ -138,7 +139,8 @@ compat mode), so `{{target.vars.prefix}}` works inside `{{#each keys}}`. A field
 element with one of these names is `this.<name>`.
 
 Helpers: `join list sep`, `upper`, `lower`, `regex_escape`, `url_encode`, `json`,
-`replace s regex replacement`, `redis_quote`, plus the built-ins `if`, `unless`, `each`, `with`,
+`replace s regex replacement`, `redis_quote s…` (its arguments concatenated, as one Redis
+argument), plus the built-ins `if`, `unless`, `each`, `with`,
 `lookup`, `eq`, `ne`, `gt`, `lt`, `and`, `or`, `not`, `len`. String literals in templates take
 JSON escapes: write `"\\d"` for the regex `\d`.
 
@@ -193,6 +195,44 @@ Paths (`keys_path`, `next_path`, `expect`) are dotted fields with `[n]` (negativ
 | `server_identity` | `*` only: the server the positions belong to |
 | `updated_at` | written when the position moves, and at least every 30 s |
 
+## Security
+
+Templates are not escaped for you (there is no context the tool could know), so **values from
+rows go through the helper of the place they land in**:
+
+| where | write | not |
+|---|---|---|
+| a JSON string or value | `"_id":{{json key}}`, `{{json doc}}` | `"_id":"{{key}}"`: a key `1"}}…` adds `_bulk` actions |
+| a path or query | `/items/{{url_encode key}}.json` | `/items/{{key}}.json`: a key `a?x=` writes another object |
+| a regex (Varnish tags) | `{{regex_escape this}}` | `{{this}}`: a key `.*` purges everything |
+| a Redis argument | `{{redis_quote this}}`, or `ARGV` of a script | splicing keys into a Lua string |
+
+What the tool enforces on its own:
+
+* **Keys are one line of text.** A key with a control character (from a key template, `keys_sql`,
+  the snapshot or a stray listing) is ignored and reported in `last_error`; a key template is
+  rendered line by line, so a newline in a value cannot mark extra keys.
+* **Interpolated values hold no control characters**: `{{x}}` turns them into spaces, so data
+  never starts a new header, request, NDJSON line or command (`{{{x}}}` opts out). A request line
+  or header with a control character is refused.
+* **A refused key does not stall its rule.** An action the target refuses (4xx, an `expect`
+  predicate, a Redis error) is split until the refused keys stand alone; the others go through.
+  A key refused 5 times while others went through is dropped and named in `last_error`. When
+  everything is refused, nothing is dropped (the template or the target is at fault). Transient
+  failures (connection, timeout, 5xx, 429, Redis `LOADING`/`READONLY`/…) only wait.
+* **Bounded parsing**: response bodies, Redis replies and path indexes (`_path`, `a[n]`, at most
+  10000) are capped. Partials (`{{> …}}`) are refused.
+* **Secret references are confined**: `env:` cannot name lazywf's own settings (`LAZYWF_*`), and
+  `file:` must resolve (symlinks followed) inside `LAZYWF_SECRET_DIRS` (default
+  `/run/secrets:/var/run/secrets`).
+
+What it cannot enforce, so treat the tool's tables as **admin-only**:
+
+* a writer of `lazy_wire_fire_rule` / `_trigger` runs SQL as lazywf's account (give it `SELECT`
+  only where rules need it), and sends the result anywhere a target points;
+* a writer of `lazy_wire_fire_target` chooses where requests (with the credentials of that target)
+  go, including internal addresses.
+
 ## Examples
 
 **Cache purge by tag, several hosts** (no selects: the keys are the tags):
@@ -202,7 +242,7 @@ INSERT INTO lazy_wire_fire_target (name, kind, endpoints) VALUES ('varnish', 'ht
 INSERT INTO lazy_wire_fire_rule (name, target, batch_max_bytes, template, reset_steps) VALUES ('purge', 'varnish', 7000,
 'PURGE / HTTP/1.1
 Host: {{endpoint.host}}
-X-Tags-Pattern: {{#each keys}}((^|,){{this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}
+X-Tags-Pattern: {{#each keys}}((^|,){{regex_escape this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}
 ', '[{"once": true, "template": "PURGE / HTTP/1.1\nX-Tags-Pattern: .*\n"}]');
 INSERT INTO lazy_wire_fire_trigger (rule, source_table, `key`) VALUES
  ('purge', 'stock', 'product_{{new.product_id}}'),
@@ -216,7 +256,7 @@ INSERT INTO lazy_wire_fire_target (name, kind, endpoints, vars)
 VALUES ('cache', 'redis', 'redis:6379/1', '{"password": "env:REDIS_PASSWORD", "prefix": "cust:"}');
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template) VALUES ('customer_cache', 'cache', 'key',
  'SELECT id AS _key, name, email, IF(active, NULL, ''delete'') AS _op FROM customers WHERE id IN (:keys)',
- '{{#each docs}}{{#if (eq op "delete")}}DEL {{target.vars.prefix}}{{key}}{{else}}SET {{target.vars.prefix}}{{key}} {{redis_quote (json doc)}}{{/if}}{{/each}}');
+ '{{#each docs}}{{#if (eq op "delete")}}DEL {{redis_quote target.vars.prefix key}}{{else}}SET {{redis_quote target.vars.prefix key}} {{redis_quote (json doc)}}{{/if}}{{/each}}');
 ```
 
 **JSON objects in S3**, kept in sync (a `PUT` overwrites, a `DELETE` of a missing object succeeds):
@@ -228,9 +268,9 @@ INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, snapshot_keys_
  ('customers_json', 'export', 'key',
   'SELECT id AS _key, name, email, NULL AS _op FROM customers WHERE id IN (:keys)',
   'SELECT id AS _key FROM customers',
-  '{{#each docs}}{{#if (eq op "delete")}}DELETE /customers/{{key}}.json HTTP/1.1
+  '{{#each docs}}{{#if (eq op "delete")}}DELETE /customers/{{url_encode key}}.json HTTP/1.1
 
-{{else}}PUT /customers/{{key}}.json HTTP/1.1
+{{else}}PUT /customers/{{url_encode key}}.json HTTP/1.1
 Content-Type: application/json
 
 {{json doc}}{{/if}}{{/each}}',

@@ -160,13 +160,26 @@ fn key_column(row: &Row) -> Option<usize> {
         .position(|c| c.name_str() == "_key")
 }
 
+/// The `_key` values of `rows` (keys with control characters are dropped, see
+/// [`crate::template::valid_key`]).
 fn keys_of(rows: Vec<Row>) -> Vec<String> {
     let Some(i) = rows.first().and_then(key_column) else {
         return Vec::new();
     };
-    rows.into_iter()
+    let mut bad = 0;
+    let keys: Vec<String> = rows
+        .into_iter()
         .filter_map(|mut r| r.take::<My, _>(i).and_then(|v| docs::key_text(&v)))
-        .collect()
+        .filter(|k| {
+            let ok = crate::template::valid_key(k);
+            bad += usize::from(!ok && !k.is_empty());
+            ok
+        })
+        .collect();
+    if bad > 0 {
+        tracing::warn!("{bad} `_key` values hold control characters and are ignored");
+    }
+    keys
 }
 
 /// Runs the key queries of a flush; returns the keys they found.
@@ -298,10 +311,12 @@ pub struct Fired {
     pub failed: u64,
     pub skipped: u64,
     pub keys_done: u64,
+    /// Not confirmed for a transient reason (or not attempted): fire again.
     pub failed_keys: Vec<String>,
+    /// Refused by the target on their own, with why.
+    pub rejected: Vec<(String, String)>,
     pub error: Option<String>,
-    /// The failure came from the target (transport, status, reply), not from the database or
-    /// the templates.
+    /// The failure came from the target being unwell (transport, 5xx), not from this data.
     pub target_error: bool,
     pub select_time: Duration,
 }
@@ -317,7 +332,16 @@ impl Fired {
     }
 }
 
-/// Sends one action (rendered per endpoint) to every endpoint.
+/// Why an action did not go through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    /// The target or the way to it is unwell: everything waits.
+    Transient,
+    /// This action was refused (or could not be rendered): it may be its data.
+    Rejected,
+}
+
+/// Sends one action (rendered per endpoint) to every endpoint, or to `only`.
 async fn send_all(
     rule: &Rule,
     target: &Target,
@@ -325,28 +349,108 @@ async fn send_all(
     keys: &[String],
     docs: &[Doc],
     reset: &Value,
-) -> Result<Sent, (anyhow::Error, bool)> {
-    let mut rendered = Vec::with_capacity(target.endpoints.len());
-    for ep in &target.endpoints {
+    only: Option<usize>,
+) -> Result<Sent, (anyhow::Error, Fail)> {
+    let eps: Vec<usize> = match only {
+        Some(e) => vec![e],
+        None => (0..target.endpoints.len()).collect(),
+    };
+    let mut rendered = Vec::with_capacity(eps.len());
+    for &i in &eps {
+        let Some(ep) = target.endpoints.get(i) else {
+            return Err((
+                anyhow!("endpoint {i} of target `{}` is gone", target.def.name),
+                Fail::Transient,
+            ));
+        };
         let ctx = context(rule, target, keys, docs, &ep.ctx, reset);
-        rendered.push(
-            rule.templates
-                .render(template, &ctx)
-                .map_err(|e| (e, false))?,
-        );
+        let r = rule
+            .templates
+            .render(template, &ctx)
+            .map_err(|e| (e, Fail::Rejected))?;
+        rendered.push((i, r));
     }
     let results =
-        futures_util::future::join_all(rendered.iter().enumerate().map(|(i, r)| target.send(i, r)))
-            .await;
+        futures_util::future::join_all(rendered.iter().map(|(i, r)| target.send(*i, r))).await;
     let mut sent = Sent::Skipped;
+    let mut transient = None;
     for r in results {
         match r {
             Ok(Sent::Ok) => sent = Sent::Ok,
             Ok(Sent::Skipped) => {}
-            Err(e) => return Err((e, true)),
+            Err(e) if crate::target::is_rejected(&e) => return Err((e, Fail::Rejected)),
+            Err(e) => transient = transient.or(Some(e)),
         }
     }
-    Ok(sent)
+    match transient {
+        Some(e) => Err((e, Fail::Transient)),
+        None => Ok(sent),
+    }
+}
+
+/// Sends `keys` as one action; a rejected action is split until the keys it fails on stand
+/// alone (they go to `f.rejected`). `Err`: a transient failure; the keys not confirmed are in
+/// `f.failed_keys` and nothing more should be sent now.
+async fn send_group(
+    rule: &Rule,
+    target: &Target,
+    template: &str,
+    keys: &[String],
+    docs: &[Doc],
+    reset: &Value,
+    only: Option<usize>,
+    f: &mut Fired,
+) -> Result<(), ()> {
+    let mut todo = vec![(0, keys.len())];
+    while let Some((a, b)) = todo.pop() {
+        if a == b {
+            continue;
+        }
+        match send_all(
+            rule,
+            target,
+            template,
+            &keys[a..b],
+            &docs[a..b],
+            reset,
+            only,
+        )
+        .await
+        {
+            Ok(s) => {
+                if s == Sent::Ok {
+                    f.ok += 1;
+                } else {
+                    f.skipped += 1;
+                }
+                f.keys_done += (b - a) as u64;
+            }
+            Err((e, Fail::Transient)) => {
+                f.failed += 1;
+                f.error = Some(format!("{e:#}"));
+                f.target_error = true;
+                f.failed_keys.extend(keys[a..b].iter().cloned());
+                for (a, b) in todo {
+                    f.failed_keys.extend(keys[a..b].iter().cloned());
+                }
+                return Err(());
+            }
+            Err((e, Fail::Rejected)) => {
+                f.failed += 1;
+                if f.error.is_none() {
+                    f.error = Some(format!("{e:#}"));
+                }
+                if b - a == 1 {
+                    f.rejected.push((keys[a].clone(), format!("{e:#}")));
+                } else {
+                    let mid = a + (b - a) / 2;
+                    todo.push((mid, b));
+                    todo.push((a, mid));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Splits a group so each rendered action stays within `batch_max_bytes`.
@@ -387,8 +491,99 @@ fn split_by_bytes(
     Ok(out)
 }
 
-/// Reads the documents for `keys` and fires them, group by group. Stops at the first failure;
-/// the keys not confirmed are returned in `failed_keys`.
+/// Sends the actions for `keys` with their documents (one per key, or in byte-limited
+/// groups), to every endpoint or to `only`.
+async fn fire_docs(
+    env: &Env,
+    rule: &Rule,
+    target: &Target,
+    keys: &[String],
+    docs: &[Doc],
+    template: &str,
+    reset: &Value,
+    only: Option<usize>,
+    f: &mut Fired,
+) -> Result<(), ()> {
+    match rule.def.fire_per {
+        FirePer::Key => {
+            // Concurrently, each key on its own.
+            let futs: Vec<_> = keys
+                .iter()
+                .zip(docs)
+                .map(|(k, d)| async move {
+                    let mut one = Fired::default();
+                    let r = send_group(
+                        rule,
+                        target,
+                        template,
+                        std::slice::from_ref(k),
+                        std::slice::from_ref(d),
+                        reset,
+                        only,
+                        &mut one,
+                    )
+                    .await;
+                    (one, r)
+                })
+                .collect();
+            let results: Vec<(Fired, Result<(), ()>)> = stream::iter(futs)
+                .buffer_unordered(env.send_concurrency)
+                .collect()
+                .await;
+            let mut res = Ok(());
+            for (one, r) in results {
+                f.ok += one.ok;
+                f.skipped += one.skipped;
+                f.failed += one.failed;
+                f.keys_done += one.keys_done;
+                f.failed_keys.extend(one.failed_keys);
+                f.rejected.extend(one.rejected);
+                if one.target_error {
+                    f.target_error = true;
+                    f.error = one.error;
+                } else if f.error.is_none() {
+                    f.error = one.error;
+                }
+                res = res.and(r);
+            }
+            res
+        }
+        FirePer::Batch => {
+            let parts = match split_by_bytes(rule, target, template, keys, docs, reset) {
+                Ok(p) => p,
+                Err(e) => {
+                    f.error = Some(format!("{e:#}"));
+                    f.failed_keys.extend(keys.iter().cloned());
+                    return Err(());
+                }
+            };
+            for (n, (a, b)) in parts.iter().enumerate() {
+                if send_group(
+                    rule,
+                    target,
+                    template,
+                    &keys[*a..*b],
+                    &docs[*a..*b],
+                    reset,
+                    only,
+                    f,
+                )
+                .await
+                .is_err()
+                {
+                    for (a, b) in &parts[n + 1..] {
+                        f.failed_keys.extend(keys[*a..*b].iter().cloned());
+                    }
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Reads the documents for `keys` and fires them, group by group. A transient failure stops
+/// it; the keys not confirmed are in `failed_keys`, the refused ones in `rejected`.
 pub async fn fire_keys(
     env: &Env,
     rule: &Rule,
@@ -434,7 +629,7 @@ pub async fn fire_keys(
             None => load_docs(env, rule, &unit).await,
         };
         f.select_time += t0.elapsed();
-        let docs = match docs {
+        let docs: Vec<Doc> = match docs {
             Ok(d) => d,
             Err(e) => {
                 f.error = Some(format!("{e:#}"));
@@ -442,100 +637,12 @@ pub async fn fire_keys(
                 break;
             }
         };
-        let r = match rule.def.fire_per {
-            FirePer::Key => {
-                let futs: Vec<_> = docs
-                    .iter()
-                    .enumerate()
-                    .map(|(j, d)| {
-                        let target = target.clone();
-                        let reset = reset.clone();
-                        async move {
-                            let k = [d.key.clone()];
-                            (
-                                j,
-                                send_all(
-                                    rule,
-                                    &target,
-                                    template,
-                                    &k,
-                                    std::slice::from_ref(d),
-                                    &reset,
-                                )
-                                .await,
-                            )
-                        }
-                    })
-                    .collect();
-                let results: Vec<(usize, Result<Sent, (anyhow::Error, bool)>)> = stream::iter(futs)
-                    .buffer_unordered(env.send_concurrency)
-                    .collect()
-                    .await;
-                let mut first_err = None;
-                for (j, r) in results {
-                    match r {
-                        Ok(Sent::Ok) => {
-                            f.ok += 1;
-                            f.keys_done += 1;
-                        }
-                        Ok(Sent::Skipped) => {
-                            f.skipped += 1;
-                            f.keys_done += 1;
-                        }
-                        Err(e) => {
-                            f.failed += 1;
-                            f.failed_keys.push(unit[j].clone());
-                            first_err.get_or_insert(e);
-                        }
-                    }
-                }
-                first_err.map_or(Ok(()), Err)
-            }
-            FirePer::Batch => {
-                let parts = match split_by_bytes(rule, &target, template, &unit, &docs, &reset) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        f.error = Some(format!("{e:#}"));
-                        f.failed_keys.extend(unit);
-                        break;
-                    }
-                };
-                let mut res = Ok(());
-                for (n, (a, b)) in parts.iter().enumerate() {
-                    match send_all(
-                        rule,
-                        &target,
-                        template,
-                        &unit[*a..*b],
-                        &docs[*a..*b],
-                        &reset,
-                    )
-                    .await
-                    {
-                        Ok(s) => {
-                            if s == Sent::Ok {
-                                f.ok += 1;
-                            } else {
-                                f.skipped += 1;
-                            }
-                            f.keys_done += (b - a) as u64;
-                        }
-                        Err(e) => {
-                            f.failed += 1;
-                            for (a, b) in &parts[n..] {
-                                f.failed_keys.extend(unit[*a..*b].iter().cloned());
-                            }
-                            res = Err(e);
-                            break;
-                        }
-                    }
-                }
-                res
-            }
-        };
-        if let Err((e, target_side)) = r {
-            f.error = Some(format!("{e:#}"));
-            f.target_error = target_side;
+        if fire_docs(
+            env, rule, &target, &unit, &docs, template, &reset, None, &mut f,
+        )
+        .await
+        .is_err()
+        {
             break;
         }
     }
@@ -555,13 +662,13 @@ pub async fn fire_once(rule: &Rule, template: &str, reset: Value) -> Fired {
             return f;
         }
     };
-    match send_all(rule, &target, template, &[], &[], &reset).await {
+    match send_all(rule, &target, template, &[], &[], &reset, None).await {
         Ok(Sent::Ok) => f.ok = 1,
         Ok(Sent::Skipped) => f.skipped = 1,
-        Err((e, t)) => {
+        Err((e, fail)) => {
             f.failed = 1;
             f.error = Some(format!("{e:#}"));
-            f.target_error = t;
+            f.target_error = fail == Fail::Transient;
         }
     }
     f
@@ -623,7 +730,7 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
                 .get(&resp)
                 .into_iter()
                 .map(crate::template::text)
-                .filter(|k| !k.is_empty())
+                .filter(|k| crate::template::valid_key(k))
                 .collect();
             let before = keys.len();
             for k in page_keys {
@@ -660,7 +767,13 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
 }
 
 /// Fires deletes for stray `keys` on endpoint `ep` only.
-pub async fn fire_strays(rule: &Rule, step: usize, ep: usize, keys: Vec<String>) -> Fired {
+pub async fn fire_strays(
+    env: &Env,
+    rule: &Rule,
+    step: usize,
+    ep: usize,
+    keys: Vec<String>,
+) -> Fired {
     let mut f = Fired::default();
     let target = match (&rule.target, &rule.error) {
         (Some(t), None) => t.clone(),
@@ -670,20 +783,19 @@ pub async fn fire_strays(rule: &Rule, step: usize, ep: usize, keys: Vec<String>)
             return f;
         }
     };
-    let name = rule.step(step).map(|s| s.name.clone()).unwrap_or_default();
-    let template = rule.step_action(step);
-    let group = rule.group_size().max(1);
-    let all = keys;
-    let mut done = 0;
     if ep >= target.endpoints.len() {
         f.error = Some(format!(
             "endpoint {ep} of target `{}` is gone",
             target.def.name
         ));
-        f.failed_keys = all;
+        f.failed_keys = keys;
         return f;
     }
-    for chunk in all.chunks(group) {
+    let name = rule.step(step).map(|s| s.name.clone()).unwrap_or_default();
+    let template = rule.step_action(step);
+    let group = rule.group_size().max(1);
+    let chunks: Vec<Vec<String>> = keys.chunks(group).map(<[String]>::to_vec).collect();
+    for (n, chunk) in chunks.iter().enumerate() {
         let docs: Vec<Doc> = chunk
             .iter()
             .map(|k| Doc {
@@ -693,39 +805,24 @@ pub async fn fire_strays(rule: &Rule, step: usize, ep: usize, keys: Vec<String>)
             })
             .collect();
         let reset = json!({"step": name, "keys": chunk});
-        let units: Vec<(Vec<String>, Vec<Doc>)> = match rule.def.fire_per {
-            FirePer::Key => chunk
-                .iter()
-                .cloned()
-                .zip(docs.iter().cloned())
-                .map(|(k, d)| (vec![k], vec![d]))
-                .collect(),
-            FirePer::Batch => vec![(chunk.to_vec(), docs)],
-        };
-        for (ks, ds) in units {
-            let ep_ctx = target.endpoints[ep].ctx.clone();
-            let ctx = context(rule, &target, &ks, &ds, &ep_ctx, &reset);
-            let rendered = match rule.templates.render(&template, &ctx) {
-                Ok(r) => r,
-                Err(e) => {
-                    f.error = Some(format!("{e:#}"));
-                    f.failed_keys = all[done..].to_vec();
-                    return f;
-                }
-            };
-            match target.send(ep, &rendered).await {
-                Ok(Sent::Ok) => f.ok += 1,
-                Ok(Sent::Skipped) => f.skipped += 1,
-                Err(e) => {
-                    f.failed += 1;
-                    f.error = Some(format!("{e:#}"));
-                    f.target_error = true;
-                    f.failed_keys = all[done..].to_vec();
-                    return f;
-                }
+        if fire_docs(
+            env,
+            rule,
+            &target,
+            chunk,
+            &docs,
+            &template,
+            &reset,
+            Some(ep),
+            &mut f,
+        )
+        .await
+        .is_err()
+        {
+            for c in &chunks[n + 1..] {
+                f.failed_keys.extend(c.iter().cloned());
             }
-            done += ks.len();
-            f.keys_done += ks.len() as u64;
+            break;
         }
     }
     f

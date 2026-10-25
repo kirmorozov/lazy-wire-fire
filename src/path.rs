@@ -7,6 +7,10 @@ use std::fmt;
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 
+/// Indexes are bounded: a path (possibly built from data, `_path`) must not allocate a huge
+/// array.
+pub const MAX_INDEX: i64 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Step {
     Field(String),
@@ -59,7 +63,8 @@ impl Path {
                         steps.push(Step::Each);
                     } else {
                         match inner.parse::<i64>() {
-                            Ok(n) => steps.push(Step::Index(n)),
+                            Ok(n) if n.abs() <= MAX_INDEX => steps.push(Step::Index(n)),
+                            Ok(_) => bail!("path `{s}`: index above {MAX_INDEX}"),
                             Err(_) => bail!("path `{s}`: `[{inner}]` is not an index"),
                         }
                     }

@@ -185,6 +185,26 @@ impl Reply {
     }
 }
 
+/// Error replies that mean "not now" rather than "not this command".
+pub fn transient_error(e: &str) -> bool {
+    let code = e.split_whitespace().next().unwrap_or("");
+    matches!(
+        code,
+        "LOADING"
+            | "BUSY"
+            | "TRYAGAIN"
+            | "CLUSTERDOWN"
+            | "MASTERDOWN"
+            | "READONLY"
+            | "NOAUTH"
+            | "OOM"
+            | "MISCONF"
+            | "NOREPLICAS"
+            | "MOVED"
+            | "ASK"
+    )
+}
+
 pub fn encode(args: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + args.iter().map(|a| a.len() + 16).sum::<usize>());
     out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
@@ -195,6 +215,11 @@ pub fn encode(args: &[Vec<u8>]) -> Vec<u8> {
     }
     out
 }
+
+/// Limits on what a reply may claim, so a broken or hostile server cannot exhaust memory.
+const MAX_LINE: usize = 64 * 1024;
+const MAX_BULK: usize = 256 * 1024 * 1024;
+const MAX_ELEMENTS: i64 = 10_000_000;
 
 struct Conn {
     stream: Stream,
@@ -224,11 +249,17 @@ impl Conn {
                 self.pos += i + 2;
                 return Ok(s);
             }
+            if self.buf.len() - self.pos > MAX_LINE {
+                bail!("redis reply line longer than {MAX_LINE} bytes");
+            }
             self.fill().await?;
         }
     }
 
     async fn bytes(&mut self, n: usize) -> Result<Vec<u8>> {
+        if n > MAX_BULK {
+            bail!("redis bulk reply of {n} bytes is too large");
+        }
         while self.buf.len() - self.pos < n + 2 {
             self.fill().await?;
         }
@@ -264,12 +295,15 @@ impl Conn {
                     let n: i64 = rest
                         .parse()
                         .map_err(|_| anyhow!("bad array length `{rest}`"))?;
+                    if n > MAX_ELEMENTS {
+                        bail!("redis array reply of {n} elements is too large");
+                    }
                     if n < 0 {
                         Reply::Array(None)
                     } else if n == 0 {
                         Reply::Array(Some(Vec::new()))
                     } else {
-                        stack.push((Vec::with_capacity(n as usize), n as usize));
+                        stack.push((Vec::with_capacity((n as usize).min(1024)), n as usize));
                         continue;
                     }
                 }

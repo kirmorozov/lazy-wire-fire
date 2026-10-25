@@ -40,6 +40,19 @@ pub struct Target {
     s3: Option<(S3Spec, aws::Provider)>,
 }
 
+/// The target refused an action; sending it again would not help.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Rejected(pub String);
+
+fn rejected(msg: String) -> anyhow::Error {
+    anyhow::Error::new(Rejected(msg))
+}
+
+pub fn is_rejected(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<Rejected>().is_some())
+}
+
 /// What sending one rendered action did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
@@ -159,37 +172,50 @@ impl Target {
 
     /// Sends one rendered action to endpoint `ep` and checks `expect`. `Err` holds why it
     /// failed (transport, status, body predicate or Redis error).
+    /// Sends one rendered action to endpoint `ep` and checks `expect`. An error wrapping
+    /// [`Rejected`] means the target refused this action (it would refuse it again); any
+    /// other error is transient (the target or the way to it is unwell).
     pub async fn send(&self, ep: usize, rendered: &str) -> Result<Sent> {
-        match &self.endpoints[ep].transport {
+        let Some(endpoint) = self.endpoints.get(ep) else {
+            bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+        };
+        match &endpoint.transport {
             Transport::Http {
                 client,
                 prefix,
                 host_header,
             } => {
-                let Some(req) = RawRequest::parse(rendered).context("the rendered request")? else {
-                    return Ok(Sent::Skipped);
+                let req = match RawRequest::parse(rendered) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Ok(Sent::Skipped),
+                    Err(e) => return Err(rejected(format!("the rendered request: {e:#}"))),
                 };
                 let req = self.prepare(req, prefix, host_header).await?;
                 let resp = client
                     .send(&req, self.def.timeout)
                     .await
                     .with_context(|| format!("{} {}", req.method, client.base.url()))?;
-                self.def
-                    .expect
-                    .check_http(resp.status, &resp.body)
-                    .map_err(|e| {
-                        anyhow!(
-                            "{} {}{}: {e}: {}",
-                            req.method,
-                            client.base.url(),
-                            req.target,
-                            resp.body_snippet()
-                        )
-                    })?;
+                if let Err(e) = self.def.expect.check_http(resp.status, &resp.body) {
+                    let msg = format!(
+                        "{} {}{}: {e}: {}",
+                        req.method,
+                        client.base.url(),
+                        req.target,
+                        resp.body_snippet()
+                    );
+                    // 5xx, 408 and 429 say "not now"; other refusals are about this request.
+                    let transient = resp.status >= 500 || matches!(resp.status, 408 | 429);
+                    return Err(if transient {
+                        anyhow!(msg)
+                    } else {
+                        rejected(msg)
+                    });
+                }
                 Ok(Sent::Ok)
             }
             Transport::Redis(client) => {
-                let args = redis::tokenize(rendered).context("the rendered command")?;
+                let args = redis::tokenize(rendered)
+                    .map_err(|e| rejected(format!("the rendered command: {e:#}")))?;
                 if args.is_empty() {
                     return Ok(Sent::Skipped);
                 }
@@ -199,12 +225,17 @@ impl Target {
                     .await
                     .with_context(|| format!("{name} on {}", client.addr.url()))?;
                 if let Some(e) = reply.error() {
-                    bail!("{name} on {}: {e}", client.addr.url());
+                    let msg = format!("{name} on {}: {e}", client.addr.url());
+                    return Err(if redis::transient_error(e) {
+                        anyhow!(msg)
+                    } else {
+                        rejected(msg)
+                    });
                 }
                 self.def
                     .expect
                     .check_value(&reply.to_json())
-                    .map_err(|e| anyhow!("{name} on {}: {e}", client.addr.url()))?;
+                    .map_err(|e| rejected(format!("{name} on {}: {e}", client.addr.url())))?;
                 Ok(Sent::Ok)
             }
         }

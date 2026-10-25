@@ -118,10 +118,14 @@ enum Lane {
         since: Option<Position>,
         since_ts: u32,
         first: Option<Instant>,
+        keys: Vec<String>,
         queries: Vec<KeyQuery>,
     },
     Reset,
 }
+
+/// A key the target refused this many times (while others went through) is dropped.
+const STRIKES: u32 = 5;
 
 enum Phase {
     Start,
@@ -179,8 +183,50 @@ struct RuleState {
     /// `reset_requested` must be cleared in the rule table.
     pending_clear: bool,
     counters: Counters,
+    /// Refusals per key (see [`STRIKES`]).
+    strikes: HashMap<String, u32>,
     written: Option<(Position, Instant)>,
     dirty: bool,
+}
+
+impl RuleState {
+    /// Splits refused keys into those to try again and those dropped. A refusal counts
+    /// against a key when other keys of the same action went through (or it was singled out
+    /// before): when everything is refused, the template or the target is at fault, not a key.
+    fn judge(
+        &mut self,
+        rejected: Vec<(String, String)>,
+        others_ok: bool,
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let mut retry = Vec::new();
+        let mut dropped = Vec::new();
+        for (k, why) in rejected {
+            if !others_ok && !self.strikes.contains_key(&k) {
+                retry.push(k);
+                continue;
+            }
+            let n = self.strikes.entry(k.clone()).or_insert(0);
+            *n += 1;
+            if *n >= STRIKES {
+                self.strikes.remove(&k);
+                dropped.push((k, why));
+            } else {
+                retry.push(k);
+            }
+        }
+        (retry, dropped)
+    }
+
+    fn report_dropped(&mut self, rule: &str, dropped: &[(String, String)], now_ms: u64) {
+        for (k, why) in dropped {
+            let k: String = k.chars().take(200).collect();
+            warn!(rule = %rule, "key `{k}` was refused {STRIKES} times and is dropped: {why}");
+            self.last_error = Some((
+                format!("key `{k}` refused {STRIKES} times, dropped: {why}"),
+                now_ms,
+            ));
+        }
+    }
 }
 
 enum Outcome {
@@ -277,6 +323,7 @@ pub struct Engine {
     clear_retry: Option<Instant>,
     star_written: Option<(Position, Instant)>,
     render_warnings: u64,
+    invalid_keys: u64,
 }
 
 fn server_code(e: &anyhow::Error) -> Option<u16> {
@@ -415,6 +462,7 @@ pub async fn run(
         clear_retry: None,
         star_written: None,
         render_warnings: 0,
+        invalid_keys: 0,
         cfg,
     };
     e.reload_config(true).await?;
@@ -813,6 +861,7 @@ impl Engine {
             backoff: Backoff::default(),
             pending_clear: false,
             counters: Counters::default(),
+            strikes: HashMap::new(),
             written: None,
             dirty: true,
         };
@@ -1323,6 +1372,7 @@ impl Engine {
             RowsKind::Update => "update",
             RowsKind::Delete => "delete",
         };
+        let mut invalid: Vec<(String, u64, String)> = Vec::new();
         for (before, after) in rows {
             let images: Vec<&BinlogRow> = match kind {
                 RowsKind::Insert => after.iter().collect(),
@@ -1376,35 +1426,44 @@ impl Engine {
                                     }
                                 }
                                 let k = k.trim();
-                                if !k.is_empty() {
+                                if template::valid_key(k) {
                                     marks.keys.insert(k.to_string());
+                                } else if !k.is_empty() {
+                                    invalid.push((name.clone(), t.def.id, k.to_string()));
                                 }
                             }
                         }
-                        Some(KeyTemplate::Full(tpl)) => {
+                        Some(KeyTemplate::Full(lines)) => {
                             let obj = objects[ii]
                                 .get_or_insert_with(|| w.layout.object(img))
                                 .clone();
                             let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op, "table": w.table});
-                            match rule.templates.render(tpl, &ctx) {
-                                Ok(s) => marks
-                                    .keys
-                                    .extend(template::split_keys(&s).map(str::to_string)),
-                                Err(e) => {
-                                    // Reported on the rule, so a key that cannot be rendered
-                                    // does not pass unnoticed.
-                                    self.render_warnings += 1;
-                                    if self.render_warnings <= 10
-                                        || self.render_warnings.is_multiple_of(1000)
-                                    {
-                                        warn!(rule = %name, "trigger {} key: {e:#}", t.def.id);
+                            for tpl in lines {
+                                match rule.templates.render(tpl, &ctx) {
+                                    Ok(s) => {
+                                        let k = s.trim();
+                                        if template::valid_key(k) {
+                                            marks.keys.insert(k.to_string());
+                                        } else if !k.is_empty() {
+                                            invalid.push((name.clone(), t.def.id, k.to_string()));
+                                        }
                                     }
-                                    if let Some(st) = self.rules.get_mut(name) {
-                                        st.last_error = Some((
-                                            format!("trigger {} key: {e:#}", t.def.id),
-                                            crate::time::unix_now_ms(),
-                                        ));
-                                        st.dirty = true;
+                                    Err(e) => {
+                                        // Reported on the rule, so a key that cannot be rendered
+                                        // does not pass unnoticed.
+                                        self.render_warnings += 1;
+                                        if self.render_warnings <= 10
+                                            || self.render_warnings.is_multiple_of(1000)
+                                        {
+                                            warn!(rule = %name, "trigger {} key: {e:#}", t.def.id);
+                                        }
+                                        if let Some(st) = self.rules.get_mut(name) {
+                                            st.last_error = Some((
+                                                format!("trigger {} key: {e:#}", t.def.id),
+                                                crate::time::unix_now_ms(),
+                                            ));
+                                            st.dirty = true;
+                                        }
                                     }
                                 }
                             }
@@ -1429,6 +1488,20 @@ impl Engine {
                         marks.queries.insert(q.id(), q);
                     }
                 }
+            }
+        }
+        for (name, trigger, k) in invalid {
+            self.invalid_keys += 1;
+            let shown: String = k.escape_debug().take(120).collect();
+            if self.invalid_keys <= 10 || self.invalid_keys.is_multiple_of(1000) {
+                warn!(rule = %name, "trigger {trigger}: key \"{shown}\" holds control characters and is ignored");
+            }
+            if let Some(st) = self.rules.get_mut(&name) {
+                st.last_error = Some((
+                    format!("trigger {trigger}: key \"{shown}\" holds control characters and is ignored"),
+                    crate::time::unix_now_ms(),
+                ));
+                st.dirty = true;
             }
         }
     }
@@ -1560,6 +1633,7 @@ impl Engine {
             since: buf.since,
             since_ts: buf.since_ts,
             first: buf.first,
+            keys: keys.clone(),
             queries: queries.clone(),
         });
         let (rule, incarnation, name) = (st.rule.clone(), st.incarnation, name.to_string());
@@ -1745,7 +1819,7 @@ impl Engine {
                         fired: Fired::failed(Vec::new()),
                     };
                     spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
-                        let fired = action::fire_strays(&rule, i, e, chunk).await;
+                        let fired = action::fire_strays(&env, &rule, i, e, chunk).await;
                         Outcome::Reset { run: rid, fired }
                     });
                     return;
@@ -1776,6 +1850,7 @@ impl Engine {
                     since,
                     since_ts,
                     first,
+                    keys: sent_keys,
                     queries,
                 }) = st.lane.take()
                 else {
@@ -1787,15 +1862,27 @@ impl Engine {
                 if let Some(t) = st.reset.as_mut().and_then(|r| r.touched.as_mut()) {
                     t.extend(resolved);
                 }
+                let keyless = fired.error.is_some()
+                    && fired.failed_keys.is_empty()
+                    && fired.rejected.is_empty();
+                let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
+                st.report_dropped(&d.rule, &dropped, now_ms);
+                let mut again: IndexSet<String> = fired.failed_keys.into_iter().collect();
+                again.extend(retry);
+                for k in &sent_keys {
+                    if !again.contains(k) {
+                        st.strikes.remove(k);
+                    }
+                }
                 match fired.error {
-                    None if fired.failed_keys.is_empty() => {
+                    _ if again.is_empty() && !keyless => {
                         st.backoff.ok();
-                        target_ok = true;
+                        target_ok = !fired.target_error;
                     }
                     err => {
                         let err = err.unwrap_or_else(|| "some actions failed".into());
                         // Back into the buffer, ahead of what was marked meanwhile.
-                        let mut keys: IndexSet<String> = fired.failed_keys.into_iter().collect();
+                        let mut keys = again;
                         keys.extend(std::mem::take(&mut st.buffer.keys));
                         st.buffer.keys = keys;
                         if keep_queries {
@@ -1829,11 +1916,18 @@ impl Engine {
                 }
                 st.counters.actions_ok += fired.ok;
                 st.counters.actions_failed += fired.failed;
-                let Some(run) = st.reset.as_mut().filter(|r| r.id == rid) else {
+                if !st.reset.as_ref().is_some_and(|r| r.id == rid) {
                     return;
-                };
+                }
+                let keyless = fired.error.is_some()
+                    && fired.failed_keys.is_empty()
+                    && fired.rejected.is_empty();
+                let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
+                st.report_dropped(&d.rule, &dropped, now_ms);
+                let done = !keyless && fired.failed_keys.is_empty() && retry.is_empty();
+                let run = st.reset.as_mut().expect("checked above");
                 match fired.error {
-                    None if fired.failed_keys.is_empty() => {
+                    _ if done => {
                         run.backoff.ok();
                         target_ok = true;
                         match &mut run.phase {

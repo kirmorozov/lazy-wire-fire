@@ -42,6 +42,12 @@ impl RawRequest {
             Some(line.strip_suffix('\r').unwrap_or(line))
         };
         let line = next_line().unwrap_or_default();
+        // A control character (a stray CR, a NUL…) in the request line or a header is never
+        // meant: it is how data smuggles extra lines in.
+        let control = |s: &str| s.bytes().any(|c| (c < b' ' && c != b'\t') || c == 0x7f);
+        if control(line) {
+            bail!("the request line holds a control character");
+        }
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or_default().to_string();
         let target = parts
@@ -77,6 +83,9 @@ impl RawRequest {
                     let name = name.trim();
                     if name.is_empty() || name.bytes().any(|c| c <= b' ' || c >= 0x7f) {
                         bail!("header line `{h}`: invalid header name");
+                    }
+                    if control(value) {
+                        bail!("header `{name}` holds a control character");
                     }
                     headers.push((name.to_string(), value.trim().to_string()));
                 }
@@ -482,7 +491,7 @@ async fn read_chunked(c: &mut Conn) -> Result<Vec<u8>> {
             while !c.read_line().await?.is_empty() {}
             return Ok(body);
         }
-        if body.len() + size > MAX_BODY {
+        if body.len().checked_add(size).is_none_or(|n| n > MAX_BODY) {
             bail!("chunked response body too large");
         }
         let chunk = c.read_exact_buf(size + 2).await?;
@@ -535,6 +544,9 @@ mod tests {
         assert!(RawRequest::parse("GET /a b HTTP/1.1").is_err());
         assert!(RawRequest::parse("GET x HTTP/1.1").is_err());
         assert!(RawRequest::parse("GET / HTTP/1.1\nbroken header\n").is_err());
+        assert!(RawRequest::parse("GET / HTTP/1.1\nX-Tag: a\rX-Evil: 1\n").is_err());
+        assert!(RawRequest::parse("GET /a\u{0}b HTTP/1.1\n").is_err());
+        assert!(RawRequest::parse("GET / HTTP/1.1\nX-Tab: a\tb\n").is_ok());
     }
 
     #[test]
