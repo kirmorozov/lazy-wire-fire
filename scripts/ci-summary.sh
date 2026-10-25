@@ -22,7 +22,7 @@ case ${1:-} in
     shift
     for s in "$@"; do
       v=$("${compose[@]}" exec -T -e MYSQL_PWD=root "$s" \
-            sh -c 'exec "$(command -v mariadb || command -v mysql)" -uroot -NB -e "SELECT VERSION()"' 2>/dev/null) \
+            sh -c 'exec "$(command -v mariadb || command -v mysql)" --protocol=TCP -h127.0.0.1 -uroot -NB -e "SELECT VERSION()"' 2>/dev/null) \
         || v="(not reachable)"
       echo "| \`$s\` | $v |"
     done
