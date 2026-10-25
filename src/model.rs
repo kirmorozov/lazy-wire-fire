@@ -115,6 +115,8 @@ pub enum Kind {
     HttpHeader,
     HttpS3,
     Redis,
+    MySql,
+    PgSql,
 }
 
 impl Kind {
@@ -126,14 +128,26 @@ impl Kind {
             "http.header" => Kind::HttpHeader,
             "http.s3" => Kind::HttpS3,
             "redis" => Kind::Redis,
+            "mysql" | "mariadb" => Kind::MySql,
+            "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3 or redis)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, redis, mysql or pgsql)"
             ),
         })
     }
 
     pub fn is_http(self) -> bool {
-        self != Kind::Redis
+        !matches!(self, Kind::Redis | Kind::MySql | Kind::PgSql)
+    }
+
+    /// The SQL dialect templates quote for (`sql_quote`, `sql_ident`): PostgreSQL for `pgsql`,
+    /// MySQL otherwise (also right for SQL sent over HTTP to MySQL-like engines).
+    pub fn dialect(self) -> crate::sqlwire::Dialect {
+        if self == Kind::PgSql {
+            crate::sqlwire::Dialect::Postgres
+        } else {
+            crate::sqlwire::Dialect::MySql
+        }
     }
 
     /// `vars` entries that hold credentials and never reach templates.
@@ -144,7 +158,7 @@ impl Kind {
             Kind::HttpBearer => &["token"],
             Kind::HttpHeader => &["value"],
             Kind::HttpS3 => &["access_key_ref", "secret_key_ref", "session_token_ref"],
-            Kind::Redis => &["password"],
+            Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
         }
     }
 }
@@ -238,7 +252,7 @@ impl TargetDef {
                     bail!("`vars.access_key_ref` and `vars.secret_key_ref` go together");
                 }
             }
-            Kind::Http | Kind::Redis => {}
+            Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         if endpoints.is_empty() && kind != Kind::HttpS3 {
             bail!("`endpoints` is empty");

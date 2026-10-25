@@ -1400,3 +1400,144 @@ async fn hostile_values_stay_contained() {
     );
     inst.stop().await;
 }
+
+/// Names an attacker could enter: quotes, backslashes, a statement after a `;`.
+const HOSTILE_NAMES: [&str; 3] = [
+    "O'Brien",
+    "x'); DROP TABLE copy; --",
+    "back\\slash \\' quote",
+];
+
+/// `mysql` and `pgsql` targets: the template renders one statement per action; `sql_quote`
+/// keeps every value a value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_targets() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "sqlsrc").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(100))")
+        .await;
+    tables(&db).await;
+    // MySQL sink: another schema of the same server.
+    let sink = Db::fresh(&root, "sqlsink").await;
+    sink.exec("CREATE TABLE copy (id INT PRIMARY KEY, name VARCHAR(100), doc JSON)")
+        .await;
+    let my_host = root
+        .trim_start_matches("mysql://")
+        .split('@')
+        .nth(1)
+        .unwrap()
+        .to_string();
+    db.target(
+        "mysink",
+        "mysql",
+        &format!("{my_host}/lwf_sqlsink"),
+        Some("affected_rows != 0"),
+        r#"{"username": "root", "password": "env:LWF_TEST_MY_PW"}"#,
+    )
+    .await;
+    std::env::set_var("LWF_TEST_MY_PW", "root");
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms) VALUES ('my', 'mysink', \
+         'SELECT id AS _key, name, NULL AS _op FROM customers WHERE id IN (:keys)', ?, 100)",
+        ("{{#each docs}}{{#if (eq op \"delete\")}}DELETE FROM copy WHERE id = {{sql_quote key}}{{else}}INSERT INTO {{sql_ident \"copy\"}} (id, name, doc) VALUES ({{sql_quote key}}, {{sql_quote doc.name}}, {{sql_quote (json doc)}}) ON DUPLICATE KEY UPDATE name = VALUES(name), doc = VALUES(doc){{/if}}{{/each}}",),
+    )
+    .await;
+    db.exec("UPDATE lazy_wire_fire_rule SET fire_per = 'key' WHERE name = 'my'")
+        .await;
+    db.trigger("my", "customers", Some("{{new.id}}"), None)
+        .await;
+    // PostgreSQL sink, if one is up (`postgres` service of the compose file).
+    let pg = tokio_postgres::connect(
+        "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink",
+        tokio_postgres::NoTls,
+    )
+    .await
+    .ok();
+    let pg = match pg {
+        Some((client, conn)) => {
+            tokio::spawn(conn);
+            client.batch_execute("DROP TABLE IF EXISTS copy; CREATE TABLE copy (id text PRIMARY KEY, name text, doc jsonb)").await.unwrap();
+            std::env::set_var("LWF_TEST_PG_PW", "pgpw");
+            db.target(
+                "pgsink",
+                "pgsql",
+                "127.0.0.1:34432/sink",
+                None,
+                r#"{"username": "postgres", "password": "env:LWF_TEST_PG_PW"}"#,
+            )
+            .await;
+            db.exec_params(
+                "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('pg', 'pgsink', 'key', \
+                 'SELECT id AS _key, name, NULL AS _op FROM customers WHERE id IN (:keys)', ?, 100)",
+                ("{{#each docs}}{{#if (eq op \"delete\")}}DELETE FROM copy WHERE id = {{sql_quote key}}{{else}}INSERT INTO {{sql_ident \"copy\"}} (id, name, doc) VALUES ({{sql_quote key}}, {{sql_quote doc.name}}, {{sql_quote (json doc)}}) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, doc = EXCLUDED.doc{{/if}}{{/each}}",),
+            )
+            .await;
+            db.trigger("pg", "customers", Some("{{new.id}}"), None)
+                .await;
+            Some(client)
+        }
+        None => {
+            eprintln!("no PostgreSQL on 127.0.0.1:34432: testing the mysql target only");
+            None
+        }
+    };
+    let inst = Instance::ready(config(&db, &[])).await;
+    for (i, n) in HOSTILE_NAMES.iter().enumerate() {
+        db.exec_params("INSERT INTO customers VALUES (?, ?)", (i as i64 + 1, *n))
+            .await;
+    }
+    let want: Vec<(i64, String)> = HOSTILE_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as i64 + 1, n.to_string()))
+        .collect();
+    wait_for(Duration::from_secs(15), "the MySQL copy", || async {
+        let got: Vec<(i64, String)> = sink.query("SELECT id, name FROM copy ORDER BY id").await;
+        (got == want).then_some(())
+    })
+    .await;
+    let doc: Vec<String> = sink
+        .query("SELECT CAST(doc AS CHAR) FROM copy WHERE id = 3")
+        .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&doc[0]).unwrap(),
+        json!({"name": HOSTILE_NAMES[2]})
+    );
+    if let Some(pg) = &pg {
+        wait_for(Duration::from_secs(15), "the PostgreSQL copy", || async {
+            let rows = pg
+                .query("SELECT id, name, doc::text FROM copy ORDER BY id", &[])
+                .await
+                .ok()?;
+            let got: Vec<(i64, String)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>(0).parse().unwrap(),
+                        r.get::<_, String>(1),
+                    )
+                })
+                .collect();
+            let doc: Value = serde_json::from_str(&rows.get(2)?.get::<_, String>(2)).ok()?;
+            (got == want && doc == json!({"name": HOSTILE_NAMES[2]})).then_some(())
+        })
+        .await;
+    }
+    db.exec("DELETE FROM customers WHERE id = 2").await;
+    wait_for(Duration::from_secs(10), "the deletes", || async {
+        let my: Vec<i64> = sink.query("SELECT id FROM copy ORDER BY id").await;
+        let pg_ok = match &pg {
+            Some(pg) => {
+                pg.query("SELECT id FROM copy ORDER BY id", &[])
+                    .await
+                    .ok()?
+                    .len()
+                    == 2
+            }
+            None => true,
+        };
+        (my == vec![1, 3] && pg_ok).then_some(())
+    })
+    .await;
+    inst.stop().await;
+}

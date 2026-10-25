@@ -3,7 +3,8 @@
 Change-triggered actions from the MySQL binlog. Row changes in the tables you register mark
 **keys**. For the changed keys a rule runs its queries concurrently, merges the rows into one JSON
 document per key, renders one Handlebars template and fires the result at a target: an HTTP
-endpoint (any method, a whole raw request) or Redis (one command).
+endpoint (any method, a whole raw request), Redis (one command), or MySQL / PostgreSQL (one SQL
+statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
 knows nothing about any application: everything it does is rows in four tables. It reads the
@@ -129,13 +130,13 @@ Tested on every line below with the whole integration suite (`make test-matrix`,
 | MariaDB | 10.11 LTS, 12.3 LTS, 13.0 (latest GA) |
 
 Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7,
-Valkey 8, an S3 API (versitygw).
+Valkey 8, an S3 API (versitygw), MySQL and PostgreSQL 17 as SQL targets.
 
 ## Development
 
 ```sh
 make test                      # unit tests
-make servers                   # MySQL 8.4, MySQL 8.0, MariaDB 10.11, Redis, an S3 server (docker)
+make servers                   # MySQL 8.4 / 8.0, MariaDB 10.11, Redis, Valkey, PostgreSQL, S3 (docker)
 make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: 8.4, 8.0, MariaDB 10.11
 make test-matrix               # latest LTS and latest GA of MySQL, Percona, MariaDB, one at a time
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time

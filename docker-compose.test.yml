@@ -45,6 +45,12 @@ services:
               "--user", "default", "off", "--user", "lazywf", "on", ">valkeypw", "~*", "&*", "+@all"]
     ports: ["127.0.0.1:34380:6379"]
 
+  postgres:
+    image: postgres:17-alpine
+    environment: { POSTGRES_PASSWORD: pgpw, POSTGRES_DB: sink }
+    ports: ["127.0.0.1:34432:5432"]
+    healthcheck: { test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], interval: 2s, retries: 30 }
+
   s3:
     image: versity/versitygw:latest
     command: ["--port", ":7070", "posix", "--nometa", "/data"]

@@ -354,6 +354,31 @@ pub fn neutralize(s: &str) -> String {
     }
 }
 
+/// `sql_quote v` (a string literal, `NULL` for null) and `sql_ident name` in a SQL dialect.
+struct Sql {
+    dialect: crate::sqlwire::Dialect,
+    ident: bool,
+}
+
+impl HelperDef for Sql {
+    fn call_inner<'reg: 'rc, 'rc>(
+        &self,
+        h: &Helper<'rc>,
+        _: &'reg Handlebars<'reg>,
+        _: &'rc Context,
+        _: &mut RenderContext<'reg, 'rc>,
+    ) -> Result<ScopedJson<'rc>, RenderError> {
+        let v = h.param(0).map(|p| p.value().clone()).unwrap_or(Value::Null);
+        let out = if self.ident {
+            crate::sqlwire::ident(self.dialect, &text(&v))
+        } else {
+            crate::sqlwire::quote(self.dialect, &v)
+        };
+        out.map(|s| ScopedJson::Derived(Value::String(s)))
+            .map_err(|e| RenderErrorReason::Other(format!("{e:#}")).into())
+    }
+}
+
 /// A set of named templates sharing the helpers.
 pub struct Templates {
     hb: Handlebars<'static>,
@@ -373,6 +398,11 @@ impl Default for Templates {
 
 impl Templates {
     pub fn new() -> Templates {
+        Templates::for_dialect(crate::sqlwire::Dialect::MySql)
+    }
+
+    /// Templates whose `sql_quote` / `sql_ident` speak `dialect` (the rule's target's).
+    pub fn for_dialect(dialect: crate::sqlwire::Dialect) -> Templates {
         let mut hb = Handlebars::new();
         hb.register_escape_fn(neutralize);
         hb.set_strict_mode(false);
@@ -390,6 +420,20 @@ impl Templates {
             hb.register_helper(name, Box::new(Simple(f)));
         }
         hb.register_helper("replace", Box::<Replace>::default());
+        hb.register_helper(
+            "sql_quote",
+            Box::new(Sql {
+                dialect,
+                ident: false,
+            }),
+        );
+        hb.register_helper(
+            "sql_ident",
+            Box::new(Sql {
+                dialect,
+                ident: true,
+            }),
+        );
         Templates { hb }
     }
 

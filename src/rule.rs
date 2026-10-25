@@ -208,7 +208,11 @@ pub async fn compile(
     triggers: Vec<TriggerDef>,
     targets: &HashMap<String, std::result::Result<Arc<Target>, String>>,
 ) -> Rule {
-    let mut templates = Templates::new();
+    let dialect = match targets.get(&def.target) {
+        Some(Ok(t)) => t.def.kind.dialect(),
+        _ => crate::sqlwire::Dialect::MySql,
+    };
+    let mut templates = Templates::for_dialect(dialect);
     let mut errors: Vec<String> = Vec::new();
     let mut add = |templates: &mut Templates, name: &str, src: &str| {
         if let Err(e) = templates.add(name, src, ACTION_ROOTS) {

@@ -21,6 +21,7 @@ pub mod rule;
 pub mod s3;
 pub mod secrets;
 pub mod sql;
+pub mod sqlwire;
 pub mod status;
 pub mod target;
 pub mod template;

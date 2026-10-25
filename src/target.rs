@@ -30,6 +30,8 @@ enum Transport {
         host_header: String,
     },
     Redis(RedisClient),
+    MySql(crate::sqlwire::MySqlClient),
+    Pg(crate::sqlwire::PgClient),
 }
 
 pub struct Target {
@@ -73,6 +75,24 @@ impl Target {
         let mut endpoints = Vec::new();
         let mut s3_rt = None;
         match def.kind {
+            Kind::MySql | Kind::PgSql => {
+                use crate::sqlwire::{Credentials, MySqlClient, PgClient, SqlAddr};
+                let d = def.kind.dialect();
+                for e in &def.endpoints {
+                    let addr = SqlAddr::parse(e, d)?;
+                    let ctx = addr.ctx(d);
+                    let creds = Credentials {
+                        user: var(&def, "username").map(str::to_string),
+                        password: var(&def, "password").map(str::to_string),
+                    };
+                    let transport = if def.kind == Kind::MySql {
+                        Transport::MySql(MySqlClient::new(addr, &def.tls, creds))
+                    } else {
+                        Transport::Pg(PgClient::new(addr, &def.tls, creds))
+                    };
+                    endpoints.push(Endpoint { ctx, transport });
+                }
+            }
             Kind::Redis => {
                 for e in &def.endpoints {
                     let addr = RedisAddr::parse(e)?;
@@ -238,13 +258,39 @@ impl Target {
                     .map_err(|e| rejected(format!("{name} on {}: {e}", client.addr.url())))?;
                 Ok(Sent::Ok)
             }
+            Transport::MySql(_) | Transport::Pg(_) => {
+                let sql = match crate::sqlwire::single_statement(rendered) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Ok(Sent::Skipped),
+                    Err(e) => return Err(rejected(format!("{e:#}"))),
+                };
+                let (affected, at) = match &endpoint.transport {
+                    Transport::MySql(c) => (
+                        c.exec(sql, self.def.timeout).await?,
+                        format!("{}/{}", c.addr.host, c.addr.db),
+                    ),
+                    Transport::Pg(c) => (
+                        c.exec(&sql, self.def.timeout).await?,
+                        format!("{}/{}", c.addr.host, c.addr.db),
+                    ),
+                    _ => unreachable!(),
+                };
+                self.def
+                    .expect
+                    .check_value(&serde_json::json!({"affected_rows": affected}))
+                    .map_err(|e| rejected(format!("{at}: {e}")))?;
+                Ok(Sent::Ok)
+            }
         }
     }
 
     /// Sends a listing request (stray reset steps) and returns the response as JSON: the parsed
     /// body (http, which must answer 2xx) or the reply (redis).
     pub async fn fetch(&self, ep: usize, rendered: &str) -> Result<Value> {
-        match &self.endpoints[ep].transport {
+        let Some(endpoint) = self.endpoints.get(ep) else {
+            bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+        };
+        match &endpoint.transport {
             Transport::Http {
                 client,
                 prefix,
@@ -278,6 +324,16 @@ impl Target {
                     bail!("{e}");
                 }
                 Ok(reply.to_json())
+            }
+            Transport::MySql(c) => {
+                let sql = crate::sqlwire::single_statement(rendered)?
+                    .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
+                c.rows(sql, self.def.timeout).await
+            }
+            Transport::Pg(c) => {
+                let sql = crate::sqlwire::single_statement(rendered)?
+                    .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
+                c.rows(&sql, self.def.timeout).await
             }
         }
     }

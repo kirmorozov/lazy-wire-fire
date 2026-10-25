@@ -21,8 +21,8 @@ object.
 | column | meaning |
 |---|---|
 | `name` | referenced by rules |
-| `kind` | `http`, `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `redis` (`vars.password`, optional `vars.username` for ACLs) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). `http.s3`: optional, the service URL; derived from `vars` when empty. An action goes to every endpoint |
+| `kind` | `http`, `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` / `pgsql` (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database`. `http.s3`: optional, the service URL; derived from `vars` when empty. An action goes to every endpoint |
 | `tls` | empty (TLS for `https://` / `rediss://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion, below |
@@ -48,7 +48,24 @@ Identity), EC2 instance metadata. The template renders paths inside the bucket
   `<path> != <value>`, e.g. `errors == false`. `<value>` is JSON or a bare word. A missing path
   is `null`. `$` is the whole reply: `$ == OK`.
 
-Redis error replies always fail. Examples: `2xx and errors == false`, `200, 204`.
+Redis error replies always fail. Examples: `2xx and errors == false`, `200, 204`. SQL targets
+check `affected_rows`: `affected_rows != 0`.
+
+**SQL targets** (`mysql`, `pgsql`) {#sql-targets}: the template renders one SQL statement, run on
+the target database (a statement followed by another is refused; PostgreSQL runs it through the
+extended protocol, which refuses batches too). Each connect pins the session so quoting is sound:
+MySQL `SET NAMES utf8mb4` with backslash escapes on, PostgreSQL UTF-8 with
+`standard_conforming_strings`. Put values in with `sql_quote` (a string literal of the target's
+dialect, `NULL` for null; numbers are quoted too and converted by the server) and names with
+`sql_ident`. Deadlocks, lock waits, timeouts and lost connections are transient; other SQL errors
+count as refusals (see [security](#security)). Give the account only the rights the template
+needs.
+
+```
+{{#each docs}}{{#if (eq op "delete")}}DELETE FROM copy WHERE id = {{sql_quote key}}
+{{else}}INSERT INTO copy (id, name, doc) VALUES ({{sql_quote key}}, {{sql_quote doc.name}}, {{sql_quote (json doc)}})
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, doc = EXCLUDED.doc{{/if}}{{/each}}
+```
 
 ## Rules
 
@@ -140,7 +157,8 @@ element with one of these names is `this.<name>`.
 
 Helpers: `join list sep`, `upper`, `lower`, `regex_escape`, `url_encode`, `json`,
 `replace s regex replacement`, `redis_quote s…` (its arguments concatenated, as one Redis
-argument), plus the built-ins `if`, `unless`, `each`, `with`,
+argument), `sql_quote v`, `sql_ident name` (in the dialect of the rule's target: PostgreSQL for
+`pgsql`, MySQL otherwise), plus the built-ins `if`, `unless`, `each`, `with`,
 `lookup`, `eq`, `ne`, `gt`, `lt`, `and`, `or`, `not`, `len`. String literals in templates take
 JSON escapes: write `"\\d"` for the regex `\d`.
 
@@ -151,6 +169,7 @@ What a template renders:
   and the authentication. Blank output sends nothing.
 * **redis**: one command, split like `redis-cli` arguments (`"…"` with `\n`, `\"`, `\xHH`;
   `'…'`). `redis_quote` makes any string a safe argument. Blank output sends nothing.
+* **mysql / pgsql**: one SQL statement. Blank output sends nothing.
 
 ## Reset steps
 
@@ -206,6 +225,7 @@ rows go through the helper of the place they land in**:
 | a path or query | `/items/{{url_encode key}}.json` | `/items/{{key}}.json`: a key `a?x=` writes another object |
 | a regex (Varnish tags) | `{{regex_escape this}}` | `{{this}}`: a key `.*` purges everything |
 | a Redis argument | `{{redis_quote this}}`, or `ARGV` of a script | splicing keys into a Lua string |
+| SQL | `{{sql_quote key}}`, `{{sql_ident name}}` | `'{{key}}'`: a key `x'); DROP …` runs SQL |
 
 What the tool enforces on its own:
 
