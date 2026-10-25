@@ -124,7 +124,9 @@ async fn documents_follow_the_rows() {
     assert_eq!(r.header("content-type"), Some("application/x-ndjson"));
     assert_eq!(r.header("host"), Some(mock.addr.to_string().as_str()));
 
-    // A change in a related table reaches the orders through keys_sql.
+    // A change in a related table reaches the orders through keys_sql (after the trailing
+    // fires of the inserts are done).
+    inst.quiet().await;
     mock.clear();
     db.exec("UPDATE customers SET name = 'Ann B' WHERE id = 1")
         .await;
@@ -146,6 +148,7 @@ async fn documents_follow_the_rows() {
     );
 
     // A burst of changes to one key fires it once (or twice with a trailing fire).
+    inst.quiet().await;
     mock.clear();
     // On one connection: a burst, not 30 logins (those alone can outlast the debounce).
     let mut c = db.conn().await;
@@ -181,6 +184,7 @@ async fn documents_follow_the_rows() {
     assert!(fires <= 3, "30 updates fired {fires} times");
 
     // `_op`: cancelled orders and orders gone are deleted.
+    inst.quiet().await;
     mock.clear();
     db.exec("UPDATE orders SET status = 'cancelled' WHERE id = 11")
         .await;

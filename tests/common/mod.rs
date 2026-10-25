@@ -200,6 +200,25 @@ impl Instance {
         i
     }
 
+    /// Waits until no rule has keys pending or an action in flight (twice in a row, a status
+    /// period apart): trailing fires of earlier changes are done.
+    pub async fn quiet(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut calm = 0;
+        while calm < 2 {
+            let s = self.health.status();
+            let busy = s["rules"].as_object().is_none_or(|r| {
+                r.values()
+                    .any(|v| v["pending_keys"] != 0 || v["firing"] == true)
+            });
+            calm = if busy { 0 } else { calm + 1 };
+            if Instant::now() > deadline {
+                panic!("the engine did not quiet down: {s}");
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
     pub async fn stop(self) {
         let _ = self.stop.send(true);
         match tokio::time::timeout(Duration::from_secs(20), self.task).await {

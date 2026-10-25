@@ -64,6 +64,11 @@ impl Health {
         self.with(|i| i.phase == "streaming" && i.streaming && i.beat.elapsed() < STALL)
     }
 
+    /// What `/status` shows (without `phase` and `streaming`).
+    pub fn status(&self) -> Value {
+        self.with(|i| i.status.clone())
+    }
+
     pub fn set_status(&self, status: Value) {
         self.with(|i| i.status = status);
     }
