@@ -143,39 +143,64 @@ gh attestation verify oci://ghcr.io/kirmorozov/lazy-wire-fire:edge --owner kirmo
 docker buildx imagetools inspect ghcr.io/kirmorozov/lazy-wire-fire:edge --format '{{json .SBOM}}'
 ```
 
-Releases: bump `version` in `Cargo.toml`, merge, push a `vX.Y.Z` tag. CI publishes it once every job
-passes, the server matrix and search included, and fails it when `lazywf --version` does not match
-the tag. Pre-release tags (`v1.2.0-rc.1`) publish only `1.2.0-rc.1`.
+Releases: bump `version` in `Cargo.toml`, merge, push a `vX.Y.Z` tag. CI publishes it once every
+blocking job passes, the search engines included, and fails it when `lazywf --version` does not
+match the tag. Pre-release tags (`v1.2.0-rc.1`) publish only `1.2.0-rc.1`.
 
 ## Supported servers
 
-Tested on every line below with the whole integration suite (`make test-matrix`, `make test-e2e-all`):
+Every vendor-supported LTS line at its latest build, each product's current GA, the lines Amazon
+RDS / Aurora still run after their community end of life, and the newest MariaDB release candidate
+and preview. The whole integration suite runs on each, one CI runner per server; every tier but
+pre-release blocks `edge` and releases. Builds are pinned exactly in
+[docker-compose.test.yml](docker-compose.test.yml) (the preview by digest).
 
-| product | lines |
-|---|---|
-| MySQL | 8.0, 8.4 LTS, 9.7 LTS, 26.10 (latest GA) |
-| Percona Server | 8.4 LTS, 9.7 LTS (latest) |
-| MariaDB | 10.11 LTS, 12.3 LTS, 13.0 (latest GA) |
+| product | line | tested build | tier | vendor support ends |
+|---|---|---|---|---|
+| MySQL | 8.0 | 8.0.46 (final) | AWS-only (RDS / Aurora 8.0), blocking | community: April 2026; RDS Extended Support: 2029-07-31 |
+| MySQL | 8.4 LTS | 8.4.13 | LTS, blocking | Premier Apr 2029, Extended Apr 2032 |
+| MySQL | 9.7 LTS | 9.7.4 | LTS, blocking | Premier Apr 2031, Extended Apr 2034 |
+| MySQL | 26.10 Innovation | 26.10.0 | GA, blocking | with the next Innovation release |
+| Percona Server | 8.4 LTS | 8.4.11-11 | LTS, blocking | active (upstream 8.4: Apr 2032) |
+| Percona Server | 9.7 LTS | 9.7.2-2 | LTS, blocking | active (upstream 9.7: Apr 2034) |
+| MariaDB | 10.6 | 10.6.28 (final) | AWS-only (RDS), blocking until 2026-12-31 | community: 2026-07-06; RDS standard support: 2026-12-31 |
+| MariaDB | 10.11 LTS | 10.11.19 | LTS, blocking | 2028-02-16 |
+| MariaDB | 11.4 LTS | 11.4.13 | LTS, blocking | 2029-05-29 |
+| MariaDB | 11.8 LTS | 11.8.9 | LTS, blocking | 2028-06-04 (community) |
+| MariaDB | 12.3 LTS | 12.3.3 | LTS, blocking | 2029-06-12 |
+| MariaDB | 13.0 rolling | 13.0.2 | GA, blocking | with the next rolling GA (13.1) |
+| MariaDB | 13.1 | 13.1.1 RC | pre-release, advisory | unsupported |
+| MariaDB | 13.2 | 13.2 Preview | pre-release, advisory | unsupported |
 
-Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7,
-Valkey 8, an S3 API (versitygw), MySQL and PostgreSQL 17 as SQL targets.
+Also supported: Amazon RDS for MySQL and MariaDB, and Aurora MySQL, on the lines above; setup in [docs/server-setup.md](docs/server-setup.md#amazon-rds-and-aurora).
+
+MySQL and Percona publish no pre-release in a registry (MySQL early access ships as downloads
+only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
+its summary, and blocks nothing. MySQL and Percona run with GTIDs on. Dropped as end of life:
+Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after 2026-12-31.
+
+Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7.4,
+Valkey 8.1, an S3 API (versitygw 1.10), MySQL and PostgreSQL 17 as SQL targets.
 
 ## Development
 
 ```sh
 make test                      # unit tests
-make servers                   # MySQL 8.4 / 8.0, MariaDB 10.11, Redis, Valkey, PostgreSQL, S3 (docker)
-make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: 8.4, 8.0, MariaDB 10.11
-make test-matrix               # latest LTS and latest GA of MySQL, Percona, MariaDB, one at a time
+make servers                   # MySQL 8.4, MariaDB 10.11, Redis, Valkey, PostgreSQL, S3 (docker)
+make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: MySQL 8.4 and MariaDB 10.11
+make test-matrix               # every other blocking line of "Supported servers", one at a time
+make test-prerelease           # the advisory MariaDB 13.1 RC and 13.2 preview
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
 ```
 
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
-lint, unit tests, the integration suite on the default servers (Varnish included), the server
-matrix and the search engines (one runner each), and the image for both platforms. Pushes to `main`
-publish `edge`, `v*` tags a release. Dependabot bumps actions, crates and base images weekly.
+lint, unit tests, the integration suite on the default servers (Varnish included), on every other
+server (one runner each, pre-releases advisory) and with the search engines, and the image for both
+platforms. Pushes to `main` publish `edge` once every blocking job passes; `v*` tags a release, which
+also needs the search engines. Dependabot bumps actions, crates, base images and the test servers'
+patch builds weekly.
 
 The binlog reader (`src/binlog.rs`) comes from [lazyview](https://github.com/kirmorozov/lazyview).
 

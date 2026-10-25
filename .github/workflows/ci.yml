@@ -3,18 +3,19 @@ name: ci
 # Every push, pull request, weekly and on demand:
 #   lint         cargo fmt --check, clippy -D warnings (make lint), Cargo.lock up to date
 #   unit         make test
-#   integration  make servers + make test-e2e-all: MySQL 8.4 (GTIDs), MySQL 8.0, MariaDB 10.11
+#   integration  make servers + make test-e2e-all: MySQL 8.4 and MariaDB 10.11 (the default set)
 #                with Redis, Valkey, PostgreSQL, S3 and Varnish as targets
-#   matrix       make test-matrix, one job per server: MySQL 9.7 / 26.10, Percona 8.4 / 9.7,
-#                MariaDB 12.3 / 13.0
+#   matrix       make test-matrix, one job per server: every other required line (MySQL 8.0, 9.7,
+#                26.10; Percona 8.4, 9.7; MariaDB 10.6, 11.4, 11.8, 12.3, 13.0) and, advisory
+#                (continue-on-error, never blocking), the MariaDB 13.1 RC and 13.2 preview
 #   search       make test-e2e-search: OpenSearch 2.19, Elasticsearch 7.17 and 8.17
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, then make docker-e2e on amd64
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
 #
 # Images go to ghcr.io/kirmorozov/lazy-wire-fire (publish-image.yml) only for pushes:
-#   main -> edge    needs lint + unit + integration + image (matrix and search run alongside)
-#   v*   -> release needs all of them, matrix and search included
+#   main -> edge    needs lint + unit + integration + matrix (required servers) + image
+#   v*   -> release needs those and search
 # Pull requests never get registry credentials and never push.
 on:
   push:
@@ -97,7 +98,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   integration:
-    name: integration (MySQL 8.4, 8.0, MariaDB 10.11 + targets)
+    name: integration (MySQL 8.4.13 (LTS), MariaDB 10.11.19 (LTS) + targets)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -125,14 +126,14 @@ jobs:
       - name: make servers
         run: make servers
       - name: server versions
-        run: scripts/ci-summary.sh versions mysql84 mysql80 mariadb1011 | tee versions.md
+        run: scripts/ci-summary.sh versions mysql84 mariadb1011 | tee versions.md
       - name: make test-e2e-all
         timeout-minutes: 30
         run: make test-e2e-all 2>&1 | tee e2e.log
       - name: summary
         if: always()
         run: |
-          scripts/ci-summary.sh report "Integration: MySQL 8.4, 8.0, MariaDB 10.11 + targets" e2e.log versions.md \
+          scripts/ci-summary.sh report "Integration: MySQL 8.4.13 (LTS), MariaDB 10.11.19 (LTS) + targets" e2e.log versions.md \
             >> "$GITHUB_STEP_SUMMARY"
       - name: collect server logs
         if: failure()
@@ -155,26 +156,40 @@ jobs:
         run: make servers-down
 
   matrix:
-    # The latest LTS and latest GA of each product, one runner per server (make test-matrix runs
-    # them one after another locally). Redis, Valkey, PostgreSQL and S3 are the targets.
-    name: integration (${{ matrix.title }})
+    # Every required line besides the default set, one runner per server (make test-matrix runs
+    # them one after another locally), plus the newest MariaDB pre-releases as advisory entries:
+    # continue-on-error, so they are reported (annotation + summary) but never block edge or a
+    # release. Redis, Valkey, PostgreSQL and S3 are the targets. Policy: README "Supported servers".
+    name: integration (${{ matrix.title }} (${{ matrix.tier }}))
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    continue-on-error: ${{ matrix.advisory }}
     strategy:
       fail-fast: false
       matrix:
-        # Service names and host ports from docker-compose.test.yml (profile `matrix`).
+        # Service names and host ports from docker-compose.test.yml (profiles `matrix`, `prerelease`).
         include:
-          - { title: MySQL 9.7 LTS, service: mysql97, port: 34197 }
-          - { title: MySQL 26.10, service: mysql2610, port: 34210 }
-          - { title: Percona 8.4 LTS, service: percona84, port: 34284 }
-          - { title: Percona 9.7 LTS, service: percona97, port: 34297 }
-          - { title: MariaDB 12.3 LTS, service: mariadb123, port: 34123 }
-          - { title: MariaDB 13.0, service: mariadb130, port: 34130 }
+          # Tiers (README "Supported servers"): LTS, GA and AWS-only block edge and releases;
+          # pre-release is advisory.
+          - { title: MySQL 8.0.46, tier: AWS-only, service: mysql80, port: 34180, advisory: false }
+          - { title: MySQL 9.7.4, tier: LTS, service: mysql97, port: 34197, advisory: false }
+          - { title: MySQL 26.10.0, tier: GA, service: mysql2610, port: 34210, advisory: false }
+          - { title: Percona 8.4.11-11, tier: LTS, service: percona84, port: 34284, advisory: false }
+          - { title: Percona 9.7.2-2, tier: LTS, service: percona97, port: 34297, advisory: false }
+          # AWS-only while RDS for MariaDB 10.6 has standard support: drop after 2026-12-31.
+          - { title: MariaDB 10.6.28, tier: AWS-only, service: mariadb106, port: 34106, advisory: false }
+          - { title: MariaDB 11.4.13, tier: LTS, service: mariadb114, port: 34114, advisory: false }
+          - { title: MariaDB 11.8.9, tier: LTS, service: mariadb118, port: 34118, advisory: false }
+          - { title: MariaDB 12.3.3, tier: LTS, service: mariadb123, port: 34123, advisory: false }
+          - { title: MariaDB 13.0.2, tier: GA, service: mariadb130, port: 34130, advisory: false }
+          # The newest pre-releases (MySQL and Percona publish none in a registry).
+          - { title: MariaDB 13.1.1-rc, tier: "pre-release, advisory", service: mariadb131-rc, port: 34131, advisory: true }
+          - { title: MariaDB 13.2 preview, tier: "pre-release, advisory", service: mariadb132-pre, port: 34132, advisory: true }
     env:
-      COMPOSE_PROFILES: matrix
+      COMPOSE_PROFILES: matrix,prerelease
       SERVICES: redis valkey postgres s3 ${{ matrix.service }}
       MATRIX: ${{ matrix.service }}:${{ matrix.port }}
+      TITLE: "Integration: ${{ matrix.title }} (${{ matrix.tier }})"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -205,8 +220,15 @@ jobs:
         run: make test-matrix MATRIX="$MATRIX" 2>&1 | tee e2e.log
       - name: summary
         if: always()
+        run: scripts/ci-summary.sh report "$TITLE" e2e.log versions.md >> "$GITHUB_STEP_SUMMARY"
+      - name: advisory server failed
+        if: failure() && matrix.advisory
         run: |
-          scripts/ci-summary.sh report "Integration: ${{ matrix.title }}" e2e.log versions.md >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=advisory server failed::${{ matrix.title }} is a pre-release (advisory, does not block edge or a release): see the logs"
+          {
+            echo "### :warning: ${{ matrix.title }}: advisory pre-release failed"
+            echo "It does not block this run. Check it before the latest-GA pin moves to this line."
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: collect server logs
         if: failure()
         run: |
@@ -378,7 +400,7 @@ jobs:
 
   publish-edge:
     name: publish edge
-    needs: [lint, unit, integration, image]
+    needs: [lint, unit, integration, matrix, image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read

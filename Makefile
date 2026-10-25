@@ -6,7 +6,7 @@ IMAGE ?= lazywf:dev
 BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
 .PHONY: build release test lint servers servers-down test-e2e test-e2e-all test-e2e-search test-matrix \
-	docker-smoke docker-e2e image-digests
+	test-prerelease docker-smoke docker-e2e image-digests
 
 build:
 	$(CARGO) build
@@ -25,15 +25,14 @@ servers:
 	$(COMPOSE) up -d --wait
 
 servers-down:
-	$(COMPOSE) --profile search --profile varnish --profile matrix down -v
+	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease down -v
 
 # Integration tests against MySQL 8.4 (GTIDs on).
 test-e2e:
 	LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:34184 $(CARGO) test --test e2e -- --test-threads=4
 
-# The same tests on every server of the compose file.
+# The same tests on both servers of the default set (MySQL 8.4, MariaDB 10.11).
 test-e2e-all: test-e2e
-	LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:34180 $(CARGO) test --test e2e -- --test-threads=4
 	LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:34111 $(CARGO) test --test e2e -- --test-threads=4
 
 # The search re-sync against OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (compose profile
@@ -51,14 +50,21 @@ test-e2e-search:
 	$(E2E_DB) LAZYWF_TEST_ES8=https://127.0.0.1:34202 LAZYWF_TEST_ES8_CA=$(CURDIR)/tmp/out/es8-ca.crt $(CARGO) test --test e2e search_elasticsearch8
 	$(COMPOSE) --profile search stop es8
 
-# The integration tests on the latest LTS and latest GA of MySQL, Percona Server and MariaDB,
-# one server at a time (service:port).
-MATRIX := mysql97:34197 mysql2610:34210 percona84:34284 percona97:34297 mariadb123:34123 mariadb130:34130
+# The integration tests on every other required line (README "Supported servers"), one server
+# at a time (service:port; the targets of `make servers` must be up). MariaDB 10.6 goes after
+# 2026-12-31, when RDS for MariaDB 10.6 standard support ends.
+MATRIX := mysql80:34180 mysql97:34197 mysql2610:34210 percona84:34284 percona97:34297 \
+	mariadb106:34106 mariadb114:34114 mariadb118:34118 mariadb123:34123 mariadb130:34130
 test-matrix:
 	@set -e; for sp in $(MATRIX); do s=$${sp%%:*}; p=$${sp##*:}; \
-	  echo "=== $$s"; $(COMPOSE) --profile matrix up -d --wait $$s; \
-	  LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:$$p $(CARGO) test --test e2e -- --test-threads=4 || { $(COMPOSE) --profile matrix stop $$s; exit 1; }; \
-	  $(COMPOSE) --profile matrix stop $$s; done
+	  echo "=== $$s"; $(COMPOSE) --profile matrix --profile prerelease up -d --wait $$s; \
+	  LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:$$p $(CARGO) test --test e2e -- --test-threads=4 || { $(COMPOSE) --profile matrix --profile prerelease stop $$s; exit 1; }; \
+	  $(COMPOSE) --profile matrix --profile prerelease stop $$s; done
+
+# The advisory pre-releases (MariaDB RC and preview): the same, never required.
+PRERELEASE := mariadb131-rc:34131 mariadb132-pre:34132
+test-prerelease:
+	@$(MAKE) --no-print-directory test-matrix MATRIX="$(PRERELEASE)"
 
 # A loaded image, checked without a shell inside it: version, exit 2 without configuration,
 # user, entrypoint, health check, no shell. CI runs it on both platforms of every build.

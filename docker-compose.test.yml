@@ -1,28 +1,26 @@
-# Servers for the integration tests (tests/e2e.rs). Ports bind to 127.0.0.1 only.
+# Servers for the integration tests (tests/e2e.rs). Ports bind to 127.0.0.1 only. Every image is
+# pinned to an exact build (the preview by digest); Dependabot proposes patch bumps. Which lines
+# are tested and why: README "Supported servers".
 #
-#   docker compose -f docker-compose.test.yml up -d --wait
+#   make servers             # the default set: MySQL 8.4, MariaDB 10.11 and the targets
+#   make test-e2e-all        # the integration tests on both
+#   make test-matrix         # every other required line (profile `matrix`), one at a time
+#   make test-prerelease     # the advisory MariaDB RC and preview (profile `prerelease`)
 #   docker compose -f docker-compose.test.yml --profile search up -d --wait    # + OpenSearch, Elasticsearch 8 / 7
 #   docker compose -f docker-compose.test.yml --profile varnish up -d --wait   # + Varnish (host network)
-#   make test-matrix   # every database line below (profile `matrix`), one at a time
-#   make test-e2e            # MySQL 8.4 (GTID), then MySQL 8.0 and MariaDB 10.11
-#   docker compose -f docker-compose.test.yml down -v
+#   make servers-down        # every profile, volumes included
+#
+# MySQL and Percona run with GTIDs on, MariaDB with its own (always on). Host ports: 341xx for
+# MySQL and MariaDB (34180 = 8.0, 34106 = 10.6, ...), 342xx for Percona and MySQL 26.x.
 name: lazywf-test
 
 services:
   mysql84:
-    image: mysql:8.4.11
+    image: mysql:8.4.13
     command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
               "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
     environment: { MYSQL_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34184:3306"]
-    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
-
-  mysql80:
-    image: mysql:8.0
-    command: ["--server-id=1", "--log-bin=binlog", "--binlog-row-metadata=FULL", "--max-connections=500",
-              "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
-    environment: { MYSQL_ROOT_PASSWORD: root }
-    ports: ["127.0.0.1:34180:3306"]
     healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
 
   mariadb1011:
@@ -34,25 +32,25 @@ services:
     healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.11-alpine
     command: ["redis-server", "--requirepass", "redispw", "--save", "", "--appendonly", "no"]
     ports: ["127.0.0.1:34379:6379"]
     healthcheck: { test: ["CMD", "redis-cli", "-a", "redispw", "ping"], interval: 2s, retries: 30 }
 
   valkey:
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:8.1.10-alpine
     command: ["valkey-server", "--save", "", "--appendonly", "no",
               "--user", "default", "off", "--user", "lazywf", "on", ">valkeypw", "~*", "&*", "+@all"]
     ports: ["127.0.0.1:34380:6379"]
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17.11-alpine
     environment: { POSTGRES_PASSWORD: pgpw, POSTGRES_DB: sink }
     ports: ["127.0.0.1:34432:5432"]
     healthcheck: { test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], interval: 2s, retries: 30 }
 
   s3:
-    image: versity/versitygw:latest
+    image: versity/versitygw:v1.10.0
     command: ["--port", ":7070", "posix", "--nometa", "/data"]
     environment: { ROOT_ACCESS_KEY: lazywfaccess, ROOT_SECRET_KEY: lazywfsecret }
     tmpfs: ["/data"]
@@ -96,23 +94,36 @@ services:
   # varnishd as the first argument: with flags only, the image's entrypoint also binds :80 and
   # :8443 on the host network (refused for its unprivileged user on a stock Linux host).
   varnish:
-    image: varnish:7.6
+    image: varnish:7.6.5
     profiles: ["varnish"]
     network_mode: host
     command: ["varnishd", "-F", "-a", "127.0.0.1:34681", "-f", "/etc/varnish/default.vcl", "-s", "malloc,64m"]
     volumes: ["./docker/varnish/default.vcl:/etc/varnish/default.vcl:ro"]
 
-  # The latest LTS and the latest GA of each product (make test-matrix runs them one by one).
-  mysql97:
-    image: mysql:9.7
+  # ---- profile `matrix`: every other required line (make test-matrix, one at a time) -------
+  # MySQL 8.0 is community EOL (final 8.0.46) but Amazon RDS (Extended Support until 2029-07-31)
+  # and Aurora MySQL 3 still run it.
+  mysql80:
+    image: mysql:8.0.46
     profiles: ["matrix"]
-    command: ["--server-id=1", "--log-bin=binlog", "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
+              "--binlog-row-metadata=FULL", "--max-connections=500", "--innodb-buffer-pool-size=128M",
+              "--performance-schema=OFF"]
+    environment: { MYSQL_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34180:3306"]
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
+
+  mysql97:
+    image: mysql:9.7.4
+    profiles: ["matrix"]
+    command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
     environment: { MYSQL_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34197:3306"]
     healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
 
   mysql2610:
-    image: mysql:26.10
+    image: mysql:26.10.0
     profiles: ["matrix"]
     command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
               "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
@@ -123,7 +134,8 @@ services:
   percona84:
     image: percona/percona-server:8.4.11-11
     profiles: ["matrix"]
-    command: ["--server-id=1", "--log-bin=binlog", "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
     environment: { MYSQL_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34284:3306"]
     healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
@@ -131,13 +143,43 @@ services:
   percona97:
     image: percona/percona-server:9.7.2-2
     profiles: ["matrix"]
-    command: ["--server-id=1", "--log-bin=binlog", "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
     environment: { MYSQL_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34297:3306"]
     healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
 
+  # Community EOL (final 10.6.28); required while RDS for MariaDB 10.6 has standard support.
+  # Drop it after 2026-12-31 (here, Makefile MATRIX, ci.yml, README).
+  mariadb106:
+    image: mariadb:10.6.28
+    profiles: ["matrix"]
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34106:3306"]
+    healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
+  mariadb114:
+    image: mariadb:11.4.13
+    profiles: ["matrix"]
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34114:3306"]
+    healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
+  mariadb118:
+    image: mariadb:11.8.9
+    profiles: ["matrix"]
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34118:3306"]
+    healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
   mariadb123:
-    image: mariadb:12.3
+    image: mariadb:12.3.3
     profiles: ["matrix"]
     command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
               "--max-connections=500", "--innodb-buffer-pool-size=128M"]
@@ -153,3 +195,29 @@ services:
     environment: { MARIADB_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34130:3306"]
     healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
+  # ---- profile `prerelease`: advisory, never required (make test-prerelease) ----------------
+  # MySQL and Percona publish no pre-release image (MySQL early access ships as downloads only).
+  mariadb131-rc:
+    image: mariadb:13.1.1-rc
+    profiles: ["prerelease"]
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34131:3306"]
+    healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
+  # MariaDB 13.2 Preview: no Docker Hub image; the MariaDB Foundation's devel image, pinned by
+  # digest (the tag moves). Its my.cnf puts the socket and pid file under /run/mariadbd, which the
+  # image does not create, and its data directory /var/lib/mariadb (renamed in 13.2) ships
+  # pre-initialized, so the entrypoint would skip the first-start setup (root password). Use the
+  # paths the other images use, and a TCP health check (only the real server listens on TCP).
+  mariadb132-pre:
+    image: quay.io/mariadb-foundation/mariadb-devel:13.2-preview@sha256:b065780c004aa1031ec674444d47667530c025c17d27b9ed35750b0394d7b6bb
+    profiles: ["prerelease"]
+    command: ["--server-id=1", "--socket=/run/mysqld/mysqld.sock", "--pid-file=/run/mysqld/mysqld.pid",
+              "--datadir=/var/lib/mysql", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34132:3306"]
+    healthcheck: { test: ["CMD", "mariadb", "--protocol=TCP", "-h127.0.0.1", "-uroot", "-proot", "-e", "SELECT 1"], interval: 2s, retries: 60 }

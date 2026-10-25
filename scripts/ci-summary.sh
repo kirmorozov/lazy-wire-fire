@@ -12,7 +12,7 @@ compose=(docker compose -f docker-compose.test.yml)
 
 # PORT SERVICE per line, from the compose file's "127.0.0.1:PORT:..." mappings.
 ports() {
-  awk '/^  [a-z0-9]+:$/ { s = $1; sub(":", "", s) }
+  awk '/^  [a-z0-9-]+:$/ { s = $1; sub(":", "", s) }
        match($0, /127\.0\.0\.1:[0-9]+:/) { p = substr($0, RSTART + 10, RLENGTH - 11); print p, s }' \
     docker-compose.test.yml
 }
