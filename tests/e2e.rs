@@ -147,10 +147,14 @@ async fn documents_follow_the_rows() {
 
     // A burst of changes to one key fires it once (or twice with a trailing fire).
     mock.clear();
+    // On one connection: a burst, not 30 logins (those alone can outlast the debounce).
+    let mut c = db.conn().await;
     for i in 0..30 {
-        db.exec(&format!("UPDATE orders SET total = {i} WHERE id = 11"))
-            .await;
+        c.query_drop(format!("UPDATE orders SET total = {i} WHERE id = 11"))
+            .await
+            .unwrap();
     }
+    c.disconnect().await.ok();
     let d = wait_for(
         Duration::from_secs(10),
         "the burst to settle on 29",

@@ -118,12 +118,27 @@ Rules, triggers and targets: [docs/reference.md](docs/reference.md).
 Under a supervisor: environment for the DSN and secrets, a health address on 127.0.0.1, an
 instance name, SIGTERM to stop.
 
+## Supported servers
+
+Tested on every line below with the whole integration suite (`make test-matrix`, `make test-e2e-all`):
+
+| product | lines |
+|---|---|
+| MySQL | 8.0, 8.4 LTS, 9.7 LTS, 26.10 (latest GA) |
+| Percona Server | 8.4 LTS, 9.7 LTS (latest) |
+| MariaDB | 10.11 LTS, 12.3 LTS, 13.0 (latest GA) |
+
+Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7,
+Valkey 8, an S3 API (versitygw).
+
 ## Development
 
 ```sh
 make test                      # unit tests
 make servers                   # MySQL 8.4, MySQL 8.0, MariaDB 10.11, Redis, an S3 server (docker)
-make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: on all three
+make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: 8.4, 8.0, MariaDB 10.11
+make test-matrix               # latest LTS and latest GA of MySQL, Percona, MariaDB, one at a time
+make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
 docker buildx build -t lazywf --load .   # static musl binary on distroless
 ```
 
