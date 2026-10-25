@@ -1,5 +1,9 @@
 # lazy_wire_fire (lazywf)
 
+[![ci](https://github.com/kirmorozov/lazy-wire-fire/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kirmorozov/lazy-wire-fire/actions/workflows/ci.yml)
+[![image](https://img.shields.io/badge/image-ghcr.io%2Fkirmorozov%2Flazy--wire--fire-2496ED?logo=docker&logoColor=white)](https://github.com/kirmorozov/lazy-wire-fire/pkgs/container/lazy-wire-fire)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Change-triggered actions from the MySQL binlog. Row changes in the tables you register mark
 **keys**. For the changed keys a rule runs its queries concurrently, merges the rows into one JSON
 document per key, renders one Handlebars template and fires the result at a target: an HTTP
@@ -119,6 +123,30 @@ Rules, triggers and targets: [docs/reference.md](docs/reference.md).
 Under a supervisor: environment for the DSN and secrets, a health address on 127.0.0.1, an
 instance name, SIGTERM to stop.
 
+## Image
+
+```sh
+docker pull ghcr.io/kirmorozov/lazy-wire-fire:edge
+docker run -d --name lazywf -e LAZYWF_DSN=mysql://lazywf:secret@db:3306/app ghcr.io/kirmorozov/lazy-wire-fire:edge
+```
+
+| | |
+|---|---|
+| platforms | `linux/amd64`, `linux/arm64`: one static musl binary `/lazywf`, cross-compiled (cargo-zigbuild) |
+| base | `gcr.io/distroless/static-debian12:nonroot`, pinned by digest: uid 65532, no shell, no package manager |
+| health | `HEALTHCHECK` runs `lazywf healthcheck` (`/livez` on `LAZYWF_HEALTH_ADDR`, inside the container by default) |
+| tags | `edge`: the latest `main`; `sha-<commit>`: every build, the newest 20 kept; releases: `X.Y.Z`, `X.Y`, `X` (not for `0.x`), `latest` |
+| attestations | BuildKit provenance (`mode=max`) and SBOM (Debian packages and crates), a signed GitHub build provenance |
+
+```sh
+gh attestation verify oci://ghcr.io/kirmorozov/lazy-wire-fire:edge --owner kirmorozov
+docker buildx imagetools inspect ghcr.io/kirmorozov/lazy-wire-fire:edge --format '{{json .SBOM}}'
+```
+
+Releases: bump `version` in `Cargo.toml`, merge, push a `vX.Y.Z` tag. CI publishes it once every job
+passes, the server matrix and search included, and fails it when `lazywf --version` does not match
+the tag. Pre-release tags (`v1.2.0-rc.1`) publish only `1.2.0-rc.1`.
+
 ## Supported servers
 
 Tested on every line below with the whole integration suite (`make test-matrix`, `make test-e2e-all`):
@@ -140,8 +168,14 @@ make servers                   # MySQL 8.4 / 8.0, MariaDB 10.11, Redis, Valkey, 
 make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: 8.4, 8.0, MariaDB 10.11
 make test-matrix               # latest LTS and latest GA of MySQL, Percona, MariaDB, one at a time
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
-docker buildx build -t lazywf --load .   # static musl binary on distroless
+docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
+make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
 ```
+
+CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
+lint, unit tests, the integration suite on the default servers (Varnish included), the server
+matrix and the search engines (one runner each), and the image for both platforms. Pushes to `main`
+publish `edge`, `v*` tags a release. Dependabot bumps actions, crates and base images weekly.
 
 The binlog reader (`src/binlog.rs`) comes from [lazyview](https://github.com/kirmorozov/lazyview).
 
