@@ -240,10 +240,12 @@ impl Req {
 }
 
 type Handler = Box<dyn Fn(&Req) -> (u16, String) + Send>;
+type HeaderFn = Box<dyn Fn(&Req) -> Vec<(String, String)> + Send>;
 
 struct MockState {
     reqs: Vec<Req>,
     handler: Handler,
+    headers: HeaderFn,
 }
 
 /// An HTTP server that records requests and answers with a replaceable handler.
@@ -255,11 +257,17 @@ pub struct Mock {
 
 impl Mock {
     pub async fn start() -> Mock {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Mock::start_on(0).await
+    }
+
+    /// On a fixed port (a backend other servers are configured with).
+    pub async fn start_on(port: u16) -> Mock {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::new(Mutex::new(MockState {
             reqs: Vec::new(),
             handler: Box::new(|_| (200, "{}".into())),
+            headers: Box::new(|_| Vec::new()),
         }));
         let st = state.clone();
         tokio::spawn(async move {
@@ -314,14 +322,18 @@ impl Mock {
                             headers,
                             body,
                         };
-                        let (status, body) = {
+                        let (status, body, extra) = {
                             let mut g = st.lock().unwrap();
-                            let r = (g.handler)(&req);
+                            let (status, body) = (g.handler)(&req);
+                            let extra: String = (g.headers)(&req)
+                                .into_iter()
+                                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                                .collect();
                             g.reqs.push(req);
-                            r
+                            (status, body, extra)
                         };
                         let resp = format!(
-                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
                             body.len()
                         );
                         if s.write_all(resp.as_bytes()).await.is_err() {
@@ -340,6 +352,11 @@ impl Mock {
 
     pub fn respond(&self, f: impl Fn(&Req) -> (u16, String) + Send + 'static) {
         self.state.lock().unwrap().handler = Box::new(f);
+    }
+
+    /// Extra response headers.
+    pub fn headers(&self, f: impl Fn(&Req) -> Vec<(String, String)> + Send + 'static) {
+        self.state.lock().unwrap().headers = Box::new(f);
     }
 
     pub fn requests(&self) -> Vec<Req> {

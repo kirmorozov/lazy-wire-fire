@@ -363,21 +363,28 @@ async fn reset_steps_run_in_order() {
     inst.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn redis_target() {
+/// The Redis rules against one server: a document per key (SET / DEL) and the
+/// clear-by-tag script in the Cm_Cache_Backend_Redis layout.
+async fn redis_rules(
+    root: &str,
+    name: &str,
+    endpoint: &str,
+    username: Option<&str>,
+    password: &str,
+) {
     use lazy_wire_fire::redis::{Client, RedisAddr, Reply};
     use lazy_wire_fire::tls::TlsSpec;
-    let root = need_db!();
-    let db = Db::fresh(&root, "redis").await;
+    let db = Db::fresh(root, name).await;
     db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), active TINYINT)")
         .await;
     tables(&db).await;
-    std::env::set_var("LWF_TEST_REDIS_PW", "redispw");
+    let pw_var = format!("LWF_TEST_{}_PW", name.to_uppercase());
+    std::env::set_var(&pw_var, password);
     let redis = Client::new(
-        RedisAddr::parse("127.0.0.1:34379/5").unwrap(),
+        RedisAddr::parse(endpoint).unwrap(),
         &TlsSpec::parse(None).unwrap(),
-        None,
-        Some("redispw".into()),
+        username.map(str::to_string),
+        Some(password.into()),
     )
     .unwrap();
     let t = Duration::from_secs(3);
@@ -393,18 +400,16 @@ async fn redis_target() {
         .await
         .unwrap();
 
-    db.target(
-        "cache",
-        "redis",
-        "127.0.0.1:34379/5",
-        None,
-        r#"{"password": "env:LWF_TEST_REDIS_PW", "prefix": "app_"}"#,
-    )
-    .await;
+    let mut vars = json!({"password": format!("env:{pw_var}"), "prefix": "app_"});
+    if let Some(u) = username {
+        vars["username"] = json!(u);
+    }
+    db.target("cache", "redis", endpoint, None, &vars.to_string())
+        .await;
     db.exec(
         "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('docs', 'cache', 'key', \
          'SELECT id AS _key, name, IF(active, NULL, ''delete'') AS _op FROM customers WHERE id IN (:keys)', \
-         '{{#each docs}}{{#if (eq op \"delete\")}}DEL {{target.vars.prefix}}{{key}}{{else}}SET {{target.vars.prefix}}{{key}} {{redis_quote (json doc)}}{{/if}}{{/each}}', 100)",
+         '{{#each docs}}{{#if (eq op \"delete\")}}DEL {{redis_quote target.vars.prefix key}}{{else}}SET {{redis_quote target.vars.prefix key}} {{redis_quote (json doc)}}{{/if}}{{/each}}', 100)",
     )
     .await;
     db.exec_params(
@@ -452,6 +457,115 @@ async fn redis_target() {
         .then_some(())
     })
     .await;
+    inst.stop().await;
+}
+
+/// Redis 7, password `AUTH`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_target() {
+    let root = need_db!();
+    redis_rules(&root, "redis", "127.0.0.1:34379/5", None, "redispw").await;
+}
+
+/// Valkey 8 with an ACL user (`AUTH user password`); its default user is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn valkey_target() {
+    let root = need_db!();
+    redis_rules(
+        &root,
+        "valkey",
+        "127.0.0.1:34380/2",
+        Some("lazywf"),
+        "valkeypw",
+    )
+    .await;
+}
+
+/// Magento-style tag purging through a real Varnish (`LAZYWF_TEST_VARNISH`, compose profile
+/// `varnish`; its backend is this test on 127.0.0.1:34682): pages tagged with a changed key are
+/// banned, other pages stay cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn varnish_purges_by_tag() {
+    let root = need_db!();
+    let Ok(varnish) = std::env::var("LAZYWF_TEST_VARNISH") else {
+        return eprintln!("LAZYWF_TEST_VARNISH not set: skipping");
+    };
+    use lazy_wire_fire::http::{BaseUrl, Client, RawRequest};
+    use lazy_wire_fire::tls::TlsSpec;
+    let backend = Mock::start_on(34682).await;
+    backend.respond(|r| (200, format!("page {}", r.path)));
+    backend.headers(|r| {
+        let n = r.path.trim_start_matches("/p/").to_string();
+        vec![
+            ("X-Magento-Tags".into(), format!("cat_p_{n},cat_c_9")),
+            ("Cache-Control".into(), "public, max-age=3600".into()),
+        ]
+    });
+    let base = BaseUrl::parse(&varnish).unwrap();
+    let client = Client::new(base.clone(), &TlsSpec::parse(Some("disabled")).unwrap()).unwrap();
+    let get = |path: &str| {
+        let mut r = RawRequest::parse(&format!("GET {path} HTTP/1.1\n\n"))
+            .unwrap()
+            .unwrap();
+        r.set_header("Host", base.host_header());
+        r
+    };
+    let hits = |b: &Mock, path: &str| b.requests().iter().filter(|r| r.path == path).count();
+
+    let db = Db::fresh(&root, "varnish").await;
+    db.exec("CREATE TABLE stock (product_id INT PRIMARY KEY, qty INT)")
+        .await;
+    db.exec("INSERT INTO stock VALUES (1, 5), (2, 5)").await;
+    tables(&db).await;
+    db.target("varnish", "http", &varnish, None, "{}").await;
+    let steps = json!([{"once": true, "template": "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Magento-Tags-Pattern: .*\n"}]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, batch_max_bytes, debounce_ms) VALUES ('purge', 'varnish', ?, ?, 7000, 100)",
+        (
+            "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Magento-Tags-Pattern: {{#each keys}}((^|,){{regex_escape this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}\n",
+            steps.to_string(),
+        ),
+    )
+    .await;
+    db.trigger("purge", "stock", Some("cat_p_{{new.product_id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // The first start purges everything once.
+    wait_for(Duration::from_secs(10), "the first-start purge", || async {
+        db.status("purge")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .map(|_| ())
+    })
+    .await;
+    for path in ["/p/1", "/p/2", "/p/1", "/p/2"] {
+        let r = client
+            .send(&get(path), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+    }
+    assert_eq!(
+        (hits(&backend, "/p/1"), hits(&backend, "/p/2")),
+        (1, 1),
+        "pages are cached"
+    );
+
+    db.exec("UPDATE stock SET qty = 0 WHERE product_id = 1")
+        .await;
+    wait_for(Duration::from_secs(10), "page 1 purged", || async {
+        client
+            .send(&get("/p/1"), Duration::from_secs(5))
+            .await
+            .ok()?;
+        (hits(&backend, "/p/1") >= 2).then_some(())
+    })
+    .await;
+    client
+        .send(&get("/p/2"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(hits(&backend, "/p/2"), 1, "page 2 is still cached");
     inst.stop().await;
 }
 
