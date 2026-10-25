@@ -303,6 +303,76 @@ async fn failures_retry_and_hold_the_position() {
     inst.stop().await;
 }
 
+/// An account with only the documented grants (no SUPER or other admin rights: what Amazon
+/// RDS lets the master user create) runs the tool end to end: it creates its tables, takes its
+/// lock, streams the binlog, reads, fires and saves its position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn least_privilege_account() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "grants").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status VARCHAR(20), total DECIMAL(10,2))")
+        .await;
+    let mariadb = {
+        let mut c = db.conn().await;
+        let v: String = c.query_first("SELECT VERSION()").await.unwrap().unwrap();
+        c.disconnect().await.ok();
+        v.contains("MariaDB")
+    };
+    let user = "'lwf_least'@'%'";
+    db.exec(&format!("DROP USER IF EXISTS {user}")).await;
+    db.exec(&format!("CREATE USER {user} IDENTIFIED BY 'least-pw'"))
+        .await;
+    db.exec(&format!(
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT{} ON *.* TO {user}",
+        if mariadb { ", BINLOG MONITOR" } else { "" }
+    ))
+    .await;
+    db.exec(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON `{}`.* TO {user}",
+        db.schema
+    ))
+    .await;
+    let (scheme, rest) = root.split_once("://").unwrap();
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let least = Db {
+        schema: db.schema.clone(),
+        dsn: format!(
+            "{scheme}://lwf_least:least-pw@{host}/{}?prefer_socket=false",
+            db.schema
+        ),
+    };
+    // The tool's tables do not exist yet: the account creates them.
+    let inst = Instance::ready(config(&least, &[])).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms) VALUES ('o', 'hook', \
+         'SELECT id AS _key, status FROM orders WHERE id IN (:keys)', \
+         'POST /o HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.status}};{{/each}}', 100)",
+    )
+    .await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    // The rule is picked up from its own row events.
+    sleep_ms(1500).await;
+    db.exec("INSERT INTO orders VALUES (7, 1, 'paid', 3)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(15), "the action", || async {
+        mock.requests()
+            .iter()
+            .any(|r| r.body == "7=paid;")
+            .then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(10), "the saved position", || async {
+        let (f, p, _, _) = db.status("o").await?;
+        ((f, p) >= after).then_some(())
+    })
+    .await;
+    inst.stop().await;
+    db.exec(&format!("DROP USER {user}")).await;
+}
+
 /// `expect` is SQL over the response row: a condition on the body and a header holds the key
 /// (and the rule's position) until the target's answer meets it; a condition naming `status`
 /// replaces the 2xx default.

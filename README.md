@@ -23,9 +23,11 @@ binlog ─► triggers mark keys ─► per rule: debounce, dedupe ─► select
 ## Quickstart
 
 lazywf creates its tables on start (`lazy_wire_fire_target`, `_rule`, `_trigger`, `_status`) in
-the schema of its DSN. The account needs `SELECT` on what the rules read, the usual DML on its
-own tables, and `REPLICATION SLAVE, REPLICATION CLIENT` (MariaDB: `BINLOG MONITOR` too). The
-binlog must be `ROW` with `binlog_row_image=FULL`.
+the schema of its DSN. The account needs `SELECT` on what the rules read, `SELECT, INSERT,
+UPDATE, DELETE, CREATE` on its own schema, and `REPLICATION SLAVE, REPLICATION CLIENT` (MariaDB:
+`BINLOG MONITOR` too), and no admin rights. The binlog must be `ROW` with
+`binlog_row_image=FULL`. Details, Amazon RDS and Aurora included:
+[server setup](docs/server-setup.md).
 
 ```sh
 LAZYWF_DSN=mysql://lazywf:secret@db:3306/app lazywf
