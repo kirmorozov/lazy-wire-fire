@@ -38,3 +38,20 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: docker
+
+  # Servers and targets in docker-compose.test.yml, pinned to exact builds (the preview by
+  # digest; Dependabot refreshes the digest). Patch updates only: moving to another line (a new
+  # LTS, GA or pre-release) is a policy change made by hand (README "Supported servers").
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      docker-compose:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    commit-message:
+      prefix: test
