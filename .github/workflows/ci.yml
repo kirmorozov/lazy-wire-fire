@@ -1,0 +1,371 @@
+name: ci
+
+# Every push, pull request, weekly and on demand:
+#   lint         cargo fmt --check, clippy -D warnings (make lint), Cargo.lock up to date
+#   unit         make test
+#   integration  make servers + make test-e2e-all: MySQL 8.4 (GTIDs), MySQL 8.0, MariaDB 10.11
+#                with Redis, Valkey, PostgreSQL, S3 and Varnish as targets
+#   matrix       make test-matrix, one job per server: MySQL 9.7 / 26.10, Percona 8.4 / 9.7,
+#                MariaDB 12.3 / 13.0
+#   search       make test-e2e-search: OpenSearch 2.19, Elasticsearch 7.17 and 8.17
+#   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
+#                make docker-smoke on both, make docker-e2e on amd64
+# Commands live in the Makefile; this file only provides servers, toolchain and caches.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC: new server patch releases behind the floating tags
+  workflow_dispatch:
+
+# A newer run for the same ref and event cancels the superseded one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+env:
+  # Keep in step with the rust image in the Dockerfile.
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  COMPOSE_FILE: docker-compose.test.yml
+  # cargo jobs inside the image build (the Dockerfile's default 4 is for shared hosts). It is in
+  # the builder stage's cache key, so the publish job gets the same value from the image job.
+  IMAGE_CARGO_BUILD_JOBS: "8"
+
+jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Cargo.lock is up to date
+        run: cargo fetch --locked
+      - name: make lint
+        run: make lint
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: make test
+        run: make test 2>&1 | tee unit.log
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Unit tests"
+            echo '```'
+            grep -E '^test result:' unit.log || echo "no test result (see the log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    name: integration (MySQL 8.4, 8.0, MariaDB 10.11 + targets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Varnish (host network) besides the default services; its test runs when this is set.
+      COMPOSE_PROFILES: varnish
+      LAZYWF_TEST_VARNISH: http://127.0.0.1:34681
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start the servers (in the background)
+        run: docker compose up -d --quiet-pull
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Shared with the matrix and search jobs (same test binary); this job writes it.
+          shared-key: e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: build the integration tests
+        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --no-run
+      - name: make servers
+        run: make servers
+      - name: server versions
+        run: scripts/ci-summary.sh versions mysql84 mysql80 mariadb1011 | tee versions.md
+      - name: make test-e2e-all
+        timeout-minutes: 30
+        run: make test-e2e-all 2>&1 | tee e2e.log
+      - name: summary
+        if: always()
+        run: |
+          scripts/ci-summary.sh report "Integration: MySQL 8.4, 8.0, MariaDB 10.11 + targets" e2e.log versions.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          docker compose logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
+          docker compose ps --all > server-logs/compose-ps.txt 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-logs
+          path: |
+            server-logs/
+            e2e.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: make servers-down
+
+  matrix:
+    # The latest LTS and latest GA of each product, one runner per server (make test-matrix runs
+    # them one after another locally). Redis, Valkey, PostgreSQL and S3 are the targets.
+    name: integration (${{ matrix.title }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # Service names and host ports from docker-compose.test.yml (profile `matrix`).
+        include:
+          - { title: MySQL 9.7 LTS, service: mysql97, port: 34197 }
+          - { title: MySQL 26.10, service: mysql2610, port: 34210 }
+          - { title: Percona 8.4 LTS, service: percona84, port: 34284 }
+          - { title: Percona 9.7 LTS, service: percona97, port: 34297 }
+          - { title: MariaDB 12.3 LTS, service: mariadb123, port: 34123 }
+          - { title: MariaDB 13.0, service: mariadb130, port: 34130 }
+    env:
+      COMPOSE_PROFILES: matrix
+      SERVICES: redis valkey postgres s3 ${{ matrix.service }}
+      MATRIX: ${{ matrix.service }}:${{ matrix.port }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start ${{ matrix.service }} and the targets (in the background)
+        run: |
+          read -ra names <<<"$SERVICES"
+          docker compose up -d --quiet-pull "${names[@]}"
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Reads the integration job's cache (same test binary).
+          shared-key: e2e
+          save-if: false
+      - name: build the integration tests
+        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --no-run
+      - name: wait for the servers
+        run: |
+          read -ra names <<<"$SERVICES"
+          docker compose up -d --wait --wait-timeout 300 "${names[@]}"
+      - name: server version
+        run: scripts/ci-summary.sh versions "${{ matrix.service }}" | tee versions.md
+      - name: make test-matrix MATRIX=${{ matrix.service }}:${{ matrix.port }}
+        timeout-minutes: 25
+        run: make test-matrix MATRIX="$MATRIX" 2>&1 | tee e2e.log
+      - name: summary
+        if: always()
+        run: |
+          scripts/ci-summary.sh report "Integration: ${{ matrix.title }}" e2e.log versions.md >> "$GITHUB_STEP_SUMMARY"
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          docker compose logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: matrix-logs-${{ matrix.service }}
+          path: |
+            server-logs/
+            e2e.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: make servers-down
+
+  search:
+    # make test-e2e-search starts one engine at a time (three JVMs do not fit a shared host).
+    name: search (OpenSearch 2.19, Elasticsearch 7.17, 8.17)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start MySQL 8.4, pull the engines (in the background)
+        run: |
+          docker compose up -d --quiet-pull mysql84
+          nohup docker compose --profile search pull --quiet opensearch es7 es8 > pull.log 2>&1 &
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: e2e
+          save-if: false
+      - name: build the integration tests
+        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --no-run
+      - name: wait for MySQL 8.4
+        run: docker compose up -d --wait --wait-timeout 300 mysql84
+      - name: server version
+        run: scripts/ci-summary.sh versions mysql84 | tee versions.md
+      - name: make test-e2e-search
+        timeout-minutes: 30
+        run: make test-e2e-search 2>&1 | tee e2e.log
+      - name: summary
+        if: always()
+        run: |
+          scripts/ci-summary.sh report "Search: OpenSearch 2.19, Elasticsearch 7.17, 8.17" e2e.log versions.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          cp pull.log server-logs/ 2>/dev/null || true
+          docker compose --profile search logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: search-logs
+          path: |
+            server-logs/
+            e2e.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: make servers-down
+
+  image:
+    name: image (build, smoke, end to end)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      cargo-build-jobs: ${{ env.IMAGE_CARGO_BUILD_JOBS }}
+    env:
+      AMD64_IMAGE: lazywf:ci-amd64
+      ARM64_IMAGE: lazywf:ci-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start MySQL 8.4 and Redis (in the background)
+        run: docker compose up -d --quiet-pull mysql84 redis
+      # QEMU only runs the finished arm64 image for its smoke test; the Dockerfile
+      # cross-compiles on the runner platform (no emulation during the build).
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The per-platform GitHub Actions caches written here are what the publish job
+      # (publish-image.yml) builds from, so it only assembles, attests and pushes.
+      - name: build linux/amd64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.AMD64_IMAGE }}
+          build-args: |
+            CARGO_BUILD_JOBS=${{ env.IMAGE_CARGO_BUILD_JOBS }}
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: |
+            type=gha,scope=image-amd64
+          cache-to: type=gha,scope=image-amd64,mode=max
+      - name: make docker-smoke (linux/amd64)
+        run: make docker-smoke IMAGE="$AMD64_IMAGE"
+      - name: binary version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          got=$(docker run --rm "$AMD64_IMAGE" --version)
+          want="lazywf ${GITHUB_REF_NAME#v}"
+          if [[ $got != "$want" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} but the binary reports '${got}': bump the version in Cargo.toml"
+            exit 1
+          fi
+      - name: make docker-e2e (linux/amd64 against MySQL 8.4 and Redis)
+        timeout-minutes: 10
+        run: make docker-e2e IMAGE="$AMD64_IMAGE"
+
+      - name: build linux/arm64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: ${{ env.ARM64_IMAGE }}
+          build-args: |
+            CARGO_BUILD_JOBS=${{ env.IMAGE_CARGO_BUILD_JOBS }}
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: |
+            type=gha,scope=image-amd64
+            type=gha,scope=image-arm64
+          cache-to: type=gha,scope=image-arm64,mode=max
+      - name: make docker-smoke (linux/arm64, QEMU)
+        run: |
+          test "$(docker image inspect "$ARM64_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
+          make docker-smoke IMAGE="$ARM64_IMAGE"
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Image (not pushed)"
+            echo
+            echo "| platform | size | version |"
+            echo "|---|---|---|"
+            for img in "$AMD64_IMAGE" "$ARM64_IMAGE"; do
+              docker image inspect "$img" >/dev/null 2>&1 || continue
+              echo "| $(docker image inspect "$img" --format '{{.Os}}/{{.Architecture}}') | $(docker image inspect "$img" --format '{{.Size}}' | numfmt --to=iec) | $(docker run --rm "$img" --version) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: server logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps mysql84 redis 2>&1 | tail -n 200 || true
+      - name: stop the servers
+        if: always()
+        run: docker compose down -v
