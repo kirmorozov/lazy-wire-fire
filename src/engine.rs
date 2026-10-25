@@ -786,7 +786,13 @@ impl Engine {
             skip_until: None,
             frozen_at: frozen.then(|| self.settled.clone()),
             reset: None,
-            reset_state: String::new(),
+            // A finished or missing reset stays reported across restarts.
+            reset_state: self
+                .saved
+                .get(name)
+                .map(|s| s.reset_state.clone())
+                .filter(|r| r.starts_with("done") || r.starts_with("missing"))
+                .unwrap_or_default(),
             last_error: error.map(|e| (e, crate::time::unix_now_ms())),
             backoff: Backoff::default(),
             pending_clear: false,

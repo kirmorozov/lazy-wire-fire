@@ -858,3 +858,82 @@ async fn throughput() {
     );
     inst.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targets_add_their_authentication() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "auth").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    std::env::set_var("LWF_TEST_TOKEN", "t0ken");
+    let secret = std::env::current_dir()
+        .unwrap()
+        .join("tmp/out/lwf-test-secret");
+    std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+    std::fs::write(&secret, "s3cret\n").unwrap();
+    let file_ref = format!("file:{}", secret.display());
+    let url = format!("{}/base", mock.url());
+    db.target(
+        "basic",
+        "http.basic",
+        &url,
+        None,
+        &json!({"username": "u", "password": file_ref}).to_string(),
+    )
+    .await;
+    db.target(
+        "bearer",
+        "http.bearer",
+        &url,
+        None,
+        r#"{"token": "env:LWF_TEST_TOKEN"}"#,
+    )
+    .await;
+    db.target(
+        "header",
+        "http.header",
+        &url,
+        None,
+        r#"{"header": "X-Api-Key", "value": "k3y", "note": "visible"}"#,
+    )
+    .await;
+    for t in ["basic", "bearer", "header"] {
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, \
+             'POST /{{rule}} HTTP/1.1\n\n{{json target.vars}}', 50)",
+            (t, t),
+        )
+        .await;
+        db.trigger(t, "orders", Some("{{new.id}}"), None).await;
+    }
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 1)").await;
+    let reqs = wait_for(Duration::from_secs(10), "three requests", || async {
+        let r = mock.requests();
+        (r.len() >= 3).then_some(r)
+    })
+    .await;
+    let get = |p: &str| {
+        reqs.iter()
+            .find(|r| r.path == p)
+            .unwrap_or_else(|| panic!("no {p}: {reqs:?}"))
+    };
+    // base64("u:s3cret")
+    assert_eq!(
+        get("/base/basic").header("authorization"),
+        Some("Basic dTpzM2NyZXQ=")
+    );
+    assert_eq!(
+        get("/base/bearer").header("authorization"),
+        Some("Bearer t0ken")
+    );
+    assert_eq!(get("/base/header").header("x-api-key"), Some("k3y"));
+    // Credentials never reach templates.
+    assert_eq!(get("/base/basic").body, r#"{"username":"u"}"#);
+    assert_eq!(get("/base/bearer").body, "{}");
+    assert_eq!(
+        get("/base/header").body,
+        r#"{"header":"X-Api-Key","note":"visible"}"#
+    );
+    inst.stop().await;
+}
