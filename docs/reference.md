@@ -172,7 +172,8 @@ background while streaming continues. An interrupted reset starts over after a r
 * `for_each: stray`: pages through the target's keys with `list_template` (context
   `reset.next`: the previous page's `next_path` value, `null` first; `reset.page`). `keys_path`
   picks the keys of a page, `next_path` the cursor. Paging stops when the cursor is missing,
-  `null`, unchanged, `0` / `"0"` (Redis `SCAN`), or an http page is empty. The keys missing from
+  `null` or `0` / `"0"` (Redis `SCAN`), when an http page brings no new keys, or when a Redis
+  cursor repeats. The keys missing from
   the snapshot, read after the listing, are rendered with op `delete` (`reset.keys` holds them),
   per endpoint. Keys marked while the step runs are never treated as strays.
 

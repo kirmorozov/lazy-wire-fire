@@ -938,30 +938,64 @@ async fn targets_add_their_authentication() {
     inst.stop().await;
 }
 
-/// Against a real OpenSearch (`LAZYWF_TEST_OPENSEARCH=http://127.0.0.1:34200`, compose profile
-/// `search`): the re-sync in place, upserts and deletes through `_bulk`, strays paged with
-/// `search_after` sorted by `_id`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn search_index_resync() {
+/// One search engine of the OpenSearch / Elasticsearch family.
+struct Search {
+    name: &'static str,
+    url: String,
+    /// The target's `tls` column.
+    tls: Option<String>,
+    kind: &'static str,
+    vars: Value,
+    /// `Authorization` for the test's own calls.
+    auth: Option<String>,
+    /// How strays are paged: `search_after` sorted by `_id`, or a scroll (Elasticsearch 8
+    /// refuses to sort on `_id` by default).
+    scroll: bool,
+}
+
+async fn search_count(
+    client: &lazy_wire_fire::http::Client,
+    req: impl Fn(&str, &str, &str) -> lazy_wire_fire::http::RawRequest,
+    index: &str,
+    q: &str,
+) -> Option<u64> {
+    let t = Duration::from_secs(10);
+    client
+        .send(&req("POST", &format!("/{index}/_refresh"), ""), t)
+        .await
+        .ok()?;
+    let r = client
+        .send(&req("POST", &format!("/{index}/_search?size=0"), q), t)
+        .await
+        .ok()?;
+    let v: Value = serde_json::from_slice(&r.body).ok()?;
+    v["hits"]["total"]["value"].as_u64()
+}
+
+/// The re-sync in place against a real engine: upserts and deletes through `_bulk`, strays
+/// paged through the index.
+async fn search_resync(root: &str, e: Search) {
     use lazy_wire_fire::http::{BaseUrl, Client, RawRequest};
     use lazy_wire_fire::tls::TlsSpec;
-    let root = need_db!();
-    let Ok(os) = std::env::var("LAZYWF_TEST_OPENSEARCH") else {
-        eprintln!("LAZYWF_TEST_OPENSEARCH not set: skipping");
-        return;
-    };
-    let client = Client::new(BaseUrl::parse(&os).unwrap(), &TlsSpec::parse(None).unwrap()).unwrap();
-    let host = BaseUrl::parse(&os).unwrap().host_header();
-    let call = |method: &str, path: &str, body: &str| {
+    let base = BaseUrl::parse(&e.url).unwrap();
+    // The test's own calls skip certificate checks; the target is verified as configured.
+    let tls = TlsSpec::parse(Some(if base.secure { "required" } else { "disabled" })).unwrap();
+    let client = Client::new(base.clone(), &tls).unwrap();
+    let host = base.host_header();
+    let auth = e.auth.clone();
+    let call = move |method: &str, path: &str, body: &str| {
         let mut r = RawRequest::parse(&format!(
             "{method} {path} HTTP/1.1\nContent-Type: application/json\n\n{body}"
         ))
         .unwrap()
         .unwrap();
         r.set_header("Host", host.clone());
+        if let Some(a) = &auth {
+            r.set_header("Authorization", a.clone());
+        }
         r
     };
-    let index = format!("lwf_items_{}", std::process::id());
+    let index = format!("lwf_items_{}_{}", e.name, std::process::id());
     let t = Duration::from_secs(10);
     client
         .send(&call("DELETE", &format!("/{index}"), ""), t)
@@ -978,7 +1012,7 @@ async fn search_index_resync() {
         )
         .await
         .unwrap();
-    assert_eq!(r.status, 200, "{}", r.body_snippet());
+    assert_eq!(r.status, 200, "{}: {}", e.name, r.body_snippet());
     // Strays and a stale document, as an index left behind would have them.
     for (id, title) in [("5000", "stray"), ("5001", "stray"), ("1", "stale")] {
         client
@@ -994,9 +1028,10 @@ async fn search_index_resync() {
             .unwrap();
     }
 
-    let db = Db::fresh(&root, "search").await;
+    let db = Db::fresh(root, &format!("search_{}", e.name)).await;
     db.exec("CREATE TABLE items (id INT PRIMARY KEY, title VARCHAR(50))")
         .await;
+    // ids 1..999 and 1001..1999: two listing pages of 1000.
     db.exec(
         "INSERT INTO items WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 999) \
          SELECT a.i * 1000 + b.i, CONCAT('item ', a.i * 1000 + b.i) FROM s a JOIN s b WHERE a.i < 2 AND b.i <= 999 \
@@ -1005,15 +1040,26 @@ async fn search_index_resync() {
     .await;
     let n: Vec<u64> = db.query("SELECT COUNT(*) FROM items").await;
     tables(&db).await;
-    db.target("os", "http", &os, Some("2xx and errors == false"), "{}")
-        .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, expect, vars) VALUES ('os', ?, ?, ?, '2xx and errors == false', ?)",
+        (e.kind, &e.url, e.tls.clone(), e.vars.to_string()),
+    )
+    .await;
+    let list = if e.scroll {
+        "{{#if reset.next}}POST /_search/scroll HTTP/1.1\nContent-Type: application/json\n\n{\"scroll\":\"1m\",\"scroll_id\":{{json reset.next}}}{{else}}POST /{{vars.index}}/_search?scroll=1m HTTP/1.1\nContent-Type: application/json\n\n{\"size\":1000,\"_source\":false,\"sort\":[\"_doc\"]}{{/if}}"
+    } else {
+        "POST /{{vars.index}}/_search HTTP/1.1\nContent-Type: application/json\n\n{\"size\":1000,\"_source\":false,\"sort\":[{\"_id\":\"asc\"}]{{#if reset.next}},\"search_after\":{{json reset.next}}{{/if}}}"
+    };
+    let next = if e.scroll {
+        "_scroll_id"
+    } else {
+        "hits.hits[-1].sort"
+    };
     let steps = json!([
         {"for_each": "snapshot"},
-        {"for_each": "stray",
-         "list_template": "POST /{{vars.index}}/_search HTTP/1.1\nContent-Type: application/json\n\n{\"size\":1000,\"_source\":false,\"sort\":[{\"_id\":\"asc\"}]{{#if reset.next}},\"search_after\":{{json reset.next}}{{/if}}}",
-         "keys_path": "hits.hits[]._id", "next_path": "hits.hits[-1].sort"}
+        {"for_each": "stray", "list_template": list, "keys_path": "hits.hits[]._id", "next_path": next}
     ]);
-    let template = "POST /{{vars.index}}/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{{#each docs}}{{#if (eq op \"delete\")}}{\"delete\":{\"_id\":\"{{key}}\"}}\n{{else}}{\"update\":{\"_id\":\"{{key}}\"}}\n{\"doc\":{{json doc}},\"doc_as_upsert\":true}\n{{/if}}{{/each}}";
+    let template = "POST /{{vars.index}}/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{{#each docs}}{{#if (eq op \"delete\")}}{\"delete\":{\"_id\":{{json key}}}}\n{{else}}{\"update\":{\"_id\":{{json key}}}}\n{\"doc\":{{json doc}},\"doc_as_upsert\":true}\n{{/if}}{{/each}}";
     db.exec_params(
         "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, vars, debounce_ms) \
          VALUES ('items', 'os', 'SELECT id AS _key, title, NULL AS _op FROM items WHERE id IN (:keys)', 'SELECT id AS _key FROM items', ?, ?, ?, 100)",
@@ -1022,41 +1068,18 @@ async fn search_index_resync() {
     .await;
     db.trigger("items", "items", Some("{{new.id}}"), None).await;
     let inst = Instance::ready(config(&db, &[])).await;
-
-    async fn count(client: &Client, host: &str, index: &str, q: &str) -> Option<u64> {
-        let req = |method: &str, path: String, body: &str| {
-            let mut r = RawRequest::parse(&format!(
-                "{method} {path} HTTP/1.1\nContent-Type: application/json\n\n{body}"
-            ))
-            .unwrap()
-            .unwrap();
-            r.set_header("Host", host.to_string());
-            r
-        };
-        let t = Duration::from_secs(10);
-        client
-            .send(&req("POST", format!("/{index}/_refresh"), ""), t)
-            .await
-            .ok()?;
-        let r = client
-            .send(&req("POST", format!("/{index}/_search?size=0"), q), t)
-            .await
-            .ok()?;
-        let v: Value = serde_json::from_slice(&r.body).ok()?;
-        v["hits"]["total"]["value"].as_u64()
-    }
     wait_for(Duration::from_secs(60), "the re-synced index", || async {
-        let total = count(&client, &host, &index, r#"{"track_total_hits":true}"#).await?;
-        let strays = count(
+        let total = search_count(&client, &call, &index, r#"{"track_total_hits":true}"#).await?;
+        let strays = search_count(
             &client,
-            &host,
+            &call,
             &index,
             r#"{"query":{"term":{"title":"stray"}}}"#,
         )
         .await?;
-        let stale = count(
+        let stale = search_count(
             &client,
-            &host,
+            &call,
             &index,
             r#"{"query":{"term":{"title":"stale"}}}"#,
         )
@@ -1076,14 +1099,14 @@ async fn search_index_resync() {
         .await;
     db.exec("DELETE FROM items WHERE id = 6").await;
     wait_for(Duration::from_secs(10), "incremental changes", || async {
-        let renamed = count(
+        let renamed = search_count(
             &client,
-            &host,
+            &call,
             &index,
             r#"{"query":{"term":{"title":"renamed"}}}"#,
         )
         .await?;
-        let total = count(&client, &host, &index, r#"{"track_total_hits":true}"#).await?;
+        let total = search_count(&client, &call, &index, r#"{"track_total_hits":true}"#).await?;
         (renamed == 1 && total == n[0] - 1).then_some(())
     })
     .await;
@@ -1092,4 +1115,75 @@ async fn search_index_resync() {
         .send(&call("DELETE", &format!("/{index}"), ""), t)
         .await
         .ok();
+}
+
+/// `LAZYWF_TEST_OPENSEARCH=http://127.0.0.1:34200` (compose profile `search`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_opensearch() {
+    let root = need_db!();
+    let Ok(url) = std::env::var("LAZYWF_TEST_OPENSEARCH") else {
+        return eprintln!("LAZYWF_TEST_OPENSEARCH not set: skipping");
+    };
+    search_resync(
+        &root,
+        Search {
+            name: "os",
+            url,
+            tls: None,
+            kind: "http",
+            vars: json!({}),
+            auth: None,
+            scroll: false,
+        },
+    )
+    .await;
+}
+
+/// `LAZYWF_TEST_ES7=http://127.0.0.1:34207`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_elasticsearch7() {
+    let root = need_db!();
+    let Ok(url) = std::env::var("LAZYWF_TEST_ES7") else {
+        return eprintln!("LAZYWF_TEST_ES7 not set: skipping");
+    };
+    search_resync(
+        &root,
+        Search {
+            name: "es7",
+            url,
+            tls: None,
+            kind: "http",
+            vars: json!({}),
+            auth: None,
+            scroll: false,
+        },
+    )
+    .await;
+}
+
+/// `LAZYWF_TEST_ES8=https://127.0.0.1:34202`, `LAZYWF_TEST_ES8_CA=<http_ca.crt>`: security on,
+/// basic auth from an `env:` reference, the cluster's private CA (`verify-ca`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_elasticsearch8() {
+    let root = need_db!();
+    let (Ok(url), Ok(ca)) = (
+        std::env::var("LAZYWF_TEST_ES8"),
+        std::env::var("LAZYWF_TEST_ES8_CA"),
+    ) else {
+        return eprintln!("LAZYWF_TEST_ES8 / LAZYWF_TEST_ES8_CA not set: skipping");
+    };
+    std::env::set_var("LWF_TEST_ES_PW", "elasticpw");
+    search_resync(
+        &root,
+        Search {
+            name: "es8",
+            url,
+            tls: Some(json!({"mode": "verify-ca", "ca": ca}).to_string()),
+            kind: "http.basic",
+            vars: json!({"username": "elastic", "password": "env:LWF_TEST_ES_PW"}),
+            auth: Some("Basic ZWxhc3RpYzplbGFzdGljcHc=".into()),
+            scroll: true,
+        },
+    )
+    .await;
 }

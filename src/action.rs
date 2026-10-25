@@ -625,20 +625,26 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
                 .map(crate::template::text)
                 .filter(|k| !k.is_empty())
                 .collect();
-            let n = page_keys.len();
+            let before = keys.len();
             for k in page_keys {
                 if seen.insert(k.clone()) {
                     keys.push(k);
                 }
             }
+            let fresh = keys.len() - before;
             let Some(np) = next_path else { break };
             let nv = np.get_one(&resp).cloned().unwrap_or(Value::Null);
-            // An empty page ends an HTTP listing; a Redis SCAN page may be empty mid-way.
+            // HTTP: a page without new keys ends the listing (a scroll keeps its cursor, so an
+            // unchanged cursor proves nothing). Redis SCAN pages may be empty mid-way: there the
+            // cursor decides (`0` ends it).
             let done = nv.is_null()
-                || nv == next
                 || nv == json!(0)
                 || nv == json!("0")
-                || (n == 0 && target.is_http());
+                || if target.is_http() {
+                    fresh == 0
+                } else {
+                    nv == next
+                };
             if done {
                 break;
             }
