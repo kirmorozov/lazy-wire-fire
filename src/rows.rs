@@ -34,8 +34,16 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(names: Vec<String>, kinds: Vec<ColKind>) -> Layout {
-        let by_name = names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
-        Layout { names, kinds, by_name }
+        let by_name = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        Layout {
+            names,
+            kinds,
+            by_name,
+        }
     }
 
     pub fn index(&self, name: &str) -> Option<usize> {
@@ -72,7 +80,9 @@ pub fn col_kind(data_type: &str, column_type: &str) -> ColKind {
     let dt = data_type.to_ascii_lowercase();
     let ct = column_type.to_ascii_lowercase();
     match dt.as_str() {
-        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" if ct.contains("unsigned") => {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
+            if ct.contains("unsigned") =>
+        {
             ColKind::Unsigned(match dt.as_str() {
                 "tinyint" => 8,
                 "smallint" => 16,
@@ -130,7 +140,11 @@ fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind) -> Value {
     match (kind, v) {
         (_, My::NULL) => Value::Null,
         (ColKind::Unsigned(bits), My::Int(i)) => {
-            let mask = if *bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let mask = if *bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
             Value::from((*i as u64) & mask)
         }
         (ColKind::Enum(labels), My::Int(i)) => match usize::try_from(*i) {
@@ -151,7 +165,11 @@ fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind) -> Value {
                 .collect();
             Value::String(parts.join(","))
         }
-        (ColKind::Bit, My::Bytes(b)) => Value::from(b.iter().take(8).fold(0u64, |acc, x| (acc << 8) | u64::from(*x))),
+        (ColKind::Bit, My::Bytes(b)) => Value::from(
+            b.iter()
+                .take(8)
+                .fold(0u64, |acc, x| (acc << 8) | u64::from(*x)),
+        ),
         (_, other) => crate::docs::to_json(other.clone(), None),
     }
 }
@@ -160,7 +178,10 @@ fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind) -> Value {
 pub fn table_map_names(tme: &TableMapEvent<'_>) -> Option<Vec<String>> {
     for f in tme.iter_optional_meta() {
         if let Ok(OptionalMetadataField::ColumnName(names)) = f {
-            let v: Result<Vec<String>, _> = names.iter_names().map(|n| n.map(|n| n.name().into_owned())).collect();
+            let v: Result<Vec<String>, _> = names
+                .iter_names()
+                .map(|n| n.map(|n| n.name().into_owned()))
+                .collect();
             return v.ok();
         }
     }
@@ -205,12 +226,21 @@ impl Catalog {
             )
             .await
             .with_context(|| format!("reading the columns of `{schema}`.`{table}`"))?;
-        let (names, kinds) = rows.into_iter().map(|(n, d, c)| (n, col_kind(&d, &c))).unzip();
+        let (names, kinds) = rows
+            .into_iter()
+            .map(|(n, d, c)| (n, col_kind(&d, &c)))
+            .unzip();
         Ok(Arc::new(Layout::new(names, kinds)))
     }
 
     /// The layout for rows described by `tme`.
-    pub async fn layout(&mut self, conn: &mut Conn, schema: &str, table: &str, tme: Option<&TableMapEvent<'_>>) -> Result<Arc<Layout>> {
+    pub async fn layout(
+        &mut self,
+        conn: &mut Conn,
+        schema: &str,
+        table: &str,
+        tme: Option<&TableMapEvent<'_>>,
+    ) -> Result<Arc<Layout>> {
         let key = (schema.to_string(), table.to_string());
         let have = tme.map(|t| t.columns_count() as usize);
         let mut info = match self.cache.get(&key) {
@@ -224,7 +254,11 @@ impl Catalog {
         if let Some(names) = tme.and_then(table_map_names) {
             let kinds = names
                 .iter()
-                .map(|n| info.index(n).map(|i| info.kinds[i].clone()).unwrap_or(ColKind::Plain))
+                .map(|n| {
+                    info.index(n)
+                        .map(|i| info.kinds[i].clone())
+                        .unwrap_or(ColKind::Plain)
+                })
                 .collect();
             return Ok(Arc::new(Layout::new(names, kinds)));
         }
@@ -233,7 +267,13 @@ impl Catalog {
                 info = Self::load(conn, schema, table).await?;
                 self.cache.insert(key, info.clone());
                 if have != info.len() {
-                    return Err(LayoutMismatch { schema: schema.into(), table: table.into(), have, want: info.len() }.into());
+                    return Err(LayoutMismatch {
+                        schema: schema.into(),
+                        table: table.into(),
+                        have,
+                        want: info.len(),
+                    }
+                    .into());
                 }
             }
         }
@@ -248,14 +288,35 @@ mod tests {
     #[test]
     fn kinds_and_values() {
         assert_eq!(col_kind("int", "int(10) unsigned"), ColKind::Unsigned(32));
-        assert_eq!(col_kind("enum", "enum('a','it''s')"), ColKind::Enum(vec!["a".into(), "it's".into()]));
+        assert_eq!(
+            col_kind("enum", "enum('a','it''s')"),
+            ColKind::Enum(vec!["a".into(), "it's".into()])
+        );
         let u = BinlogValue::Value(My::Int(-1));
-        assert_eq!(convert(Some(&u), &ColKind::Unsigned(32)), Value::from(4_294_967_295u64));
+        assert_eq!(
+            convert(Some(&u), &ColKind::Unsigned(32)),
+            Value::from(4_294_967_295u64)
+        );
         let e = BinlogValue::Value(My::Int(2));
-        assert_eq!(convert(Some(&e), &ColKind::Enum(vec!["x".into(), "y".into()])), Value::from("y"));
+        assert_eq!(
+            convert(Some(&e), &ColKind::Enum(vec!["x".into(), "y".into()])),
+            Value::from("y")
+        );
         let s = BinlogValue::Value(My::Bytes(vec![0b101]));
-        assert_eq!(convert(Some(&s), &ColKind::Set(vec!["a".into(), "b".into(), "c".into()])), Value::from("a,c"));
+        assert_eq!(
+            convert(
+                Some(&s),
+                &ColKind::Set(vec!["a".into(), "b".into(), "c".into()])
+            ),
+            Value::from("a,c")
+        );
         assert_eq!(convert(None, &ColKind::Plain), Value::Null);
-        assert_eq!(convert(Some(&BinlogValue::Value(My::Bytes(b"sku-1".to_vec()))), &ColKind::Plain), Value::from("sku-1"));
+        assert_eq!(
+            convert(
+                Some(&BinlogValue::Value(My::Bytes(b"sku-1".to_vec()))),
+                &ColKind::Plain
+            ),
+            Value::from("sku-1")
+        );
     }
 }

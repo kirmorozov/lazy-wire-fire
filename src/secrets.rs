@@ -10,10 +10,12 @@ pub fn is_reference(v: &str) -> bool {
 /// The value `v` designates. A file's trailing newline is dropped.
 pub fn resolve(v: &str) -> Result<String> {
     if let Some(name) = v.strip_prefix("env:") {
-        return std::env::var(name).map_err(|_| anyhow!("environment variable `{name}` is not set"));
+        return std::env::var(name)
+            .map_err(|_| anyhow!("environment variable `{name}` is not set"));
     }
     if let Some(path) = v.strip_prefix("file:") {
-        let s = std::fs::read_to_string(path).with_context(|| format!("reading secret file `{path}`"))?;
+        let s = std::fs::read_to_string(path)
+            .with_context(|| format!("reading secret file `{path}`"))?;
         return Ok(s.trim_end_matches(['\n', '\r']).to_string());
     }
     Ok(v.to_string())

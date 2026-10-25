@@ -100,11 +100,14 @@ impl Path {
     /// Whether either path is a prefix of the other, i.e. they write into the same place. Any
     /// two array steps count as the same place.
     pub fn overlaps(&self, other: &Path) -> bool {
-        self.0.iter().zip(other.0.iter()).all(|(a, b)| match (a, b) {
-            (Step::Field(x), Step::Field(y)) => x == y,
-            (Step::Field(_), _) | (_, Step::Field(_)) => false,
-            _ => true,
-        })
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .all(|(a, b)| match (a, b) {
+                (Step::Field(x), Step::Field(y)) => x == y,
+                (Step::Field(_), _) | (_, Step::Field(_)) => false,
+                _ => true,
+            })
     }
 
     /// Position of the `[]` step, if any.
@@ -228,9 +231,16 @@ mod tests {
         assert_eq!(p("name").0, vec![Step::Field("name".into())]);
         assert_eq!(
             p("array[1].value").0,
-            vec![Step::Field("array".into()), Step::Index(1), Step::Field("value".into())]
+            vec![
+                Step::Field("array".into()),
+                Step::Index(1),
+                Step::Field("value".into())
+            ]
         );
-        assert_eq!(p("category_ids[]").0, vec![Step::Field("category_ids".into()), Step::Each]);
+        assert_eq!(
+            p("category_ids[]").0,
+            vec![Step::Field("category_ids".into()), Step::Each]
+        );
         assert_eq!(p("$.hits.hits[-1].sort").to_string(), "hits.hits[-1].sort");
         assert_eq!(p("[0]").0, vec![Step::Index(0)]);
         assert!(p("$").is_root() && p(".").is_root());
@@ -254,8 +264,12 @@ mod tests {
         p("array[1].value").set(&mut d, json!("x"));
         p("ids[]").set(&mut d, json!(1));
         p("ids[]").set(&mut d, json!(2));
-        assert_eq!(d, json!({"price": {"final": 9.5}, "array": [null, {"value": "x"}], "ids": [1, 2]}));
-        let r = json!({"hits": {"hits": [{"_id": "1", "sort": ["1"]}, {"_id": "2", "sort": ["2"]}]}});
+        assert_eq!(
+            d,
+            json!({"price": {"final": 9.5}, "array": [null, {"value": "x"}], "ids": [1, 2]})
+        );
+        let r =
+            json!({"hits": {"hits": [{"_id": "1", "sort": ["1"]}, {"_id": "2", "sort": ["2"]}]}});
         let ids: Vec<_> = p("hits.hits[]._id").get(&r).into_iter().cloned().collect();
         assert_eq!(ids, vec![json!("1"), json!("2")]);
         assert_eq!(p("hits.hits[-1].sort").get_one(&r), Some(&json!(["2"])));

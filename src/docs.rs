@@ -68,7 +68,8 @@ impl Plan {
                     Role::DynValue
                 }
                 _ => {
-                    let p = Path::parse(base).map_err(|e| anyhow::anyhow!("column `{name}`: {e}"))?;
+                    let p =
+                        Path::parse(base).map_err(|e| anyhow::anyhow!("column `{name}`: {e}"))?;
                     if p.is_root() {
                         bail!("column `{name}` names no field");
                     }
@@ -103,7 +104,11 @@ impl Plan {
         if dp != dv {
             bail!("`_path` and `_value` go together");
         }
-        let plan = Plan { roles, groups, has_op };
+        let plan = Plan {
+            roles,
+            groups,
+            has_op,
+        };
         // Within one select, written places must not overlap (members of one group excepted).
         let places = plan.places();
         for (i, a) in places.iter().enumerate() {
@@ -126,7 +131,12 @@ impl Plan {
                     let mut full = self.groups[*g].clone();
                     full.0.push(Step::Each);
                     full.0.extend(inner.0.iter().cloned());
-                    Some((self.groups[*g].clone(), Some(*g), inner.clone(), full.to_string()))
+                    Some((
+                        self.groups[*g].clone(),
+                        Some(*g),
+                        inner.clone(),
+                        full.to_string(),
+                    ))
                 }
                 _ => None,
             })
@@ -175,7 +185,10 @@ impl Doc {
         let mut m = Map::new();
         m.insert("key".into(), Value::String(self.key.clone()));
         m.insert("doc".into(), self.doc.clone());
-        m.insert("op".into(), Value::String(if self.delete { "delete" } else { "upsert" }.into()));
+        m.insert(
+            "op".into(),
+            Value::String(if self.delete { "delete" } else { "upsert" }.into()),
+        );
         Value::Object(m)
     }
 }
@@ -198,7 +211,16 @@ impl Merger {
         Merger {
             docs: keys
                 .iter()
-                .map(|k| (k.clone(), Entry { doc: Value::Object(Map::new()), delete: false, seen: false }))
+                .map(|k| {
+                    (
+                        k.clone(),
+                        Entry {
+                            doc: Value::Object(Map::new()),
+                            delete: false,
+                            seen: false,
+                        },
+                    )
+                })
                 .collect(),
             any_op: false,
             warnings: Vec::new(),
@@ -208,7 +230,11 @@ impl Merger {
     /// Adds the rows of one select (values already converted to JSON).
     pub fn add(&mut self, plan: &Plan, rows: Vec<Vec<Value>>) {
         self.any_op |= plan.has_op;
-        let key_at = plan.roles.iter().position(|(r, _)| *r == Role::Key).expect("plan has _key");
+        let key_at = plan
+            .roles
+            .iter()
+            .position(|(r, _)| *r == Role::Key)
+            .expect("plan has _key");
         let mut members: HashMap<usize, Vec<(usize, &Path)>> = HashMap::new();
         for (i, (r, _)) in plan.roles.iter().enumerate() {
             if let Role::Member(g, inner) = r {
@@ -220,7 +246,9 @@ impl Merger {
                 Value::Null => continue,
                 v => crate::template::text(v),
             };
-            let Some(e) = self.docs.get_mut(&key) else { continue };
+            let Some(e) = self.docs.get_mut(&key) else {
+                continue;
+            };
             e.seen = true;
             for (i, (role, json)) in plan.roles.iter().enumerate() {
                 if *json {
@@ -228,10 +256,8 @@ impl Merger {
                 }
                 match role {
                     Role::Set(p) => p.set(&mut e.doc, row[i].clone()),
-                    Role::Op => {
-                        if crate::template::text(&row[i]).eq_ignore_ascii_case("delete") {
-                            e.delete = true;
-                        }
+                    Role::Op if crate::template::text(&row[i]).eq_ignore_ascii_case("delete") => {
+                        e.delete = true;
                     }
                     _ => {}
                 }
@@ -270,7 +296,9 @@ impl Merger {
                                 p.set(&mut e.doc, row[vi].clone());
                             }
                         }
-                        Some(_) => self.warnings.push(format!("_path `{raw}`: `[]` only at the end")),
+                        Some(_) => self
+                            .warnings
+                            .push(format!("_path `{raw}`: `[]` only at the end")),
                         None => p.set(&mut e.doc, row[vi].clone()),
                     },
                     Ok(_) => self.warnings.push("empty _path".into()),
@@ -284,7 +312,11 @@ impl Merger {
         let any_op = self.any_op;
         self.docs
             .into_iter()
-            .map(|(key, e)| Doc { key, doc: e.doc, delete: e.delete || (any_op && !e.seen) })
+            .map(|(key, e)| Doc {
+                key,
+                doc: e.doc,
+                delete: e.delete || (any_op && !e.seen),
+            })
             .collect()
     }
 }
@@ -304,7 +336,11 @@ fn frac(us: u32, decimals: u8) -> String {
     if us == 0 && decimals == 0 {
         return String::new();
     }
-    let d = if decimals == 0 || decimals > 6 { 6 } else { decimals as usize };
+    let d = if decimals == 0 || decimals > 6 {
+        6
+    } else {
+        decimals as usize
+    };
     let s = format!("{us:06}");
     format!(".{}", &s[..d])
 }
@@ -317,13 +353,24 @@ pub fn to_json(v: My, col: Option<&Column>) -> Value {
         My::NULL => Value::Null,
         My::Int(i) => Value::from(i),
         My::UInt(u) => Value::from(u),
-        My::Float(f) => serde_json::Number::from_f64(f64::from(f)).map_or(Value::Null, Value::Number),
+        My::Float(f) => {
+            serde_json::Number::from_f64(f64::from(f)).map_or(Value::Null, Value::Number)
+        }
         My::Double(f) => serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number),
         My::Date(y, m, d, h, i, s, us) => {
-            if ty == Some(ColumnType::MYSQL_TYPE_DATE) || ty == Some(ColumnType::MYSQL_TYPE_NEWDATE) {
+            if ty == Some(ColumnType::MYSQL_TYPE_DATE) || ty == Some(ColumnType::MYSQL_TYPE_NEWDATE)
+            {
                 Value::String(format!("{y:04}-{}-{}", pad2(m), pad2(d)))
             } else {
-                Value::String(format!("{y:04}-{}-{} {}:{}:{}{}", pad2(m), pad2(d), pad2(h), pad2(i), pad2(s), frac(us, decimals)))
+                Value::String(format!(
+                    "{y:04}-{}-{} {}:{}:{}{}",
+                    pad2(m),
+                    pad2(d),
+                    pad2(h),
+                    pad2(i),
+                    pad2(s),
+                    frac(us, decimals)
+                ))
             }
         }
         My::Time(neg, d, h, i, s, us) => Value::String(format!(
@@ -338,7 +385,8 @@ pub fn to_json(v: My, col: Option<&Column>) -> Value {
             let text = || String::from_utf8_lossy(&b).into_owned();
             match ty {
                 Some(ColumnType::MYSQL_TYPE_NEWDECIMAL | ColumnType::MYSQL_TYPE_DECIMAL) => {
-                    serde_json::from_str::<serde_json::Number>(&text()).map_or_else(|_| Value::String(text()), Value::Number)
+                    serde_json::from_str::<serde_json::Number>(&text())
+                        .map_or_else(|_| Value::String(text()), Value::Number)
                 }
                 Some(
                     ColumnType::MYSQL_TYPE_TINY
@@ -349,11 +397,16 @@ pub fn to_json(v: My, col: Option<&Column>) -> Value {
                     | ColumnType::MYSQL_TYPE_YEAR
                     | ColumnType::MYSQL_TYPE_FLOAT
                     | ColumnType::MYSQL_TYPE_DOUBLE,
-                ) => serde_json::from_str::<serde_json::Number>(&text()).map_or_else(|_| Value::String(text()), Value::Number),
-                Some(ColumnType::MYSQL_TYPE_JSON) => serde_json::from_slice(&b).unwrap_or_else(|_| Value::String(text())),
-                Some(ColumnType::MYSQL_TYPE_BIT) => {
-                    Value::from(b.iter().take(8).fold(0u64, |acc, x| (acc << 8) | u64::from(*x)))
+                ) => serde_json::from_str::<serde_json::Number>(&text())
+                    .map_or_else(|_| Value::String(text()), Value::Number),
+                Some(ColumnType::MYSQL_TYPE_JSON) => {
+                    serde_json::from_slice(&b).unwrap_or_else(|_| Value::String(text()))
                 }
+                Some(ColumnType::MYSQL_TYPE_BIT) => Value::from(
+                    b.iter()
+                        .take(8)
+                        .fold(0u64, |acc, x| (acc << 8) | u64::from(*x)),
+                ),
                 _ => Value::String(text()),
             }
         }
@@ -392,7 +445,14 @@ mod tests {
         assert!(Plan::new(&names(&["_key", "a[]", "a[].x"])).is_err());
         assert!(Plan::new(&names(&["_key", "a[].b[]"])).is_err());
         assert!(Plan::new(&names(&["_key", "[]"])).is_err());
-        Plan::new(&names(&["_key", "items[].sku", "items[].qty", "price.final", "price.base"])).unwrap();
+        Plan::new(&names(&[
+            "_key",
+            "items[].sku",
+            "items[].qty",
+            "price.final",
+            "price.base",
+        ]))
+        .unwrap();
     }
 
     #[test]
@@ -408,16 +468,41 @@ mod tests {
     fn merge() {
         let ks = keys(&["1", "2", "3"]);
         let mut m = Merger::new(&ks);
-        let attrs = Plan::new(&names(&["_key", "sku", "price.final", "array[1].value", "meta:json"])).unwrap();
+        let attrs = Plan::new(&names(&[
+            "_key",
+            "sku",
+            "price.final",
+            "array[1].value",
+            "meta:json",
+        ]))
+        .unwrap();
         m.add(
             &attrs,
             vec![
-                vec![json!(1), json!("A"), json!(9.5), json!("x"), json!("{\"a\":1}")],
+                vec![
+                    json!(1),
+                    json!("A"),
+                    json!(9.5),
+                    json!("x"),
+                    json!("{\"a\":1}"),
+                ],
                 vec![json!(2), json!("B"), Value::Null, Value::Null, Value::Null],
-                vec![json!(99), json!("ignored"), Value::Null, Value::Null, Value::Null],
+                vec![
+                    json!(99),
+                    json!("ignored"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
             ],
         );
-        let cats = Plan::new(&names(&["_key", "category_ids[]", "items[].sku", "items[].qty"])).unwrap();
+        let cats = Plan::new(&names(&[
+            "_key",
+            "category_ids[]",
+            "items[].sku",
+            "items[].qty",
+        ]))
+        .unwrap();
         m.add(
             &cats,
             vec![
@@ -427,14 +512,23 @@ mod tests {
             ],
         );
         let dynp = Plan::new(&names(&["_key", "_path", "_value"])).unwrap();
-        m.add(&dynp, vec![vec![json!(1), json!("position_category_10"), json!(3)], vec![json!(1), json!("tags[]"), json!("t")]]);
+        m.add(
+            &dynp,
+            vec![
+                vec![json!(1), json!("position_category_10"), json!(3)],
+                vec![json!(1), json!("tags[]"), json!("t")],
+            ],
+        );
         let docs = m.finish();
         assert_eq!(
             docs[0].doc,
             json!({"sku": "A", "price": {"final": 9.5}, "array": [null, {"value": "x"}], "meta": {"a": 1},
                    "category_ids": [10, 11], "items": [{"sku": "c1", "qty": 2}], "position_category_10": 3, "tags": ["t"]})
         );
-        assert_eq!(docs[1].doc, json!({"sku": "B", "price": {"final": null}, "array": [null, {"value": null}], "meta": null, "category_ids": [], "items": []}));
+        assert_eq!(
+            docs[1].doc,
+            json!({"sku": "B", "price": {"final": null}, "array": [null, {"value": null}], "meta": null, "category_ids": [], "items": []})
+        );
         assert_eq!(docs[2].doc, json!({}));
         assert!(docs.iter().all(|d| !d.delete));
     }
@@ -444,18 +538,33 @@ mod tests {
         let ks = keys(&["1", "2", "3"]);
         let mut m = Merger::new(&ks);
         let presence = Plan::new(&names(&["_key", "_op"])).unwrap();
-        m.add(&presence, vec![vec![json!(1), Value::Null], vec![json!(2), json!("DELETE")]]);
+        m.add(
+            &presence,
+            vec![vec![json!(1), Value::Null], vec![json!(2), json!("DELETE")]],
+        );
         let d = m.finish();
-        assert_eq!(d.iter().map(|d| d.delete).collect::<Vec<_>>(), vec![false, true, true]);
-        assert_eq!(d[1].to_json(), json!({"key": "2", "doc": {}, "op": "delete"}));
+        assert_eq!(
+            d.iter().map(|d| d.delete).collect::<Vec<_>>(),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            d[1].to_json(),
+            json!({"key": "2", "doc": {}, "op": "delete"})
+        );
     }
 
     #[test]
     fn values() {
         assert_eq!(to_json(My::Int(-3), None), json!(-3));
         assert_eq!(to_json(My::Bytes(b"x".to_vec()), None), json!("x"));
-        assert_eq!(to_json(My::Date(2024, 1, 2, 3, 4, 5, 0), None), json!("2024-01-02 03:04:05"));
-        assert_eq!(to_json(My::Time(true, 1, 2, 3, 4, 500_000), None), json!("-26:03:04.500000"));
+        assert_eq!(
+            to_json(My::Date(2024, 1, 2, 3, 4, 5, 0), None),
+            json!("2024-01-02 03:04:05")
+        );
+        assert_eq!(
+            to_json(My::Time(true, 1, 2, 3, 4, 500_000), None),
+            json!("-26:03:04.500000")
+        );
         assert_eq!(key_text(&My::UInt(7)).as_deref(), Some("7"));
         assert_eq!(key_text(&My::NULL), None);
     }

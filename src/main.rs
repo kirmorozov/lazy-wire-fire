@@ -45,9 +45,15 @@ fn init_logging() {
     let json = std::env::var("LAZYWF_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if json {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).with_ansi(color).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(color)
+            .init();
     }
 }
 
@@ -67,7 +73,11 @@ async fn main() -> ExitCode {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| ([127, 0, 0, 1], 8081).into());
-            return if lazy_wire_fire::health::probe(addr, "/livez").await { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            return if lazy_wire_fire::health::probe(addr, "/livez").await {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
         }
         Some(other) => {
             eprintln!("unknown argument `{other}`\n\n{HELP}");

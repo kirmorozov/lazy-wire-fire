@@ -36,20 +36,39 @@ impl RedisAddr {
             Some((a, d)) if d.trim_matches('/').is_empty() => (a, 0),
             Some((a, d)) => (
                 a,
-                d.trim_matches('/').parse().map_err(|_| anyhow!("redis endpoint `{s}`: invalid database `{d}`"))?,
+                d.trim_matches('/')
+                    .parse()
+                    .map_err(|_| anyhow!("redis endpoint `{s}`: invalid database `{d}`"))?,
             ),
             None => (rest, 0),
         };
         if authority.contains('@') {
-            bail!("redis endpoint `{s}`: credentials belong in the target's vars, not in the address");
+            bail!(
+                "redis endpoint `{s}`: credentials belong in the target's vars, not in the address"
+            );
         }
-        let (host, port) = split_host_port(authority, 6379).with_context(|| format!("redis endpoint `{s}`"))?;
-        Ok(RedisAddr { secure, host, port, db })
+        let (host, port) =
+            split_host_port(authority, 6379).with_context(|| format!("redis endpoint `{s}`"))?;
+        Ok(RedisAddr {
+            secure,
+            host,
+            port,
+            db,
+        })
     }
 
     pub fn url(&self) -> String {
-        let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
-        format!("{}://{host}:{}/{}", if self.secure { "rediss" } else { "redis" }, self.port, self.db)
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!(
+            "{}://{host}:{}/{}",
+            if self.secure { "rediss" } else { "redis" },
+            self.port,
+            self.db
+        )
     }
 }
 
@@ -74,9 +93,10 @@ pub fn tokenize(line: &str) -> Result<Vec<Vec<u8>>> {
             if in_dq {
                 match b.get(i) {
                     None => bail!("unbalanced double quote in redis command"),
-                    Some(b'\\') if b.get(i + 1) == Some(&b'x')
-                        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
-                        && b.get(i + 3).is_some_and(u8::is_ascii_hexdigit) =>
+                    Some(b'\\')
+                        if b.get(i + 1) == Some(&b'x')
+                            && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+                            && b.get(i + 3).is_some_and(u8::is_ascii_hexdigit) =>
                     {
                         cur.push(u8::from_str_radix(&line[i + 2..i + 4], 16).expect("hex"));
                         i += 4;
@@ -226,9 +246,14 @@ impl Conn {
             let mut item = match t {
                 "+" => Reply::Simple(rest.to_string()),
                 "-" => Reply::Error(rest.to_string()),
-                ":" => Reply::Int(rest.parse().map_err(|_| anyhow!("bad integer reply `{rest}`"))?),
+                ":" => Reply::Int(
+                    rest.parse()
+                        .map_err(|_| anyhow!("bad integer reply `{rest}`"))?,
+                ),
                 "$" => {
-                    let n: i64 = rest.parse().map_err(|_| anyhow!("bad bulk length `{rest}`"))?;
+                    let n: i64 = rest
+                        .parse()
+                        .map_err(|_| anyhow!("bad bulk length `{rest}`"))?;
                     if n < 0 {
                         Reply::Bulk(None)
                     } else {
@@ -236,7 +261,9 @@ impl Conn {
                     }
                 }
                 "*" => {
-                    let n: i64 = rest.parse().map_err(|_| anyhow!("bad array length `{rest}`"))?;
+                    let n: i64 = rest
+                        .parse()
+                        .map_err(|_| anyhow!("bad array length `{rest}`"))?;
                     if n < 0 {
                         Reply::Array(None)
                     } else if n == 0 {
@@ -280,19 +307,38 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(addr: RedisAddr, tls: &TlsSpec, username: Option<String>, password: Option<String>) -> Result<Client> {
+    pub fn new(
+        addr: RedisAddr,
+        tls: &TlsSpec,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<Client> {
         let connector = Connector::new(&addr.host, addr.port, tls, addr.secure, &[])?;
-        Ok(Client { addr, connector, username, password, conn: Mutex::new(None) })
+        Ok(Client {
+            addr,
+            connector,
+            username,
+            password,
+            conn: Mutex::new(None),
+        })
     }
 
     async fn open(&self, timeout: Duration) -> Result<Conn> {
-        let mut c = Conn { stream: self.connector.connect(timeout).await?, buf: Vec::new(), pos: 0 };
+        let mut c = Conn {
+            stream: self.connector.connect(timeout).await?,
+            buf: Vec::new(),
+            pos: 0,
+        };
         // Credentials are references or literals, resolved at every connect (secrets rotate).
         if let Some(pw) = &self.password {
             let pw = crate::secrets::resolve(pw).context("redis password")?;
             let mut args = vec![b"AUTH".to_vec()];
             if let Some(u) = &self.username {
-                args.push(crate::secrets::resolve(u).context("redis username")?.into_bytes());
+                args.push(
+                    crate::secrets::resolve(u)
+                        .context("redis username")?
+                        .into_bytes(),
+                );
             }
             args.push(pw.into_bytes());
             if let Some(e) = c.call(&args).await?.error() {
@@ -300,7 +346,9 @@ impl Client {
             }
         }
         if self.addr.db != 0 {
-            let r = c.call(&[b"SELECT".to_vec(), self.addr.db.to_string().into_bytes()]).await?;
+            let r = c
+                .call(&[b"SELECT".to_vec(), self.addr.db.to_string().into_bytes()])
+                .await?;
             if let Some(e) = r.error() {
                 bail!("SELECT {} failed: {e}", self.addr.db);
             }
@@ -337,7 +385,11 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> Vec<String> {
-        tokenize(s).unwrap().into_iter().map(|b| String::from_utf8(b).unwrap()).collect()
+        tokenize(s)
+            .unwrap()
+            .into_iter()
+            .map(|b| String::from_utf8(b).unwrap())
+            .collect()
     }
 
     #[test]
@@ -345,9 +397,18 @@ mod tests {
         assert_eq!(t("DEL k1  k2\n"), vec!["DEL", "k1", "k2"]);
         assert_eq!(
             t(r#"EVAL "for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end" 0 a b"#),
-            vec!["EVAL", "for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end", "0", "a", "b"]
+            vec![
+                "EVAL",
+                "for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end",
+                "0",
+                "a",
+                "b"
+            ]
         );
-        assert_eq!(t(r#"SET "a\"b\n\x41" 'it\'s'"#), vec!["SET", "a\"b\nA", "it's"]);
+        assert_eq!(
+            t(r#"SET "a\"b\n\x41" 'it\'s'"#),
+            vec!["SET", "a\"b\nA", "it's"]
+        );
         assert_eq!(t("SET a\"b c\""), vec!["SET", "ab c"]);
         assert!(tokenize("SET a\"b\"c").is_err());
         assert_eq!(t(r#"SET k """#), vec!["SET", "k", ""]);
@@ -360,8 +421,19 @@ mod tests {
 
     #[test]
     fn addresses() {
-        assert_eq!(RedisAddr::parse("cache:6379/1").unwrap(), RedisAddr { secure: false, host: "cache".into(), port: 6379, db: 1 });
-        assert_eq!(RedisAddr::parse("rediss://r.example.com/2").unwrap().url(), "rediss://r.example.com:6379/2");
+        assert_eq!(
+            RedisAddr::parse("cache:6379/1").unwrap(),
+            RedisAddr {
+                secure: false,
+                host: "cache".into(),
+                port: 6379,
+                db: 1
+            }
+        );
+        assert_eq!(
+            RedisAddr::parse("rediss://r.example.com/2").unwrap().url(),
+            "rediss://r.example.com:6379/2"
+        );
         assert_eq!(RedisAddr::parse("10.0.0.1").unwrap().db, 0);
         assert!(RedisAddr::parse("redis://:pw@h:6379").is_err());
         assert!(RedisAddr::parse("h:6379/x").is_err());
@@ -369,9 +441,18 @@ mod tests {
 
     #[test]
     fn encoding() {
-        assert_eq!(encode(&[b"DEL".to_vec(), b"k".to_vec()]), b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
-        let r = Reply::Array(Some(vec![Reply::Bulk(Some(b"17".to_vec())), Reply::Array(Some(vec![Reply::Bulk(Some(b"k1".to_vec()))]))]));
+        assert_eq!(
+            encode(&[b"DEL".to_vec(), b"k".to_vec()]),
+            b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n"
+        );
+        let r = Reply::Array(Some(vec![
+            Reply::Bulk(Some(b"17".to_vec())),
+            Reply::Array(Some(vec![Reply::Bulk(Some(b"k1".to_vec()))])),
+        ]));
         assert_eq!(r.to_json(), serde_json::json!(["17", ["k1"]]));
-        assert_eq!(Reply::Array(Some(vec![Reply::Int(1), Reply::Error("ERR x".into())])).error(), Some("ERR x"));
+        assert_eq!(
+            Reply::Array(Some(vec![Reply::Int(1), Reply::Error("ERR x".into())])).error(),
+            Some("ERR x")
+        );
     }
 }

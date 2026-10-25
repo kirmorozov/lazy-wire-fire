@@ -67,7 +67,10 @@ impl HelperDef for Simple {
 
 fn h_join(h: &Helper<'_>) -> Result<Value, RenderError> {
     let list = param(h, 0, "join")?;
-    let sep = h.param(1).map(|p| text(p.value())).unwrap_or_else(|| ",".into());
+    let sep = h
+        .param(1)
+        .map(|p| text(p.value()))
+        .unwrap_or_else(|| ",".into());
     let s = match list {
         Value::Array(a) => a.iter().map(text).collect::<Vec<_>>().join(&sep),
         other => text(other),
@@ -84,7 +87,11 @@ fn h_lower(h: &Helper<'_>) -> Result<Value, RenderError> {
 }
 
 fn h_regex_escape(h: &Helper<'_>) -> Result<Value, RenderError> {
-    Ok(Value::String(regex::escape(&text(param(h, 0, "regex_escape")?))))
+    Ok(Value::String(regex::escape(&text(param(
+        h,
+        0,
+        "regex_escape",
+    )?))))
 }
 
 fn h_url_encode(h: &Helper<'_>) -> Result<Value, RenderError> {
@@ -97,7 +104,11 @@ fn h_json(h: &Helper<'_>) -> Result<Value, RenderError> {
 }
 
 fn h_redis_quote(h: &Helper<'_>) -> Result<Value, RenderError> {
-    Ok(Value::String(redis_quote(&text(param(h, 0, "redis_quote")?))))
+    Ok(Value::String(redis_quote(&text(param(
+        h,
+        0,
+        "redis_quote",
+    )?))))
 }
 
 /// Percent-encodes everything but RFC 3986 unreserved characters.
@@ -165,12 +176,16 @@ impl HelperDef for Replace {
                 }
             }
         };
-        Ok(ScopedJson::Derived(Value::String(re.replace_all(&s, rep.as_str()).into_owned())))
+        Ok(ScopedJson::Derived(Value::String(
+            re.replace_all(&s, rep.as_str()).into_owned(),
+        )))
     }
 }
 
 /// Top-level names of an action template's context.
-pub const ACTION_ROOTS: &[&str] = &["keys", "docs", "rule", "target", "vars", "endpoint", "reset"];
+pub const ACTION_ROOTS: &[&str] = &[
+    "keys", "docs", "rule", "target", "vars", "endpoint", "reset",
+];
 
 /// Top-level names of a trigger key template's context.
 pub const KEY_ROOTS: &[&str] = &["old", "new", "row", "op", "table"];
@@ -195,7 +210,9 @@ pub fn resolve_roots(source: &str, roots: &[&str]) -> String {
             } else {
                 "}}"
             };
-            let end = tag[3..].find(end_pat).map_or(tag.len(), |n| 3 + n + end_pat.len());
+            let end = tag[3..]
+                .find(end_pat)
+                .map_or(tag.len(), |n| 3 + n + end_pat.len());
             out.push_str(&tag[..end]);
             rest = &tag[end..];
             continue;
@@ -212,9 +229,17 @@ pub fn resolve_roots(source: &str, roots: &[&str]) -> String {
         let inner = &tag[2..close - 2];
         let body = inner.trim_start_matches(['{', '~']).trim_start();
         let scoped = stack.iter().any(|h| h == "each" || h == "with");
-        let rewritten = if scoped { rewrite_tag(inner, roots) } else { inner.to_string() };
+        let rewritten = if scoped {
+            rewrite_tag(inner, roots)
+        } else {
+            inner.to_string()
+        };
         if let Some(b) = body.strip_prefix('#') {
-            let name = b.trim_start_matches(['*', '>']).split(|c: char| c.is_whitespace() || c == '~' || c == '}').next().unwrap_or("");
+            let name = b
+                .trim_start_matches(['*', '>'])
+                .split(|c: char| c.is_whitespace() || c == '~' || c == '}')
+                .next()
+                .unwrap_or("");
             stack.push(name.to_string());
         } else if body.starts_with('/') {
             stack.pop();
@@ -257,10 +282,7 @@ fn rewrite_tag(inner: &str, roots: &[&str]) -> String {
             }
             _ => {
                 let mut j = i;
-                while j < b.len()
-                    && !b[j].is_ascii_whitespace()
-                    && !b"()=~{}|\"'".contains(&b[j])
-                {
+                while j < b.len() && !b[j].is_ascii_whitespace() && !b"()=~{}|\"'".contains(&b[j]) {
                     j += 1;
                 }
                 let tok = &inner[i..j];
@@ -367,7 +389,9 @@ pub fn simple_key_template(source: &str) -> Option<Vec<Vec<Seg>>> {
             let (scope, col) = inner.split_once('.')?;
             if !matches!(scope, "old" | "new" | "row")
                 || col.is_empty()
-                || !col.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
+                || !col
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
             {
                 return None;
             }
@@ -404,7 +428,10 @@ mod tests {
     #[test]
     fn varnish_purge() {
         let src = "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Magento-Tags-Pattern: {{#each keys}}((^|,){{this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}\n";
-        let out = render(src, json!({"keys": ["cat_p_1", "cat_c_2"], "endpoint": {"host": "varnish"}}));
+        let out = render(
+            src,
+            json!({"keys": ["cat_p_1", "cat_c_2"], "endpoint": {"host": "varnish"}}),
+        );
         assert_eq!(
             out,
             "PURGE / HTTP/1.1\nHost: varnish\nX-Magento-Tags-Pattern: ((^|,)cat_p_1(,|$))|((^|,)cat_c_2(,|$))\n"
@@ -414,7 +441,10 @@ mod tests {
     #[test]
     fn redis_clear_by_tag() {
         let src = "EVAL \"for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end\" 0 {{#each keys}}{{target.vars.prefix}}{{upper (replace this \"[^A-Za-z0-9_]\" \"_\")}} {{/each}}";
-        let out = render(src, json!({"keys": ["cat_p_1", "a-b.c"], "target": {"vars": {"prefix": "69d_"}}}));
+        let out = render(
+            src,
+            json!({"keys": ["cat_p_1", "a-b.c"], "target": {"vars": {"prefix": "69d_"}}}),
+        );
         assert_eq!(
             out,
             "EVAL \"for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end\" 0 69d_CAT_P_1 69d_A_B_C "
@@ -440,38 +470,80 @@ mod tests {
     #[test]
     fn s3_per_key() {
         let src = "{{#each docs}}{{#if (eq op \"delete\")}}DELETE /products/{{key}}.json HTTP/1.1\n\n{{else}}PUT /products/{{key}}.json HTTP/1.1\nContent-Type: application/json\n\n{{json doc}}{{/if}}{{/each}}";
-        let put = render(src, json!({"docs": [{"key": "7", "op": "upsert", "doc": {"a": [1]}}]}));
-        assert_eq!(put, "PUT /products/7.json HTTP/1.1\nContent-Type: application/json\n\n{\"a\":[1]}");
-        let del = render(src, json!({"docs": [{"key": "7", "op": "delete", "doc": {}}]}));
+        let put = render(
+            src,
+            json!({"docs": [{"key": "7", "op": "upsert", "doc": {"a": [1]}}]}),
+        );
+        assert_eq!(
+            put,
+            "PUT /products/7.json HTTP/1.1\nContent-Type: application/json\n\n{\"a\":[1]}"
+        );
+        let del = render(
+            src,
+            json!({"docs": [{"key": "7", "op": "delete", "doc": {}}]}),
+        );
         assert_eq!(del, "DELETE /products/7.json HTTP/1.1\n\n");
     }
 
     #[test]
     fn helpers() {
-        assert_eq!(render("{{join keys \"|\"}}", json!({"keys": ["a", 1, null]})), "a|1|");
+        assert_eq!(
+            render("{{join keys \"|\"}}", json!({"keys": ["a", 1, null]})),
+            "a|1|"
+        );
         assert_eq!(render("{{join keys}}", json!({"keys": ["a", "b"]})), "a,b");
         assert_eq!(render("{{lower x}}{{upper x}}", json!({"x": "aB"})), "abAB");
-        assert_eq!(render("{{regex_escape x}}", json!({"x": "a.b*"})), "a\\.b\\*");
-        assert_eq!(render("{{url_encode x}}", json!({"x": "a b/ü"})), "a%20b%2F%C3%BC");
-        assert_eq!(render("{{json x}}", json!({"x": {"a": [1, "b"]}})), "{\"a\":[1,\"b\"]}");
+        assert_eq!(
+            render("{{regex_escape x}}", json!({"x": "a.b*"})),
+            "a\\.b\\*"
+        );
+        assert_eq!(
+            render("{{url_encode x}}", json!({"x": "a b/ü"})),
+            "a%20b%2F%C3%BC"
+        );
+        assert_eq!(
+            render("{{json x}}", json!({"x": {"a": [1, "b"]}})),
+            "{\"a\":[1,\"b\"]}"
+        );
         assert_eq!(render("{{json missing}}", json!({})), "null");
-        assert_eq!(render("{{replace x \"(\\\\d+)\" \"<$1>\"}}", json!({"x": "a1b22"})), "a<1>b<22>");
-        assert_eq!(render("{{redis_quote x}}", json!({"x": "a \"b\"\n\\"})), "\"a \\\"b\\\"\\n\\\\\"");
-        assert_eq!(render("{{#if (eq a 1)}}y{{else}}n{{/if}}", json!({"a": 1})), "y");
+        assert_eq!(
+            render("{{replace x \"(\\\\d+)\" \"<$1>\"}}", json!({"x": "a1b22"})),
+            "a<1>b<22>"
+        );
+        assert_eq!(
+            render("{{redis_quote x}}", json!({"x": "a \"b\"\n\\"})),
+            "\"a \\\"b\\\"\\n\\\\\""
+        );
+        assert_eq!(
+            render("{{#if (eq a 1)}}y{{else}}n{{/if}}", json!({"a": 1})),
+            "y"
+        );
         assert_eq!(render("{{x}}", json!({"x": "<&>"})), "<&>");
     }
 
     #[test]
     fn roots_resolve_inside_blocks() {
         let r = |s: &str| resolve_roots(s, ACTION_ROOTS);
-        assert_eq!(r("{{vars.a}}{{#each keys}}{{vars.a}}{{this}}{{/each}}"), "{{vars.a}}{{#each keys}}{{@root.vars.a}}{{this}}{{/each}}");
+        assert_eq!(
+            r("{{vars.a}}{{#each keys}}{{vars.a}}{{this}}{{/each}}"),
+            "{{vars.a}}{{#each keys}}{{@root.vars.a}}{{this}}{{/each}}"
+        );
         assert_eq!(
             r("{{#each docs}}{{key}}{{upper (replace target.vars.p \"x\" \"y\")}}{{#if (eq op \"vars\")}}{{/if}}{{/each}}"),
             "{{#each docs}}{{key}}{{upper (replace @root.target.vars.p \"x\" \"y\")}}{{#if (eq op \"vars\")}}{{/if}}{{/each}}"
         );
-        assert_eq!(r("{{#each docs as |d|}}{{d.key}}{{this.vars}}{{@root.rule}}{{../rule}}{{/each}}"), "{{#each docs as |d|}}{{d.key}}{{this.vars}}{{@root.rule}}{{../rule}}{{/each}}");
-        assert_eq!(r("{{#each keys}}{{!-- {{vars}} --}}{{{vars.x}}}{{/each}}"), "{{#each keys}}{{!-- {{vars}} --}}{{{@root.vars.x}}}{{/each}}");
-        assert_eq!(r("{{#with target}}{{x k=vars}}{{/with}}{{vars}}"), "{{#with target}}{{x k=@root.vars}}{{/with}}{{vars}}");
+        assert_eq!(
+            r("{{#each docs as |d|}}{{d.key}}{{this.vars}}{{@root.rule}}{{../rule}}{{/each}}"),
+            "{{#each docs as |d|}}{{d.key}}{{this.vars}}{{@root.rule}}{{../rule}}{{/each}}"
+        );
+        assert_eq!(
+            r("{{#each keys}}{{!-- {{vars}} --}}{{{vars.x}}}{{/each}}"),
+            "{{#each keys}}{{!-- {{vars}} --}}{{{@root.vars.x}}}{{/each}}"
+        );
+        assert_eq!(
+            r("{{#with target}}{{x k=vars}}{{/with}}{{vars}}"),
+            "{{#with target}}{{x k=@root.vars}}{{/with}}{{vars}}"
+        );
     }
 
     #[test]
@@ -486,13 +558,20 @@ mod tests {
             simple_key_template("cat_p_{{new.product_id}}\n  cat_c_{{ old.category_id }}x\n"),
             Some(vec![
                 vec![Seg::Lit("cat_p_".into()), Seg::Col("product_id".into())],
-                vec![Seg::Lit("cat_c_".into()), Seg::Col("category_id".into()), Seg::Lit("x".into())],
+                vec![
+                    Seg::Lit("cat_c_".into()),
+                    Seg::Col("category_id".into()),
+                    Seg::Lit("x".into())
+                ],
             ])
         );
         assert_eq!(simple_key_template("{{upper new.a}}"), None);
         assert_eq!(simple_key_template("{{#if new.a}}x{{/if}}"), None);
         assert_eq!(simple_key_template("{{{new.a}}}"), None);
         assert_eq!(simple_key_template("{{vars.a}}"), None);
-        assert_eq!(split_keys(" a \n\n b\n").collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            split_keys(" a \n\n b\n").collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 }

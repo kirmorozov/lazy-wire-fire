@@ -1221,7 +1221,8 @@ impl Tracker {
             None => false,
         };
         let artificial = header.flags_raw() & ARTIFICIAL_FLAG != 0;
-        if !artificial && !matches!(et, ty::HEARTBEAT | ty::HEARTBEAT_V2) && header.timestamp() != 0 {
+        if !artificial && !matches!(et, ty::HEARTBEAT | ty::HEARTBEAT_V2) && header.timestamp() != 0
+        {
             self.event_time = header.timestamp();
         }
         if !inner && !artificial && !matches!(et, ty::HEARTBEAT | ty::HEARTBEAT_V2) {

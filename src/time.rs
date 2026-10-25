@@ -3,11 +3,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn unix_now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// (year, month, day) of a day count since 1970-01-01 (Howard Hinnant's `civil_from_days`).
@@ -39,7 +45,12 @@ pub fn amz_dates(unix: u64) -> (String, String) {
     let secs = unix % 86_400;
     let (y, m, d) = civil(days);
     let date = format!("{y:04}{m:02}{d:02}");
-    let time = format!("{date}T{:02}{:02}{:02}Z", secs / 3600, secs / 60 % 60, secs % 60);
+    let time = format!(
+        "{date}T{:02}{:02}{:02}Z",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    );
     (date, time)
 }
 
@@ -47,7 +58,12 @@ pub fn amz_dates(unix: u64) -> (String, String) {
 pub fn iso(unix: u64) -> String {
     let (y, m, d) = civil((unix / 86_400) as i64);
     let s = unix % 86_400;
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        s / 3600,
+        s / 60 % 60,
+        s % 60
+    )
 }
 
 /// Parses `YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)` to unix seconds.
@@ -84,12 +100,24 @@ mod tests {
 
     #[test]
     fn dates() {
-        assert_eq!(amz_dates(1_369_353_600), ("20130524".into(), "20130524T000000Z".into()));
-        assert_eq!(amz_dates(951_782_400 + 3_723), ("20000229".into(), "20000229T010203Z".into()));
+        assert_eq!(
+            amz_dates(1_369_353_600),
+            ("20130524".into(), "20130524T000000Z".into())
+        );
+        assert_eq!(
+            amz_dates(951_782_400 + 3_723),
+            ("20000229".into(), "20000229T010203Z".into())
+        );
         assert_eq!(iso(0), "1970-01-01 00:00:00");
         assert_eq!(parse_iso8601("2013-05-24T00:00:00Z"), Some(1_369_353_600));
-        assert_eq!(parse_iso8601("2013-05-24T02:00:00.123+02:00"), Some(1_369_353_600));
-        assert_eq!(parse_iso8601("2000-02-29T01:02:03Z"), Some(951_782_400 + 3_723));
+        assert_eq!(
+            parse_iso8601("2013-05-24T02:00:00.123+02:00"),
+            Some(1_369_353_600)
+        );
+        assert_eq!(
+            parse_iso8601("2000-02-29T01:02:03Z"),
+            Some(951_782_400 + 3_723)
+        );
         assert_eq!(parse_iso8601("garbage"), None);
     }
 }

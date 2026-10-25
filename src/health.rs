@@ -28,7 +28,14 @@ pub struct Health {
 
 impl Default for Health {
     fn default() -> Self {
-        Health { inner: Mutex::new(Inner { phase: "starting", streaming: false, beat: Instant::now(), status: json!({}) }) }
+        Health {
+            inner: Mutex::new(Inner {
+                phase: "starting",
+                streaming: false,
+                beat: Instant::now(),
+                status: json!({}),
+            }),
+        }
     }
 }
 
@@ -69,7 +76,11 @@ impl Health {
                     if live {
                         (200, "ok\n".into(), "text/plain")
                     } else {
-                        (503, format!("main loop stalled for {}s\n", i.beat.elapsed().as_secs()), "text/plain")
+                        (
+                            503,
+                            format!("main loop stalled for {}s\n", i.beat.elapsed().as_secs()),
+                            "text/plain",
+                        )
                     }
                 }
                 "/readyz" => {
@@ -78,7 +89,19 @@ impl Health {
                     } else if !live {
                         (503, "stalled\n".into(), "text/plain")
                     } else {
-                        (503, format!("{}{}\n", i.phase, if i.streaming { "" } else { ", binlog not connected" }), "text/plain")
+                        (
+                            503,
+                            format!(
+                                "{}{}\n",
+                                i.phase,
+                                if i.streaming {
+                                    ""
+                                } else {
+                                    ", binlog not connected"
+                                }
+                            ),
+                            "text/plain",
+                        )
                     }
                 }
                 "/status" => {
@@ -89,7 +112,11 @@ impl Health {
                     }
                     (200, format!("{s:#}\n"), "application/json")
                 }
-                "/" => (200, "lazywf health endpoint: /livez /readyz /status\n".into(), "text/plain"),
+                "/" => (
+                    200,
+                    "lazywf health endpoint: /livez /readyz /status\n".into(),
+                    "text/plain",
+                ),
                 _ => (404, "not found\n".into(), "text/plain"),
             }
         })
@@ -122,7 +149,11 @@ async fn handle(mut s: TcpStream, h: Arc<Health>) {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/");
-    let (status, body, ctype) = if matches!(method, "GET" | "HEAD") { h.respond(path) } else { (405, "method not allowed\n".into(), "text/plain") };
+    let (status, body, ctype) = if matches!(method, "GET" | "HEAD") {
+        h.respond(path)
+    } else {
+        (405, "method not allowed\n".into(), "text/plain")
+    };
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
@@ -160,10 +191,17 @@ pub async fn serve(addr: SocketAddr, h: Arc<Health>) {
 pub async fn probe(addr: SocketAddr, path: &str) -> bool {
     let work = async {
         let mut s = TcpStream::connect(addr).await.ok()?;
-        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.ok()?;
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .ok()?;
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await.ok()?;
         Some(buf.starts_with(b"HTTP/1.1 200"))
     };
-    matches!(tokio::time::timeout(Duration::from_secs(3), work).await, Ok(Some(true)))
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), work).await,
+        Ok(Some(true))
+    )
 }

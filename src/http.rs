@@ -44,7 +44,10 @@ impl RawRequest {
         let line = next_line().unwrap_or_default();
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or_default().to_string();
-        let target = parts.next().ok_or_else(|| anyhow!("request line `{line}` has no path"))?.to_string();
+        let target = parts
+            .next()
+            .ok_or_else(|| anyhow!("request line `{line}` has no path"))?
+            .to_string();
         if let Some(v) = parts.next() {
             if !v.starts_with("HTTP/") {
                 bail!("request line `{line}`: `{v}` is not an HTTP version");
@@ -53,7 +56,10 @@ impl RawRequest {
         if parts.next().is_some() {
             bail!("request line `{line}` has extra words (spaces in the path must be encoded)");
         }
-        if !method.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        if !method
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
             bail!("request line `{line}`: `{method}` is not a method");
         }
         if !(target.starts_with('/') || target == "*") {
@@ -76,7 +82,12 @@ impl RawRequest {
                 }
             }
         }
-        Ok(Some(RawRequest { method, target, headers, body: rest.as_bytes().to_vec() }))
+        Ok(Some(RawRequest {
+            method,
+            target,
+            headers,
+            body: rest.as_bytes().to_vec(),
+        }))
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -101,12 +112,17 @@ impl RawRequest {
         let mut out = Vec::with_capacity(256 + self.body.len());
         out.extend_from_slice(format!("{} {} HTTP/1.1\r\n", self.method, self.target).as_bytes());
         for (n, v) in &self.headers {
-            if n.eq_ignore_ascii_case("content-length") || n.eq_ignore_ascii_case("transfer-encoding") {
+            if n.eq_ignore_ascii_case("content-length")
+                || n.eq_ignore_ascii_case("transfer-encoding")
+            {
                 continue;
             }
             out.extend_from_slice(format!("{n}: {v}\r\n").as_bytes());
         }
-        let bodyless = matches!(self.method.as_str(), "GET" | "HEAD" | "DELETE" | "OPTIONS" | "PURGE" | "BAN");
+        let bodyless = matches!(
+            self.method.as_str(),
+            "GET" | "HEAD" | "DELETE" | "OPTIONS" | "PURGE" | "BAN"
+        );
         if !self.body.is_empty() || !bodyless {
             out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
         }
@@ -173,13 +189,22 @@ impl BaseUrl {
         }
         let (host, port) = split_host_port(authority, if secure { 443 } else { 80 })
             .with_context(|| format!("endpoint `{s}`"))?;
-        Ok(BaseUrl { secure, host, port, base: base.to_string() })
+        Ok(BaseUrl {
+            secure,
+            host,
+            port,
+            base: base.to_string(),
+        })
     }
 
     /// `Host` header value (port omitted when it is the scheme's default).
     pub fn host_header(&self) -> String {
         let default = if self.secure { 443 } else { 80 };
-        let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         if self.port == default {
             host
         } else {
@@ -188,7 +213,12 @@ impl BaseUrl {
     }
 
     pub fn url(&self) -> String {
-        format!("{}://{}{}", if self.secure { "https" } else { "http" }, self.host_header(), self.base)
+        format!(
+            "{}://{}{}",
+            if self.secure { "https" } else { "http" },
+            self.host_header(),
+            self.base
+        )
     }
 }
 
@@ -270,7 +300,11 @@ pub struct Client {
 impl Client {
     pub fn new(base: BaseUrl, tls: &TlsSpec) -> Result<Client> {
         let connector = Connector::new(&base.host, base.port, tls, base.secure, &[b"http/1.1"])?;
-        Ok(Client { base, connector, idle: Mutex::new(Vec::new()) })
+        Ok(Client {
+            base,
+            connector,
+            idle: Mutex::new(Vec::new()),
+        })
     }
 
     fn pooled(&self) -> Option<Conn> {
@@ -304,8 +338,13 @@ impl Client {
                     Err((_, true)) => {} // stale keep-alive connection: retry fresh
                 }
             }
-            let conn = Conn { stream: self.connector.connect(timeout).await?, buf: Vec::new() };
-            self.exchange(conn, &bytes, head_only).await.map_err(|(e, _)| e)
+            let conn = Conn {
+                stream: self.connector.connect(timeout).await?,
+                buf: Vec::new(),
+            };
+            self.exchange(conn, &bytes, head_only)
+                .await
+                .map_err(|(e, _)| e)
         };
         tokio::time::timeout(timeout, work)
             .await
@@ -314,7 +353,12 @@ impl Client {
 
     /// `Err((e, retry))`: `retry` when nothing of a response arrived (the request can go again
     /// on a new connection).
-    async fn exchange(&self, mut c: Conn, bytes: &[u8], head_only: bool) -> std::result::Result<Response, (anyhow::Error, bool)> {
+    async fn exchange(
+        &self,
+        mut c: Conn,
+        bytes: &[u8],
+        head_only: bool,
+    ) -> std::result::Result<Response, (anyhow::Error, bool)> {
         if let Err(e) = async {
             c.stream.write_all(bytes).await?;
             c.stream.flush().await
@@ -341,14 +385,21 @@ impl Client {
                         ))
                     }
                     Ok(_) => got_any = true,
-                    Err(e) => return Err((e.context("reading the response"), !got_any && c.buf.is_empty())),
+                    Err(e) => {
+                        return Err((
+                            e.context("reading the response"),
+                            !got_any && c.buf.is_empty(),
+                        ))
+                    }
                 }
             };
             let mut hdrs = [httparse::EMPTY_HEADER; 128];
             let mut parsed = httparse::Response::new(&mut hdrs);
             match parsed.parse(&c.buf[..head_end]) {
                 Ok(httparse::Status::Complete(_)) => {}
-                Ok(httparse::Status::Partial) => return Err((anyhow!("incomplete response head"), false)),
+                Ok(httparse::Status::Partial) => {
+                    return Err((anyhow!("incomplete response head"), false))
+                }
                 Err(e) => return Err((anyhow!("malformed response head: {e}"), false)),
             }
             let status = parsed.code.unwrap_or(0);
@@ -356,22 +407,39 @@ impl Client {
             let headers: Vec<(String, String)> = parsed
                 .headers
                 .iter()
-                .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).trim().to_string()))
+                .map(|h| {
+                    (
+                        h.name.to_string(),
+                        String::from_utf8_lossy(h.value).trim().to_string(),
+                    )
+                })
                 .collect();
             c.buf.drain(..head_end);
             if (100..200).contains(&status) {
                 continue; // 100 Continue and friends: the real response follows.
             }
-            let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str());
+            let get = |n: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                    .map(|(_, v)| v.as_str())
+            };
             let conn_hdr = get("connection").unwrap_or("").to_ascii_lowercase();
-            let mut reusable = if http10 { conn_hdr.contains("keep-alive") } else { !conn_hdr.contains("close") };
-            let chunked = get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
+            let mut reusable = if http10 {
+                conn_hdr.contains("keep-alive")
+            } else {
+                !conn_hdr.contains("close")
+            };
+            let chunked = get("transfer-encoding")
+                .is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
             let body = if head_only || status == 204 || status == 304 {
                 Vec::new()
             } else if chunked {
                 read_chunked(&mut c).await.map_err(|e| (e, false))?
             } else if let Some(len) = get("content-length") {
-                let n: usize = len.parse().map_err(|_| (anyhow!("invalid Content-Length `{len}`"), false))?;
+                let n: usize = len
+                    .parse()
+                    .map_err(|_| (anyhow!("invalid Content-Length `{len}`"), false))?;
                 if n > MAX_BODY {
                     return Err((anyhow!("response body of {n} bytes is too large"), false));
                 }
@@ -393,7 +461,11 @@ impl Client {
             if reusable {
                 self.put_back(c);
             }
-            return Ok(Response { status, headers, body });
+            return Ok(Response {
+                status,
+                headers,
+                body,
+            });
         }
     }
 }
@@ -403,7 +475,8 @@ async fn read_chunked(c: &mut Conn) -> Result<Vec<u8>> {
     loop {
         let line = c.read_line().await?;
         let size_txt = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_txt, 16).map_err(|_| anyhow!("invalid chunk size `{size_txt}`"))?;
+        let size = usize::from_str_radix(size_txt, 16)
+            .map_err(|_| anyhow!("invalid chunk size `{size_txt}`"))?;
         if size == 0 {
             // Trailers until an empty line.
             while !c.read_line().await?.is_empty() {}
@@ -423,23 +496,39 @@ mod tests {
 
     #[test]
     fn parse_requests() {
-        let r = RawRequest::parse("\n\nPOST /idx/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{\"a\":1}\n").unwrap().unwrap();
+        let r = RawRequest::parse(
+            "\n\nPOST /idx/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{\"a\":1}\n",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(r.method, "POST");
         assert_eq!(r.target, "/idx/_bulk");
         assert_eq!(r.header("content-type"), Some("application/x-ndjson"));
         assert_eq!(r.body, b"{\"a\":1}\n");
 
-        let r = RawRequest::parse("PURGE / HTTP/1.1\r\nHost: v\r\nX-Magento-Tags-Pattern: .*\r\n").unwrap().unwrap();
+        let r = RawRequest::parse("PURGE / HTTP/1.1\r\nHost: v\r\nX-Magento-Tags-Pattern: .*\r\n")
+            .unwrap()
+            .unwrap();
         assert_eq!(r.headers.len(), 2);
         assert!(r.body.is_empty());
         let wire = String::from_utf8(r.to_bytes()).unwrap();
-        assert_eq!(wire, "PURGE / HTTP/1.1\r\nHost: v\r\nX-Magento-Tags-Pattern: .*\r\n\r\n");
+        assert_eq!(
+            wire,
+            "PURGE / HTTP/1.1\r\nHost: v\r\nX-Magento-Tags-Pattern: .*\r\n\r\n"
+        );
 
-        let r = RawRequest::parse("DELETE /p/1.json HTTP/1.1\n\n").unwrap().unwrap();
+        let r = RawRequest::parse("DELETE /p/1.json HTTP/1.1\n\n")
+            .unwrap()
+            .unwrap();
         assert!(r.headers.is_empty() && r.body.is_empty());
-        let mut put = RawRequest::parse("PUT /x\nContent-Length: 99\n\nabc").unwrap().unwrap();
+        let mut put = RawRequest::parse("PUT /x\nContent-Length: 99\n\nabc")
+            .unwrap()
+            .unwrap();
         put.set_header("Host", "h".into());
-        assert_eq!(String::from_utf8(put.to_bytes()).unwrap(), "PUT /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc");
+        assert_eq!(
+            String::from_utf8(put.to_bytes()).unwrap(),
+            "PUT /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc"
+        );
 
         assert!(RawRequest::parse("  \n ").unwrap().is_none());
         assert!(RawRequest::parse("GET").is_err());
@@ -451,11 +540,17 @@ mod tests {
     #[test]
     fn base_urls() {
         let b = BaseUrl::parse("https://es.example.com:9243/prefix/").unwrap();
-        assert_eq!((b.secure, b.host.as_str(), b.port, b.base.as_str()), (true, "es.example.com", 9243, "/prefix"));
+        assert_eq!(
+            (b.secure, b.host.as_str(), b.port, b.base.as_str()),
+            (true, "es.example.com", 9243, "/prefix")
+        );
         assert_eq!(b.host_header(), "es.example.com:9243");
         let b = BaseUrl::parse("varnish:6081").unwrap();
         assert_eq!((b.secure, b.port), (false, 6081));
-        assert_eq!(BaseUrl::parse("http://[::1]").unwrap().host_header(), "[::1]");
+        assert_eq!(
+            BaseUrl::parse("http://[::1]").unwrap().host_header(),
+            "[::1]"
+        );
         assert_eq!(BaseUrl::parse("https://h").unwrap().url(), "https://h");
         assert!(BaseUrl::parse("ftp://h").is_err());
         assert!(BaseUrl::parse("http://u:p@h").is_err());

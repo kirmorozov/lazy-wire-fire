@@ -17,22 +17,34 @@ pub fn name(schema: &str, instance: &str) -> String {
     if n.chars().count() <= 64 {
         n
     } else {
-        format!("lazywf:{}", &hex::encode(Sha256::digest(n.as_bytes()))[..40])
+        format!(
+            "lazywf:{}",
+            &hex::encode(Sha256::digest(n.as_bytes()))[..40]
+        )
     }
 }
 
 /// Waits until this connection holds the lock. `Ok(false)`: shutdown requested meanwhile.
-pub async fn acquire(conn: &mut Conn, opts: &Opts, lock: &str, health: &Health, shutdown: &mut watch::Receiver<bool>) -> Result<bool> {
+pub async fn acquire(
+    conn: &mut Conn,
+    opts: &Opts,
+    lock: &str,
+    health: &Health,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool> {
     let mut logged = false;
     let mut wait = Duration::from_millis(250);
     loop {
-        let got: Result<Option<Option<i64>>, _> = conn.exec_first("SELECT GET_LOCK(?, 0)", (lock,)).await;
+        let got: Result<Option<Option<i64>>, _> =
+            conn.exec_first("SELECT GET_LOCK(?, 0)", (lock,)).await;
         match got {
             Ok(g) if g.flatten() == Some(1) => break,
             Ok(_) => {}
             Err(e) if matches!(e, mysql_async::Error::Io(_) | mysql_async::Error::Driver(_)) => {
                 tracing::warn!("standby: control connection lost ({e}); reconnecting");
-                if let Ok(Ok(c)) = tokio::time::timeout(Duration::from_secs(10), Conn::new(opts.clone())).await {
+                if let Ok(Ok(c)) =
+                    tokio::time::timeout(Duration::from_secs(10), Conn::new(opts.clone())).await
+                {
                     *conn = c;
                 }
             }
@@ -58,7 +70,9 @@ pub async fn acquire(conn: &mut Conn, opts: &Opts, lock: &str, health: &Health, 
 
 /// Fails unless this connection still holds the lock.
 pub async fn verify(conn: &mut Conn, lock: &str) -> Result<()> {
-    let ok: Option<Option<i64>> = conn.exec_first("SELECT IS_USED_LOCK(?) = CONNECTION_ID()", (lock,)).await?;
+    let ok: Option<Option<i64>> = conn
+        .exec_first("SELECT IS_USED_LOCK(?) = CONNECTION_ID()", (lock,))
+        .await?;
     if ok.flatten() != Some(1) {
         bail!("lost the instance lock `{lock}`");
     }

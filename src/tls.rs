@@ -56,18 +56,27 @@ impl TlsSpec {
                 "required" | "insecure" => Mode::Required,
                 "verify-ca" | "verify_ca" => Mode::VerifyCa,
                 "verify-full" | "verify_full" | "verify" | "on" | "true" | "1" => Mode::VerifyFull,
-                other => bail!("tls mode `{other}` (use disabled, required, verify-ca or verify-full)"),
+                other => {
+                    bail!("tls mode `{other}` (use disabled, required, verify-ca or verify-full)")
+                }
             })
         };
         if !s.starts_with('{') {
-            return Ok(TlsSpec { mode: mode(s)?, ca: Vec::new(), server_name: None });
+            return Ok(TlsSpec {
+                mode: mode(s)?,
+                ca: Vec::new(),
+                server_name: None,
+            });
         }
         let v: Value = serde_json::from_str(s).context("tls is not valid JSON")?;
         let m = v.get("mode").and_then(Value::as_str).unwrap_or("");
         let ca = match v.get("ca") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::String(c)) => vec![c.clone()],
-            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
             Some(_) => bail!("tls.ca must be a path or a list of paths"),
         };
         let ca = ca
@@ -81,7 +90,10 @@ impl TlsSpec {
         Ok(TlsSpec {
             mode,
             ca,
-            server_name: v.get("server_name").and_then(Value::as_str).map(str::to_string),
+            server_name: v
+                .get("server_name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 
@@ -100,12 +112,18 @@ fn provider() -> Arc<CryptoProvider> {
 }
 
 fn roots(ca: &[String]) -> Result<RootCertStore> {
-    let mut store = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let mut store = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
     for path in ca {
         let mut n = 0;
-        for cert in CertificateDer::pem_file_iter(path).with_context(|| format!("reading CA file `{path}`"))? {
+        for cert in CertificateDer::pem_file_iter(path)
+            .with_context(|| format!("reading CA file `{path}`"))?
+        {
             let cert = cert.with_context(|| format!("parsing CA file `{path}`"))?;
-            store.add(cert).with_context(|| format!("adding a CA certificate from `{path}`"))?;
+            store
+                .add(cert)
+                .with_context(|| format!("adding a CA certificate from `{path}`"))?;
             n += 1;
         }
         if n == 0 {
@@ -123,7 +141,9 @@ pub fn client_config(spec: &TlsSpec, mode: Mode, alpn: &[&[u8]]) -> Result<Arc<C
         .map_err(|e| anyhow!("TLS setup: {e}"))?;
     let store = Arc::new(roots(&spec.ca)?);
     let mut cfg = match mode {
-        Mode::VerifyFull | Mode::Auto => builder.with_root_certificates(store).with_no_client_auth(),
+        Mode::VerifyFull | Mode::Auto => {
+            builder.with_root_certificates(store).with_no_client_auth()
+        }
         Mode::VerifyCa => {
             let inner = WebPkiServerVerifier::builder_with_provider(store, p.clone())
                 .build()
@@ -157,7 +177,10 @@ impl ServerCertVerifier for AnyName {
         ocsp: &[u8],
         now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        match self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp, now) {
+        match self
+            .inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+        {
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::NotValidForName
                 | rustls::CertificateError::NotValidForNameContext { .. },
@@ -213,7 +236,12 @@ impl ServerCertVerifier for NoCheck {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -222,11 +250,18 @@ impl ServerCertVerifier for NoCheck {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -245,7 +280,13 @@ pub struct Connector {
 }
 
 impl Connector {
-    pub fn new(host: &str, port: u16, spec: &TlsSpec, secure_scheme: bool, alpn: &[&[u8]]) -> Result<Connector> {
+    pub fn new(
+        host: &str,
+        port: u16,
+        spec: &TlsSpec,
+        secure_scheme: bool,
+        alpn: &[&[u8]],
+    ) -> Result<Connector> {
         let mode = spec.effective(secure_scheme);
         let tls = if mode == Mode::Disabled {
             None
@@ -256,29 +297,46 @@ impl Connector {
                 .map_err(|_| anyhow!("`{name}` is not a valid TLS server name"))?;
             Some((cfg, name))
         };
-        Ok(Connector { host: host.to_string(), port, tls })
+        Ok(Connector {
+            host: host.to_string(),
+            port,
+            tls,
+        })
     }
 
     pub async fn connect(&self, timeout: Duration) -> Result<Stream> {
         let addr = (self.host.as_str(), self.port);
         let tcp = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| anyhow!("connecting to {}:{} timed out after {timeout:?}", self.host, self.port))?
+            .map_err(|_| {
+                anyhow!(
+                    "connecting to {}:{} timed out after {timeout:?}",
+                    self.host,
+                    self.port
+                )
+            })?
             .with_context(|| format!("connecting to {}:{}", self.host, self.port))?;
         tcp.set_nodelay(true).ok();
         let Some((cfg, name)) = &self.tls else {
             return Ok(Stream::Plain(tcp));
         };
-        let tls = tokio::time::timeout(timeout, TlsConnector::from(cfg.clone()).connect(name.clone(), tcp))
-            .await
-            .map_err(|_| anyhow!("TLS handshake with {}:{} timed out", self.host, self.port))?
-            .with_context(|| format!("TLS handshake with {}:{}", self.host, self.port))?;
+        let tls = tokio::time::timeout(
+            timeout,
+            TlsConnector::from(cfg.clone()).connect(name.clone(), tcp),
+        )
+        .await
+        .map_err(|_| anyhow!("TLS handshake with {}:{} timed out", self.host, self.port))?
+        .with_context(|| format!("TLS handshake with {}:{}", self.host, self.port))?;
         Ok(Stream::Tls(Box::new(tls)))
     }
 }
 
 impl AsyncRead for Stream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_read(cx, buf),
             Stream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
@@ -287,7 +345,11 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_write(cx, buf),
             Stream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
@@ -316,9 +378,18 @@ mod tests {
     #[test]
     fn specs() {
         assert_eq!(TlsSpec::parse(None).unwrap().mode, Mode::Auto);
-        assert_eq!(TlsSpec::parse(Some("verify-ca")).unwrap().mode, Mode::VerifyCa);
-        assert_eq!(TlsSpec::parse(Some("off")).unwrap().effective(true), Mode::Disabled);
-        assert_eq!(TlsSpec::parse(Some("")).unwrap().effective(true), Mode::VerifyFull);
+        assert_eq!(
+            TlsSpec::parse(Some("verify-ca")).unwrap().mode,
+            Mode::VerifyCa
+        );
+        assert_eq!(
+            TlsSpec::parse(Some("off")).unwrap().effective(true),
+            Mode::Disabled
+        );
+        assert_eq!(
+            TlsSpec::parse(Some("")).unwrap().effective(true),
+            Mode::VerifyFull
+        );
         let j = TlsSpec::parse(Some(r#"{"ca": "file:/x.pem", "server_name": "es"}"#)).unwrap();
         assert_eq!(j.mode, Mode::VerifyFull);
         assert_eq!(j.ca, vec!["/x.pem".to_string()]);

@@ -60,7 +60,11 @@ const REFRESH_BEFORE: u64 = 300;
 
 impl Provider {
     pub fn new(refs: Option<Refs>, region: &str) -> Provider {
-        Provider { refs, region: region.to_string(), cache: Mutex::new(None) }
+        Provider {
+            refs,
+            region: region.to_string(),
+            cache: Mutex::new(None),
+        }
     }
 
     pub async fn get(&self) -> Result<Credentials> {
@@ -97,7 +101,12 @@ fn env(name: &str) -> Option<String> {
 async fn chain(region: &str) -> Result<Credentials> {
     let mut tried = Vec::new();
     if let (Some(a), Some(s)) = (env("AWS_ACCESS_KEY_ID"), env("AWS_SECRET_ACCESS_KEY")) {
-        return Ok(Credentials { access_key: a, secret_key: s, session_token: env("AWS_SESSION_TOKEN"), expires: None });
+        return Ok(Credentials {
+            access_key: a,
+            secret_key: s,
+            session_token: env("AWS_SESSION_TOKEN"),
+            expires: None,
+        });
     }
     tried.push("environment");
     match profile_file() {
@@ -105,11 +114,17 @@ async fn chain(region: &str) -> Result<Credentials> {
         Ok(None) => tried.push("shared credentials file"),
         Err(e) => return Err(e),
     }
-    if let (Some(token_file), Some(role)) = (env("AWS_WEB_IDENTITY_TOKEN_FILE"), env("AWS_ROLE_ARN")) {
-        return web_identity(&token_file, &role, region).await.context("web identity (STS AssumeRoleWithWebIdentity)");
+    if let (Some(token_file), Some(role)) =
+        (env("AWS_WEB_IDENTITY_TOKEN_FILE"), env("AWS_ROLE_ARN"))
+    {
+        return web_identity(&token_file, &role, region)
+            .await
+            .context("web identity (STS AssumeRoleWithWebIdentity)");
     }
     tried.push("web identity");
-    if env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some() || env("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some() {
+    if env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
+        || env("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
+    {
         return container().await.context("container credentials endpoint");
     }
     tried.push("container");
@@ -164,19 +179,37 @@ fn profile_file() -> Result<Option<Credentials>> {
         }
     }
     Ok(match (a, s) {
-        (Some(access_key), Some(secret_key)) => Some(Credentials { access_key, secret_key, session_token: t, expires: None }),
+        (Some(access_key), Some(secret_key)) => Some(Credentials {
+            access_key,
+            secret_key,
+            session_token: t,
+            expires: None,
+        }),
         _ => None,
     })
 }
 
-async fn get(url: &str, headers: &[(&str, String)], method: &str, timeout: Duration) -> Result<(u16, Vec<u8>)> {
-    let (base, path) = match url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j)) {
+async fn get(
+    url: &str,
+    headers: &[(&str, String)],
+    method: &str,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>)> {
+    let (base, path) = match url
+        .find("://")
+        .and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j))
+    {
         Some(i) => (&url[..i], &url[i..]),
         None => (url, "/"),
     };
     let base = BaseUrl::parse(base)?;
     let client = Client::new(base.clone(), &TlsSpec::parse(None)?)?;
-    let mut req = RawRequest { method: method.into(), target: path.to_string(), headers: Vec::new(), body: Vec::new() };
+    let mut req = RawRequest {
+        method: method.into(),
+        target: path.to_string(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
     req.set_header("Host", base.host_header());
     for (n, v) in headers {
         req.set_header(n, v.clone());
@@ -186,7 +219,8 @@ async fn get(url: &str, headers: &[(&str, String)], method: &str, timeout: Durat
 }
 
 fn from_json(body: &[u8], what: &str) -> Result<Credentials> {
-    let v: Value = serde_json::from_slice(body).with_context(|| format!("{what}: response is not JSON"))?;
+    let v: Value =
+        serde_json::from_slice(body).with_context(|| format!("{what}: response is not JSON"))?;
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     Ok(Credentials {
         access_key: s("AccessKeyId").ok_or_else(|| anyhow!("{what}: no AccessKeyId"))?,
@@ -204,8 +238,11 @@ fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 async fn web_identity(token_file: &str, role: &str, region: &str) -> Result<Credentials> {
-    let token = std::fs::read_to_string(token_file).with_context(|| format!("reading `{token_file}`"))?;
-    let region = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION")).unwrap_or_else(|| region.to_string());
+    let token =
+        std::fs::read_to_string(token_file).with_context(|| format!("reading `{token_file}`"))?;
+    let region = env("AWS_REGION")
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| region.to_string());
     let session = env("AWS_ROLE_SESSION_NAME").unwrap_or_else(|| "lazywf".into());
     let enc = |s: &str| crate::template::url_encode(s);
     let url = format!(
@@ -214,14 +251,27 @@ async fn web_identity(token_file: &str, role: &str, region: &str) -> Result<Cred
         enc(&session),
         enc(token.trim())
     );
-    let (status, body) = get(&url, &[("Accept", "application/xml".into())], "GET", Duration::from_secs(10)).await?;
+    let (status, body) = get(
+        &url,
+        &[("Accept", "application/xml".into())],
+        "GET",
+        Duration::from_secs(10),
+    )
+    .await?;
     let xml = String::from_utf8_lossy(&body);
     if status != 200 {
-        bail!("STS answered {status}: {}", xml_tag(&xml, "Message").unwrap_or(&xml));
+        bail!(
+            "STS answered {status}: {}",
+            xml_tag(&xml, "Message").unwrap_or(&xml)
+        );
     }
     Ok(Credentials {
-        access_key: xml_tag(&xml, "AccessKeyId").ok_or_else(|| anyhow!("STS: no AccessKeyId"))?.to_string(),
-        secret_key: xml_tag(&xml, "SecretAccessKey").ok_or_else(|| anyhow!("STS: no SecretAccessKey"))?.to_string(),
+        access_key: xml_tag(&xml, "AccessKeyId")
+            .ok_or_else(|| anyhow!("STS: no AccessKeyId"))?
+            .to_string(),
+        secret_key: xml_tag(&xml, "SecretAccessKey")
+            .ok_or_else(|| anyhow!("STS: no SecretAccessKey"))?
+            .to_string(),
         session_token: xml_tag(&xml, "SessionToken").map(str::to_string),
         expires: xml_tag(&xml, "Expiration").and_then(crate::time::parse_iso8601),
     })
@@ -233,7 +283,12 @@ async fn container() -> Result<Credentials> {
         None => env("AWS_CONTAINER_CREDENTIALS_FULL_URI").expect("checked by the caller"),
     };
     let token = match env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
-        Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("reading `{f}`"))?.trim().to_string()),
+        Some(f) => Some(
+            std::fs::read_to_string(&f)
+                .with_context(|| format!("reading `{f}`"))?
+                .trim()
+                .to_string(),
+        ),
         None => env("AWS_CONTAINER_AUTHORIZATION_TOKEN"),
     };
     let headers: Vec<(&str, String)> = token.into_iter().map(|t| ("Authorization", t)).collect();
@@ -257,13 +312,33 @@ async fn imds() -> Result<Credentials> {
     if status != 200 {
         bail!("IMDSv2 token request answered {status}");
     }
-    let tok = vec![("X-aws-ec2-metadata-token", String::from_utf8_lossy(&token).trim().to_string())];
-    let (status, role) = get(&format!("{BASE}/latest/meta-data/iam/security-credentials/"), &tok, "GET", t).await?;
+    let tok = vec![(
+        "X-aws-ec2-metadata-token",
+        String::from_utf8_lossy(&token).trim().to_string(),
+    )];
+    let (status, role) = get(
+        &format!("{BASE}/latest/meta-data/iam/security-credentials/"),
+        &tok,
+        "GET",
+        t,
+    )
+    .await?;
     if status != 200 {
         bail!("no instance role ({status})");
     }
-    let role = String::from_utf8_lossy(&role).lines().next().unwrap_or("").trim().to_string();
-    let (status, body) = get(&format!("{BASE}/latest/meta-data/iam/security-credentials/{role}"), &tok, "GET", t).await?;
+    let role = String::from_utf8_lossy(&role)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let (status, body) = get(
+        &format!("{BASE}/latest/meta-data/iam/security-credentials/{role}"),
+        &tok,
+        "GET",
+        t,
+    )
+    .await?;
     if status != 200 {
         bail!("instance role credentials answered {status}");
     }
@@ -281,8 +356,14 @@ mod tests {
             "t",
         )
         .unwrap();
-        assert_eq!((c.access_key.as_str(), c.session_token.as_deref()), ("A", Some("T")));
-        assert_eq!(c.expires, crate::time::parse_iso8601("2030-01-01T00:00:00Z"));
+        assert_eq!(
+            (c.access_key.as_str(), c.session_token.as_deref()),
+            ("A", Some("T"))
+        );
+        assert_eq!(
+            c.expires,
+            crate::time::parse_iso8601("2030-01-01T00:00:00Z")
+        );
         let xml = "<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId> AK </AccessKeyId></Credentials></AssumeRoleWithWebIdentityResponse>";
         assert_eq!(xml_tag(xml, "AccessKeyId"), Some("AK"));
         assert_eq!(xml_tag(xml, "Nope"), None);

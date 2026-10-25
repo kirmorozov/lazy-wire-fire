@@ -42,20 +42,28 @@ impl Config {
         let binlog_dsn = match get("LAZYWF_BINLOG_DSN").filter(|v| !v.is_empty()) {
             Some(d) => finish_dsn(&d, tls_mode(&get, "LAZYWF")?.as_deref(), "LAZYWF")?,
             None => match get("LAZYWF_BINLOG_USER").filter(|v| !v.is_empty()) {
-                Some(user) => with_credentials(&dsn, &user, get("LAZYWF_BINLOG_PASSWORD").as_deref())?,
+                Some(user) => {
+                    with_credentials(&dsn, &user, get("LAZYWF_BINLOG_PASSWORD").as_deref())?
+                }
                 None => dsn.clone(),
             },
         };
         let schema = schema_of(&dsn)?;
         let num = |k: &str, d: u64| -> Result<u64> {
             match get(k).filter(|v| !v.trim().is_empty()) {
-                Some(v) => v.trim().parse().with_context(|| format!("{k} must be a number")),
+                Some(v) => v
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("{k} must be a number")),
                 None => Ok(d),
             }
         };
         let (server_id, server_id_fixed) = match get("LAZYWF_SERVER_ID").filter(|v| !v.is_empty()) {
             Some(v) => {
-                let id: u32 = v.trim().parse().context("LAZYWF_SERVER_ID must be a number")?;
+                let id: u32 = v
+                    .trim()
+                    .parse()
+                    .context("LAZYWF_SERVER_ID must be a number")?;
                 if id == 0 {
                     bail!("LAZYWF_SERVER_ID must not be 0");
                 }
@@ -65,10 +73,15 @@ impl Config {
         };
         let health_addr = match get("LAZYWF_HEALTH_ADDR").map(|v| v.trim().to_string()) {
             Some(v) if v.eq_ignore_ascii_case("off") || v.is_empty() => None,
-            Some(v) => Some(v.parse().with_context(|| format!("LAZYWF_HEALTH_ADDR `{v}` is not host:port"))?),
+            Some(v) => Some(
+                v.parse()
+                    .with_context(|| format!("LAZYWF_HEALTH_ADDR `{v}` is not host:port"))?,
+            ),
             None => Some(([127, 0, 0, 1], 8081).into()),
         };
-        let instance = get("LAZYWF_INSTANCE").filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "default".into());
+        let instance = get("LAZYWF_INSTANCE")
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "default".into());
         if instance.len() > 64 || instance == "*" {
             bail!("LAZYWF_INSTANCE must be at most 64 characters and not `*`");
         }
@@ -132,12 +145,18 @@ fn finish_dsn(dsn: &str, tls: Option<&str>, prefix: &str) -> Result<String> {
         None => None,
         Some(t) => match t.as_str() {
             "disabled" | "off" | "false" => None,
-            "required" | "require" | "on" | "true" => Some("require_ssl=true&verify_ca=false&verify_identity=false"),
-            "verify-ca" | "verify_ca" => Some("require_ssl=true&verify_ca=true&verify_identity=false"),
+            "required" | "require" | "on" | "true" => {
+                Some("require_ssl=true&verify_ca=false&verify_identity=false")
+            }
+            "verify-ca" | "verify_ca" => {
+                Some("require_ssl=true&verify_ca=true&verify_identity=false")
+            }
             "verify-full" | "verify_identity" | "verify-identity" => {
                 Some("require_ssl=true&verify_ca=true&verify_identity=true")
             }
-            other => bail!("{prefix}_TLS must be disabled|required|verify-ca|verify-full, got {other}"),
+            other => {
+                bail!("{prefix}_TLS must be disabled|required|verify-ca|verify-full, got {other}")
+            }
         },
     };
     if let Some(p) = params {
@@ -151,23 +170,36 @@ fn assemble(part: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Opti
     let Some(host) = part("HOST") else {
         return Ok(None);
     };
-    let db = part("DATABASE").ok_or_else(|| anyhow!("{prefix}_DATABASE is required (the schema lazywf works in)"))?;
+    let db = part("DATABASE")
+        .ok_or_else(|| anyhow!("{prefix}_DATABASE is required (the schema lazywf works in)"))?;
     let user = part("USER").unwrap_or_else(|| "root".into());
     let port: u16 = match part("PORT") {
-        Some(p) => p.trim().parse().with_context(|| format!("{prefix}_PORT must be a port number"))?,
+        Some(p) => p
+            .trim()
+            .parse()
+            .with_context(|| format!("{prefix}_PORT must be a port number"))?,
         None => 3306,
     };
     let auth = match part("PASSWORD") {
         Some(pw) => format!("{}:{}", encode(&user), encode(&pw)),
         None => encode(&user),
     };
-    let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host };
-    Ok(Some(format!("mysql://{auth}@{host}:{port}/{}", encode(&db))))
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(Some(format!(
+        "mysql://{auth}@{host}:{port}/{}",
+        encode(&db)
+    )))
 }
 
 /// The same DSN with other credentials.
 fn with_credentials(dsn: &str, user: &str, password: Option<&str>) -> Result<String> {
-    let (scheme, rest) = dsn.split_once("://").ok_or_else(|| anyhow!("DSN without `://`"))?;
+    let (scheme, rest) = dsn
+        .split_once("://")
+        .ok_or_else(|| anyhow!("DSN without `://`"))?;
     let host_part = match rest.rfind('@') {
         Some(i) if rest[..i].find('/').is_none() => &rest[i + 1..],
         _ => rest,
@@ -184,7 +216,9 @@ fn schema_of(dsn: &str) -> Result<String> {
     opts.db_name()
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("the DSN names no database: the schema of lazywf's tables is required"))
+        .ok_or_else(|| {
+            anyhow!("the DSN names no database: the schema of lazywf's tables is required")
+        })
 }
 
 fn encode(s: &str) -> String {
@@ -219,7 +253,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
-        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Config::from_lookup(|k| m.get(k).cloned())
     }
 
@@ -246,9 +283,18 @@ mod tests {
             ("LAZYWF_SERVER_ID", "77"),
         ])
         .unwrap();
-        assert_eq!(c.dsn, "mysql://a:b@h:3307/s?require_ssl=true&verify_ca=false&verify_identity=false");
-        assert_eq!(c.binlog_dsn, "mysql://repl:x%20y@h:3307/s?require_ssl=true&verify_ca=false&verify_identity=false");
-        assert_eq!((c.server_id, c.server_id_fixed, c.health_addr), (77, true, None));
+        assert_eq!(
+            c.dsn,
+            "mysql://a:b@h:3307/s?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+        assert_eq!(
+            c.binlog_dsn,
+            "mysql://repl:x%20y@h:3307/s?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+        assert_eq!(
+            (c.server_id, c.server_id_fixed, c.health_addr),
+            (77, true, None)
+        );
         assert!(cfg(&[]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/")]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/s"), ("LAZYWF_SERVER_ID", "0")]).is_err());

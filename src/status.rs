@@ -30,13 +30,21 @@ pub async fn load(conn: &mut Conn, instance: &str) -> Result<HashMap<String, Sav
         .context("reading lazy_wire_fire_status")?;
     let mut out = HashMap::new();
     for r in rows {
-        let s = |i: usize| r.get_opt::<Option<String>, _>(i).and_then(|v| v.ok()).flatten();
+        let s = |i: usize| {
+            r.get_opt::<Option<String>, _>(i)
+                .and_then(|v| v.ok())
+                .flatten()
+        };
         let file = s(1).unwrap_or_default();
-        let pos = r.get_opt::<Option<u64>, _>(2).and_then(|v| v.ok()).flatten().unwrap_or(0);
+        let pos = r
+            .get_opt::<Option<u64>, _>(2)
+            .and_then(|v| v.ok())
+            .flatten()
+            .unwrap_or(0);
         out.insert(
             s(0).unwrap_or_default(),
             Saved {
-                pos: (!file.is_empty()).then(|| Position { file, pos }),
+                pos: (!file.is_empty()).then_some(Position { file, pos }),
                 reset_state: s(3).unwrap_or_default(),
                 server_identity: s(4),
             },
@@ -100,6 +108,10 @@ pub async fn write(conn: &mut Conn, instance: &str, rows: &[Write]) -> Result<()
 }
 
 pub async fn delete(conn: &mut Conn, instance: &str, rule: &str) -> Result<()> {
-    conn.exec_drop("DELETE FROM `lazy_wire_fire_status` WHERE `instance` = ? AND `rule` = ?", (instance, rule)).await?;
+    conn.exec_drop(
+        "DELETE FROM `lazy_wire_fire_status` WHERE `instance` = ? AND `rule` = ?",
+        (instance, rule),
+    )
+    .await?;
     Ok(())
 }

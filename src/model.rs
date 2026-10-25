@@ -78,12 +78,20 @@ pub const DDL: [&str; 4] = [
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 ];
 
-/// Creates the tables that are missing.
+/// Creates the tables that are missing. Without the CREATE privilege, tables created by
+/// someone else are fine.
 pub async fn ensure(conn: &mut Conn) -> Result<()> {
     for ddl in DDL {
-        conn.query_drop(ddl).await.with_context(|| {
-            format!("creating {}", ddl.split('`').nth(1).unwrap_or("the tool's tables"))
-        })?;
+        let name = ddl.split('`').nth(1).unwrap_or_default();
+        if let Err(e) = conn.query_drop(ddl).await {
+            let exists: Option<String> = conn
+                .exec_first("SHOW TABLES LIKE ?", (name,))
+                .await
+                .unwrap_or(None);
+            if exists.is_none() {
+                return Err(anyhow::Error::new(e).context(format!("creating {name}")));
+            }
+        }
     }
     Ok(())
 }
@@ -156,10 +164,12 @@ pub struct TargetDef {
 fn json_object(field: &str, s: Option<&str>) -> Result<Map<String, Value>> {
     match s.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(Map::new()),
-        Some(s) => match serde_json::from_str(s).with_context(|| format!("`{field}` is not valid JSON"))? {
-            Value::Object(m) => Ok(m),
-            _ => bail!("`{field}` must be a JSON object"),
-        },
+        Some(s) => {
+            match serde_json::from_str(s).with_context(|| format!("`{field}` is not valid JSON"))? {
+                Value::Object(m) => Ok(m),
+                _ => bail!("`{field}` must be a JSON object"),
+            }
+        }
     }
 }
 
@@ -177,11 +187,17 @@ pub fn list(s: Option<&str>) -> Result<Vec<String>> {
             .filter(|x| x.as_ref().map_or(true, |s| !s.is_empty()))
             .collect();
     }
-    Ok(s.split([',', ' ', '\n', '\r', '\t']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect())
+    Ok(s.split([',', ' ', '\n', '\r', '\t'])
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn var_str<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k).and_then(Value::as_str).filter(|s| !s.is_empty())
+    vars.get(k)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 impl TargetDef {
@@ -216,7 +232,9 @@ impl TargetDef {
                         }
                     }
                 }
-                if var_str(&vars, "access_key_ref").is_some() != var_str(&vars, "secret_key_ref").is_some() {
+                if var_str(&vars, "access_key_ref").is_some()
+                    != var_str(&vars, "secret_key_ref").is_some()
+                {
                     bail!("`vars.access_key_ref` and `vars.secret_key_ref` go together");
                 }
             }
@@ -269,7 +287,11 @@ pub struct SelectDef {
 pub enum StepKind {
     Once,
     Snapshot,
-    Stray { list_template: String, keys_path: Path, next_path: Option<Path> },
+    Stray {
+        list_template: String,
+        keys_path: Path,
+        next_path: Option<Path>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -310,7 +332,8 @@ pub fn parse_selects(s: Option<&str>) -> Result<Vec<SelectDef>> {
         sql: sql.trim().trim_end_matches(';').trim().to_string(),
     };
     if s.starts_with('[') {
-        let v: Vec<Value> = serde_json::from_str(s).context("`selects` is not a valid JSON array")?;
+        let v: Vec<Value> =
+            serde_json::from_str(s).context("`selects` is not a valid JSON array")?;
         return v
             .into_iter()
             .enumerate()
@@ -321,13 +344,21 @@ pub fn parse_selects(s: Option<&str>) -> Result<Vec<SelectDef>> {
                         .get("sql")
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow!("`selects[{i}]` has no `sql`"))?;
-                    Ok(named(i, o.get("name").and_then(Value::as_str).map(str::to_string), sql.to_string()))
+                    Ok(named(
+                        i,
+                        o.get("name").and_then(Value::as_str).map(str::to_string),
+                        sql.to_string(),
+                    ))
                 }
                 _ => bail!("`selects[{i}]` must be a string or an object with `sql`"),
             })
             .collect();
     }
-    Ok(sql::split_statements(s).into_iter().enumerate().map(|(i, q)| named(i, None, q)).collect())
+    Ok(sql::split_statements(s)
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| named(i, None, q))
+        .collect())
 }
 
 pub fn parse_reset_steps(s: Option<&str>) -> Result<Vec<ResetStep>> {
@@ -335,7 +366,8 @@ pub fn parse_reset_steps(s: Option<&str>) -> Result<Vec<ResetStep>> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
-    let v: Vec<Value> = serde_json::from_str(s).context("`reset_steps` is not a valid JSON array")?;
+    let v: Vec<Value> =
+        serde_json::from_str(s).context("`reset_steps` is not a valid JSON array")?;
     v.into_iter()
         .enumerate()
         .map(|(i, x)| {
@@ -378,7 +410,12 @@ pub fn parse_reset_steps(s: Option<&str>) -> Result<Vec<ResetStep>> {
 
 impl RuleDef {
     pub fn from_row(r: &RawRule) -> Result<RuleDef> {
-        let fire_per = match r.fire_per.as_deref().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        let fire_per = match r
+            .fire_per
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
             None | Some("") | Some("batch") => FirePer::Batch,
             Some("key") => FirePer::Key,
             Some(other) => bail!("`fire_per` `{other}` (use batch or key)"),
@@ -406,7 +443,9 @@ impl RuleDef {
         if rule.target.is_empty() {
             bail!("`target` is empty");
         }
-        if rule.reset_steps.iter().any(|s| s.kind != StepKind::Once) && rule.snapshot_keys_sql.is_none() {
+        if rule.reset_steps.iter().any(|s| s.kind != StepKind::Once)
+            && rule.snapshot_keys_sql.is_none()
+        {
             bail!("`for_each` reset steps need `snapshot_keys_sql`");
         }
         Ok(rule)
@@ -465,7 +504,11 @@ impl On {
     pub fn parse(s: Option<&str>) -> Result<On> {
         let items = list(s)?;
         if items.is_empty() {
-            return Ok(On { insert: true, update: true, delete: true });
+            return Ok(On {
+                insert: true,
+                update: true,
+                delete: true,
+            });
         }
         let mut on = On::default();
         for i in items {
@@ -473,7 +516,13 @@ impl On {
                 "insert" => on.insert = true,
                 "update" => on.update = true,
                 "delete" => on.delete = true,
-                "*" | "all" => on = On { insert: true, update: true, delete: true },
+                "*" | "all" => {
+                    on = On {
+                        insert: true,
+                        update: true,
+                        delete: true,
+                    }
+                }
                 other => bail!("`on`: unknown event `{other}` (use insert, update, delete)"),
             }
         }
@@ -494,7 +543,11 @@ pub struct TriggerDef {
 }
 
 impl TriggerDef {
-    pub fn from_row(r: &RawTrigger, default_schema: &str, lower_case_names: bool) -> Result<TriggerDef> {
+    pub fn from_row(
+        r: &RawTrigger,
+        default_schema: &str,
+        lower_case_names: bool,
+    ) -> Result<TriggerDef> {
         let st = r.source_table.trim();
         let unq = |s: &str| s.trim().trim_matches('`').to_string();
         let (schema, table) = match st.split_once('.') {
@@ -516,12 +569,14 @@ impl TriggerDef {
         }
         if let Some(q) = &keys_sql {
             for p in sql::placeholders(q) {
-                let ok = p
-                    .name
-                    .split_once('.')
-                    .is_some_and(|(img, col)| matches!(img, "old" | "new" | "row") && !col.is_empty());
+                let ok = p.name.split_once('.').is_some_and(|(img, col)| {
+                    matches!(img, "old" | "new" | "row") && !col.is_empty()
+                });
                 if !ok {
-                    bail!("`keys_sql`: `:{}` is not `:old.<column>` or `:new.<column>`", p.name);
+                    bail!(
+                        "`keys_sql`: `:{}` is not `:old.<column>` or `:new.<column>`",
+                        p.name
+                    );
                 }
             }
         }
@@ -590,11 +645,15 @@ pub struct RawConfig {
 }
 
 fn s(r: &Row, i: usize) -> Option<String> {
-    r.get_opt::<Option<String>, _>(i).and_then(|v| v.ok()).flatten()
+    r.get_opt::<Option<String>, _>(i)
+        .and_then(|v| v.ok())
+        .flatten()
 }
 
 fn n(r: &Row, i: usize) -> Option<u64> {
-    r.get_opt::<Option<u64>, _>(i).and_then(|v| v.ok()).flatten()
+    r.get_opt::<Option<u64>, _>(i)
+        .and_then(|v| v.ok())
+        .flatten()
 }
 
 pub async fn load(conn: &mut Conn) -> Result<RawConfig> {
@@ -688,8 +747,14 @@ mod tests {
         let s = parse_selects(Some("SELECT 1 AS _key; SELECT 'a;b' AS _key;")).unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s[1].sql, "SELECT 'a;b' AS _key");
-        let s = parse_selects(Some(r#"["SELECT 1 AS _key", {"name": "prices", "sql": "SELECT 2 AS _key;"}]"#)).unwrap();
-        assert_eq!((s[0].name.as_str(), s[1].name.as_str(), s[1].sql.as_str()), ("select 1", "prices", "SELECT 2 AS _key"));
+        let s = parse_selects(Some(
+            r#"["SELECT 1 AS _key", {"name": "prices", "sql": "SELECT 2 AS _key;"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            (s[0].name.as_str(), s[1].name.as_str(), s[1].sql.as_str()),
+            ("select 1", "prices", "SELECT 2 AS _key")
+        );
         assert!(parse_selects(None).unwrap().is_empty());
     }
 
@@ -703,7 +768,13 @@ mod tests {
         .unwrap();
         assert_eq!(s[0].kind, StepKind::Once);
         assert_eq!(s[1].kind, StepKind::Snapshot);
-        assert!(matches!(&s[2].kind, StepKind::Stray { next_path: Some(_), .. }));
+        assert!(matches!(
+            &s[2].kind,
+            StepKind::Stray {
+                next_path: Some(_),
+                ..
+            }
+        ));
         assert!(parse_reset_steps(Some(r#"[{"once": true}]"#)).is_err());
         assert!(parse_reset_steps(Some(r#"[{"for_each": "stray"}]"#)).is_err());
         assert!(parse_reset_steps(Some(r#"[{"template": "x"}]"#)).is_err());
@@ -718,11 +789,17 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(t.template_vars(), serde_json::json!({"bucket":"b","region":"r","prefix":"p"}));
+        assert_eq!(
+            t.template_vars(),
+            serde_json::json!({"bucket":"b","region":"r","prefix":"p"})
+        );
         let lit = RawTarget {
             name: "s3".into(),
             kind: Some("http.s3".into()),
-            vars: Some(r#"{"bucket":"b","region":"r","access_key_ref":"AKIA","secret_key_ref":"env:S"}"#.into()),
+            vars: Some(
+                r#"{"bucket":"b","region":"r","access_key_ref":"AKIA","secret_key_ref":"env:S"}"#
+                    .into(),
+            ),
             ..Default::default()
         };
         assert!(TargetDef::from_row(&lit).is_err());
@@ -763,8 +840,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!((t.schema.as_str(), t.table.as_str()), ("shop", "t"));
-        assert_eq!(t.on, On { insert: true, update: false, delete: true });
-        let bad = RawTrigger { id: 2, source_table: "t".into(), keys_sql: Some("SELECT :x AS _key".into()), ..Default::default() };
+        assert_eq!(
+            t.on,
+            On {
+                insert: true,
+                update: false,
+                delete: true
+            }
+        );
+        let bad = RawTrigger {
+            id: 2,
+            source_table: "t".into(),
+            keys_sql: Some("SELECT :x AS _key".into()),
+            ..Default::default()
+        };
         assert!(TriggerDef::from_row(&bad, "app", false).is_err());
     }
 }

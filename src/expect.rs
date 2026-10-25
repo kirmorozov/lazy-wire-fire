@@ -105,7 +105,10 @@ fn status(p: &str) -> Option<Status> {
         let (a, z) = (a.trim().parse().ok()?, z.trim().parse().ok()?);
         return Some(Status::Range(a, z));
     }
-    p.parse().ok().filter(|n| (100..=999).contains(n)).map(Status::Exact)
+    p.parse()
+        .ok()
+        .filter(|n| (100..=999).contains(n))
+        .map(Status::Exact)
 }
 
 impl Expect {
@@ -126,15 +129,21 @@ impl Expect {
             } else {
                 bail!("expect `{p}`: neither a status code nor `<path> == <value>`");
             };
-            let path = Path::parse(lhs.trim())
-                .map_err(|err| anyhow::anyhow!("expect `{p}`: {err}"))?;
+            let path =
+                Path::parse(lhs.trim()).map_err(|err| anyhow::anyhow!("expect `{p}`: {err}"))?;
             let r = rhs.trim();
-            let value = if let Some(inner) = r.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+            let value = if let Some(inner) = r.strip_prefix('\'').and_then(|x| x.strip_suffix('\''))
+            {
                 Value::String(inner.replace("\\'", "'"))
             } else {
                 serde_json::from_str(r).unwrap_or_else(|_| Value::String(r.to_string()))
             };
-            e.predicates.push(Predicate { path, equal, value, text: p.clone() });
+            e.predicates.push(Predicate {
+                path,
+                equal,
+                value,
+                text: p.clone(),
+            });
         }
         Ok(e)
     }
@@ -157,7 +166,8 @@ impl Expect {
         }
         let v: Value = serde_json::from_slice(body)
             .map_err(|_| format!("status {status}, body is not JSON (expect has predicates)"))?;
-        self.check_value(&v).map_err(|e| format!("status {status}, {e}"))
+        self.check_value(&v)
+            .map_err(|e| format!("status {status}, {e}"))
     }
 
     /// Predicates against a JSON value (a redis reply, or a parsed body).
@@ -181,7 +191,8 @@ fn json_eq(a: &Value, b: &Value) -> bool {
         // A bare word against a non-string compares the text, so `count == 3` and
         // `ok == yes` both behave.
         (Value::String(s), other) | (other, Value::String(s)) if !other.is_string() => {
-            other.to_string() == *s
+            let t = other.to_string();
+            t == *s
         }
         _ => a == b,
     }
@@ -190,7 +201,10 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 fn short(v: &Value) -> String {
     let s = v.to_string();
     if s.len() > 200 {
-        format!("{}…", &s[..s.char_indices().nth(200).map_or(s.len(), |(i, _)| i)])
+        format!(
+            "{}…",
+            &s[..s.char_indices().nth(200).map_or(s.len(), |(i, _)| i)]
+        )
     } else {
         s
     }
@@ -219,7 +233,9 @@ mod tests {
         let e = Expect::parse(Some("200, 204"), true).unwrap();
         assert!(e.check_http(204, b"").is_ok() && e.check_http(201, b"").is_err());
         let e = Expect::parse(Some("200-201 && result != 'noop'; n == 2"), true).unwrap();
-        assert!(e.check_http(201, br#"{"result":"created","n":2.0}"#).is_ok());
+        assert!(e
+            .check_http(201, br#"{"result":"created","n":2.0}"#)
+            .is_ok());
         assert!(e.check_http(201, br#"{"result":"noop","n":2}"#).is_err());
         assert!(Expect::parse(Some("errors"), true).is_err());
         assert!(Expect::parse(Some("2xx"), false).is_err());
@@ -230,6 +246,9 @@ mod tests {
         let e = Expect::parse(Some("$ == OK"), false).unwrap();
         assert!(e.check_value(&Value::String("OK".into())).is_ok());
         assert!(e.check_value(&Value::String("QUEUED".into())).is_err());
-        assert!(Expect::parse(None, false).unwrap().check_value(&Value::Null).is_ok());
+        assert!(Expect::parse(None, false)
+            .unwrap()
+            .check_value(&Value::Null)
+            .is_ok());
     }
 }

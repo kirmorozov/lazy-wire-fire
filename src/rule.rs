@@ -90,7 +90,12 @@ impl Rule {
 
     /// Template name an action of reset step `i` renders.
     pub fn step_action(&self, i: usize) -> String {
-        match self.def.reset_steps.get(i).and_then(|s| s.template.as_ref()) {
+        match self
+            .def
+            .reset_steps
+            .get(i)
+            .and_then(|s| s.template.as_ref())
+        {
             Some(_) => step_template(i),
             None => ACTION.to_string(),
         }
@@ -100,7 +105,11 @@ impl Rule {
 /// Column names a statement returns, from a prepare (nothing runs).
 async fn columns(conn: &mut Conn, sql: &str) -> Result<Vec<String>> {
     let stmt = conn.prep(sql).await?;
-    let names = stmt.columns().iter().map(|c| c.name_str().into_owned()).collect();
+    let names = stmt
+        .columns()
+        .iter()
+        .map(|c| c.name_str().into_owned())
+        .collect();
     conn.close(stmt).await.ok();
     Ok(names)
 }
@@ -119,23 +128,34 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<Vec<Select>> 
                 bail!("{}: `:{}` (selects take only `:keys`)", s.name, p.name);
             }
         }
-        let names = columns(conn, &expand_keys(&s.sql, 1)).await.with_context(|| format!("{} does not prepare", s.name))?;
+        let names = columns(conn, &expand_keys(&s.sql, 1))
+            .await
+            .with_context(|| format!("{} does not prepare", s.name))?;
         let plan = Plan::new(&names).with_context(|| s.name.clone())?;
         plans.push((s.name.clone(), plan));
-        out.push(Select { name: s.name.clone(), sql: s.sql.clone() });
+        out.push(Select {
+            name: s.name.clone(),
+            sql: s.sql.clone(),
+        });
     }
     docs::check_owners(&plans)?;
     Ok(out)
 }
 
-async fn compile_trigger(conn: &mut Conn, templates: &mut Templates, t: &TriggerDef) -> Result<Trigger> {
+async fn compile_trigger(
+    conn: &mut Conn,
+    templates: &mut Templates,
+    t: &TriggerDef,
+) -> Result<Trigger> {
     let key = match &t.key {
         None => None,
         Some(src) => Some(match template::simple_key_template(src) {
             Some(lines) => KeyTemplate::Simple(lines),
             None => {
                 let name = format!("key{}", t.id);
-                templates.add(&name, src, KEY_ROOTS).with_context(|| format!("trigger {} `key`", t.id))?;
+                templates
+                    .add(&name, src, KEY_ROOTS)
+                    .with_context(|| format!("trigger {} `key`", t.id))?;
                 KeyTemplate::Full(name)
             }
         }),
@@ -144,15 +164,24 @@ async fn compile_trigger(conn: &mut Conn, templates: &mut Templates, t: &Trigger
         None => None,
         Some(q) => {
             let (sql, names) = sql::expand(q, |_| 1);
-            let columns = names.iter().map(|n| n.split_once('.').map_or(n.clone(), |(_, c)| c.to_string())).collect();
-            let cols = self::columns(conn, &sql).await.with_context(|| format!("trigger {} `keys_sql` does not prepare", t.id))?;
+            let columns = names
+                .iter()
+                .map(|n| n.split_once('.').map_or(n.clone(), |(_, c)| c.to_string()))
+                .collect();
+            let cols = self::columns(conn, &sql)
+                .await
+                .with_context(|| format!("trigger {} `keys_sql` does not prepare", t.id))?;
             if !cols.iter().any(|c| c == "_key") {
                 bail!("trigger {} `keys_sql` returns no `_key` column", t.id);
             }
             Some(KeysSql { sql, columns })
         }
     };
-    Ok(Trigger { def: t.clone(), key, keys_sql })
+    Ok(Trigger {
+        def: t.clone(),
+        key,
+        keys_sql,
+    })
 }
 
 /// Compiles `def` with its triggers; problems end up in `error` / `trigger_error`.
@@ -174,7 +203,10 @@ pub async fn compile(
         if let Some(t) = &s.template {
             add(&mut templates, &step_template(i), t);
         }
-        if let StepKind::Stray { list_template: l, .. } = &s.kind {
+        if let StepKind::Stray {
+            list_template: l, ..
+        } = &s.kind
+        {
             add(&mut templates, &list_template(i), l);
         }
     }

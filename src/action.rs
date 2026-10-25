@@ -28,8 +28,19 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn new(pool: Pool, flavor: Flavor, visibility_delay: Duration, send_concurrency: usize) -> Env {
-        Env { pool, flavor, visibility_delay, send_concurrency, snapshot_fence: AtomicU8::new(0) }
+    pub fn new(
+        pool: Pool,
+        flavor: Flavor,
+        visibility_delay: Duration,
+        send_concurrency: usize,
+    ) -> Env {
+        Env {
+            pool,
+            flavor,
+            visibility_delay,
+            send_concurrency,
+            snapshot_fence: AtomicU8::new(0),
+        }
     }
 }
 
@@ -49,7 +60,9 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
     let mut conn = env.pool.get_conn().await.context("fence connection")?;
     if env.flavor == Flavor::MySql {
         if let Some(g) = &spec.gtid {
-            let r: Result<Option<Option<i64>>, _> = conn.exec_first("SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)", (g,)).await;
+            let r: Result<Option<Option<i64>>, _> = conn
+                .exec_first("SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)", (g,))
+                .await;
             match r {
                 Ok(Some(Some(0))) => return Ok(()),
                 Ok(Some(Some(_))) => bail!("transaction {g} not visible after 5 s"),
@@ -62,9 +75,13 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut pause = Duration::from_millis(1);
         loop {
-            conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
-            conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT").await?;
-            let rows: Result<Vec<(String, String)>, _> = conn.query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'").await;
+            conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .await?;
+            conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                .await?;
+            let rows: Result<Vec<(String, String)>, _> = conn
+                .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
+                .await;
             conn.query_drop("COMMIT").await?;
             let (mut file, mut pos) = (None, None);
             for (k, v) in rows.unwrap_or_default() {
@@ -131,35 +148,42 @@ pub fn to_param(v: &Value) -> My {
 }
 
 fn key_column(row: &Row) -> Option<usize> {
-    row.columns_ref().iter().position(|c| c.name_str() == "_key")
+    row.columns_ref()
+        .iter()
+        .position(|c| c.name_str() == "_key")
 }
 
 fn keys_of(rows: Vec<Row>) -> Vec<String> {
     let Some(i) = rows.first().and_then(key_column) else {
         return Vec::new();
     };
-    rows.into_iter().filter_map(|mut r| r.take::<My, _>(i).and_then(|v| docs::key_text(&v))).collect()
+    rows.into_iter()
+        .filter_map(|mut r| r.take::<My, _>(i).and_then(|v| docs::key_text(&v)))
+        .collect()
 }
 
 /// Runs the key queries of a flush; returns the keys they found.
 pub async fn resolve_keys(env: &Env, rule: &Rule, queries: &[KeyQuery]) -> Result<Vec<String>> {
-    let by_id: HashMap<u64, &rule::KeysSql> =
-        rule.triggers.iter().filter_map(|t| t.keys_sql.as_ref().map(|k| (t.def.id, k))).collect();
+    let by_id: HashMap<u64, &rule::KeysSql> = rule
+        .triggers
+        .iter()
+        .filter_map(|t| t.keys_sql.as_ref().map(|k| (t.def.id, k)))
+        .collect();
     // Futures collected first: closures inside stream combinators trip `Send` inference.
     let futs: Vec<_> = queries
         .iter()
         .map(|q| {
-        let ks = by_id.get(&q.trigger).copied();
-        async move {
-            let Some(ks) = ks else { return Ok(Vec::new()) };
-            let mut conn = env.pool.get_conn().await?;
-            let params: Vec<My> = q.params.iter().map(to_param).collect();
-            let rows: Vec<Row> = conn
-                .exec(ks.sql.as_str(), Params::Positional(params))
-                .await
-                .with_context(|| format!("trigger {} keys_sql", q.trigger))?;
-            Ok::<_, anyhow::Error>(keys_of(rows))
-        }
+            let ks = by_id.get(&q.trigger).copied();
+            async move {
+                let Some(ks) = ks else { return Ok(Vec::new()) };
+                let mut conn = env.pool.get_conn().await?;
+                let params: Vec<My> = q.params.iter().map(to_param).collect();
+                let rows: Vec<Row> = conn
+                    .exec(ks.sql.as_str(), Params::Positional(params))
+                    .await
+                    .with_context(|| format!("trigger {} keys_sql", q.trigger))?;
+                Ok::<_, anyhow::Error>(keys_of(rows))
+            }
         })
         .collect();
     let lists: Vec<Vec<String>> = stream::iter(futs).buffer_unordered(8).try_collect().await?;
@@ -177,36 +201,66 @@ fn padded(n: usize) -> usize {
 /// Documents for `keys`: every select runs concurrently on its own connection.
 pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Doc>> {
     if rule.selects.is_empty() {
-        return Ok(keys.iter().map(|k| Doc { key: k.clone(), doc: json!({}), delete: false }).collect());
+        return Ok(keys
+            .iter()
+            .map(|k| Doc {
+                key: k.clone(),
+                doc: json!({}),
+                delete: false,
+            })
+            .collect());
     }
     let mut out = Vec::with_capacity(keys.len());
     for chunk in keys.chunks(SELECT_CHUNK) {
         let n = padded(chunk.len());
-        let params: Vec<My> = (0..n).map(|i| My::Bytes(chunk[i.min(chunk.len() - 1)].clone().into_bytes())).collect();
-        let futs: Vec<_> = rule.selects.iter().map(|s| {
-            let params = params.clone();
-            async move {
-                // Each `:keys` becomes `n` parameters.
-                let (sql, slots) = crate::sql::expand(&s.sql, |_| n);
-                let mut conn = env.pool.get_conn().await?;
-                let stmt = conn.prep(sql.as_str()).await.with_context(|| s.name.clone())?;
-                let names: Vec<String> = stmt.columns().iter().map(|c| c.name_str().into_owned()).collect();
-                let plan = Plan::new(&names).with_context(|| s.name.clone())?;
-                let cols = stmt.columns().to_vec();
-                let p = if slots.is_empty() {
-                    Params::Empty
-                } else {
-                    Params::Positional(params.iter().cycle().take(slots.len()).cloned().collect())
-                };
-                let rows: Vec<Row> = conn.exec(&stmt, p).await.with_context(|| s.name.clone())?;
-                let rows = rows
-                    .into_iter()
-                    .map(|r| r.unwrap().into_iter().enumerate().map(|(i, v)| docs::to_json(v, cols.get(i))).collect())
-                    .collect();
-                Ok::<_, anyhow::Error>((plan, rows))
-            }
-        }).collect();
-        let results: Vec<(Plan, Vec<Vec<Value>>)> = futures_util::future::try_join_all(futs).await?;
+        let params: Vec<My> = (0..n)
+            .map(|i| My::Bytes(chunk[i.min(chunk.len() - 1)].clone().into_bytes()))
+            .collect();
+        let futs: Vec<_> = rule
+            .selects
+            .iter()
+            .map(|s| {
+                let params = params.clone();
+                async move {
+                    // Each `:keys` becomes `n` parameters.
+                    let (sql, slots) = crate::sql::expand(&s.sql, |_| n);
+                    let mut conn = env.pool.get_conn().await?;
+                    let stmt = conn
+                        .prep(sql.as_str())
+                        .await
+                        .with_context(|| s.name.clone())?;
+                    let names: Vec<String> = stmt
+                        .columns()
+                        .iter()
+                        .map(|c| c.name_str().into_owned())
+                        .collect();
+                    let plan = Plan::new(&names).with_context(|| s.name.clone())?;
+                    let cols = stmt.columns().to_vec();
+                    let p = if slots.is_empty() {
+                        Params::Empty
+                    } else {
+                        Params::Positional(
+                            params.iter().cycle().take(slots.len()).cloned().collect(),
+                        )
+                    };
+                    let rows: Vec<Row> =
+                        conn.exec(&stmt, p).await.with_context(|| s.name.clone())?;
+                    let rows = rows
+                        .into_iter()
+                        .map(|r| {
+                            r.unwrap()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, v)| docs::to_json(v, cols.get(i)))
+                                .collect()
+                        })
+                        .collect();
+                    Ok::<_, anyhow::Error>((plan, rows))
+                }
+            })
+            .collect();
+        let results: Vec<(Plan, Vec<Vec<Value>>)> =
+            futures_util::future::try_join_all(futs).await?;
         let mut m = Merger::new(chunk);
         for (plan, rows) in &results {
             m.add(plan, rows.clone());
@@ -220,7 +274,14 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
 }
 
 /// Context for one action.
-pub fn context(rule: &Rule, target: &Target, keys: &[String], docs: &[Doc], endpoint: &Value, reset: &Value) -> Value {
+pub fn context(
+    rule: &Rule,
+    target: &Target,
+    keys: &[String],
+    docs: &[Doc],
+    endpoint: &Value,
+    reset: &Value,
+) -> Value {
     json!({
         "keys": keys,
         "docs": docs.iter().map(Doc::to_json).collect::<Vec<_>>(),
@@ -247,13 +308,26 @@ pub struct Fired {
 }
 
 /// Sends one action (rendered per endpoint) to every endpoint.
-async fn send_all(rule: &Rule, target: &Target, template: &str, keys: &[String], docs: &[Doc], reset: &Value) -> Result<Sent, (anyhow::Error, bool)> {
+async fn send_all(
+    rule: &Rule,
+    target: &Target,
+    template: &str,
+    keys: &[String],
+    docs: &[Doc],
+    reset: &Value,
+) -> Result<Sent, (anyhow::Error, bool)> {
     let mut rendered = Vec::with_capacity(target.endpoints.len());
     for ep in &target.endpoints {
         let ctx = context(rule, target, keys, docs, &ep.ctx, reset);
-        rendered.push(rule.templates.render(template, &ctx).map_err(|e| (e, false))?);
+        rendered.push(
+            rule.templates
+                .render(template, &ctx)
+                .map_err(|e| (e, false))?,
+        );
     }
-    let results = futures_util::future::join_all(rendered.iter().enumerate().map(|(i, r)| target.send(i, r))).await;
+    let results =
+        futures_util::future::join_all(rendered.iter().enumerate().map(|(i, r)| target.send(i, r)))
+            .await;
     let mut sent = Sent::Skipped;
     for r in results {
         match r {
@@ -266,15 +340,32 @@ async fn send_all(rule: &Rule, target: &Target, template: &str, keys: &[String],
 }
 
 /// Splits a group so each rendered action stays within `batch_max_bytes`.
-fn split_by_bytes(rule: &Rule, target: &Target, template: &str, keys: &[String], docs: &[Doc], reset: &Value) -> Result<Vec<(usize, usize)>> {
+fn split_by_bytes(
+    rule: &Rule,
+    target: &Target,
+    template: &str,
+    keys: &[String],
+    docs: &[Doc],
+    reset: &Value,
+) -> Result<Vec<(usize, usize)>> {
     let Some(max) = rule.def.batch_max_bytes else {
         return Ok(vec![(0, keys.len())]);
     };
-    let ep = target.endpoints.first().map(|e| e.ctx.clone()).unwrap_or(Value::Null);
+    let ep = target
+        .endpoints
+        .first()
+        .map(|e| e.ctx.clone())
+        .unwrap_or(Value::Null);
     let mut out = Vec::new();
     let mut todo = vec![(0, keys.len())];
     while let Some((a, b)) = todo.pop() {
-        let len = rule.templates.render(template, &context(rule, target, &keys[a..b], &docs[a..b], &ep, reset))?.len();
+        let len = rule
+            .templates
+            .render(
+                template,
+                &context(rule, target, &keys[a..b], &docs[a..b], &ep, reset),
+            )?
+            .len();
         if len <= max || b - a <= 1 {
             out.push((a, b));
         } else {
@@ -288,7 +379,14 @@ fn split_by_bytes(rule: &Rule, target: &Target, template: &str, keys: &[String],
 
 /// Reads the documents for `keys` and fires them, group by group. Stops at the first failure;
 /// the keys not confirmed are returned in `failed_keys`.
-pub async fn fire_keys(env: &Env, rule: &Rule, keys: Vec<String>, template: &str, reset: Value, docs_override: Option<Vec<Doc>>) -> Fired {
+pub async fn fire_keys(
+    env: &Env,
+    rule: &Rule,
+    keys: Vec<String>,
+    template: &str,
+    reset: Value,
+    docs_override: Option<Vec<Doc>>,
+) -> Fired {
     let mut f = Fired::default();
     let Some(target) = rule.target.clone() else {
         f.error = Some(rule.error.clone().unwrap_or_else(|| "no target".into()));
@@ -302,14 +400,27 @@ pub async fn fire_keys(env: &Env, rule: &Rule, keys: Vec<String>, template: &str
     }
     let group = rule.group_size().max(1);
     let mut chunks: Vec<Vec<String>> = keys.chunks(group).map(<[String]>::to_vec).collect();
-    let mut overrides = docs_override.map(|d| d.into_iter().map(|d| (d.key.clone(), d)).collect::<HashMap<_, _>>());
+    let mut overrides = docs_override.map(|d| {
+        d.into_iter()
+            .map(|d| (d.key.clone(), d))
+            .collect::<HashMap<_, _>>()
+    });
     let mut i = 0;
     while i < chunks.len() {
         let unit = std::mem::take(&mut chunks[i]);
         i += 1;
         let t0 = Instant::now();
         let docs = match &mut overrides {
-            Some(o) => Ok(unit.iter().map(|k| o.remove(k).unwrap_or(Doc { key: k.clone(), doc: json!({}), delete: true })).collect()),
+            Some(o) => Ok(unit
+                .iter()
+                .map(|k| {
+                    o.remove(k).unwrap_or(Doc {
+                        key: k.clone(),
+                        doc: json!({}),
+                        delete: true,
+                    })
+                })
+                .collect()),
             None => load_docs(env, rule, &unit).await,
         };
         f.select_time += t0.elapsed();
@@ -331,12 +442,25 @@ pub async fn fire_keys(env: &Env, rule: &Rule, keys: Vec<String>, template: &str
                         let reset = reset.clone();
                         async move {
                             let k = [d.key.clone()];
-                            (j, send_all(rule, &target, template, &k, std::slice::from_ref(d), &reset).await)
+                            (
+                                j,
+                                send_all(
+                                    rule,
+                                    &target,
+                                    template,
+                                    &k,
+                                    std::slice::from_ref(d),
+                                    &reset,
+                                )
+                                .await,
+                            )
                         }
                     })
                     .collect();
-                let results: Vec<(usize, Result<Sent, (anyhow::Error, bool)>)> =
-                    stream::iter(futs).buffer_unordered(env.send_concurrency).collect().await;
+                let results: Vec<(usize, Result<Sent, (anyhow::Error, bool)>)> = stream::iter(futs)
+                    .buffer_unordered(env.send_concurrency)
+                    .collect()
+                    .await;
                 let mut first_err = None;
                 for (j, r) in results {
                     match r {
@@ -368,7 +492,16 @@ pub async fn fire_keys(env: &Env, rule: &Rule, keys: Vec<String>, template: &str
                 };
                 let mut res = Ok(());
                 for (n, (a, b)) in parts.iter().enumerate() {
-                    match send_all(rule, &target, template, &unit[*a..*b], &docs[*a..*b], &reset).await {
+                    match send_all(
+                        rule,
+                        &target,
+                        template,
+                        &unit[*a..*b],
+                        &docs[*a..*b],
+                        &reset,
+                    )
+                    .await
+                    {
                         Ok(s) => {
                             if s == Sent::Ok {
                                 f.ok += 1;
@@ -426,11 +559,18 @@ pub async fn fire_once(rule: &Rule, template: &str, reset: Value) -> Fired {
 
 /// Every key, from `snapshot_keys_sql`.
 pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<Vec<String>> {
-    let q = rule.def.snapshot_keys_sql.as_deref().ok_or_else(|| anyhow!("the rule has no snapshot_keys_sql"))?;
+    let q = rule
+        .def
+        .snapshot_keys_sql
+        .as_deref()
+        .ok_or_else(|| anyhow!("the rule has no snapshot_keys_sql"))?;
     let mut conn = env.pool.get_conn().await?;
     let rows: Vec<Row> = conn.exec(q, ()).await.context("snapshot_keys_sql")?;
     let mut seen = HashSet::new();
-    Ok(keys_of(rows).into_iter().filter(|k| seen.insert(k.clone())).collect())
+    Ok(keys_of(rows)
+        .into_iter()
+        .filter(|k| seen.insert(k.clone()))
+        .collect())
 }
 
 const MAX_PAGES: usize = 1_000_000;
@@ -438,12 +578,22 @@ const MAX_PAGES: usize = 1_000_000;
 /// Stray candidates per endpoint for reset step `step`: the target's keys (paged with the
 /// step's `list_template`) that the snapshot, read after the listing, does not have.
 pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<String>>> {
-    let target = rule.target.clone().ok_or_else(|| anyhow!(rule.error.clone().unwrap_or_else(|| "no target".into())))?;
+    let target = rule
+        .target
+        .clone()
+        .ok_or_else(|| anyhow!(rule.error.clone().unwrap_or_else(|| "no target".into())))?;
     if let Some(e) = &rule.error {
         bail!("{e}");
     }
-    let s = rule.step(step).ok_or_else(|| anyhow!("no reset step {step}"))?;
-    let StepKind::Stray { keys_path, next_path, .. } = &s.kind else {
+    let s = rule
+        .step(step)
+        .ok_or_else(|| anyhow!("no reset step {step}"))?;
+    let StepKind::Stray {
+        keys_path,
+        next_path,
+        ..
+    } = &s.kind
+    else {
         bail!("reset step {step} is not a stray step");
     };
     let mut listed: Vec<Vec<String>> = Vec::new();
@@ -455,8 +605,16 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
             let reset = json!({"step": s.name, "keys": [], "next": next, "page": page});
             let ctx = context(rule, &target, &[], &[], &ep.ctx, &reset);
             let req = rule.templates.render(&rule::list_template(step), &ctx)?;
-            let resp = target.fetch(i, &req).await.with_context(|| format!("listing page {page}"))?;
-            let page_keys: Vec<String> = keys_path.get(&resp).into_iter().map(crate::template::text).filter(|k| !k.is_empty()).collect();
+            let resp = target
+                .fetch(i, &req)
+                .await
+                .with_context(|| format!("listing page {page}"))?;
+            let page_keys: Vec<String> = keys_path
+                .get(&resp)
+                .into_iter()
+                .map(crate::template::text)
+                .filter(|k| !k.is_empty())
+                .collect();
             let n = page_keys.len();
             for k in page_keys {
                 if seen.insert(k.clone()) {
@@ -466,7 +624,11 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
             let Some(np) = next_path else { break };
             let nv = np.get_one(&resp).cloned().unwrap_or(Value::Null);
             // An empty page ends an HTTP listing; a Redis SCAN page may be empty mid-way.
-            let done = nv.is_null() || nv == next || nv == json!(0) || nv == json!("0") || (n == 0 && target.is_http());
+            let done = nv.is_null()
+                || nv == next
+                || nv == json!(0)
+                || nv == json!("0")
+                || (n == 0 && target.is_http());
             if done {
                 break;
             }
@@ -475,7 +637,10 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
         listed.push(keys);
     }
     let snapshot: HashSet<String> = snapshot_keys(env, rule).await?.into_iter().collect();
-    Ok(listed.into_iter().map(|l| l.into_iter().filter(|k| !snapshot.contains(k)).collect()).collect())
+    Ok(listed
+        .into_iter()
+        .map(|l| l.into_iter().filter(|k| !snapshot.contains(k)).collect())
+        .collect())
 }
 
 /// Fires deletes for stray `keys` on endpoint `ep` only.
@@ -495,10 +660,22 @@ pub async fn fire_strays(rule: &Rule, step: usize, ep: usize, keys: Vec<String>)
     let all = keys;
     let mut done = 0;
     for chunk in all.chunks(group) {
-        let docs: Vec<Doc> = chunk.iter().map(|k| Doc { key: k.clone(), doc: json!({}), delete: true }).collect();
+        let docs: Vec<Doc> = chunk
+            .iter()
+            .map(|k| Doc {
+                key: k.clone(),
+                doc: json!({}),
+                delete: true,
+            })
+            .collect();
         let reset = json!({"step": name, "keys": chunk});
         let units: Vec<(Vec<String>, Vec<Doc>)> = match rule.def.fire_per {
-            FirePer::Key => chunk.iter().cloned().zip(docs.iter().cloned()).map(|(k, d)| (vec![k], vec![d])).collect(),
+            FirePer::Key => chunk
+                .iter()
+                .cloned()
+                .zip(docs.iter().cloned())
+                .map(|(k, d)| (vec![k], vec![d]))
+                .collect(),
             FirePer::Batch => vec![(chunk.to_vec(), docs)],
         };
         for (ks, ds) in units {

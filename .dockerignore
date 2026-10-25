@@ -1,0 +1,5 @@
+# Only Cargo.toml, Cargo.lock and src/ are needed to build the image.
+*
+!Cargo.toml
+!Cargo.lock
+!src

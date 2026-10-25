@@ -20,15 +20,33 @@ impl S3Spec {
     pub fn address(&self, service: &BaseUrl) -> (BaseUrl, String) {
         if self.path_style {
             let prefix = format!("{}/{}", service.base, uri_encode(&self.bucket, true));
-            (BaseUrl { base: String::new(), ..service.clone() }, prefix)
+            (
+                BaseUrl {
+                    base: String::new(),
+                    ..service.clone()
+                },
+                prefix,
+            )
         } else {
             let host = format!("{}.{}", self.bucket, service.host);
-            (BaseUrl { host, base: String::new(), ..service.clone() }, service.base.clone())
+            (
+                BaseUrl {
+                    host,
+                    base: String::new(),
+                    ..service.clone()
+                },
+                service.base.clone(),
+            )
         }
     }
 
     pub fn aws_endpoint(&self) -> BaseUrl {
-        BaseUrl { secure: true, host: format!("s3.{}.amazonaws.com", self.region), port: 443, base: String::new() }
+        BaseUrl {
+            secure: true,
+            host: format!("s3.{}.amazonaws.com", self.region),
+            port: 443,
+            base: String::new(),
+        }
     }
 }
 
@@ -36,7 +54,10 @@ impl S3Spec {
 pub fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') || (b == b'/' && !encode_slash) {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || (b == b'/' && !encode_slash)
+        {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -77,11 +98,18 @@ fn canonical_target(target: &str) -> (String, String) {
         .filter(|p| !p.is_empty())
         .map(|p| {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (uri_encode(&percent_decode(k), true), uri_encode(&percent_decode(v), true))
+            (
+                uri_encode(&percent_decode(k), true),
+                uri_encode(&percent_decode(v), true),
+            )
         })
         .collect();
     pairs.sort();
-    let query = pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let query = pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
     (if path.is_empty() { "/".into() } else { path }, query)
 }
 
@@ -127,7 +155,11 @@ pub fn sign(
     }
     let (date, stamp) = crate::time::amz_dates(unix_now);
     let (path, query) = canonical_target(&format!("{prefix}{}", req.target));
-    req.target = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
+    req.target = if query.is_empty() {
+        path.clone()
+    } else {
+        format!("{path}?{query}")
+    };
     let payload = hex::encode(Sha256::digest(&req.body));
     req.set_header("Host", host_header.to_string());
     req.set_header("x-amz-date", stamp.clone());
@@ -140,19 +172,34 @@ pub fn sign(
     let mut signed: Vec<(String, String)> = req
         .headers
         .iter()
-        .map(|(n, v)| (n.to_ascii_lowercase(), v.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .map(|(n, v)| {
+            (
+                n.to_ascii_lowercase(),
+                v.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
         .filter(|(n, _)| n == "host" || n.starts_with("x-amz-") || SIGNED.contains(&n.as_str()))
         .collect();
     signed.sort();
     let canonical_headers: String = signed.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
-    let signed_names = signed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(";");
+    let signed_names = signed
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
     let canonical = format!(
         "{}\n{path}\n{query}\n{canonical_headers}\n{signed_names}\n{payload}",
         req.method.to_ascii_uppercase()
     );
     let scope = format!("{date}/{region}/{service}/aws4_request");
-    let to_sign = format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}", hex::encode(Sha256::digest(canonical.as_bytes())));
-    let k_date = hmac_sha256(format!("AWS4{}", creds.secret_key).as_bytes(), date.as_bytes());
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    );
+    let k_date = hmac_sha256(
+        format!("AWS4{}", creds.secret_key).as_bytes(),
+        date.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -184,8 +231,19 @@ mod tests {
     // Transferring Payload in a Single Chunk").
     #[test]
     fn aws_get_object_example() {
-        let mut r = RawRequest::parse("GET /test.txt HTTP/1.1\nRange: bytes=0-9\n\n").unwrap().unwrap();
-        sign(&mut r, "examplebucket.s3.amazonaws.com", "", "us-east-1", "s3", &creds(), 1_369_353_600).unwrap();
+        let mut r = RawRequest::parse("GET /test.txt HTTP/1.1\nRange: bytes=0-9\n\n")
+            .unwrap()
+            .unwrap();
+        sign(
+            &mut r,
+            "examplebucket.s3.amazonaws.com",
+            "",
+            "us-east-1",
+            "s3",
+            &creds(),
+            1_369_353_600,
+        )
+        .unwrap();
         assert_eq!(
             r.header("authorization").unwrap(),
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
@@ -201,7 +259,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        sign(&mut r, "examplebucket.s3.amazonaws.com", "", "us-east-1", "s3", &creds(), 1_369_353_600).unwrap();
+        sign(
+            &mut r,
+            "examplebucket.s3.amazonaws.com",
+            "",
+            "us-east-1",
+            "s3",
+            &creds(),
+            1_369_353_600,
+        )
+        .unwrap();
         assert_eq!(r.target, "/test%24file.text");
         assert!(r.header("authorization").unwrap().ends_with(
             "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, \
@@ -211,23 +278,49 @@ mod tests {
 
     #[test]
     fn aws_list_objects_example() {
-        let mut r = RawRequest::parse("GET /?max-keys=2&prefix=J HTTP/1.1\n\n").unwrap().unwrap();
-        sign(&mut r, "examplebucket.s3.amazonaws.com", "", "us-east-1", "s3", &creds(), 1_369_353_600).unwrap();
-        assert!(r
-            .header("authorization")
+        let mut r = RawRequest::parse("GET /?max-keys=2&prefix=J HTTP/1.1\n\n")
             .unwrap()
-            .ends_with("Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"));
+            .unwrap();
+        sign(
+            &mut r,
+            "examplebucket.s3.amazonaws.com",
+            "",
+            "us-east-1",
+            "s3",
+            &creds(),
+            1_369_353_600,
+        )
+        .unwrap();
+        assert!(r.header("authorization").unwrap().ends_with(
+            "Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
+        ));
     }
 
     #[test]
     fn addressing() {
-        let s = S3Spec { bucket: "b".into(), region: "eu-west-1".into(), path_style: false };
+        let s = S3Spec {
+            bucket: "b".into(),
+            region: "eu-west-1".into(),
+            path_style: false,
+        };
         let (base, prefix) = s.address(&s.aws_endpoint());
-        assert_eq!((base.host.as_str(), prefix.as_str()), ("b.s3.eu-west-1.amazonaws.com", ""));
-        let p = S3Spec { path_style: true, ..s };
+        assert_eq!(
+            (base.host.as_str(), prefix.as_str()),
+            ("b.s3.eu-west-1.amazonaws.com", "")
+        );
+        let p = S3Spec {
+            path_style: true,
+            ..s
+        };
         let (base, prefix) = p.address(&BaseUrl::parse("http://minio:9000").unwrap());
-        assert_eq!((base.host_header(), prefix.as_str()), ("minio:9000".to_string(), "/b"));
-        assert_eq!(canonical_target("/a b/c%2Fd+e?z=1&a=x%20y&b"), ("/a%20b/c%2Fd%2Be".into(), "a=x%20y&b=&z=1".into()));
+        assert_eq!(
+            (base.host_header(), prefix.as_str()),
+            ("minio:9000".to_string(), "/b")
+        );
+        assert_eq!(
+            canonical_target("/a b/c%2Fd+e?z=1&a=x%20y&b"),
+            ("/a%20b/c%2Fd%2Be".into(), "a=x%20y&b=&z=1".into())
+        );
     }
 
     #[test]

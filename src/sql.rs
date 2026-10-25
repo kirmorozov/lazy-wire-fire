@@ -77,7 +77,11 @@ fn lex(sql: &str) -> Vec<Lexed> {
             }
             b'\'' => {
                 i += quoted_len(b, i);
-                out.push(Lexed { tok: Tok::Other, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::Other,
+                    start,
+                    end: i,
+                });
             }
             b'"' | b'`' => {
                 i += quoted_len(b, i);
@@ -100,7 +104,8 @@ fn lex(sql: &str) -> Vec<Lexed> {
                 // Executable comments (`/*! … */`, `/*!50001 … */`, `/*M! … */`) are SQL.
                 let body = &sql[i + 2..end.saturating_sub(2).max(i + 2)];
                 if let Some(rest) = body.strip_prefix('!').or_else(|| body.strip_prefix("M!")) {
-                    let skip = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                    let skip =
+                        rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
                     let off = i + 2 + (body.len() - rest.len()) + skip;
                     for mut l in lex(&rest[skip..]) {
                         l.start += off;
@@ -110,7 +115,10 @@ fn lex(sql: &str) -> Vec<Lexed> {
                 }
                 i = end;
             }
-            b':' if b.get(i + 1).is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_') => {
+            b':' if b
+                .get(i + 1)
+                .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_') =>
+            {
                 let mut j = i + 1;
                 loop {
                     while j < b.len() && is_ident(b[j]) {
@@ -136,28 +144,52 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     Some((head, tail)) => format!("{head}.{}", unquote(&format!("`{tail}"))),
                     None => raw.to_string(),
                 };
-                out.push(Lexed { tok: Tok::Param(name), start, end: j });
+                out.push(Lexed {
+                    tok: Tok::Param(name),
+                    start,
+                    end: j,
+                });
                 i = j;
             }
             b'.' => {
                 i += 1;
-                out.push(Lexed { tok: Tok::Dot, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::Dot,
+                    start,
+                    end: i,
+                });
             }
             b',' => {
                 i += 1;
-                out.push(Lexed { tok: Tok::Comma, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::Comma,
+                    start,
+                    end: i,
+                });
             }
             b';' => {
                 i += 1;
-                out.push(Lexed { tok: Tok::Semi, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::Semi,
+                    start,
+                    end: i,
+                });
             }
             b'(' => {
                 i += 1;
-                out.push(Lexed { tok: Tok::LParen, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::LParen,
+                    start,
+                    end: i,
+                });
             }
             b')' => {
                 i += 1;
-                out.push(Lexed { tok: Tok::RParen, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::RParen,
+                    start,
+                    end: i,
+                });
             }
             c if is_ident(c) => {
                 while i < b.len() && is_ident(b[i]) {
@@ -172,7 +204,11 @@ fn lex(sql: &str) -> Vec<Lexed> {
             _ => {
                 // One UTF-8 character.
                 i += sql[i..].chars().next().map_or(1, char::len_utf8);
-                out.push(Lexed { tok: Tok::Other, start, end: i });
+                out.push(Lexed {
+                    tok: Tok::Other,
+                    start,
+                    end: i,
+                });
             }
         }
     }
@@ -193,7 +229,11 @@ pub fn placeholders(sql: &str) -> Vec<Placeholder> {
     lex(sql)
         .into_iter()
         .filter_map(|l| match l.tok {
-            Tok::Param(name) => Some(Placeholder { name, start: l.start, end: l.end }),
+            Tok::Param(name) => Some(Placeholder {
+                name,
+                start: l.start,
+                end: l.end,
+            }),
             _ => None,
         })
         .collect()
@@ -241,7 +281,7 @@ pub fn split_statements(text: &str) -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DdlEffect {
     /// Content replaced or removed without row events: `TRUNCATE`, `DROP`, `RENAME` (both
-    /// sides), `CREATE`, `EXCHANGE PARTITION`, `REPAIR`.
+    /// sides), `CREATE OR REPLACE TABLE`, `EXCHANGE PARTITION`, `REPAIR`.
     Replace,
     /// Structure only (`ALTER TABLE t ADD …`, `CREATE INDEX … ON t`): column positions may move.
     Reshape,
@@ -251,7 +291,12 @@ pub enum DdlEffect {
 /// (`DROP DATABASE`). Unqualified names belong to `default_schema`.
 pub fn ddl_tables(query: &str, default_schema: &str) -> Vec<(String, String, DdlEffect)> {
     let toks: Vec<Tok> = lex(query).into_iter().map(|l| l.tok).collect();
-    let mut p = Ddl { t: &toks, i: 0, schema: default_schema, out: Vec::new() };
+    let mut p = Ddl {
+        t: &toks,
+        i: 0,
+        schema: default_schema,
+        out: Vec::new(),
+    };
     p.statement();
     p.out
 }
@@ -395,10 +440,17 @@ impl Ddl<'_> {
                 }
             }
             "CREATE" => {
+                // A new table holds no rows (`CREATE … SELECT` logs its rows as row events);
+                // MariaDB's `CREATE OR REPLACE TABLE` drops the old one first.
+                let replace = self.kw_at(0, "OR") && self.kw_at(1, "REPLACE");
                 self.skip_modifiers();
                 if self.eat("TABLE") {
                     self.eat_if_exists();
-                    self.push(DdlEffect::Replace);
+                    self.push(if replace {
+                        DdlEffect::Replace
+                    } else {
+                        DdlEffect::Reshape
+                    });
                 } else if self.eat("INDEX") {
                     self.ident();
                     if self.eat("ON") {
@@ -419,7 +471,8 @@ impl Ddl<'_> {
                 // Scan the rest for RENAME [TO|AS] x and EXCHANGE PARTITION p WITH TABLE x.
                 while self.i < self.t.len() {
                     if self.eat("RENAME") {
-                        if self.kw_at(0, "COLUMN") || self.kw_at(0, "INDEX") || self.kw_at(0, "KEY") {
+                        if self.kw_at(0, "COLUMN") || self.kw_at(0, "INDEX") || self.kw_at(0, "KEY")
+                        {
                             continue;
                         }
                         let _ = self.eat("TO") || self.eat("AS");
@@ -463,24 +516,31 @@ mod tests {
 
     #[test]
     fn expansion_counts() {
-        let (s, names) = expand("SELECT x AS _key FROM t WHERE id IN (:keys) OR p = :new.id", |n| {
-            if n == "keys" {
-                3
-            } else {
-                1
-            }
-        });
+        let (s, names) = expand(
+            "SELECT x AS _key FROM t WHERE id IN (:keys) OR p = :new.id",
+            |n| {
+                if n == "keys" {
+                    3
+                } else {
+                    1
+                }
+            },
+        );
         assert_eq!(s, "SELECT x AS _key FROM t WHERE id IN (?, ?, ?) OR p = ?");
         assert_eq!(names, vec!["keys", "keys", "keys", "new.id"]);
         // Escaped quotes do not end literals early.
-        let (s, n) = expand("SELECT 'it''s :keys', 'a\\':keys' WHERE k IN (:keys)", |_| 1);
+        let (s, n) = expand(
+            "SELECT 'it''s :keys', 'a\\':keys' WHERE k IN (:keys)",
+            |_| 1,
+        );
         assert_eq!(s, "SELECT 'it''s :keys', 'a\\':keys' WHERE k IN (?)");
         assert_eq!(n.len(), 1);
     }
 
     #[test]
     fn statements_split() {
-        let parts = split_statements("SELECT 1 AS _key; SELECT ';' AS x -- ; c\n;\n\n ; /* only */ ;");
+        let parts =
+            split_statements("SELECT 1 AS _key; SELECT ';' AS x -- ; c\n;\n\n ; /* only */ ;");
         assert_eq!(parts, vec!["SELECT 1 AS _key", "SELECT ';' AS x -- ; c"]);
     }
 
@@ -488,7 +548,10 @@ mod tests {
     fn ddl() {
         use DdlEffect::*;
         let d = |q: &str| ddl_tables(q, "app");
-        assert_eq!(d("TRUNCATE TABLE t"), vec![("app".into(), "t".into(), Replace)]);
+        assert_eq!(
+            d("TRUNCATE TABLE t"),
+            vec![("app".into(), "t".into(), Replace)]
+        );
         assert_eq!(
             d("RENAME TABLE `t` TO old_t, s.new_t TO t"),
             vec![
@@ -498,20 +561,48 @@ mod tests {
                 ("app".into(), "t".into(), Replace)
             ]
         );
-        assert_eq!(d("ALTER TABLE t ADD INDEX i (a)"), vec![("app".into(), "t".into(), Reshape)]);
-        assert_eq!(d("ALTER TABLE t RENAME COLUMN a TO b"), vec![("app".into(), "t".into(), Reshape)]);
+        assert_eq!(
+            d("ALTER TABLE t ADD INDEX i (a)"),
+            vec![("app".into(), "t".into(), Reshape)]
+        );
+        assert_eq!(
+            d("ALTER TABLE t RENAME COLUMN a TO b"),
+            vec![("app".into(), "t".into(), Reshape)]
+        );
         assert_eq!(
             d("ALTER TABLE t RENAME TO u"),
-            vec![("app".into(), "t".into(), Replace), ("app".into(), "u".into(), Replace)]
+            vec![
+                ("app".into(), "t".into(), Replace),
+                ("app".into(), "u".into(), Replace)
+            ]
         );
         assert_eq!(
             d("DROP TABLE IF EXISTS a, `b`"),
-            vec![("app".into(), "a".into(), Replace), ("app".into(), "b".into(), Replace)]
+            vec![
+                ("app".into(), "a".into(), Replace),
+                ("app".into(), "b".into(), Replace)
+            ]
         );
-        assert_eq!(d("CREATE TABLE IF NOT EXISTS x (a int)"), vec![("app".into(), "x".into(), Replace)]);
-        assert_eq!(d("CREATE UNIQUE INDEX i ON x (a)"), vec![("app".into(), "x".into(), Reshape)]);
-        assert_eq!(d("DROP DATABASE shop"), vec![("shop".into(), "*".into(), Replace)]);
-        assert_eq!(d("/*!40000 TRUNCATE t */"), vec![("app".into(), "t".into(), Replace)]);
+        assert_eq!(
+            d("CREATE TABLE IF NOT EXISTS x (a int)"),
+            vec![("app".into(), "x".into(), Reshape)]
+        );
+        assert_eq!(
+            d("CREATE OR REPLACE TABLE x (a int)"),
+            vec![("app".into(), "x".into(), Replace)]
+        );
+        assert_eq!(
+            d("CREATE UNIQUE INDEX i ON x (a)"),
+            vec![("app".into(), "x".into(), Reshape)]
+        );
+        assert_eq!(
+            d("DROP DATABASE shop"),
+            vec![("shop".into(), "*".into(), Replace)]
+        );
+        assert_eq!(
+            d("/*!40000 TRUNCATE t */"),
+            vec![("app".into(), "t".into(), Replace)]
+        );
         assert!(d("GRANT SELECT ON *.* TO u").is_empty());
         assert!(d("CREATE DATABASE x").is_empty());
     }
