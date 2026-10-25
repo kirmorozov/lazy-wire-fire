@@ -140,8 +140,9 @@ old one, and an update is rendered for both, so a key that moved marks the old a
 A line referring to a NULL column marks nothing. Simple templates (text and `{{new.col}}`) skip
 Handlebars entirely; others get `old`, `new`, `row`, `op` and `table`.
 
-`keys_sql` runs at flush time, once per distinct set of parameters, after the changes are
-visible. It reads the current state: for a delete, rows already gone are not found (have a
+The same holds for `keys_sql`: `:old.<col>` and `:new.<col>` both bind the image being looked at,
+so an update runs the query with the old image and with the new one. `keys_sql` runs at flush
+time, once per distinct set of parameters, after the changes are visible. It reads the current state: for a delete, rows already gone are not found (have a
 trigger on that table too).
 
 ## Documents from path-named columns

@@ -371,6 +371,67 @@ async fn connect_wait(
     }
 }
 
+/// Amazon RDS (`@@basedir` under `rdsdbbin`) or Aurora (`@@aurora_version` exists).
+fn is_managed(basedir: Option<&str>, aurora: bool) -> bool {
+    aurora || basedir.is_some_and(|b| b.contains("rdsdbbin"))
+}
+
+/// What to say at startup on Amazon RDS / Aurora, from the binlog retention (`Ok(None)`: not
+/// set, `Err`: unreadable) and, on MySQL, `gtid_mode`. `true` marks a warning.
+fn managed_notes(
+    retention: &std::result::Result<Option<u64>, String>,
+    gtid_mode: Option<&str>,
+) -> Vec<(bool, String)> {
+    const FIX: &str = "Run once as the master user: CALL mysql.rds_set_configuration('binlog retention hours', 24);";
+    let mut out = Vec::new();
+    let consequence =
+        "after an outage longer than that lazywf cannot resume and runs every rule's reset steps";
+    match retention {
+        Ok(Some(h)) if *h >= 12 => {}
+        Ok(Some(h)) => out.push((true, format!("Amazon RDS / Aurora binlog retention is {h} hours; {consequence}. {FIX}"))),
+        Ok(None) => out.push((true, format!("Amazon RDS / Aurora binlog retention is not set (binlogs are purged within minutes); {consequence}. {FIX}"))),
+        Err(e) => out.push((true, format!("Amazon RDS / Aurora binlog retention could not be read ({e}); make sure it is at least 12 hours (CALL mysql.rds_show_configuration). {FIX}"))),
+    }
+    if gtid_mode.is_some_and(|g| !g.eq_ignore_ascii_case("ON")) {
+        out.push((false, "tip: gtid_mode=ON and enforce_gtid_consistency=ON in the DB parameter group (Aurora: the DB cluster parameter group) give lazywf an exact visibility fence; without GTIDs it waits LAZYWF_VISIBILITY_DELAY_MS before reading".into()));
+    }
+    out
+}
+
+/// Amazon RDS / Aurora purge binlogs within minutes by default, and without GTIDs the
+/// visibility fence falls back to a delay: both are said once at startup.
+async fn managed_service_checks(conn: &mut Conn, flavor: Flavor) {
+    let basedir: Option<String> = conn.query_first("SELECT @@basedir").await.unwrap_or(None);
+    let aurora: Option<String> = conn
+        .query_first("SELECT @@aurora_version")
+        .await
+        .unwrap_or(None);
+    if !is_managed(basedir.as_deref(), aurora.is_some()) {
+        return;
+    }
+    let retention = conn
+        .query_first::<Option<String>, _>(
+            "SELECT value FROM mysql.rds_configuration WHERE name = 'binlog retention hours'",
+        )
+        .await
+        .map(|v| v.flatten().and_then(|h| h.trim().parse::<u64>().ok()))
+        .map_err(|e| e.to_string());
+    let gtid: Option<String> = if flavor == Flavor::MySql {
+        conn.query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
+    for (warning, note) in managed_notes(&retention, gtid.as_deref()) {
+        if warning {
+            warn!("{note}");
+        } else {
+            info!("{note}");
+        }
+    }
+}
+
 async fn server_identity(conn: &mut Conn, flavor: Flavor) -> Result<String> {
     let q = match flavor {
         Flavor::MySql => "SELECT CAST(@@server_uuid AS CHAR)",
@@ -401,6 +462,7 @@ pub async fn run(
     }
     health.set_phase("starting");
     let info = binlog::server_info(&mut control).await?;
+    managed_service_checks(&mut control, info.flavor).await;
     let identity = server_identity(&mut control, info.flavor).await?;
     let lower: Option<i64> = control
         .query_first("SELECT @@lower_case_table_names")
@@ -2312,6 +2374,26 @@ async fn flush_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_service_notes() {
+        assert!(is_managed(Some("/rdsdbbin/mysql-8.4.8.R1/"), false));
+        assert!(is_managed(None, true));
+        assert!(!is_managed(Some("/usr/"), false));
+        let notes =
+            |r: std::result::Result<Option<u64>, String>, g: Option<&str>| managed_notes(&r, g);
+        assert!(notes(Ok(Some(24)), Some("ON")).is_empty());
+        let short = notes(Ok(Some(2)), Some("ON"));
+        assert!(short.len() == 1 && short[0].0 && short[0].1.contains("2 hours"));
+        assert!(notes(Ok(None), None)[0].1.contains("not set"));
+        assert!(notes(Err("denied".into()), None)[0]
+            .1
+            .contains("could not be read (denied)"));
+        let tip = notes(Ok(Some(48)), Some("OFF"));
+        assert!(tip.len() == 1 && !tip[0].0 && tip[0].1.contains("gtid_mode=ON"));
+        // MariaDB: no gtid_mode to read, no tip.
+        assert!(notes(Ok(Some(48)), None).is_empty());
+    }
 
     #[test]
     fn debounce_and_max_delay() {

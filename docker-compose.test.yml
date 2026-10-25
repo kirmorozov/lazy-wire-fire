@@ -10,7 +10,8 @@
 #   docker compose -f docker-compose.test.yml --profile varnish up -d --wait   # + Varnish (host network)
 #   make servers-down        # every profile, volumes included
 #
-# MySQL and Percona run with GTIDs on, MariaDB with its own (always on). Host ports: 341xx for
+# MySQL and Percona run with GTIDs on except MySQL 8.0 (off, as in RDS for MySQL's default
+# parameter group), MariaDB with its own (always on). Host ports: 341xx for
 # MySQL and MariaDB (34180 = 8.0, 34106 = 10.6, ...), 342xx for Percona and MySQL 26.x.
 name: lazywf-test
 
@@ -102,13 +103,13 @@ services:
 
   # ---- profile `matrix`: every other required line (make test-matrix, one at a time) -------
   # MySQL 8.0 is community EOL (final 8.0.46) but Amazon RDS (Extended Support until 2029-07-31)
-  # and Aurora MySQL 3 still run it.
+  # and Aurora MySQL 3 still run it. GTIDs off, as in RDS for MySQL's default parameter group: the
+  # one MySQL server that tests the file/position path and the LAZYWF_VISIBILITY_DELAY_MS fence.
   mysql80:
     image: mysql:8.0.46
     profiles: ["matrix"]
-    command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
-              "--binlog-row-metadata=FULL", "--max-connections=500", "--innodb-buffer-pool-size=128M",
-              "--performance-schema=OFF"]
+    command: ["--server-id=1", "--log-bin=binlog", "--binlog-row-metadata=FULL", "--max-connections=500",
+              "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
     environment: { MYSQL_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34180:3306"]
     healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }

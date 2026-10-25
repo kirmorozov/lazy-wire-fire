@@ -171,7 +171,8 @@ jobs:
         include:
           # Tiers (README "Supported servers"): LTS, GA and AWS-only block edge and releases;
           # pre-release is advisory.
-          - { title: MySQL 8.0.46, tier: AWS-only, service: mysql80, port: 34180, advisory: false }
+          # GTIDs off (RDS for MySQL's default): covers the LAZYWF_VISIBILITY_DELAY_MS fence.
+          - { title: MySQL 8.0.46, tier: "AWS-only, GTID off", service: mysql80, port: 34180, advisory: false }
           - { title: MySQL 9.7.4, tier: LTS, service: mysql97, port: 34197, advisory: false }
           - { title: MySQL 26.10.0, tier: GA, service: mysql2610, port: 34210, advisory: false }
           - { title: Percona 8.4.11-11, tier: LTS, service: percona84, port: 34284, advisory: false }

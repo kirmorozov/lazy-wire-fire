@@ -23,9 +23,11 @@ binlog ─► triggers mark keys ─► per rule: debounce, dedupe ─► select
 ## Quickstart
 
 lazywf creates its tables on start (`lazy_wire_fire_target`, `_rule`, `_trigger`, `_status`) in
-the schema of its DSN. The account needs `SELECT` on what the rules read, the usual DML on its
-own tables, and `REPLICATION SLAVE, REPLICATION CLIENT` (MariaDB: `BINLOG MONITOR` too). The
-binlog must be `ROW` with `binlog_row_image=FULL`.
+the schema of its DSN. The account needs `SELECT` on what the rules read, `SELECT, INSERT,
+UPDATE, DELETE, CREATE` on its own schema, and `REPLICATION SLAVE, REPLICATION CLIENT` (MariaDB:
+`BINLOG MONITOR` too), and no admin rights. The binlog must be `ROW` with
+`binlog_row_image=FULL`. Details, Amazon RDS and Aurora included:
+[server setup](docs/server-setup.md).
 
 ```sh
 LAZYWF_DSN=mysql://lazywf:secret@db:3306/app lazywf
@@ -155,29 +157,38 @@ and preview. The whole integration suite runs on each, one CI runner per server;
 pre-release blocks `edge` and releases. Builds are pinned exactly in
 [docker-compose.test.yml](docker-compose.test.yml) (the preview by digest).
 
-| product | line | tested build | tier | vendor support ends |
+| product | line | tested build | tier | vendor support ends (as of 2026-10-25) |
 |---|---|---|---|---|
-| MySQL | 8.0 | 8.0.46 (final) | AWS-only (RDS / Aurora 8.0), blocking | community: April 2026; RDS Extended Support: 2029-07-31 |
-| MySQL | 8.4 LTS | 8.4.13 | LTS, blocking | Premier Apr 2029, Extended Apr 2032 |
-| MySQL | 9.7 LTS | 9.7.4 | LTS, blocking | Premier Apr 2031, Extended Apr 2034 |
-| MySQL | 26.10 Innovation | 26.10.0 | GA, blocking | with the next Innovation release |
-| Percona Server | 8.4 LTS | 8.4.11-11 | LTS, blocking | active (upstream 8.4: Apr 2032) |
-| Percona Server | 9.7 LTS | 9.7.2-2 | LTS, blocking | active (upstream 9.7: Apr 2034) |
+| MySQL | 8.0 | 8.0.46 (final) | AWS-only (RDS / Aurora 8.0), GTID off, blocking | community: April 2026; RDS Extended Support: 2029-07-31; Aurora MySQL 3: standard 2028-04-30, Extended Support 2029-07-31 |
+| MySQL | 8.4 LTS | 8.4.13 | LTS, blocking | Premier 2029-04-30, Extended 2032-04-30 (third-party dates, from Oracle's 5 + 3 year rule) |
+| MySQL | 9.7 LTS | 9.7.4 | LTS, blocking | Premier 2031-04-30, Extended 2034-04-30 (third-party dates, from Oracle's 5 + 3 year rule) |
+| MySQL | 26.10 Innovation | 26.10.0 | GA, blocking | with the next Innovation release (no fixed date) |
+| Percona Server | 8.4 LTS | 8.4.11-11 | LTS, blocking | end of life 2032-04-30 (its table also lists 2029-04-30 under "extended support") |
+| Percona Server | 9.7 LTS | 9.7.2-2 | LTS, blocking | end of life 2034-04-21 (its table also lists 2031-04-21 under "extended support") |
 | MariaDB | 10.6 | 10.6.28 (final) | AWS-only (RDS), blocking until 2026-12-31 | community: 2026-07-06; RDS standard support: 2026-12-31 |
 | MariaDB | 10.11 LTS | 10.11.19 | LTS, blocking | 2028-02-16 |
 | MariaDB | 11.4 LTS | 11.4.13 | LTS, blocking | 2029-05-29 |
-| MariaDB | 11.8 LTS | 11.8.9 | LTS, blocking | 2028-06-04 (community) |
+| MariaDB | 11.8 LTS | 11.8.9 | LTS, blocking | 2028-06-04 |
 | MariaDB | 12.3 LTS | 12.3.3 | LTS, blocking | 2029-06-12 |
-| MariaDB | 13.0 rolling | 13.0.2 | GA, blocking | with the next rolling GA (13.1) |
-| MariaDB | 13.1 | 13.1.1 RC | pre-release, advisory | unsupported |
-| MariaDB | 13.2 | 13.2 Preview | pre-release, advisory | unsupported |
+| MariaDB | 13.0 rolling | 13.0.2 | GA, blocking | Q4 2026 |
+| MariaDB | 13.1 | 13.1.1 RC | pre-release, advisory | pre-release; GA date unknown (policy page: end of life Q1 2027) |
+| MariaDB | 13.2 | 13.2 Preview | pre-release, advisory | pre-release; unknown |
 
 Also supported: Amazon RDS for MySQL and MariaDB, and Aurora MySQL, on the lines above; setup in [docs/server-setup.md](docs/server-setup.md#amazon-rds-and-aurora).
+AWS offers only some of them: RDS for MySQL 8.4 and 8.0, RDS for MariaDB 10.6 to 12.3, Aurora
+MySQL 3 (8.0) and 8.4. Lifecycle pages: [MySQL](https://dev.mysql.com/doc/en/mysql-releases.html),
+[Percona](https://www.percona.com/services/policies/percona-software-support-lifecycle),
+[MariaDB](https://mariadb.org/about/),
+[RDS for MySQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/MySQL.Concepts.VersionMgmt.html),
+[RDS for MariaDB](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/MariaDB.Concepts.VersionMgmt.html),
+[Aurora MySQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraMySQLReleaseNotes/AuroraMySQL.release-calendars.html).
 
 MySQL and Percona publish no pre-release in a registry (MySQL early access ships as downloads
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
-its summary, and blocks nothing. MySQL and Percona run with GTIDs on. Dropped as end of life:
-Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after 2026-12-31.
+its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
+RDS for MySQL's default parameter group, so it also tests the `LAZYWF_VISIBILITY_DELAY_MS` fence.
+Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
+2026-12-31.
 
 Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7.4,
 Valkey 8.1, an S3 API (versitygw 1.10), MySQL and PostgreSQL 17 as SQL targets.
