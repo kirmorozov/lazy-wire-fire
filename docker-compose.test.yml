@@ -1,0 +1,44 @@
+# Servers for the integration tests (tests/e2e.rs). Ports bind to 127.0.0.1 only.
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   make test-e2e            # MySQL 8.4 (GTID), then MySQL 8.0 and MariaDB 10.11
+#   docker compose -f docker-compose.test.yml down -v
+name: lazywf-test
+
+services:
+  mysql84:
+    image: mysql:8.4.11
+    command: ["--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-bin=binlog",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    environment: { MYSQL_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34184:3306"]
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
+
+  mysql80:
+    image: mysql:8.0
+    command: ["--server-id=1", "--log-bin=binlog", "--binlog-row-metadata=FULL", "--max-connections=500",
+              "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    environment: { MYSQL_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34180:3306"]
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
+
+  mariadb1011:
+    image: mariadb:10.11.19
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34111:3306"]
+    healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "redispw", "--save", "", "--appendonly", "no"]
+    ports: ["127.0.0.1:34379:6379"]
+    healthcheck: { test: ["CMD", "redis-cli", "-a", "redispw", "ping"], interval: 2s, retries: 30 }
+
+  s3:
+    image: versity/versitygw:latest
+    command: ["--port", ":7070", "posix", "--nometa", "/data"]
+    environment: { ROOT_ACCESS_KEY: lazywfaccess, ROOT_SECRET_KEY: lazywfsecret }
+    tmpfs: ["/data"]
+    ports: ["127.0.0.1:34070:7070"]

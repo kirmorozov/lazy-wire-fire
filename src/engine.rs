@@ -506,7 +506,6 @@ impl Engine {
         if st.rule.def.reset_steps.is_empty() {
             warn!(rule = %name, "continuity lost ({reason}); the rule has no reset_steps, changes in between are not covered");
             st.reset_state = format!("missing: {reason}");
-            st.last_error = Some((format!("continuity lost ({reason}) and the rule has no reset_steps"), crate::time::unix_now_ms()));
             st.dirty = true;
         } else {
             self.start_reset(name, reason, false);

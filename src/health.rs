@@ -52,6 +52,11 @@ impl Health {
         self.with(|i| i.streaming = on);
     }
 
+    /// What `/readyz` answers 200 for.
+    pub fn is_ready(&self) -> bool {
+        self.with(|i| i.phase == "streaming" && i.streaming && i.beat.elapsed() < STALL)
+    }
+
     pub fn set_status(&self, status: Value) {
         self.with(|i| i.status = status);
     }
