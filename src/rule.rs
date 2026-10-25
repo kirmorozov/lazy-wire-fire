@@ -39,7 +39,7 @@ pub enum KeyTemplate {
 #[derive(Debug, Clone)]
 pub struct KeysSql {
     /// The statement with `?` placeholders.
-    pub sql: String,
+    pub sql: Arc<str>,
     /// Column of the image bound to each `?`.
     pub columns: Vec<String>,
 }
@@ -174,7 +174,10 @@ async fn compile_trigger(
             if !cols.iter().any(|c| c == "_key") {
                 bail!("trigger {} `keys_sql` returns no `_key` column", t.id);
             }
-            Some(KeysSql { sql, columns })
+            Some(KeysSql {
+                sql: sql.into(),
+                columns,
+            })
         }
     };
     Ok(Trigger {
@@ -252,7 +255,12 @@ pub async fn compile(
         tracing::debug!(rule = %def.name, "rule has no triggers");
     }
     Rule {
-        fingerprint: def.fingerprint(),
+        // A changed target (endpoints, kind) restarts a running reset like a changed rule.
+        fingerprint: format!(
+            "{}|{:?}",
+            def.fingerprint(),
+            target.as_ref().map(|t| &t.def)
+        ),
         def,
         templates,
         selects,

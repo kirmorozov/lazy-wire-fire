@@ -248,7 +248,10 @@ pub struct Engine {
     settled: Position,
     in_txn: bool,
     txn_foreign: bool,
+    /// GTID of the last transaction read (`None` when it had none: the fence then waits
+    /// another way).
     last_gtid: Option<String>,
+    txn_gtid: Option<String>,
     last_event_ts: u32,
     caught_up: bool,
     table_ids: HashMap<u64, Route>,
@@ -266,8 +269,12 @@ pub struct Engine {
     incarnations: u64,
     runs: u64,
     target_backoff: HashMap<String, Backoff>,
+    /// Tables whose binlog layout does not match (reported once).
+    mismatched: HashSet<(String, String)>,
+    column_warnings: HashSet<(String, u64, String)>,
     tx: mpsc::UnboundedSender<Done>,
     last_persist: Instant,
+    clear_retry: Option<Instant>,
     star_written: Option<(Position, Instant)>,
     render_warnings: u64,
 }
@@ -384,6 +391,7 @@ pub async fn run(
         in_txn: false,
         txn_foreign: false,
         last_gtid: None,
+        txn_gtid: None,
         last_event_ts: 0,
         caught_up: false,
         table_ids: HashMap::new(),
@@ -400,8 +408,11 @@ pub async fn run(
         incarnations: 0,
         runs: 0,
         target_backoff: HashMap::new(),
+        mismatched: HashSet::new(),
+        column_warnings: HashSet::new(),
         tx,
         last_persist: Instant::now(),
+        clear_retry: None,
         star_written: None,
         render_warnings: 0,
         cfg,
@@ -542,7 +553,7 @@ impl Engine {
                             n.clone(),
                             format!("binlog position {p} is no longer available"),
                         )),
-                        None => {}
+                        None => lost.push((n.clone(), "new rule".to_string())),
                     }
                 }
             }
@@ -553,6 +564,11 @@ impl Engine {
             .unwrap_or_else(|| current.clone());
         self.boundary = start.clone();
         self.settled = start.clone();
+        for st in self.rules.values_mut() {
+            if st.frozen_at.is_some() {
+                st.frozen_at = Some(start.clone());
+            }
+        }
         for (n, p) in rule_pos {
             if p > start {
                 if let Some(st) = self.rules.get_mut(&n) {
@@ -605,7 +621,7 @@ impl Engine {
             return;
         };
         if st.rule.def.reset_steps.is_empty() {
-            if requested {
+            if requested && st.reset.is_none() && st.rule.error.is_none() {
                 st.pending_clear = true;
             }
             return;
@@ -803,14 +819,15 @@ impl Engine {
         self.rules.insert(name.to_string(), st);
         if !initial {
             info!(rule = %name, "rule added");
-            // A rule that ran before and comes back missed what happened in between.
-            if let Some(p) = self.saved.get(name).and_then(|s| s.pos.clone()) {
-                if p < self.settled {
-                    self.lose_continuity(
-                        name,
-                        format!("enabled again, nothing was tracked since {p}"),
-                    );
-                }
+            // A new rule's target has no history; one that ran before and comes back missed
+            // what happened in between.
+            match self.saved.get(name).and_then(|s| s.pos.clone()) {
+                None => self.lose_continuity(name, "new rule".into()),
+                Some(p) if p < self.settled => self.lose_continuity(
+                    name,
+                    format!("enabled again, nothing was tracked since {p}"),
+                ),
+                Some(_) => {}
             }
         }
         if rule.def.reset_requested {
@@ -890,6 +907,7 @@ impl Engine {
         let mut backoff = Duration::from_millis(500);
         let mut pos = start;
         let mut item_failures = 0u32;
+        let mut failed_at: Option<Position> = None;
         let silence = (self.cfg.heartbeat * 3).max(Duration::from_secs(15));
         self.health.set_phase("streaming");
         'reconnect: loop {
@@ -954,6 +972,7 @@ impl Engine {
                                 self.caught_up = matches!(item, Item::Heartbeat);
                                 if let Err(e) = self.on_item(&reader, item).await {
                                     item_failures += 1;
+                                    failed_at = Some(self.boundary.clone());
                                     if item_failures >= 10 {
                                         return Err(e.context("processing binlog events keeps failing"));
                                     }
@@ -987,9 +1006,12 @@ impl Engine {
                 if quiet && !self.in_txn {
                     self.caught_up = true;
                 }
-                if !self.in_txn {
+                if failed_at.as_ref().is_some_and(|p| self.boundary > *p) {
                     item_failures = 0;
-                    self.schedule();
+                    failed_at = None;
+                }
+                self.schedule();
+                if !self.in_txn {
                     self.housekeeping().await?;
                 }
             }
@@ -1080,6 +1102,7 @@ impl Engine {
     fn end_txn(&mut self, pos: Position) -> Position {
         self.in_txn = false;
         self.table_ids.clear();
+        self.last_gtid = self.txn_gtid.take();
         if std::mem::take(&mut self.txn_foreign) {
             self.settled = pos.clone();
         }
@@ -1094,7 +1117,7 @@ impl Engine {
     async fn on_item(&mut self, reader: &BinlogReader, item: Item) -> Result<()> {
         match item {
             Item::Gtid { gtid } => {
-                self.last_gtid = Some(gtid);
+                self.txn_gtid = Some(gtid);
                 self.in_txn = true;
             }
             Item::TableMap {
@@ -1219,10 +1242,12 @@ impl Engine {
             .await
         {
             Ok(layout) => {
-                let triggers = list
+                self.mismatched.remove(&key);
+                let triggers: Vec<(String, Arc<Rule>, usize)> = list
                     .iter()
                     .filter_map(|(n, i)| self.rules.get(n).map(|s| (n.clone(), s.rule.clone(), *i)))
                     .collect();
+                self.check_columns(&layout, schema, table, &triggers);
                 Ok(Route::Watched(Arc::new(Watched {
                     layout,
                     table: format!("{schema}.{table}"),
@@ -1230,14 +1255,59 @@ impl Engine {
                 })))
             }
             Err(e) if e.downcast_ref::<LayoutMismatch>().is_some() => {
-                warn!("{e:#}");
                 self.catalog.invalidate(schema, table);
-                for (n, _) in list {
-                    self.lose_continuity(&n, format!("{e}"));
+                // Once per mismatch, not for every transaction read before the DDL.
+                if self.mismatched.insert(key) {
+                    warn!("{e:#}");
+                    for (n, _) in list {
+                        self.lose_continuity(&n, format!("{e}"));
+                    }
                 }
                 Ok(Route::Ignore)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Reports (once) trigger columns the table does not have: such a trigger marks nothing.
+    fn check_columns(
+        &mut self,
+        layout: &Layout,
+        schema: &str,
+        table: &str,
+        triggers: &[(String, Arc<Rule>, usize)],
+    ) {
+        for (name, rule, ti) in triggers {
+            let t = &rule.triggers[*ti];
+            let mut cols: Vec<&str> = t.def.changed_columns.iter().map(String::as_str).collect();
+            if let Some(KeyTemplate::Simple(lines)) = &t.key {
+                for seg in lines.iter().flatten() {
+                    if let template::Seg::Col(c) = seg {
+                        cols.push(c);
+                    }
+                }
+            }
+            if let Some(ks) = &t.keys_sql {
+                cols.extend(ks.columns.iter().map(String::as_str));
+            }
+            for c in cols {
+                if layout.index(c).is_some()
+                    || !self
+                        .column_warnings
+                        .insert((name.clone(), t.def.id, c.to_string()))
+                {
+                    continue;
+                }
+                let msg = format!(
+                    "trigger {}: `{schema}`.`{table}` has no column `{c}`",
+                    t.def.id
+                );
+                warn!(rule = %name, "{msg}");
+                if let Some(st) = self.rules.get_mut(name) {
+                    st.last_error = Some((msg, crate::time::unix_now_ms()));
+                    st.dirty = true;
+                }
+            }
         }
     }
 
@@ -1321,11 +1391,20 @@ impl Engine {
                                     .keys
                                     .extend(template::split_keys(&s).map(str::to_string)),
                                 Err(e) => {
+                                    // Reported on the rule, so a key that cannot be rendered
+                                    // does not pass unnoticed.
                                     self.render_warnings += 1;
                                     if self.render_warnings <= 10
                                         || self.render_warnings.is_multiple_of(1000)
                                     {
                                         warn!(rule = %name, "trigger {} key: {e:#}", t.def.id);
+                                    }
+                                    if let Some(st) = self.rules.get_mut(name) {
+                                        st.last_error = Some((
+                                            format!("trigger {} key: {e:#}", t.def.id),
+                                            crate::time::unix_now_ms(),
+                                        ));
+                                        st.dirty = true;
                                     }
                                 }
                             }
@@ -1344,6 +1423,7 @@ impl Engine {
                             .collect();
                         let q = KeyQuery {
                             trigger: t.def.id,
+                            sql: ks.sql.clone(),
                             params,
                         };
                         marks.queries.insert(q.id(), q);
@@ -1413,12 +1493,14 @@ impl Engine {
 
     fn next_wakeup(&self) -> Instant {
         let now = Instant::now();
-        let mut t = (self.last_persist + self.cfg.status_every).min(self.next_poll);
-        if self.in_txn {
-            return t.max(now + Duration::from_millis(5));
-        }
-        if let Some(d) = self.config_dirty {
-            t = t.min(d + Duration::from_millis(50));
+        let mut t = now + Duration::from_secs(3600);
+        if !self.in_txn {
+            t = t
+                .min(self.last_persist + self.cfg.status_every)
+                .min(self.next_poll);
+            if let Some(d) = self.config_dirty {
+                t = t.min(d);
+            }
         }
         for st in self.rules.values() {
             let blocked = st.backoff.blocked(now).max(
@@ -1481,13 +1563,13 @@ impl Engine {
             queries: queries.clone(),
         });
         let (rule, incarnation, name) = (st.rule.clone(), st.incarnation, name.to_string());
-        tokio::spawn(async move {
-            let outcome = flush_job(&env, &rule, spec, keys, queries).await;
-            let _ = tx.send(Done {
-                rule: name,
-                incarnation,
-                outcome,
-            });
+        let failed = Outcome::Flush {
+            fired: Fired::failed(keys.clone()),
+            keep_queries: true,
+            resolved: Vec::new(),
+        };
+        spawn_job(tx, name, incarnation, failed, async move {
+            flush_job(&env, &rule, spec, keys, queries).await
         });
     }
 
@@ -1537,15 +1619,15 @@ impl Engine {
                         run.phase = Phase::Waiting;
                         st.lane = Some(Lane::Reset);
                         let (rule, tx, rname) = (rule.clone(), tx.clone(), rname.clone());
-                        tokio::spawn(async move {
+                        let failed = Outcome::Reset {
+                            run: rid,
+                            fired: Fired::failed(Vec::new()),
+                        };
+                        spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                             let reset = json!({"step": rule.def.reset_steps[i].name, "keys": []});
                             let fired =
                                 action::fire_once(&rule, &rule::step_template(i), reset).await;
-                            let _ = tx.send(Done {
-                                rule: rname,
-                                incarnation,
-                                outcome: Outcome::Reset { run: rid, fired },
-                            });
+                            Outcome::Reset { run: rid, fired }
                         });
                         return;
                     }
@@ -1554,15 +1636,15 @@ impl Engine {
                         st.prep = true;
                         let (rule, env, tx, rname) =
                             (rule.clone(), env.clone(), tx.clone(), rname.clone());
-                        tokio::spawn(async move {
+                        let failed = Outcome::Snapshot {
+                            run: rid,
+                            keys: Err("internal error".into()),
+                        };
+                        spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                             let keys = action::snapshot_keys(&env, &rule)
                                 .await
                                 .map_err(|e| format!("{e:#}"));
-                            let _ = tx.send(Done {
-                                rule: rname,
-                                incarnation,
-                                outcome: Outcome::Snapshot { run: rid, keys },
-                            });
+                            Outcome::Snapshot { run: rid, keys }
                         });
                         return;
                     }
@@ -1572,15 +1654,15 @@ impl Engine {
                         st.prep = true;
                         let (rule, env, tx, rname) =
                             (rule.clone(), env.clone(), tx.clone(), rname.clone());
-                        tokio::spawn(async move {
+                        let failed = Outcome::Strays {
+                            run: rid,
+                            per_ep: Err("internal error".into()),
+                        };
+                        spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                             let per_ep = action::list_strays(&env, &rule, i)
                                 .await
                                 .map_err(|e| format!("{e:#}"));
-                            let _ = tx.send(Done {
-                                rule: rname,
-                                incarnation,
-                                outcome: Outcome::Strays { run: rid, per_ep },
-                            });
+                            Outcome::Strays { run: rid, per_ep }
                         });
                         return;
                     }
@@ -1609,7 +1691,11 @@ impl Engine {
                     st.lane = Some(Lane::Reset);
                     let (rule, env, tx, rname) =
                         (rule.clone(), env.clone(), tx.clone(), rname.clone());
-                    tokio::spawn(async move {
+                    let failed = Outcome::Reset {
+                        run: rid,
+                        fired: Fired::failed(Vec::new()),
+                    };
+                    spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                         let reset = json!({"step": rule.def.reset_steps[i].name, "keys": chunk});
                         let fired = action::fire_keys(
                             &env,
@@ -1620,11 +1706,7 @@ impl Engine {
                             None,
                         )
                         .await;
-                        let _ = tx.send(Done {
-                            rule: rname,
-                            incarnation,
-                            outcome: Outcome::Reset { run: rid, fired },
-                        });
+                        Outcome::Reset { run: rid, fired }
                     });
                     return;
                 }
@@ -1658,13 +1740,13 @@ impl Engine {
                     st.lane = Some(Lane::Reset);
                     let e = *ep;
                     let (rule, tx, rname) = (rule.clone(), tx.clone(), rname.clone());
-                    tokio::spawn(async move {
+                    let failed = Outcome::Reset {
+                        run: rid,
+                        fired: Fired::failed(Vec::new()),
+                    };
+                    spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                         let fired = action::fire_strays(&rule, i, e, chunk).await;
-                        let _ = tx.send(Done {
-                            rule: rname,
-                            incarnation,
-                            outcome: Outcome::Reset { run: rid, fired },
-                        });
+                        Outcome::Reset { run: rid, fired }
                     });
                     return;
                 }
@@ -1838,12 +1920,15 @@ impl Engine {
 
     async fn housekeeping(&mut self) -> Result<()> {
         let now = Instant::now();
-        let clears: Vec<String> = self
-            .rules
-            .iter()
-            .filter(|(_, s)| s.pending_clear)
-            .map(|(n, _)| n.clone())
-            .collect();
+        let clears: Vec<String> = if self.clear_retry.is_some_and(|t| now < t) {
+            Vec::new()
+        } else {
+            self.rules
+                .iter()
+                .filter(|(_, s)| s.pending_clear)
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
         for n in clears {
             match self
                 .control
@@ -1859,14 +1944,13 @@ impl Engine {
                     }
                 }
                 Err(e) => {
-                    warn!(rule = %n, "clearing reset_requested: {e}");
+                    warn!(rule = %n, "clearing reset_requested: {e}; retrying in 5 s");
+                    self.clear_retry = Some(now + Duration::from_secs(5));
                     self.heal_control().await?;
                 }
             }
         }
-        let dirty = self
-            .config_dirty
-            .is_some_and(|t| now >= t + Duration::from_millis(50));
+        let dirty = self.config_dirty.is_some_and(|t| now >= t);
         if dirty || now >= self.next_poll {
             if dirty {
                 // The change was read from the binlog: wait until it is visible.
@@ -2008,6 +2092,31 @@ impl Engine {
     }
 }
 
+/// Runs a job on its own task; if it panics, a failure is still reported, so the rule's lane
+/// is never left taken.
+fn spawn_job(
+    tx: mpsc::UnboundedSender<Done>,
+    rule: String,
+    incarnation: u64,
+    failed: Outcome,
+    job: impl std::future::Future<Output = Outcome> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let outcome = match tokio::spawn(job).await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(rule = %rule, "job failed unexpectedly: {e}");
+                failed
+            }
+        };
+        let _ = tx.send(Done {
+            rule,
+            incarnation,
+            outcome,
+        });
+    });
+}
+
 fn merge_marks(into: &mut Marks, m: Marks) {
     into.keys.extend(m.keys);
     into.queries.extend(m.queries);
@@ -2040,7 +2149,7 @@ async fn flush_job(
     }
     let mut resolved = Vec::new();
     if !queries.is_empty() {
-        match action::resolve_keys(env, rule, &queries).await {
+        match action::resolve_keys(env, &queries).await {
             Ok(found) => {
                 let mut seen: HashSet<String> = keys.iter().cloned().collect();
                 for k in found {

@@ -116,16 +116,23 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
     Ok(())
 }
 
-/// A trigger's `keys_sql` with the values of one row image.
+/// A trigger's `keys_sql` with the values of one row image. It carries the statement it was
+/// marked with, so a trigger edited or removed before the flush does not strand or drop it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyQuery {
     pub trigger: u64,
+    pub sql: Arc<str>,
     pub params: Vec<Value>,
 }
 
 impl KeyQuery {
     pub fn id(&self) -> String {
-        format!("{}:{}", self.trigger, Value::Array(self.params.clone()))
+        format!(
+            "{}:{}:{}",
+            self.trigger,
+            self.sql,
+            Value::Array(self.params.clone())
+        )
     }
 }
 
@@ -163,27 +170,18 @@ fn keys_of(rows: Vec<Row>) -> Vec<String> {
 }
 
 /// Runs the key queries of a flush; returns the keys they found.
-pub async fn resolve_keys(env: &Env, rule: &Rule, queries: &[KeyQuery]) -> Result<Vec<String>> {
-    let by_id: HashMap<u64, &rule::KeysSql> = rule
-        .triggers
-        .iter()
-        .filter_map(|t| t.keys_sql.as_ref().map(|k| (t.def.id, k)))
-        .collect();
+pub async fn resolve_keys(env: &Env, queries: &[KeyQuery]) -> Result<Vec<String>> {
     // Futures collected first: closures inside stream combinators trip `Send` inference.
     let futs: Vec<_> = queries
         .iter()
-        .map(|q| {
-            let ks = by_id.get(&q.trigger).copied();
-            async move {
-                let Some(ks) = ks else { return Ok(Vec::new()) };
-                let mut conn = env.pool.get_conn().await?;
-                let params: Vec<My> = q.params.iter().map(to_param).collect();
-                let rows: Vec<Row> = conn
-                    .exec(ks.sql.as_str(), Params::Positional(params))
-                    .await
-                    .with_context(|| format!("trigger {} keys_sql", q.trigger))?;
-                Ok::<_, anyhow::Error>(keys_of(rows))
-            }
+        .map(|q| async move {
+            let mut conn = env.pool.get_conn().await?;
+            let params: Vec<My> = q.params.iter().map(to_param).collect();
+            let rows: Vec<Row> = conn
+                .exec(&*q.sql, Params::Positional(params))
+                .await
+                .with_context(|| format!("trigger {} keys_sql", q.trigger))?;
+            Ok::<_, anyhow::Error>(keys_of(rows))
         })
         .collect();
     let lists: Vec<Vec<String>> = stream::iter(futs).buffer_unordered(8).try_collect().await?;
@@ -284,7 +282,8 @@ pub fn context(
 ) -> Value {
     json!({
         "keys": keys,
-        "docs": docs.iter().map(Doc::to_json).collect::<Vec<_>>(),
+        // The contract: `docs` is empty when the rule has no selects (the keys are the data).
+        "docs": if rule.selects.is_empty() { Vec::new() } else { docs.iter().map(Doc::to_json).collect::<Vec<_>>() },
         "rule": rule.name(),
         "target": target.ctx,
         "vars": Value::Object(rule.def.vars.clone()),
@@ -305,6 +304,17 @@ pub struct Fired {
     /// the templates.
     pub target_error: bool,
     pub select_time: Duration,
+}
+
+impl Fired {
+    /// A job that ended without a result: all its keys stay pending.
+    pub fn failed(keys: Vec<String>) -> Fired {
+        Fired {
+            error: Some("internal error (see the log)".into()),
+            failed_keys: keys,
+            ..Default::default()
+        }
+    }
 }
 
 /// Sends one action (rendered per endpoint) to every endpoint.
@@ -659,6 +669,14 @@ pub async fn fire_strays(rule: &Rule, step: usize, ep: usize, keys: Vec<String>)
     let group = rule.group_size().max(1);
     let all = keys;
     let mut done = 0;
+    if ep >= target.endpoints.len() {
+        f.error = Some(format!(
+            "endpoint {ep} of target `{}` is gone",
+            target.def.name
+        ));
+        f.failed_keys = all;
+        return f;
+    }
     for chunk in all.chunks(group) {
         let docs: Vec<Doc> = chunk
             .iter()
