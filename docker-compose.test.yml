@@ -92,12 +92,14 @@ services:
     ports: ["127.0.0.1:34207:9200"]
     healthcheck: { test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"], interval: 3s, retries: 80 }
 
-  # Listens on 127.0.0.1:34681; its backend is the test's HTTP server on 127.0.0.1:34682.
+  # Listens on 127.0.0.1:34681 only; its backend is the test's HTTP server on 127.0.0.1:34682.
+  # varnishd as the first argument: with flags only, the image's entrypoint also binds :80 and
+  # :8443 on the host network (refused for its unprivileged user on a stock Linux host).
   varnish:
     image: varnish:7.6
     profiles: ["varnish"]
     network_mode: host
-    command: ["-a", "127.0.0.1:34681", "-f", "/etc/varnish/default.vcl", "-s", "malloc,64m"]
+    command: ["varnishd", "-F", "-a", "127.0.0.1:34681", "-f", "/etc/varnish/default.vcl", "-s", "malloc,64m"]
     volumes: ["./docker/varnish/default.vcl:/etc/varnish/default.vcl:ro"]
 
   # The latest LTS and the latest GA of each product (make test-matrix runs them one by one).
