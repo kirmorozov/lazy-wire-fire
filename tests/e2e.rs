@@ -823,3 +823,38 @@ async fn a_second_copy_stands_by_and_takes_over() {
     .await;
     b.stop().await;
 }
+
+/// `cargo test --test e2e throughput -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn throughput() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "bulk").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false}"#.into()));
+    order_rule(&db, &mock).await;
+    db.exec("UPDATE lazy_wire_fire_rule SET batch_max_keys = 1000 WHERE name = 'orders'")
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let n = 50_000;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    let t0 = std::time::Instant::now();
+    db.exec(&format!(
+        "INSERT INTO orders WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 999) \
+         SELECT a.i * 1000 + b.i + 1, 1, 'new', b.i FROM s a, s b WHERE a.i < {}",
+        n / 1000
+    ))
+    .await;
+    let written = t0.elapsed();
+    wait_for(Duration::from_secs(120), "every order", || async {
+        (last_docs(&mock.requests()).len() >= n).then_some(())
+    })
+    .await;
+    let total = t0.elapsed();
+    eprintln!(
+        "{n} rows in one transaction: written in {written:?}, all fired after {total:?} ({} requests)",
+        mock.requests().len()
+    );
+    inst.stop().await;
+}
