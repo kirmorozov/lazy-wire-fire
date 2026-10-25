@@ -51,8 +51,9 @@ Identity), EC2 instance metadata. The template renders paths inside the bucket
 Redis error replies always fail. Examples: `2xx and errors == false`, `200, 204`. SQL targets
 check `affected_rows`: `affected_rows != 0`.
 
-**SQL targets** (`mysql`, `pgsql`) {#sql-targets}: the template renders one SQL statement, run on
-the target database (a statement followed by another is refused; PostgreSQL runs it through the
+### SQL targets
+
+`mysql` and `pgsql`: the template renders one SQL statement, run on the target database (a statement followed by another is refused; PostgreSQL runs it through the
 extended protocol, which refuses batches too). Each connect pins the session so quoting is sound:
 MySQL `SET NAMES utf8mb4` with backslash escapes on, PostgreSQL UTF-8 with
 `standard_conforming_strings`. Put values in with `sql_quote` (a string literal of the target's
