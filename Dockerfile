@@ -7,8 +7,12 @@
 #
 #   docker buildx build -t lazywf --load .
 #   docker run --rm lazywf --version
+#
+# Base images are pinned by their multi-arch index digest (the tag is for readability; with
+# tag@digest the digest wins). The FROM lines are literal so Dependabot can bump them;
+# `make image-digests` prints the current digests. CI publishes ghcr.io/kirmorozov/lazy-wire-fire.
 
-FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-bookworm AS toolchain
+FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-bookworm@sha256:86234e857a413004348b471d11a4ebe1aa92d2eae2b6b143cac68fd1ac3c48be AS toolchain
 ARG ZIG_VERSION=0.17.0
 ARG CARGO_ZIGBUILD_VERSION=0.23.4
 ARG BUILDARCH
@@ -34,7 +38,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM toolchain AS builder
 ARG TARGETARCH
-# Builds share hosts; raise with --build-arg CARGO_BUILD_JOBS=… where that is fine.
+# SBOM attestations (`--sbom=true`) also scan this stage, so the crates of Cargo.lock are listed
+# next to the distroless Debian packages.
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
+# Builds share hosts; raise with --build-arg CARGO_BUILD_JOBS=… where that is fine (CI does).
 ARG CARGO_BUILD_JOBS=4
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 RUN set -eux; \
@@ -61,10 +68,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo zigbuild --release --locked --target "${t}"; \
     mkdir -p /out; cp "target/${t}/release/lazywf" /out/lazywf
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
+# Set by CI (docker/metadata-action sets the same labels and annotations on what it pushes).
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG CREATED=
+ARG SOURCE=https://github.com/kirmorozov/lazy-wire-fire
 LABEL org.opencontainers.image.title="lazywf" \
-      org.opencontainers.image.description="Change-triggered actions from the MySQL binlog" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.description="Change-triggered actions from the MySQL binlog: HTTP, Redis and SQL targets" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.url="${SOURCE}" \
+      org.opencontainers.image.documentation="${SOURCE}#readme" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.base.name="gcr.io/distroless/static-debian12:nonroot"
 COPY --from=builder --chown=0:0 --chmod=0555 /out/lazywf /lazywf
 USER 65532:65532
 # The health endpoint listens on 127.0.0.1:8081 by default (LAZYWF_HEALTH_ADDR); set
