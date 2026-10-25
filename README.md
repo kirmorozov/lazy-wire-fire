@@ -159,7 +159,7 @@ pre-release blocks `edge` and releases. Builds are pinned exactly in
 
 | product | line | tested build | tier | vendor support ends (as of 2026-10-25) |
 |---|---|---|---|---|
-| MySQL | 8.0 | 8.0.46 (final) | AWS-only (RDS / Aurora 8.0), blocking | community: April 2026; RDS Extended Support: 2029-07-31; Aurora MySQL 3: standard 2028-04-30, Extended Support 2029-07-31 |
+| MySQL | 8.0 | 8.0.46 (final) | AWS-only (RDS / Aurora 8.0), GTID off, blocking | community: April 2026; RDS Extended Support: 2029-07-31; Aurora MySQL 3: standard 2028-04-30, Extended Support 2029-07-31 |
 | MySQL | 8.4 LTS | 8.4.13 | LTS, blocking | Premier 2029-04-30, Extended 2032-04-30 (third-party dates, from Oracle's 5 + 3 year rule) |
 | MySQL | 9.7 LTS | 9.7.4 | LTS, blocking | Premier 2031-04-30, Extended 2034-04-30 (third-party dates, from Oracle's 5 + 3 year rule) |
 | MySQL | 26.10 Innovation | 26.10.0 | GA, blocking | with the next Innovation release (no fixed date) |
@@ -185,8 +185,10 @@ MySQL 3 (8.0) and 8.4. Lifecycle pages: [MySQL](https://dev.mysql.com/doc/en/mys
 
 MySQL and Percona publish no pre-release in a registry (MySQL early access ships as downloads
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
-its summary, and blocks nothing. MySQL and Percona run with GTIDs on. Dropped as end of life:
-Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after 2026-12-31.
+its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
+RDS for MySQL's default parameter group, so it also tests the `LAZYWF_VISIBILITY_DELAY_MS` fence.
+Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
+2026-12-31.
 
 Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7.4,
 Valkey 8.1, an S3 API (versitygw 1.10), MySQL and PostgreSQL 17 as SQL targets.
