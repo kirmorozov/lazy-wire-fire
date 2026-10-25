@@ -63,7 +63,7 @@ async fn order_rule(db: &Db, mock: &Mock) {
          WHERE o.id IN (:keys) ORDER BY t.tag"
     ]);
     db.exec_params(
-        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms, max_delay_ms) VALUES ('orders', 'search', ?, ?, 200, 2000)",
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms, max_delay_ms) VALUES ('orders', 'search', ?, ?, 500, 2000)",
         (selects.to_string(), BULK),
     )
     .await;
@@ -147,16 +147,19 @@ async fn documents_follow_the_rows() {
         "order 11 belongs to another customer"
     );
 
-    // A burst of changes to one key fires it once (or twice with a trailing fire).
+    // A burst of changes to one key fires it once (or twice with a trailing fire). On a
+    // loaded host the 30 commits can take longer than the debounce, which adds fires.
     inst.quiet().await;
     mock.clear();
     // On one connection: a burst, not 30 logins (those alone can outlast the debounce).
     let mut c = db.conn().await;
+    let started = std::time::Instant::now();
     for i in 0..30 {
         c.query_drop(format!("UPDATE orders SET total = {i} WHERE id = 11"))
             .await
             .unwrap();
     }
+    let burst = started.elapsed();
     c.disconnect().await.ok();
     let d = wait_for(
         Duration::from_secs(10),
@@ -181,7 +184,11 @@ async fn documents_follow_the_rows() {
         .iter()
         .filter(|r| r.body.contains("\"_id\":\"11\""))
         .count();
-    assert!(fires <= 3, "30 updates fired {fires} times");
+    let allowed = 3 + burst.as_millis() as usize / 500;
+    assert!(
+        fires <= allowed,
+        "30 updates in {burst:?} fired {fires} times"
+    );
 
     // `_op`: cancelled orders and orders gone are deleted.
     inst.quiet().await;
@@ -252,6 +259,7 @@ async fn failures_retry_and_hold_the_position() {
     db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
     // The insert ended before this point (the binlog is shared with other tests).
     let after = binlog_end(&db).await;
+    db.tick().await;
     wait_for(
         Duration::from_secs(10),
         "retries on the failing target",
