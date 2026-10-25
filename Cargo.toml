@@ -2,7 +2,7 @@
 name = "lazy-wire-fire"
 version = "0.1.0"
 edition = "2021"
-description = "Change-triggered actions from the MySQL binlog: rows change, keys are marked, queries render one action per batch and fire it at HTTP or Redis targets"
+description = "Change-triggered actions from the MySQL binlog: rows change, keys are marked, queries render one action per batch and fire it at HTTP, Redis or SQL targets"
 license = "MIT"
 publish = false
 

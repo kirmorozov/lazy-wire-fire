@@ -1,7 +1,7 @@
 //! Sets of keys, compact for the usual shapes: a key that is an integer (`42`) or a prefix and
 //! an integer (`cat_p_42`) lives in a 64-bit roaring bitmap of its prefix, like lazyview's unit
-//! sets; any other key in an ordered set. A million product ids take a few MB, not 60 MB of
-//! strings.
+//! sets; any other key in an ordered set. A million consecutive ids take under 300 KB, not
+//! 60 MB of strings.
 //!
 //! Only canonical integers go into bitmaps (no leading zeros, up to `u64::MAX`), so a key reads
 //! back exactly as written. Iteration: prefixes in order, numbers ascending, then the other keys

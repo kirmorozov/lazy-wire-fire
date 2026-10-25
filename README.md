@@ -13,7 +13,7 @@ binlog as a replica, so the source tables are never locked or polled.
 ```
 binlog ─► triggers mark keys ─► per rule: debounce, dedupe ─► selects (concurrent) ─► docs
                                                                       │
-                     lazy_wire_fire_status ◄── confirmed ◄── expect ◄─┴─► template ─► HTTP / Redis
+                     lazy_wire_fire_status ◄── confirmed ◄── expect ◄─┴─► template ─► HTTP / Redis / SQL
 ```
 
 ## Quickstart
@@ -67,12 +67,12 @@ export, reset steps, in [docs/reference.md](docs/reference.md#examples).
 | guarantee | how |
 |---|---|
 | after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, else `LAZYWF_VISIBILITY_DELAY_MS`) |
-| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `cat_p_42`) live in 64-bit roaring bitmaps, as in lazyview: a million product ids take a few MB |
+| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `cat_p_42`) live in 64-bit roaring bitmaps, as in lazyview: a million consecutive ids take under 300 KB |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
 | at least once | a rule's position in `lazy_wire_fire_status` only passes changes whose actions met `expect` on every endpoint. After a restart the stream resumes from the lowest position; rules ahead skip what they confirmed |
 | failure | retry with backoff (0.5 s doubling, up to `LAZYWF_MAX_BACKOFF_MS`), the keys stay pending. Other rules and targets keep going |
-| lost continuity | first start, a purged binlog, another server, a re-enabled rule, a watched table replaced without row events (`TRUNCATE`, `RENAME` onto it, `DROP`): the rule's `reset_steps` run once in the background while streaming continues. Rules without them are reported in `reset_state` |
+| lost continuity | first start, a purged binlog, another server, a new or re-enabled rule, a watched table replaced without row events (`TRUNCATE`, `RENAME` onto it, `DROP`): the rule's `reset_steps` run once in the background while streaming continues. Rules without them are reported in `reset_state` |
 
 The status table holds only what a restart needs: per rule (and `*` for the instance) the
 confirmed binlog position, lag, reset state and the last error, written every few seconds when it
