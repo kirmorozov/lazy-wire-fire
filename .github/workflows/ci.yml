@@ -9,7 +9,7 @@ name: ci
 #                MariaDB 12.3 / 13.0
 #   search       make test-e2e-search: OpenSearch 2.19, Elasticsearch 7.17 and 8.17
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
-#                make docker-smoke on both, make docker-e2e on amd64
+#                make docker-smoke on both, then make docker-e2e on amd64
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
 #
 # Images go to ghcr.io/kirmorozov/lazy-wire-fire (publish-image.yml) only for pushes:
@@ -331,9 +331,6 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} but the binary reports '${got}': bump the version in Cargo.toml"
             exit 1
           fi
-      - name: make docker-e2e (linux/amd64 against MySQL 8.4 and Redis)
-        timeout-minutes: 10
-        run: make docker-e2e IMAGE="$AMD64_IMAGE"
 
       - name: build linux/arm64
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -355,6 +352,10 @@ jobs:
         run: |
           test "$(docker image inspect "$ARM64_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
           make docker-smoke IMAGE="$ARM64_IMAGE"
+      # Last, so that a failure here does not hide (or skip) the arm64 build and its smoke test.
+      - name: make docker-e2e (linux/amd64 against MySQL 8.4 and Redis)
+        timeout-minutes: 10
+        run: make docker-e2e IMAGE="$AMD64_IMAGE"
       - name: summary
         if: always()
         run: |
