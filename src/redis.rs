@@ -287,12 +287,14 @@ impl Client {
 
     async fn open(&self, timeout: Duration) -> Result<Conn> {
         let mut c = Conn { stream: self.connector.connect(timeout).await?, buf: Vec::new(), pos: 0 };
+        // Credentials are references or literals, resolved at every connect (secrets rotate).
         if let Some(pw) = &self.password {
+            let pw = crate::secrets::resolve(pw).context("redis password")?;
             let mut args = vec![b"AUTH".to_vec()];
             if let Some(u) = &self.username {
-                args.push(u.as_bytes().to_vec());
+                args.push(crate::secrets::resolve(u).context("redis username")?.into_bytes());
             }
-            args.push(pw.as_bytes().to_vec());
+            args.push(pw.into_bytes());
             if let Some(e) = c.call(&args).await?.error() {
                 bail!("AUTH failed: {e}");
             }

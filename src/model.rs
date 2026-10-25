@@ -66,21 +66,10 @@ pub const DDL: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS `lazy_wire_fire_status` (
   `instance` VARCHAR(64) NOT NULL,
   `rule` VARCHAR(191) NOT NULL,
-  `state` VARCHAR(32) NOT NULL DEFAULT '',
   `binlog_file` VARCHAR(255) NOT NULL DEFAULT '',
   `binlog_pos` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `lag_ms` BIGINT UNSIGNED NULL,
-  `pending_keys` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `events_seen` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `keys_marked` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `keys_fired` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `select_ms` BIGINT UNSIGNED NULL,
-  `select_ms_total` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `actions_fired` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `actions_failed` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  `reset_state` VARCHAR(16) NOT NULL DEFAULT 'none',
-  `reset_reason` VARCHAR(255) NULL,
-  `reset_detail` VARCHAR(255) NULL,
+  `reset_state` VARCHAR(255) NOT NULL DEFAULT '',
   `last_error` TEXT NULL,
   `last_error_at` DATETIME(3) NULL,
   `server_identity` VARCHAR(255) NULL,
@@ -421,6 +410,27 @@ impl RuleDef {
             bail!("`for_each` reset steps need `snapshot_keys_sql`");
         }
         Ok(rule)
+    }
+
+    /// Stand-in for a row that does not parse: it fires nothing, but its triggers still mark
+    /// keys, so none are lost while the row is being fixed.
+    pub fn placeholder(r: &RawRule) -> RuleDef {
+        RuleDef {
+            name: r.name.clone(),
+            enabled: r.enabled,
+            target: r.target.clone().unwrap_or_default(),
+            selects: Vec::new(),
+            snapshot_keys_sql: None,
+            template: String::new(),
+            fire_per: FirePer::Batch,
+            batch_max_keys: None,
+            batch_max_bytes: None,
+            debounce: Duration::from_millis(r.debounce_ms.unwrap_or(1000)),
+            max_delay: Duration::from_millis(r.max_delay_ms.unwrap_or(5000).max(1)),
+            reset_steps: Vec::new(),
+            reset_requested: false,
+            vars: Map::new(),
+        }
     }
 
     /// Everything but the switches: two rules with the same fingerprint fire the same actions.

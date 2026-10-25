@@ -86,7 +86,7 @@ impl Config {
             pool_size: num("LAZYWF_POOL_SIZE", 16)?.max(2) as usize,
             send_concurrency: num("LAZYWF_SEND_CONCURRENCY", 16)?.max(1) as usize,
             config_poll: ms("LAZYWF_CONFIG_POLL_MS", 30_000)?.max(Duration::from_millis(200)),
-            status_every: ms("LAZYWF_STATUS_MS", 1_000)?.max(Duration::from_millis(100)),
+            status_every: ms("LAZYWF_STATUS_MS", 5_000)?.max(Duration::from_millis(100)),
             max_backoff: ms("LAZYWF_MAX_BACKOFF_MS", 60_000)?.max(Duration::from_millis(100)),
             stop_grace: ms("LAZYWF_STOP_GRACE_MS", 10_000)?,
         })
