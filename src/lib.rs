@@ -12,6 +12,7 @@ pub mod engine;
 pub mod expect;
 pub mod health;
 pub mod http;
+pub mod keyset;
 pub mod lock;
 pub mod model;
 pub mod path;

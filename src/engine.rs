@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use indexmap::{IndexMap, IndexSet};
+
+use crate::keyset::KeySet;
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
@@ -71,7 +73,7 @@ impl Backoff {
 /// Keys one transaction marked for one rule.
 #[derive(Debug, Default)]
 struct Marks {
-    keys: IndexSet<String>,
+    keys: KeySet,
     queries: IndexMap<String, KeyQuery>,
     rows: u64,
 }
@@ -79,7 +81,7 @@ struct Marks {
 /// Marked keys waiting for their flush.
 #[derive(Debug, Default)]
 struct Buffer {
-    keys: IndexSet<String>,
+    keys: KeySet,
     /// `keys_sql` to run at flush time, deduplicated by parameters.
     queries: IndexMap<String, KeyQuery>,
     /// Stream position before the oldest transaction that marked something here.
@@ -118,7 +120,8 @@ enum Lane {
         since: Option<Position>,
         since_ts: u32,
         first: Option<Instant>,
-        keys: Vec<String>,
+        /// Keys of this flush that have strikes.
+        struck: Vec<String>,
         queries: Vec<KeyQuery>,
     },
     Reset,
@@ -131,14 +134,18 @@ enum Phase {
     Start,
     /// A job of this step is running.
     Waiting,
+    /// Snapshot keys still to send; `batch` is in flight (kept until confirmed).
     Batches {
-        keys: Vec<String>,
-        offset: usize,
+        keys: KeySet,
+        total: u64,
+        done: u64,
+        batch: Option<Vec<String>>,
     },
     Strays {
-        per_ep: Vec<Vec<String>>,
+        per_ep: Vec<KeySet>,
         ep: usize,
-        offset: usize,
+        done: u64,
+        batch: Option<Vec<String>>,
     },
 }
 
@@ -149,10 +156,8 @@ struct ResetRun {
     fingerprint: String,
     step: usize,
     phase: Phase,
-    /// Keys covered by the batch in flight.
-    sending: usize,
     /// Keys marked since the current stray step began (never deleted as strays).
-    touched: Option<HashSet<String>>,
+    touched: Option<KeySet>,
     backoff: Backoff,
 }
 
@@ -241,11 +246,11 @@ enum Outcome {
     },
     Snapshot {
         run: u64,
-        keys: Result<Vec<String>, String>,
+        keys: Result<KeySet, String>,
     },
     Strays {
         run: u64,
-        per_ep: Result<Vec<Vec<String>>, String>,
+        per_ep: Result<Vec<KeySet>, String>,
     },
 }
 
@@ -683,7 +688,6 @@ impl Engine {
             fingerprint: st.rule.fingerprint.clone(),
             step: 0,
             phase: Phase::Start,
-            sending: 0,
             touched: None,
             backoff: Backoff::default(),
         });
@@ -1427,7 +1431,7 @@ impl Engine {
                                 }
                                 let k = k.trim();
                                 if template::valid_key(k) {
-                                    marks.keys.insert(k.to_string());
+                                    marks.keys.insert(k);
                                 } else if !k.is_empty() {
                                     invalid.push((name.clone(), t.def.id, k.to_string()));
                                 }
@@ -1443,7 +1447,7 @@ impl Engine {
                                     Ok(s) => {
                                         let k = s.trim();
                                         if template::valid_key(k) {
-                                            marks.keys.insert(k.to_string());
+                                            marks.keys.insert(k);
                                         } else if !k.is_empty() {
                                             invalid.push((name.clone(), t.def.id, k.to_string()));
                                         }
@@ -1522,7 +1526,7 @@ impl Engine {
                 continue;
             }
             if let Some(t) = st.reset.as_mut().and_then(|r| r.touched.as_mut()) {
-                t.extend(m.keys.iter().cloned());
+                t.extend(m.keys.clone());
             }
             st.buffer.keys.extend(m.keys);
             st.buffer.queries.extend(m.queries);
@@ -1627,13 +1631,22 @@ impl Engine {
         let (env, tx) = (self.env.clone(), self.tx.clone());
         let st = self.rules.get_mut(name).expect("present");
         let buf = std::mem::take(&mut st.buffer);
-        let keys: Vec<String> = buf.keys.into_iter().collect();
+        let keys: Vec<String> = buf.keys.into_vec();
         let queries: Vec<KeyQuery> = buf.queries.into_values().collect();
+        // Only the keys with strikes are remembered (to clear them once confirmed).
+        let struck = if st.strikes.is_empty() {
+            Vec::new()
+        } else {
+            keys.iter()
+                .filter(|k| st.strikes.contains_key(*k))
+                .cloned()
+                .collect()
+        };
         st.lane = Some(Lane::Flush {
             since: buf.since,
             since_ts: buf.since_ts,
             first: buf.first,
-            keys: keys.clone(),
+            struck,
             queries: queries.clone(),
         });
         let (rule, incarnation, name) = (st.rule.clone(), st.incarnation, name.to_string());
@@ -1724,7 +1737,7 @@ impl Engine {
                     }
                     StepKind::Stray { .. } => {
                         run.phase = Phase::Waiting;
-                        run.touched = Some(HashSet::new());
+                        run.touched = Some(KeySet::new());
                         st.prep = true;
                         let (rule, env, tx, rname) =
                             (rule.clone(), env.clone(), tx.clone(), rname.clone());
@@ -1741,27 +1754,34 @@ impl Engine {
                         return;
                     }
                 },
-                Phase::Batches { keys, offset } => {
-                    if *offset >= keys.len() {
-                        run.step += 1;
-                        run.phase = Phase::Start;
-                        continue;
+                Phase::Batches {
+                    keys,
+                    total,
+                    done,
+                    batch: pending,
+                } => {
+                    if pending.is_none() {
+                        let next = keys.take(batch);
+                        if next.is_empty() {
+                            run.step += 1;
+                            run.phase = Phase::Start;
+                            continue;
+                        }
+                        *pending = Some(next);
                     }
                     if !lane_free {
                         return;
                     }
-                    let end = (*offset + batch).min(keys.len());
-                    let chunk = keys[*offset..end].to_vec();
+                    let chunk = pending.clone().expect("set above");
                     st.reset_state = format!(
                         "running: step {}/{} {}: {}/{} keys: {}",
                         i + 1,
                         steps,
                         step.name,
-                        offset,
-                        keys.len(),
+                        done,
+                        total,
                         run.reason
                     );
-                    run.sending = chunk.len();
                     st.lane = Some(Lane::Reset);
                     let (rule, env, tx, rname) =
                         (rule.clone(), env.clone(), tx.clone(), rname.clone());
@@ -1784,33 +1804,39 @@ impl Engine {
                     });
                     return;
                 }
-                Phase::Strays { per_ep, ep, offset } => {
-                    while *ep < per_ep.len() && *offset >= per_ep[*ep].len() {
-                        *ep += 1;
-                        *offset = 0;
-                    }
-                    if *ep >= per_ep.len() {
-                        run.touched = None;
-                        run.step += 1;
-                        run.phase = Phase::Start;
-                        continue;
+                Phase::Strays {
+                    per_ep,
+                    ep,
+                    done: _,
+                    batch: pending,
+                } => {
+                    if pending.is_none() {
+                        // Keys marked since the step began are not strays.
+                        let touched = run.touched.as_ref();
+                        let mut next = Vec::new();
+                        while next.is_empty() && *ep < per_ep.len() {
+                            let taken = per_ep[*ep].take(batch);
+                            if taken.is_empty() {
+                                *ep += 1;
+                                continue;
+                            }
+                            next = taken
+                                .into_iter()
+                                .filter(|k| touched.is_none_or(|t| !t.contains(k)))
+                                .collect();
+                        }
+                        if next.is_empty() {
+                            run.touched = None;
+                            run.step += 1;
+                            run.phase = Phase::Start;
+                            continue;
+                        }
+                        *pending = Some(next);
                     }
                     if !lane_free {
                         return;
                     }
-                    let list = &per_ep[*ep];
-                    let end = (*offset + batch).min(list.len());
-                    let touched = run.touched.as_ref();
-                    let chunk: Vec<String> = list[*offset..end]
-                        .iter()
-                        .filter(|k| touched.is_none_or(|t| !t.contains(*k)))
-                        .cloned()
-                        .collect();
-                    run.sending = end - *offset;
-                    if chunk.is_empty() {
-                        *offset = end;
-                        continue;
-                    }
+                    let chunk = pending.clone().expect("set above");
                     st.lane = Some(Lane::Reset);
                     let e = *ep;
                     let (rule, tx, rname) = (rule.clone(), tx.clone(), rname.clone());
@@ -1850,7 +1876,7 @@ impl Engine {
                     since,
                     since_ts,
                     first,
-                    keys: sent_keys,
+                    struck,
                     queries,
                 }) = st.lane.take()
                 else {
@@ -1860,16 +1886,20 @@ impl Engine {
                 st.counters.actions_failed += fired.failed;
                 st.counters.select_ms = fired.select_time.as_millis() as u64;
                 if let Some(t) = st.reset.as_mut().and_then(|r| r.touched.as_mut()) {
-                    t.extend(resolved);
+                    for k in &resolved {
+                        t.insert(k);
+                    }
                 }
                 let keyless = fired.error.is_some()
                     && fired.failed_keys.is_empty()
                     && fired.rejected.is_empty();
                 let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
                 st.report_dropped(&d.rule, &dropped, now_ms);
-                let mut again: IndexSet<String> = fired.failed_keys.into_iter().collect();
-                again.extend(retry);
-                for k in &sent_keys {
+                let mut again: KeySet = fired.failed_keys.into_iter().collect();
+                for k in &retry {
+                    again.insert(k);
+                }
+                for k in &struck {
                     if !again.contains(k) {
                         st.strikes.remove(k);
                     }
@@ -1935,8 +1965,9 @@ impl Engine {
                                 run.step += 1;
                                 run.phase = Phase::Start;
                             }
-                            Phase::Batches { offset, .. } | Phase::Strays { offset, .. } => {
-                                *offset += run.sending
+                            Phase::Batches { done, batch, .. }
+                            | Phase::Strays { done, batch, .. } => {
+                                *done += batch.take().map_or(0, |b| b.len() as u64);
                             }
                             Phase::Start => {}
                         }
@@ -1964,7 +1995,13 @@ impl Engine {
                 match keys {
                     Ok(keys) => {
                         info!(rule = %d.rule, "reset step {}: {} keys in the snapshot", run.step + 1, keys.len());
-                        run.phase = Phase::Batches { keys, offset: 0 };
+                        let total = keys.len();
+                        run.phase = Phase::Batches {
+                            keys,
+                            total,
+                            done: 0,
+                            batch: None,
+                        };
                     }
                     Err(e) => {
                         run.phase = Phase::Start;
@@ -1982,11 +2019,12 @@ impl Engine {
                 };
                 match per_ep {
                     Ok(per_ep) => {
-                        info!(rule = %d.rule, "reset step {}: {} stray keys", run.step + 1, per_ep.iter().map(Vec::len).sum::<usize>());
+                        info!(rule = %d.rule, "reset step {}: {} stray keys", run.step + 1, per_ep.iter().map(KeySet::len).sum::<u64>());
                         run.phase = Phase::Strays {
                             per_ep,
                             ep: 0,
-                            offset: 0,
+                            done: 0,
+                            batch: None,
                         };
                     }
                     Err(e) => {
@@ -2245,9 +2283,9 @@ async fn flush_job(
     if !queries.is_empty() {
         match action::resolve_keys(env, &queries).await {
             Ok(found) => {
-                let mut seen: HashSet<String> = keys.iter().cloned().collect();
+                let mut seen: KeySet = keys.iter().map(String::as_str).collect();
                 for k in found {
-                    if seen.insert(k.clone()) {
+                    if seen.insert(&k) {
                         keys.push(k.clone());
                         resolved.push(k);
                     }
@@ -2282,7 +2320,7 @@ mod tests {
             .due(Duration::from_secs(1), Duration::from_secs(5))
             .is_none());
         let t0 = Instant::now();
-        b.keys.insert("a".into());
+        b.keys.insert("a");
         b.first = Some(t0);
         b.last = Some(t0 + Duration::from_secs(3));
         assert_eq!(

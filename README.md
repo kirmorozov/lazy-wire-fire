@@ -67,7 +67,7 @@ export, reset steps, in [docs/reference.md](docs/reference.md#examples).
 | guarantee | how |
 |---|---|
 | after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, else `LAZYWF_VISIBILITY_DELAY_MS`) |
-| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms` |
+| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `cat_p_42`) live in 64-bit roaring bitmaps, as in lazyview: a million product ids take a few MB |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
 | at least once | a rule's position in `lazy_wire_fire_status` only passes changes whose actions met `expect` on every endpoint. After a restart the stream resumes from the lowest position; rules ahead skip what they confirmed |

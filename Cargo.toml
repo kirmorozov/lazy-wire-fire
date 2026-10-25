@@ -33,6 +33,7 @@ hex = "0.4"
 base64 = "0.22"
 httparse = "1"
 indexmap = "2"
+roaring = "0.11"
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
 [dev-dependencies]

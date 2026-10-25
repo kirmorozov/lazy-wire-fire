@@ -347,7 +347,7 @@ async fn reset_steps_run_in_order() {
     .await;
     assert!(order.0 < order.1 && order.1 < order.2, "{order:?}");
     let strays: Vec<String> = serde_json::from_str(&order.3).unwrap();
-    assert_eq!(strays, vec!["99".to_string(), "98".to_string()]);
+    assert_eq!(strays, vec!["98".to_string(), "99".to_string()]);
     wait_for(Duration::from_secs(5), "reset done", || async {
         db.status("items")
             .await

@@ -1,7 +1,7 @@
 //! The work behind a flush or a reset step: wait until the changes read are visible, find the
 //! keys (`keys_sql`), read the documents (all `selects` concurrently), render and send.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::binlog::{Flavor, Position};
 use crate::docs::{self, Doc, Merger, Plan};
+use crate::keyset::KeySet;
 use crate::model::{FirePer, StepKind};
 use crate::rule::{self, Rule};
 use crate::target::{Sent, Target};
@@ -675,7 +676,7 @@ pub async fn fire_once(rule: &Rule, template: &str, reset: Value) -> Fired {
 }
 
 /// Every key, from `snapshot_keys_sql`.
-pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<Vec<String>> {
+pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<KeySet> {
     let q = rule
         .def
         .snapshot_keys_sql
@@ -683,18 +684,14 @@ pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<Vec<String>> {
         .ok_or_else(|| anyhow!("the rule has no snapshot_keys_sql"))?;
     let mut conn = env.pool.get_conn().await?;
     let rows: Vec<Row> = conn.exec(q, ()).await.context("snapshot_keys_sql")?;
-    let mut seen = HashSet::new();
-    Ok(keys_of(rows)
-        .into_iter()
-        .filter(|k| seen.insert(k.clone()))
-        .collect())
+    Ok(keys_of(rows).into_iter().collect())
 }
 
 const MAX_PAGES: usize = 1_000_000;
 
 /// Stray candidates per endpoint for reset step `step`: the target's keys (paged with the
 /// step's `list_template`) that the snapshot, read after the listing, does not have.
-pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<String>>> {
+pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeySet>> {
     let target = rule
         .target
         .clone()
@@ -713,10 +710,9 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
     else {
         bail!("reset step {step} is not a stray step");
     };
-    let mut listed: Vec<Vec<String>> = Vec::new();
+    let mut listed: Vec<KeySet> = Vec::new();
     for (i, ep) in target.endpoints.iter().enumerate() {
-        let mut keys = Vec::new();
-        let mut seen = HashSet::new();
+        let mut keys = KeySet::new();
         let mut next = Value::Null;
         for page in 0..MAX_PAGES {
             let reset = json!({"step": s.name, "keys": [], "next": next, "page": page});
@@ -732,13 +728,7 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
                 .map(crate::template::text)
                 .filter(|k| crate::template::valid_key(k))
                 .collect();
-            let before = keys.len();
-            for k in page_keys {
-                if seen.insert(k.clone()) {
-                    keys.push(k);
-                }
-            }
-            let fresh = keys.len() - before;
+            let fresh = page_keys.iter().filter(|k| keys.insert(k)).count();
             let Some(np) = next_path else { break };
             let nv = np.get_one(&resp).cloned().unwrap_or(Value::Null);
             // HTTP: a page without new keys ends the listing (a scroll keeps its cursor, so an
@@ -759,10 +749,11 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<Vec<
         }
         listed.push(keys);
     }
-    let snapshot: HashSet<String> = snapshot_keys(env, rule).await?.into_iter().collect();
+    // Read after the listing: a key created meanwhile is in the snapshot, not a stray.
+    let snapshot = snapshot_keys(env, rule).await?;
     Ok(listed
-        .into_iter()
-        .map(|l| l.into_iter().filter(|k| !snapshot.contains(k)).collect())
+        .iter()
+        .map(|l| l.iter().filter(|k| !snapshot.contains(k)).collect())
         .collect())
 }
 
