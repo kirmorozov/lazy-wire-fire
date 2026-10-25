@@ -115,7 +115,6 @@ impl Db {
         .await;
     }
 
-    /// `(binlog_file, binlog_pos, reset_state, last_error)` of a status row.
     /// A transaction on a table of its own. Positions only pass transactions on tables other
     /// than the tool's status table, so after this one a rule with nothing pending can pass a
     /// binlog end that a status write slipped in front of.
@@ -124,6 +123,7 @@ impl Db {
         self.exec("INSERT INTO tick VALUES (1)").await;
     }
 
+    /// `(binlog_file, binlog_pos, reset_state, last_error)` of a status row.
     pub async fn status(&self, rule: &str) -> Option<(String, u64, String, Option<String>)> {
         let mut c = self.conn().await;
         let r = c
