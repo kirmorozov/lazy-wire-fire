@@ -1,0 +1,88 @@
+name: ghcr cleanup
+
+# Retention for ghcr.io/kirmorozov/lazy-wire-fire:
+#   kept   : every semver tag (X.Y.Z, X.Y, X, pre-releases), edge, latest,
+#            and the newest N images tagged sha-* (default 20)
+#   deleted: older sha-* images, and untagged images (superseded re-runs, pushes
+#            interrupted before the index was written)
+#   Images pushed within the last hour are never touched.
+#
+# A multi-arch image is an index whose platform manifests and attestation manifests show up
+# on GHCR as separate *untagged* versions. A plain "delete untagged versions" would delete
+# those children and break every multi-arch tag. dataaxiom/ghcr-cleanup-action walks the
+# indexes (and referrers) first, never deletes a child that a kept image references, and
+# deletes an image together with its children.
+#
+# Runs after each publish (called from publish-image.yml), daily, and on demand
+# (Actions > ghcr cleanup > Run workflow; dry-run by default).
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Only log what would be deleted
+        type: boolean
+        default: true
+      keep-sha-tags:
+        description: Number of newest sha-* images to keep
+        type: number
+        default: 20
+      older-than:
+        description: Only consider images older than this (e.g. "1 hour", "30 minutes")
+        type: string
+        default: 1 hour
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: delete untagged and old sha-* images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: write
+    # The cleanup is not safe to run concurrently against the same package.
+    concurrency:
+      group: ghcr-cleanup-lazy-wire-fire
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_API: /users/${{ github.repository_owner }}/packages/container/lazy-wire-fire
+      VERSIONS_API: /users/${{ github.repository_owner }}/packages/container/lazy-wire-fire/versions
+    steps:
+      - name: package
+        run: |
+          gh api "$PACKAGE_API" --jq '{name, visibility, repository: .repository.full_name, version_count, html_url}'
+      - name: package versions (before)
+        run: |
+          gh api --paginate "$VERSIONS_API?per_page=100" \
+            --jq '.[] | [.id, .name, .created_at, (.metadata.container.tags | join(","))] | @tsv' | tee before.tsv
+          echo "versions: $(wc -l < before.tsv), tagged: $(awk -F'\t' '$4 != ""' before.tsv | wc -l)"
+      - uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          package: lazy-wire-fire
+          use-regex: true
+          # Protected from every rule below: edge, latest and anything starting with a digit
+          # (X, X.Y, X.Y.Z, X.Y.Z-rc.N). An image is protected if any of its tags matches.
+          # (No nested quantifiers: the action rejects them as ReDoS-prone.)
+          exclude-tags: '^(edge|latest|[0-9][0-9A-Za-z.-]*)$'
+          # Keep only the newest N of the images tagged sha-*.
+          delete-tags: '^sha-[0-9a-f]+$'
+          keep-n-tagged: ${{ inputs.keep-sha-tags || 20 }}
+          delete-untagged: true
+          # Never touch anything pushed in the last hour: while a build is being pushed (here,
+          # or a release from a tag running in parallel) its platform manifests exist before
+          # the index that references them and would look untagged.
+          older-than: ${{ inputs.older-than || '1 hour' }}
+          # Log any multi-arch image with a missing platform/attestation manifest.
+          validate: true
+          # Scheduled and post-publish runs delete; manual runs default to a dry run.
+          dry-run: ${{ inputs.dry-run == true }}
+      - name: package versions (after)
+        if: always()
+        run: |
+          gh api --paginate "$VERSIONS_API?per_page=100" \
+            --jq '.[] | [.id, .name, .created_at, (.metadata.container.tags | join(","))] | @tsv' | tee after.tsv
+          echo "versions: $(wc -l < after.tsv), tagged: $(awk -F'\t' '$4 != ""' after.tsv | wc -l)"

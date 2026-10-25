@@ -11,6 +11,11 @@ name: ci
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, make docker-e2e on amd64
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
+#
+# Images go to ghcr.io/kirmorozov/lazy-wire-fire (publish-image.yml) only for pushes:
+#   main -> edge    needs lint + unit + integration + image (matrix and search run alongside)
+#   v*   -> release needs all of them, matrix and search included
+# Pull requests never get registry credentials and never push.
 on:
   push:
     branches: [main]
@@ -369,3 +374,29 @@ jobs:
       - name: stop the servers
         if: always()
         run: docker compose down -v
+
+  publish-edge:
+    name: publish edge
+    needs: [lint, unit, integration, image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      cargo-build-jobs: ${{ needs.image.outputs.cargo-build-jobs }}
+
+  publish-release:
+    name: publish release
+    needs: [lint, unit, integration, matrix, search, image]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      cargo-build-jobs: ${{ needs.image.outputs.cargo-build-jobs }}
