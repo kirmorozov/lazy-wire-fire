@@ -1,8 +1,12 @@
 # Builds and tests share the host with other projects: keep cargo to 4 jobs.
 CARGO := CARGO_BUILD_JOBS=4 cargo
 COMPOSE := docker compose -f docker-compose.test.yml
+IMAGE ?= lazywf:dev
+# Keep in step with the FROM lines of the Dockerfile.
+BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
-.PHONY: build release test lint servers servers-down test-e2e test-e2e-all test-e2e-search test-matrix
+.PHONY: build release test lint servers servers-down test-e2e test-e2e-all test-e2e-search test-matrix \
+	docker-smoke docker-e2e image-digests
 
 build:
 	$(CARGO) build
@@ -55,3 +59,31 @@ test-matrix:
 	  echo "=== $$s"; $(COMPOSE) --profile matrix up -d --wait $$s; \
 	  LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:$$p $(CARGO) test --test e2e -- --test-threads=4 || { $(COMPOSE) --profile matrix stop $$s; exit 1; }; \
 	  $(COMPOSE) --profile matrix stop $$s; done
+
+# A loaded image, checked without a shell inside it: version, exit 2 without configuration,
+# user, entrypoint, health check, no shell. CI runs it on both platforms of every build.
+docker-smoke: SHELL := bash
+docker-smoke:
+	@v=$$(docker run --rm "$(IMAGE)" --version); echo "version: $$v"; \
+	  [[ $$v =~ ^lazywf\ [0-9]+\.[0-9]+\.[0-9]+ ]]
+	@rc=0; docker run --rm "$(IMAGE)" >/dev/null 2>&1 || rc=$$?; \
+	  if [[ $$rc -ne 2 ]]; then echo "expected exit 2 (configuration error) without env, got $$rc" >&2; exit 1; fi; \
+	  echo "no-config exit code: $$rc (ok)"
+	@cfg=$$(docker image inspect "$(IMAGE)" --format '{{.Config.User}} {{json .Config.Entrypoint}}'); echo "user/entrypoint: $$cfg"; \
+	  [[ $$cfg == '65532:65532 ["/lazywf"]' ]]
+	@hc=$$(docker image inspect "$(IMAGE)" --format '{{json .Config.Healthcheck.Test}}'); echo "healthcheck: $$hc"; \
+	  [[ $$hc == '["CMD","/lazywf","healthcheck"]' ]]
+	@for sh in /bin/sh /bin/bash /busybox/sh sh; do \
+	  if docker run --rm --entrypoint "$$sh" "$(IMAGE)" -c true >/dev/null 2>&1; then echo "image has a shell: $$sh" >&2; exit 1; fi; \
+	done; echo "no shell in the image (ok)"
+
+# The image against the compose MySQL 8.4 and Redis: ready, healthy, uid 65532, a row fires a
+# Redis SET, exit 0 on SIGTERM.
+docker-e2e:
+	scripts/docker-e2e.sh "$(IMAGE)"
+
+# The current multi-arch index digests, to refresh the pins in the Dockerfile.
+image-digests:
+	@for ref in $(BASE_IMAGES); do \
+	  printf '%-50s ' "$$ref"; docker buildx imagetools inspect "$$ref" --format '{{json .Manifest.Digest}}'; echo; \
+	done
