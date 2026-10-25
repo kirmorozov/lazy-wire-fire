@@ -937,3 +937,159 @@ async fn targets_add_their_authentication() {
     );
     inst.stop().await;
 }
+
+/// Against a real OpenSearch (`LAZYWF_TEST_OPENSEARCH=http://127.0.0.1:34200`, compose profile
+/// `search`): the re-sync in place, upserts and deletes through `_bulk`, strays paged with
+/// `search_after` sorted by `_id`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_index_resync() {
+    use lazy_wire_fire::http::{BaseUrl, Client, RawRequest};
+    use lazy_wire_fire::tls::TlsSpec;
+    let root = need_db!();
+    let Ok(os) = std::env::var("LAZYWF_TEST_OPENSEARCH") else {
+        eprintln!("LAZYWF_TEST_OPENSEARCH not set: skipping");
+        return;
+    };
+    let client = Client::new(BaseUrl::parse(&os).unwrap(), &TlsSpec::parse(None).unwrap()).unwrap();
+    let host = BaseUrl::parse(&os).unwrap().host_header();
+    let call = |method: &str, path: &str, body: &str| {
+        let mut r = RawRequest::parse(&format!(
+            "{method} {path} HTTP/1.1\nContent-Type: application/json\n\n{body}"
+        ))
+        .unwrap()
+        .unwrap();
+        r.set_header("Host", host.clone());
+        r
+    };
+    let index = format!("lwf_items_{}", std::process::id());
+    let t = Duration::from_secs(10);
+    client
+        .send(&call("DELETE", &format!("/{index}"), ""), t)
+        .await
+        .unwrap();
+    let r = client
+        .send(
+            &call(
+                "PUT",
+                &format!("/{index}"),
+                r#"{"mappings":{"properties":{"title":{"type":"keyword"}}}}"#,
+            ),
+            t,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200, "{}", r.body_snippet());
+    // Strays and a stale document, as an index left behind would have them.
+    for (id, title) in [("5000", "stray"), ("5001", "stray"), ("1", "stale")] {
+        client
+            .send(
+                &call(
+                    "PUT",
+                    &format!("/{index}/_doc/{id}?refresh=true"),
+                    &format!(r#"{{"title":"{title}"}}"#),
+                ),
+                t,
+            )
+            .await
+            .unwrap();
+    }
+
+    let db = Db::fresh(&root, "search").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, title VARCHAR(50))")
+        .await;
+    db.exec(
+        "INSERT INTO items WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 999) \
+         SELECT a.i * 1000 + b.i, CONCAT('item ', a.i * 1000 + b.i) FROM s a JOIN s b WHERE a.i < 2 AND b.i <= 999 \
+         UNION ALL SELECT b.i, CONCAT('item ', b.i) FROM s b",
+    )
+    .await;
+    let n: Vec<u64> = db.query("SELECT COUNT(*) FROM items").await;
+    tables(&db).await;
+    db.target("os", "http", &os, Some("2xx and errors == false"), "{}")
+        .await;
+    let steps = json!([
+        {"for_each": "snapshot"},
+        {"for_each": "stray",
+         "list_template": "POST /{{vars.index}}/_search HTTP/1.1\nContent-Type: application/json\n\n{\"size\":1000,\"_source\":false,\"sort\":[{\"_id\":\"asc\"}]{{#if reset.next}},\"search_after\":{{json reset.next}}{{/if}}}",
+         "keys_path": "hits.hits[]._id", "next_path": "hits.hits[-1].sort"}
+    ]);
+    let template = "POST /{{vars.index}}/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{{#each docs}}{{#if (eq op \"delete\")}}{\"delete\":{\"_id\":\"{{key}}\"}}\n{{else}}{\"update\":{\"_id\":\"{{key}}\"}}\n{\"doc\":{{json doc}},\"doc_as_upsert\":true}\n{{/if}}{{/each}}";
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, vars, debounce_ms) \
+         VALUES ('items', 'os', 'SELECT id AS _key, title, NULL AS _op FROM items WHERE id IN (:keys)', 'SELECT id AS _key FROM items', ?, ?, ?, 100)",
+        (template, steps.to_string(), json!({"index": index}).to_string()),
+    )
+    .await;
+    db.trigger("items", "items", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    async fn count(client: &Client, host: &str, index: &str, q: &str) -> Option<u64> {
+        let req = |method: &str, path: String, body: &str| {
+            let mut r = RawRequest::parse(&format!(
+                "{method} {path} HTTP/1.1\nContent-Type: application/json\n\n{body}"
+            ))
+            .unwrap()
+            .unwrap();
+            r.set_header("Host", host.to_string());
+            r
+        };
+        let t = Duration::from_secs(10);
+        client
+            .send(&req("POST", format!("/{index}/_refresh"), ""), t)
+            .await
+            .ok()?;
+        let r = client
+            .send(&req("POST", format!("/{index}/_search?size=0"), q), t)
+            .await
+            .ok()?;
+        let v: Value = serde_json::from_slice(&r.body).ok()?;
+        v["hits"]["total"]["value"].as_u64()
+    }
+    wait_for(Duration::from_secs(60), "the re-synced index", || async {
+        let total = count(&client, &host, &index, r#"{"track_total_hits":true}"#).await?;
+        let strays = count(
+            &client,
+            &host,
+            &index,
+            r#"{"query":{"term":{"title":"stray"}}}"#,
+        )
+        .await?;
+        let stale = count(
+            &client,
+            &host,
+            &index,
+            r#"{"query":{"term":{"title":"stale"}}}"#,
+        )
+        .await?;
+        (total == n[0] && strays == 0 && stale == 0).then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(10), "reset done", || async {
+        db.status("items")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .map(|_| ())
+    })
+    .await;
+
+    db.exec("UPDATE items SET title = 'renamed' WHERE id = 5")
+        .await;
+    db.exec("DELETE FROM items WHERE id = 6").await;
+    wait_for(Duration::from_secs(10), "incremental changes", || async {
+        let renamed = count(
+            &client,
+            &host,
+            &index,
+            r#"{"query":{"term":{"title":"renamed"}}}"#,
+        )
+        .await?;
+        let total = count(&client, &host, &index, r#"{"track_total_hits":true}"#).await?;
+        (renamed == 1 && total == n[0] - 1).then_some(())
+    })
+    .await;
+    inst.stop().await;
+    client
+        .send(&call("DELETE", &format!("/{index}"), ""), t)
+        .await
+        .ok();
+}
