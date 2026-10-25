@@ -58,7 +58,7 @@ services:
     ports: ["127.0.0.1:34070:7070"]
 
   opensearch:
-    image: opensearchproject/opensearch:2.19.6
+    image: opensearchproject/opensearch:2.19.7
     profiles: ["search"]
     environment:
       discovery.type: single-node
