@@ -1,2 +1,8 @@
 /target
 /tmp
+
+# rustfmt backups, MSVC debug info, cargo-mutants output, rustc ICE dumps
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+rustc-ice-*.txt
