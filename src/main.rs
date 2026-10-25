@@ -57,8 +57,37 @@ fn init_logging() {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Stack of the thread the runtime is driven from.
+const MAIN_STACK: usize = 8 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    // Not on the process's main thread: with musl its stack bounds read as only the pages
+    // touched so far, and the template parser (pest, via `stacker`) then refuses every
+    // template for lack of stack. A thread created with an explicit size reports its bounds.
+    let thread = std::thread::Builder::new()
+        .name("lazywf".into())
+        .stack_size(MAIN_STACK)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map(|rt| rt.block_on(run()))
+        });
+    match thread.map(|t| t.join()) {
+        Ok(Ok(Ok(code))) => code,
+        Ok(Ok(Err(e))) => {
+            eprintln!("lazywf: cannot start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(Err(_)) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("lazywf: cannot start: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("--version" | "-V" | "version") => {
             println!("lazywf {}", env!("CARGO_PKG_VERSION"));
