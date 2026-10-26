@@ -41,6 +41,8 @@ use crate::template;
 const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// An XA transaction prepared longer ago stops holding the saved position back.
 const XA_PIN_MAX: Duration = Duration::from_secs(3600);
+/// Tables created `LIKE` another that are remembered at most (online schema changes in flight).
+const MAX_SHADOWS: usize = 1000;
 /// Status rows are rewritten at least this often (`updated_at`).
 const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 const RETRY_FIRST: Duration = Duration::from_millis(500);
@@ -321,6 +323,9 @@ pub struct Engine {
     rewinds: Vec<(String, Position)>,
     /// A replay whose first connect is pending, to undo if its position was purged meanwhile.
     rewound: Option<Rewound>,
+    /// Tables created `LIKE` another while streaming (copy → original): the copies an online
+    /// schema change fills and then swaps in.
+    shadows: HashMap<(String, String), (String, String)>,
 
     config_dirty: Option<Instant>,
     config_fp: u64,
@@ -528,6 +533,7 @@ pub async fn run(
         xa_pending: HashMap::new(),
         rewinds: Vec::new(),
         rewound: None,
+        shadows: HashMap::new(),
         config_dirty: None,
         config_fp: 0,
         next_poll: Instant::now() + cfg.config_poll,
@@ -1698,6 +1704,32 @@ impl Engine {
     }
 
     fn on_statement(&mut self, schema: &str, query: &str) {
+        if let Some(((cs, ct), (os, ot))) = crate::sql::table_like(query, schema) {
+            if self.shadows.len() < MAX_SHADOWS {
+                let copy = self.norm(&cs, &ct);
+                let original = self.norm(&os, &ot);
+                self.shadows.insert(copy, original);
+            }
+        }
+        // An online schema change ends by swapping its copy in, in one RENAME (`t TO old,
+        // copy TO t`). The copy was created LIKE `t` and filled through row events, so it holds
+        // the same rows: the rules of `t` keep their continuity.
+        let pairs: Vec<_> = crate::sql::renames(query, schema)
+            .into_iter()
+            .map(|((fs, ft), (ts, tt))| (self.norm(&fs, &ft), self.norm(&ts, &tt)))
+            .collect();
+        let mut kept: HashSet<(String, String)> = HashSet::new();
+        for (k, (from, to)) in pairs.iter().enumerate() {
+            let moved_away = pairs[..k].iter().any(|(f, _)| f == to);
+            if moved_away && self.shadows.get(from) == Some(to) {
+                info!(
+                    "`{}`.`{}` was swapped for `{}`.`{}`, a copy created LIKE it (an online schema change): continuity kept",
+                    to.0, to.1, from.0, from.1
+                );
+                kept.insert(to.clone());
+            }
+        }
+        let mut reset: HashSet<String> = HashSet::new();
         for (s, t, effect) in crate::sql::ddl_tables(query, schema) {
             self.catalog.invalidate(&s, &t);
             if s == self.cfg.schema && (model::is_config_table(&t) || t == "*") {
@@ -1707,11 +1739,18 @@ impl Engine {
                 continue;
             }
             let (ns, nt) = self.norm(&s, &t);
+            // Renamed or dropped: no longer a copy waiting to be swapped in.
+            self.shadows.remove(&(ns.clone(), nt.clone()));
+            if kept.contains(&(ns.clone(), nt.clone())) {
+                continue;
+            }
+            // A table named twice (`t TO old, new TO t`) resets its rules once.
             let hit: Vec<String> = self
                 .routes
                 .iter()
                 .filter(|((rs, rt), _)| *rs == ns && (nt == "*" || *rt == nt))
                 .flat_map(|(_, v)| v.iter().map(|(n, _)| n.clone()))
+                .filter(|n| reset.insert(n.clone()))
                 .collect::<IndexSet<_>>()
                 .into_iter()
                 .collect();
