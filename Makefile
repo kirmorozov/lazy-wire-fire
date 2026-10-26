@@ -17,9 +17,12 @@ release:
 test:
 	$(CARGO) test --lib
 
+# The lazyview copies (vendor/lazyview.lock) are checked against the lock, and on CI
+# (CI=true) also against lazyview itself at the locked commit.
 lint:
 	$(CARGO) fmt --check
 	$(CARGO) clippy --all-targets -- -D warnings
+	scripts/sync-lazyview.sh --check $(if $(CI),--upstream)
 
 servers:
 	$(COMPOSE) up -d --wait

@@ -10,8 +10,9 @@ The repository is public: it names no project that uses the tool and no local pa
   or key ledgers in tables (counters may appear on `/status` only).
 - A rule's position advances only after its actions met `expect`. One lane per rule (a flush or a
   reset batch at a time); rules and targets never wait for each other.
-- `src/binlog.rs` is lazyview's reader (https://github.com/kirmorozov/lazyview); never modify lazyview,
-  copy fixes from it instead of diverging.
+- The files in `vendor/lazyview.lock` (`src/binlog.rs`, lazyview's reader) are byte-for-byte copies
+  of lazyview (https://github.com/kirmorozov/lazyview). Never edit them and never modify lazyview:
+  fixes land in lazyview, then `scripts/sync-lazyview.sh <commit>`. `make lint` checks the copies.
 
 ## Files and the host
 - Scratch files and outputs: `tmp/` and `tmp/out/` in this repo (git-ignored), not `/tmp`.
