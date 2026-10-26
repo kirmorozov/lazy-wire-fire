@@ -303,6 +303,87 @@ async fn failures_retry_and_hold_the_position() {
     inst.stop().await;
 }
 
+/// Generated (VIRTUAL, STORED) and INVISIBLE columns before the ones a trigger reads: every image
+/// still maps each value to its own column (MariaDB 13 leaves VIRTUAL columns out of update and
+/// delete images), for the key template and for `changed_columns`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generated_and_invisible_columns() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "gencols").await;
+    db.exec(
+        "CREATE TABLE gen (id INT PRIMARY KEY, a INT NOT NULL, v INT AS (a * 2) VIRTUAL, \
+         s INT AS (a + 1) STORED, h INT NOT NULL DEFAULT 7 INVISIBLE, b VARCHAR(20) NOT NULL, c INT NOT NULL)",
+    )
+    .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES \
+         ('g', 'hook', 'POST /k HTTP/1.1\n\n{{#each keys}}{{this}};{{/each}}', 100)",
+    )
+    .await;
+    db.exec(
+        "INSERT INTO lazy_wire_fire_trigger (rule, source_table, changed_columns, `key`) VALUES \
+         ('g', 'gen', 'b', '{{new.id}}|{{new.a}}|{{new.s}}|{{new.h}}|{{new.b}}|{{new.c}}')",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    /// Lets earlier fires arrive, then forgets them.
+    async fn settle(mock: &Mock) {
+        sleep_ms(400).await;
+        mock.clear();
+    }
+    let keys = |m: &Mock| -> std::collections::BTreeSet<String> {
+        m.requests()
+            .iter()
+            .flat_map(|r| r.body.split(';').map(str::to_string).collect::<Vec<_>>())
+            .filter(|k| !k.is_empty())
+            .collect()
+    };
+    let step = |sql: &'static str, want: &'static [&'static str]| {
+        let (db, mock) = (&db, &mock);
+        async move {
+            settle(mock).await;
+            db.exec(sql).await;
+            let want: std::collections::BTreeSet<String> =
+                want.iter().map(|s| s.to_string()).collect();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while keys(mock) != want && std::time::Instant::now() < deadline {
+                sleep_ms(100).await;
+            }
+            assert_eq!(keys(mock), want, "keys marked by `{sql}`");
+        }
+    };
+    step(
+        "INSERT INTO gen (id, a, b, c) VALUES (1, 1, 'x', 100)",
+        &["1|1|2|7|x|100"],
+    )
+    .await;
+    // An update renders both images.
+    step(
+        "UPDATE gen SET b = 'y' WHERE id = 1",
+        &["1|1|2|7|x|100", "1|1|2|7|y|100"],
+    )
+    .await;
+    // `b` did not change: nothing fires.
+    settle(&mock).await;
+    db.exec("UPDATE gen SET a = 5 WHERE id = 1").await;
+    sleep_ms(1000).await;
+    assert!(
+        keys(&mock).is_empty(),
+        "fired without a change of b: {:?}",
+        keys(&mock)
+    );
+    step(
+        "UPDATE gen SET b = 'z', c = 200 WHERE id = 1",
+        &["1|5|6|7|y|100", "1|5|6|7|z|200"],
+    )
+    .await;
+    step("DELETE FROM gen WHERE id = 1", &["1|5|6|7|z|200"]).await;
+    inst.stop().await;
+}
+
 /// An account with only the documented grants (no SUPER or other admin rights: what Amazon
 /// RDS lets the master user create) runs the tool end to end: it creates its tables, takes its
 /// lock, streams the binlog, reads, fires and saves its position.
