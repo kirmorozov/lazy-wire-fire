@@ -462,6 +462,8 @@ pub async fn run(
     health: Arc<Health>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    // The reader names lazyview in its messages unless told otherwise (main does it earlier).
+    binlog::set_product("lazywf", "LAZYWF_");
     let opts = binlog::replica_opts(&cfg.dsn)?;
     let binlog_opts = binlog::replica_opts(&cfg.binlog_dsn)?;
     let Some(mut control) = connect_wait(&opts, &health, &mut shutdown).await? else {
