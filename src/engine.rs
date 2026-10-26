@@ -280,6 +280,13 @@ struct XaTxn {
     prepared_at: Instant,
 }
 
+/// Where the stream was before a replay for re-enabled rules moved it back.
+struct Rewound {
+    boundary: Position,
+    settled: Position,
+    rules: Vec<String>,
+}
+
 pub struct Engine {
     cfg: Config,
     lock: String,
@@ -309,6 +316,11 @@ pub struct Engine {
     txn_marks: HashMap<String, Marks>,
     xa_current: Option<(String, XaTxn)>,
     xa_pending: HashMap<String, XaTxn>,
+    /// Rules enabled again at a position the stream has passed: replayed from there (see
+    /// `begin_rewind`), not reset.
+    rewinds: Vec<(String, Position)>,
+    /// A replay whose first connect is pending, to undo if its position was purged meanwhile.
+    rewound: Option<Rewound>,
 
     config_dirty: Option<Instant>,
     config_fp: u64,
@@ -512,6 +524,8 @@ pub async fn run(
         txn_marks: HashMap::new(),
         xa_current: None,
         xa_pending: HashMap::new(),
+        rewinds: Vec::new(),
+        rewound: None,
         config_dirty: None,
         config_fp: 0,
         next_poll: Instant::now() + cfg.config_poll,
@@ -620,16 +634,7 @@ impl Engine {
 
     /// The position to stream from, and which rules lost continuity.
     async fn choose_start(&mut self) -> Result<Position> {
-        let current = binlog::current_position(&mut self.control).await?;
-        let logs: Vec<mysql_async::Row> = self
-            .control
-            .query("SHOW BINARY LOGS")
-            .await
-            .context("SHOW BINARY LOGS")?;
-        let files: HashSet<String> = logs
-            .iter()
-            .filter_map(|r| r.get_opt::<String, _>(0).and_then(|v| v.ok()))
-            .collect();
+        let (current, files) = self.binlog_files().await?;
         let available = |p: &Position| files.contains(&p.file) && *p <= current;
         let star = self.saved.get(INSTANCE_ROW).cloned();
         let lost_all = match &star {
@@ -777,6 +782,20 @@ impl Engine {
     }
 
     async fn on_missing_binlog(&mut self, e: &anyhow::Error) -> Result<()> {
+        if let Some(rw) = self.rewound.take() {
+            // Purged before the replay began: only the rules enabled again lose continuity, the
+            // others go on from where the stream was.
+            let at = std::mem::replace(&mut self.boundary, rw.boundary);
+            self.settled = rw.settled;
+            warn!("binlog position {at} is no longer available ({e:#}); the rules enabled again run their reset steps instead of replaying");
+            for n in rw.rules {
+                self.lose_continuity(
+                    &n,
+                    format!("enabled again, and binlog position {at} is no longer available"),
+                );
+            }
+            return Ok(());
+        }
         let current = binlog::current_position(&mut self.control).await?;
         let old = self.boundary.clone();
         warn!("binlog position {old} is no longer available ({e:#}); continuing from {current} and running the reset steps");
@@ -786,6 +805,64 @@ impl Engine {
             self.lose_continuity(&n, format!("binlog position {old} is no longer available"));
         }
         Ok(())
+    }
+
+    /// Moves the stream back to the lowest position of the rules enabled again behind it, before
+    /// the next connect. Every other rule skips what it already read; a rule whose position is
+    /// no longer in the binlog runs its reset steps instead.
+    async fn begin_rewind(&mut self) -> Result<()> {
+        let (current, files) = self.binlog_files().await?;
+        let mut replay: Vec<(String, Position)> = Vec::new();
+        for (n, p) in std::mem::take(&mut self.rewinds) {
+            if !self.rules.contains_key(&n) || p >= self.boundary {
+                continue; // disabled again meanwhile, or nothing was missed
+            }
+            if files.contains(&p.file) && p <= current {
+                replay.push((n, p));
+            } else {
+                self.lose_continuity(
+                    &n,
+                    format!("enabled again, and binlog position {p} is no longer available"),
+                );
+            }
+        }
+        let Some(to) = replay.iter().map(|(_, p)| p.clone()).min() else {
+            return Ok(());
+        };
+        let from = self.boundary.clone();
+        for (n, st) in self.rules.iter_mut() {
+            let read = replay
+                .iter()
+                .find(|(r, _)| r == n)
+                .map_or(&from, |(_, p)| p);
+            if *read > to && st.skip_until.as_ref().is_none_or(|s| s < read) {
+                st.skip_until = Some(read.clone());
+            }
+        }
+        let rules: Vec<String> = replay.into_iter().map(|(n, _)| n).collect();
+        info!(position = %to, ?rules, "rules enabled again: replaying the binlog from their positions");
+        self.rewound = Some(Rewound {
+            boundary: from,
+            settled: std::mem::replace(&mut self.settled, to.clone()),
+            rules,
+        });
+        self.boundary = to;
+        Ok(())
+    }
+
+    /// The current binlog position and the binlog files the server still has.
+    async fn binlog_files(&mut self) -> Result<(Position, HashSet<String>)> {
+        let current = binlog::current_position(&mut self.control).await?;
+        let logs: Vec<mysql_async::Row> = self
+            .control
+            .query("SHOW BINARY LOGS")
+            .await
+            .context("SHOW BINARY LOGS")?;
+        let files = logs
+            .iter()
+            .filter_map(|r| r.get_opt::<String, _>(0).and_then(|v| v.ok()))
+            .collect();
+        Ok((current, files))
     }
 
     // ---- configuration ---------------------------------------------------------------------
@@ -934,14 +1011,11 @@ impl Engine {
         self.rules.insert(name.to_string(), st);
         if !initial {
             info!(rule = %name, "rule added");
-            // A new rule's target has no history; one that ran before and comes back missed
-            // what happened in between.
+            // A new rule's target has no history; one that ran before and comes back replays
+            // what happened in between (reset only if the binlog no longer has it).
             match self.saved.get(name).and_then(|s| s.pos.clone()) {
                 None => self.lose_continuity(name, "new rule".into()),
-                Some(p) if p < self.settled => self.lose_continuity(
-                    name,
-                    format!("enabled again, nothing was tracked since {p}"),
-                ),
+                Some(p) if p < self.settled => self.rewinds.push((name.to_string(), p)),
                 Some(_) => {}
             }
         }
@@ -1027,6 +1101,10 @@ impl Engine {
         self.health.set_phase("streaming");
         'reconnect: loop {
             self.health.beat();
+            if !self.rewinds.is_empty() {
+                self.begin_rewind().await?;
+                pos = self.boundary.clone();
+            }
             let connected = tokio::time::timeout(
                 BINLOG_CONNECT_TIMEOUT,
                 BinlogReader::connect(
@@ -1040,7 +1118,11 @@ impl Engine {
             .await
             .unwrap_or_else(|_| Err(anyhow!("timed out after {BINLOG_CONNECT_TIMEOUT:?}")));
             let mut reader = match connected {
-                Ok(r) => r,
+                Ok(r) => {
+                    // The server accepted the position, so a replay is under way.
+                    self.rewound = None;
+                    r
+                }
                 Err(e) => {
                     if binlog_unusable(&e) {
                         self.on_missing_binlog(&e).await?;
@@ -1132,6 +1214,9 @@ impl Engine {
                 self.schedule();
                 if !self.in_txn {
                     self.housekeeping().await?;
+                    if !self.rewinds.is_empty() {
+                        break; // reconnects from the positions of the rules enabled again
+                    }
                 }
             }
             self.health.set_streaming(false);
@@ -1225,8 +1310,10 @@ impl Engine {
         if std::mem::take(&mut self.txn_foreign) {
             self.settled = pos.clone();
         }
+        // A rule skips transactions ending at or before its `skip_until` (it read them already),
+        // so the one ending exactly there is still skipped.
         for st in self.rules.values_mut() {
-            if st.skip_until.as_ref().is_some_and(|s| *s <= pos) {
+            if st.skip_until.as_ref().is_some_and(|s| *s < pos) {
                 st.skip_until = None;
             }
         }
@@ -1308,7 +1395,13 @@ impl Engine {
                     Some(_) => {}
                     None if commit => {
                         warn!(%xid, "XA COMMIT of a transaction prepared before the start position: its changes are unknown");
-                        let names: Vec<String> = self.rules.keys().cloned().collect();
+                        // Rules that read this commit before (they skip it) lost nothing.
+                        let names: Vec<String> = self
+                            .rules
+                            .iter()
+                            .filter(|(_, st)| st.skip_until.as_ref().is_none_or(|s| pos > *s))
+                            .map(|(n, _)| n.clone())
+                            .collect();
                         for n in names {
                             self.lose_continuity(
                                 &n,

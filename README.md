@@ -78,7 +78,7 @@ export, reset steps, in [docs/reference.md](docs/reference.md#examples).
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
 | at least once | a rule's position in `lazy_wire_fire_status` only passes changes whose actions met `expect` on every endpoint. After a restart the stream resumes from the lowest position; rules ahead skip what they confirmed |
 | failure | retry with backoff (0.5 s doubling, up to `LAZYWF_MAX_BACKOFF_MS`), the keys stay pending. Other rules and targets keep going |
-| lost continuity | first start, a purged binlog, another server, a new or re-enabled rule, a watched table replaced without row events (`TRUNCATE`, `RENAME` onto it, `DROP`): the rule's `reset_steps` run once in the background while streaming continues. Rules without them are reported in `reset_state` |
+| lost continuity | first start, a purged binlog, another server, a new rule (a rule enabled again replays what it missed while the binlog still has it), a watched table replaced without row events (`TRUNCATE`, `RENAME` onto it, `DROP`): the rule's `reset_steps` run once in the background while streaming continues. Rules without them are reported in `reset_state` |
 
 The status table holds only what a restart needs: per rule (and `*` for the instance) the
 confirmed binlog position, lag, reset state and the last error, written every few seconds when it
