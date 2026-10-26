@@ -203,9 +203,10 @@ What a template renders:
 ## Reset steps
 
 A JSON array, run in order; a failed step is retried, and the next one never starts before it
-succeeded. They run when continuity is lost (first start, purged binlog, another server, a rule
-enabled again, a watched table replaced without row events) or on `reset_requested = 1`, in the
-background while streaming continues. An interrupted reset starts over after a restart.
+succeeded. They run when continuity is lost (first start, purged binlog, another server, a new
+rule, a watched table replaced without row events) or on `reset_requested = 1`, in the background
+while streaming continues. A rule enabled again replays the binlog from where it stopped instead,
+and resets only when that part of the binlog was purged. An interrupted reset starts over after a restart.
 
 ```json
 [
@@ -353,7 +354,7 @@ The stray step has no `template`, so the rule's own `_bulk` template renders the
 
 ## Notes
 
-* Set `binlog_row_metadata=FULL` (MySQL 8) to name row images exactly while a DDL is in flight;
+* Set `binlog_row_metadata=FULL` (MySQL 8.0+, MariaDB 10.5+) to name row images exactly while a DDL is in flight;
   otherwise names come from `information_schema` and a column-count mismatch resets the rules of
   that table.
 * A DDL that changes values without row events (`ALTER TABLE … ADD COLUMN … DEFAULT …` read by a
