@@ -360,6 +360,60 @@ pub fn ddl_tables(query: &str, default_schema: &str) -> Vec<(String, String, Ddl
     p.out
 }
 
+/// `(new, original)` of a `CREATE TABLE new LIKE original` (or `… (LIKE original)`); not for
+/// temporary tables.
+pub fn table_like(
+    query: &str,
+    default_schema: &str,
+) -> Option<((String, String), (String, String))> {
+    let toks: Vec<Tok> = lex(query).into_iter().map(|l| l.tok).collect();
+    let mut p = Ddl {
+        t: &toks,
+        i: 0,
+        schema: default_schema,
+        out: Vec::new(),
+    };
+    if !p.eat("CREATE") || !p.eat("TABLE") {
+        return None;
+    }
+    p.eat_if_exists();
+    let new = p.name()?;
+    if p.t.get(p.i) == Some(&Tok::LParen) {
+        p.i += 1;
+    }
+    if !p.eat("LIKE") {
+        return None;
+    }
+    Some((new, p.name()?))
+}
+
+/// The `(from, to)` pairs of a `RENAME TABLE a TO b, …`, in order.
+pub fn renames(query: &str, default_schema: &str) -> Vec<((String, String), (String, String))> {
+    let toks: Vec<Tok> = lex(query).into_iter().map(|l| l.tok).collect();
+    let mut p = Ddl {
+        t: &toks,
+        i: 0,
+        schema: default_schema,
+        out: Vec::new(),
+    };
+    let mut out = Vec::new();
+    if !p.eat("RENAME") || !(p.eat("TABLE") || p.eat("TABLES")) {
+        return out;
+    }
+    while let Some(from) = p.name() {
+        if !p.eat("TO") {
+            break;
+        }
+        let Some(to) = p.name() else { break };
+        out.push((from, to));
+        if p.t.get(p.i) != Some(&Tok::Comma) {
+            break;
+        }
+        p.i += 1;
+    }
+    out
+}
+
 struct Ddl<'a> {
     t: &'a [Tok],
     i: usize,
@@ -664,6 +718,39 @@ mod tests {
         );
         assert!(d("GRANT SELECT ON *.* TO u").is_empty());
         assert!(d("CREATE DATABASE x").is_empty());
+    }
+
+    #[test]
+    fn online_schema_change_statements() {
+        let n = |s: &str, t: &str| (s.to_string(), t.to_string());
+        assert_eq!(
+            table_like(
+                "create /* gh-ost */ table `app`.`_t_gho` like `app`.`t`",
+                "x"
+            ),
+            Some((n("app", "_t_gho"), n("app", "t")))
+        );
+        assert_eq!(
+            table_like("CREATE TABLE IF NOT EXISTS t2 (LIKE s.t1)", "app"),
+            Some((n("app", "t2"), n("s", "t1")))
+        );
+        assert_eq!(table_like("CREATE TABLE t2 (a INT)", "app"), None);
+        assert_eq!(table_like("CREATE TEMPORARY TABLE t2 LIKE t", "app"), None);
+        assert_eq!(
+            renames(
+                "rename /* gh-ost */ table `app`.`t` to `app`.`_t_del`, `app`.`_t_gho` to `app`.`t`",
+                "x"
+            ),
+            vec![
+                (n("app", "t"), n("app", "_t_del")),
+                (n("app", "_t_gho"), n("app", "t"))
+            ]
+        );
+        assert_eq!(
+            renames("RENAME TABLE t TO u", "app"),
+            vec![(n("app", "t"), n("app", "u"))]
+        );
+        assert!(renames("ALTER TABLE t RENAME TO u", "app").is_empty());
     }
 
     #[test]

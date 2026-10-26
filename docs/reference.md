@@ -361,3 +361,8 @@ The stray step has no `template`, so the rule's own `_bulk` template renders the
   select) is not detected: request a reset (`reset_requested = 1`).
 * Tables replaced by a swap (`RENAME TABLE new TO watched`) reset the rules watching them, since
   their rows changed without row events; avoid watching tables that are rebuilt this way often.
+  The exception is an online schema change (gh-ost, pt-online-schema-change): when the table
+  swapped in was created `LIKE` the watched one while lazywf was streaming, and the same `RENAME`
+  moves the watched one away, it holds the same rows (filled through row events), so the rules
+  keep their continuity. If you rebuild a table with other rows that way, set
+  `reset_requested = 1`. After a lazywf restart during the copy, the swap resets as before.

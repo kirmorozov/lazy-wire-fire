@@ -1071,6 +1071,82 @@ async fn rule_enabled_again_replays_what_it_missed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn online_schema_change_keeps_continuity() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "osc").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"once": true, "template": "PURGE /all HTTP/1.1\n\n"}]).to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) VALUES ('o', 'hook', \
+         'POST /o HTTP/1.1\n\n{{join keys \",\"}}', ?, 50)",
+        (steps,),
+    )
+    .await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 1), (2, 1, 'n', 1)")
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(Duration::from_secs(10), "the first-start reset", || async {
+        mock.requests()
+            .iter()
+            .any(|r| r.method == "PURGE")
+            .then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    mock.clear();
+
+    // As gh-ost does it: a copy created LIKE the table, altered, filled, kept current, swapped in.
+    db.exec("CREATE TABLE _orders_gho LIKE orders").await;
+    db.exec("ALTER TABLE _orders_gho ADD COLUMN note VARCHAR(20) NULL")
+        .await;
+    db.exec("INSERT INTO _orders_gho (id, customer_id, status, total) SELECT id, customer_id, status, total FROM orders").await;
+    db.exec("UPDATE orders SET total = 5 WHERE id = 1").await;
+    db.exec("UPDATE _orders_gho SET total = 5 WHERE id = 1")
+        .await;
+    db.exec("RENAME TABLE orders TO _orders_del, _orders_gho TO orders")
+        .await;
+    db.exec("INSERT INTO orders (id, customer_id, status, total, note) VALUES (3, 1, 'n', 1, 'x')")
+        .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the change during the copy and the insert after the swap",
+        || async {
+            let o = fired(&mock.requests(), "/o");
+            (o.contains(&"1".to_string()) && o.contains(&"3".to_string())).then_some(())
+        },
+    )
+    .await;
+    inst.quiet().await;
+    let r = mock.requests();
+    assert!(!r.iter().any(|r| r.method == "PURGE"), "a reset ran: {r:?}");
+    assert!(
+        !fired(&r, "/o").contains(&"2".to_string()),
+        "an unchanged row fired: {r:?}"
+    );
+
+    // A table swapped in that is not such a copy may hold other rows: the rule resets.
+    mock.clear();
+    db.exec("CREATE TABLE orders_rebuilt (id INT PRIMARY KEY, customer_id INT, status VARCHAR(20), total DECIMAL(10,2), note VARCHAR(20))").await;
+    db.exec("RENAME TABLE orders TO orders_before, orders_rebuilt TO orders")
+        .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the reset after a swap",
+        || async {
+            mock.requests()
+                .iter()
+                .any(|r| r.method == "PURGE")
+                .then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batches_split_and_go_to_every_endpoint() {
     let root = need_db!();
     let db = Db::fresh(&root, "split").await;
