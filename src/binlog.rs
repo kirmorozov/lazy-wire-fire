@@ -1,6 +1,5 @@
 // Copied from lazyview (https://github.com/kirmorozov/lazyview, src/binlog.rs, MIT), with the
-// product names in messages changed and `BinlogReader::event_time` added. Keep it in sync with
-// upstream fixes rather than diverging.
+// product names in messages changed. Keep it in sync with upstream fixes rather than diverging.
 
 //! Binlog replication client: positions, server checks and a decoded event stream.
 //!
@@ -662,8 +661,6 @@ struct Tracker {
     generation: u64,
     /// Second item produced by one event (MariaDB XA GTID → `Gtid` + `XaStart`).
     queued: Option<Item>,
-    /// Header timestamp (unix seconds) of the last event from the file.
-    event_time: u32,
 }
 
 impl Tracker {
@@ -678,7 +675,6 @@ impl Tracker {
             tables: HashMap::new(),
             generation: 0,
             queued: None,
-            event_time: 0,
         }
     }
 
@@ -782,12 +778,6 @@ impl BinlogReader {
     /// The table map currently known for `table_id` (column types / metadata).
     pub fn table_map(&self, table_id: u64) -> Option<&TableMapEvent<'static>> {
         self.t.table_map(table_id)
-    }
-
-    /// Header timestamp (unix seconds, the time the transaction was logged) of the last event
-    /// read from the file; 0 before the first one.
-    pub fn event_time(&self) -> u32 {
-        self.t.event_time
     }
 
     /// Next item; `Ok(None)` when the server closed the stream.
@@ -1221,10 +1211,6 @@ impl Tracker {
             None => false,
         };
         let artificial = header.flags_raw() & ARTIFICIAL_FLAG != 0;
-        if !artificial && !matches!(et, ty::HEARTBEAT | ty::HEARTBEAT_V2) && header.timestamp() != 0
-        {
-            self.event_time = header.timestamp();
-        }
         if !inner && !artificial && !matches!(et, ty::HEARTBEAT | ty::HEARTBEAT_V2) {
             if log_pos != 0 {
                 self.pos.pos = log_pos;
