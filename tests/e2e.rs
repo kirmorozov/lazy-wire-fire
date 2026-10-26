@@ -979,6 +979,97 @@ async fn ddl_resets_and_rules_change_live() {
     inst.stop().await;
 }
 
+/// The keys `path` received, over all its requests (comma-separated bodies).
+fn fired(reqs: &[Req], path: &str) -> Vec<String> {
+    reqs.iter()
+        .filter(|r| r.path == path)
+        .flat_map(|r| r.body.split(',').map(String::from).collect::<Vec<_>>())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_enabled_again_replays_what_it_missed() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "reenable").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"once": true, "template": "PURGE /all HTTP/1.1\n\n"}]).to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) VALUES ('o', 'hook', \
+         'POST /o HTTP/1.1\n\n{{join keys \",\"}}', ?, 50)",
+        (steps,),
+    )
+    .await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('c', 'hook', 'POST /c HTTP/1.1\n\n{{join keys \",\"}}', 50)").await;
+    db.trigger("c", "customers", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(Duration::from_secs(10), "the first-start reset", || async {
+        mock.requests()
+            .iter()
+            .any(|r| r.method == "PURGE")
+            .then_some(())
+    })
+    .await;
+    db.exec("INSERT INTO customers VALUES (1, 'a')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 1)").await;
+    wait_for(Duration::from_secs(10), "both rules", || async {
+        let r = mock.requests();
+        (fired(&r, "/o") == ["1"] && fired(&r, "/c") == ["1"]).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+
+    // Disabled: its changes stay in the binlog, the other rule goes on.
+    db.exec("UPDATE lazy_wire_fire_rule SET enabled = 0 WHERE name = 'o'")
+        .await;
+    wait_for(Duration::from_secs(10), "the rule disabled", || async {
+        inst.health.status()["rules"]
+            .get("o")
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    mock.clear();
+    db.exec("INSERT INTO orders VALUES (2, 1, 'n', 1)").await;
+    db.exec("UPDATE orders SET total = 2 WHERE id = 2").await;
+    db.exec("INSERT INTO orders VALUES (3, 1, 'n', 1)").await;
+    db.exec("INSERT INTO customers VALUES (2, 'b')").await;
+    wait_for(Duration::from_secs(10), "the other rule", || async {
+        (fired(&mock.requests(), "/c") == ["2"]).then_some(())
+    })
+    .await;
+    assert!(
+        fired(&mock.requests(), "/o").is_empty(),
+        "fired while disabled"
+    );
+
+    // Enabled again: it replays what it missed instead of resetting, and the other rule does not
+    // fire again for what it already read.
+    db.exec("UPDATE lazy_wire_fire_rule SET enabled = 1 WHERE name = 'o'")
+        .await;
+    wait_for(Duration::from_secs(15), "the replayed keys", || async {
+        let o = fired(&mock.requests(), "/o");
+        (o.contains(&"2".to_string()) && o.contains(&"3".to_string())).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let r = mock.requests();
+    assert!(!r.iter().any(|r| r.method == "PURGE"), "a reset ran: {r:?}");
+    assert!(
+        !fired(&r, "/o").contains(&"1".to_string()),
+        "order 1 was confirmed before the rule was disabled: {r:?}"
+    );
+    assert_eq!(fired(&r, "/c"), ["2"], "the other rule fired again");
+    let (_, _, reset_state, _) = db.status("o").await.unwrap();
+    assert!(
+        !reset_state.starts_with("pending") && !reset_state.starts_with("running"),
+        "{reset_state}"
+    );
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batches_split_and_go_to_every_endpoint() {
     let root = need_db!();

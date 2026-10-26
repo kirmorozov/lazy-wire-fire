@@ -12,7 +12,7 @@ lines are in the [README](../README.md#supported-servers).
 | `binlog_format` | `ROW` | at start: refused otherwise |
 | `binlog_row_image` | `FULL` | at start: refused otherwise |
 | `binlog_row_value_options` (MySQL) | empty (no `PARTIAL_JSON`) | at start: refused otherwise |
-| `binlog_row_metadata` | `FULL` optional | column names then come from the table map, else from `information_schema` |
+| `binlog_row_metadata` | `FULL` recommended | column names then come from the table map, so an `ALTER` of a watched table never resets its rules; otherwise they come from `information_schema`, and a change in its column count does |
 | `gtid_mode`, `enforce_gtid_consistency` (MySQL, Percona) | `ON` recommended | the visibility fence, below |
 | binlog expiry (`binlog_expire_logs_seconds`) | longer than the longest outage to ride out | a restart after a longer one finds its position purged and runs every rule's reset steps |
 
