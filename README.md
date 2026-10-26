@@ -213,7 +213,8 @@ platforms. Pushes to `main` publish `edge` once every blocking job passes; `v*` 
 also needs the search engines. Dependabot bumps actions, crates, base images and the test servers'
 patch builds weekly.
 
-The binlog reader (`src/binlog.rs`) is an unmodified copy of
+The binlog reader (`src/binlog.rs`) and the view planner (`src/analyze.rs`, `src/analyzer/`,
+`src/catalog.rs`, `src/datum.rs`; not used by the engine yet) are unmodified copies of
 [lazyview](https://github.com/kirmorozov/lazyview)'s, pinned in `vendor/lazyview.lock` and updated
 with `scripts/sync-lazyview.sh`.
 
