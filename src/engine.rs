@@ -1081,8 +1081,12 @@ impl Engine {
                                     delivered = true;
                                     backoff = Duration::from_millis(500);
                                 }
-                                if !matches!(item, Item::Heartbeat) {
-                                    self.last_event_ts = reader.event_time();
+                                // The time a rows event was logged (statement start); 0 is unknown.
+                                if let Item::Rows { event, .. } = &item {
+                                    let ts = event.header().timestamp();
+                                    if ts != 0 {
+                                        self.last_event_ts = ts;
+                                    }
                                 }
                                 self.caught_up = matches!(item, Item::Heartbeat);
                                 if let Err(e) = self.on_item(&reader, item).await {
