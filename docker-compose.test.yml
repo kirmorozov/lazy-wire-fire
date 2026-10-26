@@ -200,7 +200,7 @@ services:
   # ---- profile `prerelease`: advisory, never required (make test-prerelease) ----------------
   # MySQL and Percona publish no pre-release image (MySQL early access ships as downloads only).
   mariadb131-rc:
-    image: mariadb:13.1.1-rc
+    image: mariadb:13.1.1-rc@sha256:a652753786e98d9f976aaab8cc21e49c16ea0cfe41a877694825a6ea73140fb1
     profiles: ["prerelease"]
     command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
               "--max-connections=500", "--innodb-buffer-pool-size=128M"]
