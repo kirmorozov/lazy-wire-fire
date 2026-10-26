@@ -4,9 +4,13 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod action;
+pub mod analyze;
+pub mod analyzer;
 pub mod aws;
 pub mod binlog;
+pub mod catalog;
 pub mod config;
+pub mod datum;
 pub mod docs;
 pub mod engine;
 pub mod health;

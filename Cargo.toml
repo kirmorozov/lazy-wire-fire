@@ -34,6 +34,7 @@ base64 = "0.23"
 httparse = "1"
 indexmap = "2"
 roaring = "0.11"
+sqlparser = { version = "0.63", features = ["visitor"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
 [dev-dependencies]
