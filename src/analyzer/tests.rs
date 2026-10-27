@@ -256,7 +256,7 @@ fn cte_inlining_is_bounded() {
         p.mode,
         Mode::Full(
             "inlining the WITH clause reads 64 table references in one SELECT (budget 32): \
-             CTE `t5` is referenced 2 times (needs internal views)"
+             CTE `t5` is referenced 2 times"
                 .into()
         )
     );
@@ -264,7 +264,7 @@ fn cte_inlining_is_bounded() {
     for n in [14, 18, 40] {
         let (p, dt) = plan(n);
         assert!(
-            matches!(p.mode, Mode::Full(ref r) if r.contains("(needs internal views)")),
+            matches!(p.mode, Mode::Full(ref r) if r.starts_with("inlining the WITH clause reads")),
             "{}",
             p.mode
         );
@@ -633,13 +633,855 @@ fn not_in_is_rendered_as_not_exists() {
     assert_eq!(
         reason("CREATE VIEW v AS SELECT o.id, d.id AS c FROM orders o LEFT JOIN (SELECT id FROM customers WHERE region_id NOT IN \
                 (SELECT r.id FROM regions r WHERE r.name = 'x')) d ON d.id = o.customer_id"),
-        "IN subquery in a derived table or CTE on the NULL side of a LEFT JOIN (needs internal views)"
+        "IN subquery in a derived table or CTE on the NULL side of a LEFT JOIN"
     );
     // Not a filter context: Full with the reason.
     assert_eq!(
         reason("CREATE VIEW v AS SELECT o.id FROM orders o ORDER BY o.customer_id NOT IN (SELECT id FROM customers WHERE region_id = 1), o.id LIMIT 2"),
         "NOT IN subquery in the ORDER BY of a top-N view (MariaDB re-executes it with a stale result): write NOT EXISTS"
     );
+}
+
+/// Schema part 2: NOT IN over columns that are never NULL is NOT EXISTS (direct units, no
+/// all-units NULL trace); a UNIQUE NOT NULL key makes a semi-join an inner join like the PK.
+#[test]
+fn not_null_columns_and_unique_keys_in_semi_joins() {
+    let mut cat = catalog();
+    let set = |cat: &mut HashMap<TableRef, Arc<TableInfo>>, t: &str, f: &dyn Fn(&mut TableInfo)| {
+        let k = ("db".to_string(), t.to_string());
+        let mut info = (*cat[&k]).clone();
+        f(&mut info);
+        cat.insert(k, Arc::new(info));
+    };
+    set(&mut cat, "customers", &|t| t.columns[0].nullable = false);
+    let plan = |cat: &HashMap<TableRef, Arc<TableInfo>>, sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let sql = "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT o.customer_id FROM orders o WHERE o.total > 5)";
+    // orders.customer_id nullable: NOT IN (its exact NOT EXISTS form in the refresh), lookups.
+    let v = plan(&cat, sql);
+    assert_eq!(v.tracing(), "c:unit,o:lookup");
+    assert!(
+        v.lookup_sql(1, "(O)").contains("IS NULL"),
+        "{}",
+        v.lookup_sql(1, "(O)")
+    );
+    // NOT NULL on both sides: NOT EXISTS, direct units.
+    set(&mut cat, "orders", &|t| t.columns[1].nullable = false);
+    let v = plan(&cat, sql);
+    assert_eq!(v.tracing(), "c:unit,o:unit");
+    assert_eq!(
+        v.where_sql.as_deref(),
+        Some("(NOT EXISTS (SELECT 1 FROM orders o WHERE (`o`.total > 5) AND (`o`.customer_id = c.id)))")
+    );
+    // The outer column on the NULL side of a LEFT JOIN can be NULL: stays NOT IN.
+    let v = plan(
+        &cat,
+        "SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.customer_id \
+         WHERE c.id NOT IN (SELECT r.id FROM regions r)",
+    );
+    assert!(
+        v.where_sql
+            .as_deref()
+            .unwrap()
+            .contains("IS NOT NULL AND NOT EXISTS"),
+        "{:?}",
+        v.where_sql
+    );
+    // A UNIQUE NOT NULL key (no PK): IN over it is an inner join when the outer column compares
+    // like the key (G1: same charset and collation).
+    set(&mut cat, "codes", &|t| {
+        t.pk.clear();
+        t.columns[0].nullable = false;
+        t.unique_keys = vec![vec![0]];
+    });
+    let v = plan(
+        &cat,
+        "SELECT cu.id FROM customers cu WHERE cu.name IN (SELECT c.code FROM codes c WHERE c.v > 1)",
+    );
+    assert!(
+        v.aliases.iter().all(|a| a.pos.0 != usize::MAX),
+        "{}",
+        v.tracing()
+    );
+    assert!(v.from_sql.contains("codes"), "{}", v.from_sql);
+    // A latin1 column against the utf8mb4 key: a semi-join (lookups).
+    let v = plan(
+        &cat,
+        "SELECT r.id FROM refs r WHERE r.code IN (SELECT c.code FROM codes c WHERE c.v > 1)",
+    );
+    assert_eq!(v.tracing(), "r:unit,c:lookup");
+    assert!(!v.from_sql.contains("codes"), "{}", v.from_sql);
+}
+
+/// G1: a semi-join becomes an inner join, and a scalar subquery a LEFT JOIN, only when the
+/// equalities on the key compare like the key. A string key against a number (`'1'`, `'01'`,
+/// `'1.0'` all equal 1) or under an explicit COLLATE matches several key rows: those stay
+/// semi-joins (lookups, exact) or subqueries. An integer expression against an integer key, or
+/// a column of the key's own collation, joins.
+#[test]
+fn semi_joins_need_key_exact_equalities() {
+    let mut cat = catalog();
+    let int = |n: &str| {
+        let mut c = Column::simple(n, "int");
+        c.nullable = false;
+        c
+    };
+    let text = |n: &str, co: &str| {
+        let mut c = Column::new(
+            n,
+            "varchar",
+            "varchar(10)",
+            Some("utf8mb4"),
+            Some(co),
+            Some(40),
+            false,
+        );
+        c.nullable = false;
+        c
+    };
+    let general = "utf8mb4_general_ci";
+    for (name, cols, pk, unique) in [
+        (
+            "c",
+            vec![
+                int("id"),
+                int("num"),
+                text("name", general),
+                Column::simple("ref", "int"),
+            ],
+            vec![0],
+            vec![],
+        ),
+        (
+            "s_str",
+            vec![int("id"), text("code", general), Column::simple("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_spk",
+            vec![text("code", general), Column::simple("v", "int")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "s_bin",
+            vec![
+                int("id"),
+                text("code", "utf8mb4_bin"),
+                Column::simple("v", "int"),
+            ],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_int",
+            vec![int("id"), int("code"), Column::simple("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        t.unique_keys = unique;
+        cat.insert(k, Arc::new(t));
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (definition, subquery table, joined)
+    for (sql, table, joined) in [
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)", "s_str", false),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = c.num)",
+            "s_str",
+            false,
+        ),
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_spk s)", "s_spk", false),
+        (
+            "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)",
+            "s_bin",
+            false,
+        ),
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)", "s_int", true),
+        ("SELECT c.id FROM c WHERE c.num * 2 + 1 IN (SELECT s.code FROM s_int s)", "s_int", true),
+        ("SELECT c.id FROM c WHERE c.name IN (SELECT s.code FROM s_str s)", "s_str", true),
+        ("SELECT c.id FROM c WHERE c.name IN (SELECT s.code FROM s_spk s)", "s_spk", true),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.from_sql.contains(table), joined, "{sql}: {}", v.from_sql);
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            !joined,
+            "{sql}: {}",
+            v.tracing()
+        );
+    }
+    // Scalar subqueries: a LEFT JOIN only over a key-exact equality, else a subquery (Full).
+    for (sql, joined) in [
+        ("SELECT c.id, (SELECT s.v FROM s_str s WHERE s.code = c.num) AS v FROM c", false),
+        ("SELECT c.id, (SELECT s.v FROM s_spk s WHERE s.code = c.num) AS v FROM c", false),
+        (
+            "SELECT c.id, (SELECT b.v FROM s_bin b WHERE b.code = c.name COLLATE utf8mb4_general_ci) AS v FROM c",
+            false,
+        ),
+        ("SELECT c.id, (SELECT s.v FROM s_int s WHERE s.code = c.num) AS v FROM c", true),
+        ("SELECT c.id, (SELECT s.v FROM s_spk s WHERE s.code = c.name) AS v FROM c", true),
+    ] {
+        let want = if joined {
+            Mode::Spj
+        } else {
+            Mode::Full("subquery".into())
+        };
+        assert_eq!(plan(sql).mode, want, "{sql}");
+    }
+}
+
+/// G1 / G4 (guard R4): the key-exact rule in other formulations: swapped sides and a one-element
+/// row, composite keys with one non-exact part, integer widths and signedness, the subquery
+/// reached through a CTE or derived table with renamed columns, scalar subqueries in the SELECT
+/// list and in WHERE, and outer columns one and two joins away.
+#[test]
+fn key_exact_formulations() {
+    let mut cat = catalog();
+    let int = |n: &str, ty: &str| {
+        let mut c = Column::new(n, ty, ty, None, None, None, false);
+        c.nullable = false;
+        c
+    };
+    let text = |n: &str| {
+        let mut c = Column::new(
+            n,
+            "varchar",
+            "varchar(10)",
+            Some("utf8mb4"),
+            Some("utf8mb4_general_ci"),
+            Some(40),
+            false,
+        );
+        c.nullable = false;
+        c
+    };
+    for (name, cols, pk, unique) in [
+        (
+            "c",
+            vec![int("id", "int"), int("num", "int"), text("name")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "d",
+            vec![
+                int("id", "int"),
+                int("c_id", "int"),
+                int("num", "int"),
+                text("code"),
+            ],
+            vec![0],
+            vec![],
+        ),
+        (
+            "e",
+            vec![int("id", "int"), int("d_id", "int"), int("num", "int")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "s_str",
+            vec![int("id", "int"), text("code"), int("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_int",
+            vec![int("id", "int"), int("code", "int"), int("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_big",
+            vec![int("id", "int"), int("code", "bigint"), int("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_uns",
+            vec![
+                int("id", "int"),
+                Column::new("code", "int", "int unsigned", None, None, None, false),
+                int("v", "int"),
+            ],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "s_comp",
+            vec![
+                int("id", "int"),
+                int("a", "int"),
+                text("b"),
+                int("v", "int"),
+            ],
+            vec![0],
+            vec![vec![1, 2]],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        for c in &mut t.columns {
+            c.nullable = false;
+        }
+        t.unique_keys = unique;
+        cat.insert(k, Arc::new(t));
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (definition, subquery table, joined)
+    for (sql, table, joined) in [
+        // (a) swapped sides, a one-element row.
+        ("SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_str s WHERE c.num = s.code)", "s_str", false),
+        ("SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_int s WHERE c.num = s.code)", "s_int", true),
+        ("SELECT c.id FROM c WHERE (c.num) IN (SELECT s.code FROM s_str s)", "s_str", false),
+        ("SELECT c.id FROM c WHERE (c.num) IN (SELECT (s.code) FROM s_int s)", "s_int", true),
+        // (b) a composite key: every part must be exact.
+        ("SELECT c.id FROM c WHERE (c.num, c.num) IN (SELECT s.a, s.b FROM s_comp s)", "s_comp", false),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_comp s WHERE s.a = c.num AND s.b = c.num)",
+            "s_comp",
+            false,
+        ),
+        ("SELECT c.id FROM c WHERE (c.num, c.name) IN (SELECT s.a, s.b FROM s_comp s)", "s_comp", true),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM s_comp s WHERE s.b = c.name AND s.a = c.num)",
+            "s_comp",
+            true,
+        ),
+        // (c) integer widths and signedness compare as integers.
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_big s)", "s_big", true),
+        ("SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_uns s)", "s_uns", true),
+        // (d) through a CTE / derived table with renamed columns, and inside a CTE.
+        (
+            "WITH t AS (SELECT c.id AS cid, c.num AS n FROM c) SELECT t.cid FROM t WHERE t.n IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            false,
+        ),
+        (
+            "WITH t AS (SELECT c.id AS cid, c.num AS n FROM c) SELECT t.cid FROM t WHERE t.n IN (SELECT s.code FROM s_int s)",
+            "s_int",
+            true,
+        ),
+        (
+            "SELECT x.cid FROM (SELECT c.id AS cid, c.num AS n FROM c) x WHERE EXISTS (SELECT 1 FROM s_str s WHERE s.code = x.n)",
+            "s_str",
+            false,
+        ),
+        (
+            "SELECT x.cid FROM (SELECT c.id AS cid, c.num AS n FROM c) x WHERE EXISTS (SELECT 1 FROM s_int s WHERE s.code = x.n)",
+            "s_int",
+            true,
+        ),
+        (
+            "WITH t AS (SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_str s)) SELECT id FROM t",
+            "s_str",
+            false,
+        ),
+        (
+            "WITH t AS (SELECT c.id FROM c WHERE c.num IN (SELECT s.code FROM s_int s)) SELECT id FROM t",
+            "s_int",
+            true,
+        ),
+        // (e) outer columns one and two joins away.
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id WHERE d.num IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id WHERE d.code IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            true,
+        ),
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id JOIN e ON e.d_id = d.id WHERE e.num IN (SELECT s.code FROM s_str s)",
+            "s_str",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c JOIN d ON d.c_id = c.id JOIN e ON e.d_id = d.id WHERE e.num IN (SELECT s.code FROM s_int s)",
+            "s_int",
+            true,
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.from_sql.contains(table), joined, "{sql}: {}", v.from_sql);
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            !joined,
+            "{sql}: {}",
+            v.tracing()
+        );
+    }
+    // Scalar subqueries in the SELECT list and in WHERE: a LEFT JOIN only over exact keys.
+    for (sql, joined) in [
+        ("SELECT c.id, (SELECT s.v FROM s_str s WHERE c.num = s.code) AS v FROM c", false),
+        ("SELECT c.id, (SELECT s.v FROM s_int s WHERE c.num = s.code) AS v FROM c", true),
+        ("SELECT c.id FROM c WHERE (SELECT s.v FROM s_str s WHERE s.code = c.num) > 1", false),
+        ("SELECT c.id FROM c WHERE (SELECT s.v FROM s_int s WHERE s.code = c.num) > 1", true),
+        (
+            "SELECT c.id, (SELECT s.v FROM s_comp s WHERE s.a = c.num AND s.b = c.num) AS v FROM c",
+            false,
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM s_comp s WHERE s.a = c.num AND s.b = c.name) AS v FROM c",
+            true,
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM s_big s WHERE s.code = d.num) AS v FROM c JOIN d ON d.c_id = c.id",
+            true,
+        ),
+    ] {
+        let m = plan(sql).mode;
+        if joined {
+            assert_eq!(m, Mode::Spj, "{sql}");
+        } else {
+            assert!(matches!(&m, Mode::Full(_)), "{sql}: {m:?}");
+        }
+    }
+}
+
+/// G4: TIMESTAMP equality is not injective under a time zone with DST (two instants of the
+/// fall-back hour show one local time), so a TIMESTAMP on either side of a key equality never
+/// turns a semi-join, a scalar subquery or an aggregated CTE into a join; DATE and DATETIME keys
+/// against their own type still do.
+#[test]
+fn timestamp_keys_are_not_key_exact() {
+    let mut cat = catalog();
+    let col = |n: &str, ty: &str| {
+        let mut c = Column::new(n, ty, ty, None, None, None, false);
+        c.nullable = false;
+        c
+    };
+    for (name, cols, pk, unique) in [
+        (
+            "c",
+            vec![
+                col("id", "int"),
+                col("d", "date"),
+                col("dt", "datetime"),
+                col("ts", "timestamp"),
+            ],
+            vec![0],
+            vec![],
+        ),
+        (
+            "k_ts",
+            vec![col("id", "int"), col("k", "timestamp"), col("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "k_tspk",
+            vec![col("k", "timestamp"), col("v", "int")],
+            vec![0],
+            vec![],
+        ),
+        (
+            "k_dt",
+            vec![col("id", "int"), col("k", "datetime"), col("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+        (
+            "k_date",
+            vec![col("id", "int"), col("k", "date"), col("v", "int")],
+            vec![0],
+            vec![vec![1]],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        t.unique_keys = unique;
+        cat.insert(k, Arc::new(t));
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (definition, subquery table, joined)
+    for (sql, table, joined) in [
+        (
+            "SELECT c.id FROM c WHERE c.dt IN (SELECT s.k FROM k_ts s)",
+            "k_ts",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM k_ts s WHERE s.k = c.dt)",
+            "k_ts",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.ts IN (SELECT s.k FROM k_ts s)",
+            "k_ts",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.ts IN (SELECT s.k FROM k_tspk s)",
+            "k_tspk",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.ts IN (SELECT s.k FROM k_dt s)",
+            "k_dt",
+            false,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.dt IN (SELECT s.k FROM k_dt s)",
+            "k_dt",
+            true,
+        ),
+        (
+            "SELECT c.id FROM c WHERE c.d IN (SELECT s.k FROM k_date s)",
+            "k_date",
+            true,
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.from_sql.contains(table), joined, "{sql}: {}", v.from_sql);
+        assert_eq!(
+            v.aliases.iter().any(|a| a.semi.is_some()),
+            !joined,
+            "{sql}: {}",
+            v.tracing()
+        );
+    }
+    for (sql, want) in [
+        (
+            "SELECT c.id, (SELECT s.v FROM k_ts s WHERE s.k = c.dt) AS v FROM c",
+            Mode::Full("subquery".into()),
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM k_tspk s WHERE s.k = c.ts) AS v FROM c",
+            Mode::Full("subquery".into()),
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM k_dt s WHERE s.k = c.ts) AS v FROM c",
+            Mode::Full("subquery".into()),
+        ),
+        (
+            "SELECT c.id, (SELECT s.v FROM k_dt s WHERE s.k = c.dt) AS v FROM c",
+            Mode::Spj,
+        ),
+        // An aggregated CTE joined on a TIMESTAMP key is not pulled up; on a DATETIME key it is.
+        (
+            "WITH t AS (SELECT ts, COUNT(*) AS n FROM c GROUP BY ts) SELECT s.id, t.n FROM k_ts s JOIN t ON t.ts = s.k",
+            Mode::Full("GROUP BY in CTE `t` joined to other tables".into()),
+        ),
+        (
+            "WITH t AS (SELECT dt, COUNT(*) AS n FROM c GROUP BY dt) SELECT s.id, t.n FROM k_dt s JOIN t ON t.dt = s.k",
+            Mode::Grouped,
+        ),
+    ] {
+        assert_eq!(plan(sql).mode, want, "{sql}");
+    }
+}
+
+/// G5: a JSON value in a composite unit is Full (MySQL compares JSON by representation in a row
+/// IN list of two or more tuples, the engine's filter for several units). Decided on the value's
+/// type, not on how it is written; a single JSON key, text and scalars over JSON, a unit the keys
+/// reduce to columns without JSON, and MariaDB's JSON (LONGTEXT) are not affected. Also through
+/// CTEs and derived tables with renamed columns, joins in every placement, and 1-3 hops.
+#[test]
+fn json_columns_in_composite_units() {
+    let mut cat = catalog();
+    let col = |n: &str, ty: &str| Column::new(n, ty, ty, None, None, None, false);
+    let mut long = Column::new(
+        "doc",
+        "longtext",
+        "longtext",
+        Some("utf8mb4"),
+        Some("utf8mb4_bin"),
+        None,
+        true,
+    );
+    long.nullable = true;
+    for (name, cols, pk) in [
+        (
+            "docs",
+            vec![col("id", "int"), col("doc", "json"), col("grp", "int")],
+            vec![0],
+        ),
+        (
+            "docs_m",
+            vec![col("id", "int"), long, col("grp", "int")],
+            vec![0],
+        ),
+        (
+            "docs_ab",
+            vec![
+                col("a", "int"),
+                col("b", "int"),
+                col("doc", "json"),
+                col("grp", "int"),
+            ],
+            vec![0, 1],
+        ),
+        (
+            "items",
+            vec![
+                col("id", "int"),
+                col("grp", "int"),
+                col("doc_id", "int"),
+                col("link_id", "int"),
+            ],
+            vec![0],
+        ),
+        (
+            "links",
+            vec![col("id", "int"), col("doc_id", "int"), col("mid_id", "int")],
+            vec![0],
+        ),
+        (
+            "mids",
+            vec![col("id", "int"), col("doc_id", "int")],
+            vec![0],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        cat.insert(k, t);
+    }
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let full = |sql: &str| {
+        let m = plan(sql).mode;
+        assert!(
+            matches!(&m, Mode::Full(r) if r.starts_with("JSON value `")
+                && r.ends_with("` in a composite group key: MySQL compares JSON by representation in multi-row IN lists")),
+            "{sql}: {m:?}"
+        );
+    };
+    let grouped = |sql: &str| assert_eq!(plan(sql).mode, Mode::Grouped, "{sql}");
+    assert_eq!(
+        plan("SELECT grp, doc, COUNT(*) AS n FROM docs GROUP BY grp, doc").mode,
+        Mode::Full(
+            "JSON value `doc` in a composite group key: MySQL compares JSON by representation in multi-row IN lists"
+                .into()
+        )
+    );
+    // JSON values next to another key: columns, choices among JSON values, JSON computed below
+    // the top (DISTINCT and PARTITION BY units alike).
+    for sql in [
+        "SELECT DISTINCT grp, doc FROM docs",
+        "SELECT id, SUM(grp) OVER (PARTITION BY grp, doc) AS s FROM docs",
+        "SELECT grp, IFNULL(doc, '{}') AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT grp, CASE WHEN grp > 1 THEN doc END AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT grp, IFNULL(JSON_OBJECT('k', id), JSON_OBJECT()) AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+    ] {
+        full(sql);
+    }
+    // JSON computed by CAST or CONVERT (both spellings), alone or next to another key: Full by
+    // the computed-JSON rule.
+    for sql in [
+        "SELECT grp, CAST(JSON_UNQUOTE(doc) AS JSON) AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT grp, CONVERT(JSON_UNQUOTE(doc), JSON) AS k, COUNT(*) AS n FROM docs GROUP BY grp, k",
+        "SELECT CONVERT(JSON_UNQUOTE(doc), JSON) AS k, COUNT(*) AS n FROM docs GROUP BY k",
+    ] {
+        let m = plan(sql).mode;
+        assert!(
+            matches!(&m, Mode::Full(r) if r.contains("is a JSON value computed by a function")),
+            "{sql}: {m:?}"
+        );
+    }
+    // Text and scalars over JSON next to another key, single JSON keys, MariaDB.
+    for sql in [
+        "SELECT doc, COUNT(*) AS n FROM docs GROUP BY doc",
+        "SELECT DISTINCT doc FROM docs",
+        "SELECT grp, JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a')) AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, doc ->> '$.a' AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, LOWER(doc ->> '$.a') AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, JSON_VALUE(doc, '$.a') AS a, COUNT(*) AS n FROM docs GROUP BY grp, a",
+        "SELECT grp, JSON_LENGTH(doc) AS l, COUNT(*) AS n FROM docs GROUP BY grp, l",
+        "SELECT grp, CAST(doc AS CHAR) AS t, COUNT(*) AS n FROM docs GROUP BY grp, t",
+        "SELECT grp, doc, COUNT(*) AS n FROM docs_m GROUP BY grp, doc",
+    ] {
+        grouped(sql);
+    }
+    // The primary key determines doc: the unit is the key alone (renamed, by position, or not
+    // selected); a composite key stays composite but holds no JSON.
+    for sql in [
+        "SELECT id, doc, COUNT(*) AS n FROM docs GROUP BY id, doc",
+        "SELECT id AS k, doc, COUNT(*) AS n FROM docs GROUP BY k, doc",
+        "SELECT id, doc, COUNT(*) AS n FROM docs GROUP BY 1, 2",
+        "SELECT doc, COUNT(*) AS n FROM docs GROUP BY id, doc",
+        "SELECT a, b, doc, COUNT(*) AS n FROM docs_ab GROUP BY a, b, doc",
+        "SELECT DISTINCT id, doc FROM docs",
+    ] {
+        grouped(sql);
+    }
+    full("SELECT a, doc, COUNT(*) AS n FROM docs_ab GROUP BY a, doc");
+    // Window units are the PARTITION BY list as written (the unit planner does not reduce them by
+    // keys): a JSON column there is Full even next to the key (conservative, sound).
+    for sql in [
+        "SELECT id, SUM(grp) OVER (PARTITION BY id, doc) AS s FROM docs",
+        "SELECT a, SUM(grp) OVER (PARTITION BY a, b, doc) AS s FROM docs_ab",
+        "SELECT a, SUM(grp) OVER (PARTITION BY a, doc) AS s FROM docs_ab",
+    ] {
+        full(sql);
+    }
+    // Through a CTE and a derived table with renamed columns.
+    for (sql, json) in [
+        ("WITH x AS (SELECT grp AS g, doc AS j FROM docs) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j", true),
+        ("SELECT g, j, COUNT(*) AS n FROM (SELECT grp AS g, doc AS j FROM docs) x GROUP BY g, j", true),
+        ("WITH x AS (SELECT grp AS g, doc AS j FROM docs_m) SELECT g, j, COUNT(*) AS n FROM x GROUP BY g, j", false),
+        ("SELECT g, j, COUNT(*) AS n FROM (SELECT grp AS g, doc AS j FROM docs_m) x GROUP BY g, j", false),
+        ("WITH x AS (SELECT id AS k, doc AS j FROM docs) SELECT k, j, COUNT(*) AS n FROM x GROUP BY k, j", false),
+    ] {
+        if json {
+            full(sql)
+        } else {
+            grouped(sql)
+        }
+    }
+    // A joined table's JSON column: joined on its key (JOIN … ON, comma + WHERE, either order,
+    // LEFT JOIN), one to three hops away; the outer key determines it (Grouped), another column
+    // does not (Full).
+    let hops = [
+        "items i JOIN docs d ON d.id = i.doc_id",
+        "items i JOIN docs d ON i.doc_id = d.id",
+        "items i, docs d WHERE d.id = i.doc_id",
+        "items i, docs d WHERE i.doc_id = d.id",
+        "docs d JOIN items i ON d.id = i.doc_id",
+        "items i LEFT JOIN docs d ON d.id = i.doc_id",
+        "items i JOIN links l ON l.id = i.link_id JOIN docs d ON d.id = l.doc_id",
+        "items i JOIN links l ON l.id = i.link_id JOIN mids m ON m.id = l.mid_id JOIN docs d ON d.id = m.doc_id",
+    ];
+    for from in hops {
+        let (from, cond) = match from.split_once(" WHERE ") {
+            Some((f, w)) => (f.to_string(), format!(" WHERE {w}")),
+            None => (from.to_string(), String::new()),
+        };
+        grouped(&format!(
+            "SELECT i.id, d.doc, COUNT(*) AS n FROM {from}{cond} GROUP BY i.id, d.doc"
+        ));
+        let other =
+            format!("SELECT i.grp, d.doc, COUNT(*) AS n FROM {from}{cond} GROUP BY i.grp, d.doc");
+        if from.contains("LEFT JOIN") {
+            // (The NULL-side group key is refused first.)
+            assert_eq!(
+                plan(&other).mode,
+                Mode::Full("group key on the NULL side of a LEFT JOIN".into())
+            );
+        } else {
+            full(&other);
+        }
+    }
+    // A one-element `IN (y)` is not a key equality for the unit planner: the key does not reduce
+    // the unit, so the JSON column stays in it and the view is Full (conservative, sound).
+    for from in [
+        "items i JOIN docs d ON d.id IN (i.doc_id)",
+        "items i, docs d WHERE d.id IN (i.doc_id)",
+    ] {
+        full(&format!(
+            "SELECT i.id, d.doc, COUNT(*) AS n FROM {from} GROUP BY i.id, d.doc"
+        ));
+    }
+}
+
+/// The VIEW_DEFINITION validator: the server's canonical text (MySQL and MariaDB printing)
+/// reads the same tables and column count; a different reading is an error naming it.
+#[test]
+fn validate_against_the_canonical_definition() {
+    let cat = catalog();
+    let check = |sql: &str, canonical: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        super::validate(&d, canonical, "db", &cat)
+    };
+    for (sql, canonical) in [
+        (
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id",
+            "select `o`.`id` AS `id`,`c`.`name` AS `name` from (`db`.`orders` `o` join `db`.`customers` `c` on((`c`.`id` = `o`.`customer_id`)))",
+        ),
+        (
+            "SELECT * FROM regions",
+            "select `db`.`regions`.`id` AS `id`,`db`.`regions`.`name` AS `name` from `db`.`regions`",
+        ),
+        (
+            "WITH t AS (SELECT id FROM orders WHERE total > 5) SELECT id FROM t",
+            "with `t` as (select `db`.`orders`.`id` AS `id` from `db`.`orders` where (`db`.`orders`.`total` > 5)) select `t`.`id` AS `id` from `t`",
+        ),
+        (
+            "SELECT d.id FROM (SELECT id FROM orders) d WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = d.id)",
+            "select `d`.`id` AS `id` from (select `db`.`orders`.`id` AS `id` from `db`.`orders`) `d` where exists(select 1 from `db`.`customers` `c` where (`c`.`id` = `d`.`id`))",
+        ),
+    ] {
+        assert!(check(sql, canonical).is_ok(), "{sql}: {:?}", check(sql, canonical));
+    }
+    let e = check(
+        "SELECT id FROM orders",
+        "select `db`.`customers`.`id` AS `id` from `db`.`customers`",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("`db`.`customers`") && e.contains("`db`.`orders`"),
+        "{e}"
+    );
+    let e = check(
+        "SELECT * FROM regions",
+        "select `db`.`regions`.`id` AS `id` from `db`.`regions`",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("1 columns where lazyview reads 2"), "{e}");
+    // Unreadable printing: not checked.
+    assert!(check("SELECT id FROM orders", "select ??? garbage").is_ok());
+}
+
+/// C4: a top-N over a set operation names the ORDER BY … LIMIT and the operator.
+#[test]
+fn top_n_over_a_union_is_named() {
+    assert_eq!(
+        reason("CREATE VIEW v AS (SELECT id, total FROM orders) UNION ALL (SELECT id, price FROM order_items) ORDER BY total DESC LIMIT 5"),
+        "ORDER BY … LIMIT over a UNION ALL"
+    );
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers ORDER BY id LIMIT 5"),
+        "ORDER BY … LIMIT over a UNION"
+    );
+    assert_eq!(
+        reason("CREATE VIEW v AS SELECT id FROM orders UNION SELECT id FROM customers"),
+        "set operation (UNION/INTERSECT/EXCEPT)"
+    );
+}
+
+/// C6: an aggregate scalar subquery names itself and its place instead of "subquery".
+#[test]
+fn aggregate_scalar_subqueries_are_named() {
+    for (sql, why) in [
+        (
+            "SELECT c.id, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS n FROM customers c",
+            "correlated aggregate subquery in the SELECT list",
+        ),
+        (
+            "SELECT o.id, (SELECT SUM(i.price) FROM order_items i WHERE i.order_id = o.id AND i.qty > 1) AS paid FROM orders o",
+            "correlated aggregate subquery in the SELECT list",
+        ),
+        (
+            "SELECT id FROM orders o WHERE o.total > (SELECT AVG(total) FROM orders)",
+            "uncorrelated aggregate subquery in the WHERE clause",
+        ),
+    ] {
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
+    }
 }
 
 /// L6: the budget applies to each join block on its own (a UNION ALL branch is planned alone):
@@ -688,7 +1530,7 @@ fn inlining_budget_is_per_join_block() {
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {wide}")),
         "inlining the WITH clause reads 64 table references in UNION branch 2 (budget 32): \
-         CTE `t5` is referenced 2 times (needs internal views)"
+         CTE `t5` is referenced 2 times"
     );
     // A 33-way join written out inlines nothing: planned as written.
     let mut join = "SELECT o0.id FROM orders o0".to_string();
@@ -705,7 +1547,7 @@ fn inlining_budget_is_per_join_block() {
     }
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {derived}")),
-        "inlining derived tables reads 33 table references in one SELECT (budget 32) (needs internal views)"
+        "inlining derived tables reads 33 table references in one SELECT (budget 32)"
     );
 }
 
@@ -790,7 +1632,7 @@ fn order_by_through_merges_and_subqueries() {
 
 /// C1: a string literal containing a newline before a semi-join marker does not break the
 /// marker replacement (token locations are converted with the literal's lines). C2: a
-/// parenthesized join that is not a chain of inner joins names what it needs.
+/// parenthesized join that is not a chain of inner joins names the construct.
 #[test]
 fn newlines_in_literals_and_nested_outer_joins() {
     let cat = catalog();
@@ -812,7 +1654,7 @@ fn newlines_in_literals_and_nested_outer_joins() {
         p.mode,
         Mode::Full(
             "parenthesized join (customers c JOIN regions r ON r.id = c.region_id) that cannot \
-             be flattened into the FROM chain (needs internal views)"
+             be flattened into the FROM chain"
                 .into()
         )
     );
@@ -905,17 +1747,17 @@ fn improvements() -> Vec<(&'static str, Result<Mode, &'static str>)> {
             "WHERE c.id IN (SELECT customer_id FROM orders WHERE total > 5) ORDER BY region_id LIMIT 3",
             Ok(Mode::Global),
         ),
-        // A group key on the NULL side: traced through the tuple-lineage view (internal views).
+        // A group key on the NULL side: Full (the tuple-lineage view is an internal view).
         (
             "SELECT i.order_id, COUNT(*) FROM orders o LEFT JOIN order_items i ON i.order_id = o.id GROUP BY i.order_id",
             Ok(Mode::Full(
-                "group key on the NULL side of a LEFT JOIN (needs internal views)".into(),
+                "group key on the NULL side of a LEFT JOIN".into(),
             )),
         ),
         (
             "SELECT COALESCE(c.name, '?') n, COUNT(*) FROM orders o LEFT JOIN customers c",
             Ok(Mode::Full(
-                "group key on the NULL side of a LEFT JOIN (needs internal views)".into(),
+                "group key on the NULL side of a LEFT JOIN".into(),
             )),
         ),
         // The server rejects the definition (2 columns for 1 name).
@@ -1129,21 +1971,21 @@ fn taxonomy_strategies_and_reasons() {
         m("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.id"),
         Mode::Grouped
     );
-    // Joined on anything else: kept apart (internal views pending).
+    // Joined on anything else: kept apart (Full).
     assert_eq!(
         full(
             "WITH t AS (SELECT customer_id, SUM(total) s FROM orders GROUP BY customer_id) \
               SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
         ),
-        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
+        "GROUP BY in CTE `t` joined to other tables"
     );
     assert_eq!(
         full("WITH t AS (SELECT DISTINCT customer_id FROM orders) SELECT c.name FROM customers c JOIN t ON t.customer_id = c.region_id"),
-        "DISTINCT in CTE `t` joined to other tables (needs internal views)"
+        "DISTINCT in CTE `t` joined to other tables"
     );
     assert_eq!(
         full("WITH t AS (SELECT customer_id, COUNT(*) n FROM orders GROUP BY customer_id) SELECT n, COUNT(*) FROM t GROUP BY n"),
-        "GROUP BY in CTE `t` under an aggregate, DISTINCT, window or LIMIT (needs internal views)"
+        "GROUP BY in CTE `t` under an aggregate, DISTINCT, window or LIMIT"
     );
     // Set operations, LIMIT, windows, recursion, constants, non-determinism.
     assert_eq!(
@@ -1158,7 +2000,7 @@ fn taxonomy_strategies_and_reasons() {
     );
     assert_eq!(
         full("WITH t AS (SELECT id FROM orders ORDER BY total DESC LIMIT 5) SELECT id FROM t"),
-        "ORDER BY … LIMIT in CTE `t` (needs internal views)"
+        "ORDER BY … LIMIT in CTE `t`"
     );
     assert_eq!(
         full("WITH t AS (SELECT id FROM orders LIMIT 5) SELECT id FROM t"),
@@ -1166,7 +2008,7 @@ fn taxonomy_strategies_and_reasons() {
     );
     assert_eq!(
         full("WITH t AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) rn FROM orders) SELECT id FROM t WHERE rn = 1"),
-        "window function in CTE `t` (needs internal views)"
+        "window function in CTE `t`"
     );
     assert_eq!(
         full("WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT o.id FROM orders o JOIN r ON r.n = o.id"),
@@ -1268,10 +2110,7 @@ fn aggregation_pulled_up_through_key_joins() {
         "CREATE VIEW v AS WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) \
          SELECT c.id, t.s FROM customers c JOIN t ON t.customer_id = c.region_id"
     );
-    assert_eq!(
-        r,
-        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
-    );
+    assert_eq!(r, "GROUP BY in CTE `t` joined to other tables");
     // NULL side, and a key compared across type families: not pulled up.
     assert!(matches!(
         v(&format!(
@@ -1371,15 +2210,15 @@ fn internal_views_for_aggregates_joined_on_non_keys() {
     // Without internal views: Full, naming the construct.
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {sql}")),
-        "GROUP BY in CTE `t` joined to other tables (needs internal views)"
+        "GROUP BY in CTE `t` joined to other tables"
     );
 }
 
-/// A semi-join whose table maps to the units neither directly nor through a unique key: an
-/// inner join with the internal view of its distinct keys.
+/// C3: a semi-join over a child of a cascading foreign key stays incremental where the subquery
+/// is correlated on the unit through the FK columns (the parent's deletes / key updates give the
+/// units); otherwise the view is Full (cascaded child rows have no binlog rows).
 #[test]
-fn internal_views_for_untraceable_semi_joins() {
-    // A cascading foreign key changes order_items rows without binlog rows of their own.
+fn semi_joins_over_cascading_children() {
     let mut cat = catalog();
     let key = ("db".to_string(), "order_items".to_string());
     let mut items = (*cat[&key]).clone();
@@ -1391,37 +2230,22 @@ fn internal_views_for_untraceable_semi_joins() {
         on_update: crate::catalog::FkAction::Cascade,
     }];
     cat.insert(key, Arc::new(items));
-    let sql = "SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT qty FROM order_items WHERE price > 1)";
-    let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-    assert_eq!(
-        analyzer_plan(&d, "db", &cat).unwrap().mode,
-        Mode::Full("IN subquery over `order_items`, a child of a cascading foreign key".into())
-    );
-    let super::Outcome::NeedsInternal(ivs) = outcome(sql, &cat) else {
-        panic!("expected an internal view")
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap()
     };
-    assert_eq!(
-        ivs[0].sql,
-        format!(
-            "CREATE VIEW `{}` AS SELECT `order_items`.`qty` AS `qty` FROM `db`.`order_items` AS `order_items` \
-             WHERE (`order_items`.price > 1) GROUP BY `order_items`.`qty`",
-            ivs[0].name
-        )
-    );
-    assert_eq!(ivs[0].key, vec!["qty".to_string()]);
-    let (k, t) = internal_table(&ivs[0], &[("qty", "int")], &[0]);
-    cat.insert(k, t);
-    let super::Outcome::Plan(v) = outcome(sql, &cat) else {
-        panic!("expected a plan")
-    };
+    // Correlated on the unit through the FK column: the parent's image gives the units.
+    let v = plan("SELECT o.id, o.status FROM orders o WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.qty > 5)");
     assert_eq!(v.mode, Mode::Spj);
-    assert_eq!(v.aliases.len(), 2);
-    assert!(
-        v.where_sql
-            .as_deref()
-            .is_some_and(|w| w.contains("`order_items_keys`.`qty` = `o`.customer_id")),
-        "{:?}",
-        v.where_sql
+    assert_eq!(v.tracing(), "o:unit,i:unit,^orders:unit");
+    // Not on the unit: the units a parent's delete changes are not known.
+    let v = plan("SELECT o.id, o.status FROM orders o WHERE o.customer_id IN (SELECT qty FROM order_items WHERE price > 1)");
+    assert_eq!(
+        v.mode,
+        Mode::Full(
+            "IN subquery over `order_items`: the units a cascade from `orders` changes are not known"
+                .into()
+        )
     );
 }
 
@@ -1556,7 +2380,7 @@ fn semi_joins_over_joined_subqueries() {
     for (sql, why) in [
         (
             "SELECT c.id FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o LEFT JOIN order_items i ON i.order_id = o.id WHERE i.qty IS NULL)",
-            "IN subquery with an outer join (needs internal views)",
+            "IN subquery with an outer join",
         ),
         (
             "SELECT id FROM orders WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = orders.id LIMIT 1)",
@@ -1564,11 +2388,11 @@ fn semi_joins_over_joined_subqueries() {
         ),
         (
             "SELECT c.id FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id GROUP BY o.customer_id HAVING SUM(i.qty) > 4)",
-            "IN subquery with an aggregate (needs internal views)",
+            "IN subquery with an aggregate",
         ),
         (
             "SELECT c.id FROM customers c WHERE c.id IN (SELECT d.customer_id FROM (SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) d WHERE d.n > 2)",
-            "IN subquery with an aggregate (needs internal views)",
+            "IN subquery with an aggregate",
         ),
     ] {
         assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
@@ -1590,9 +2414,13 @@ fn semi_joins_over_joined_subqueries() {
          (SELECT o.customer_id FROM orders o JOIN order_items i ON i.order_id = o.id)",
     )
     .unwrap();
+    let v = analyzer_plan(&d, "db", &cat).unwrap();
     assert_eq!(
-        analyzer_plan(&d, "db", &cat).unwrap().mode,
-        Mode::Full("IN subquery over `order_items`, a child of a cascading foreign key".into())
+        v.mode,
+        Mode::Full(
+            "IN subquery over `order_items`: the units a cascade from `orders` changes are not known"
+                .into()
+        )
     );
 }
 
@@ -1635,7 +2463,7 @@ fn internal_views_for_windows_and_top_n() {
     // Without internal views: Full, naming the construct.
     assert_eq!(
         reason(&format!("CREATE VIEW v AS {win}")),
-        "window function in CTE `t` (needs internal views)"
+        "window function in CTE `t`"
     );
 }
 
@@ -1738,12 +2566,18 @@ fn scalar_lookups_unnested() {
         "`c`.`name` AS `(SELECT name FROM customers c WHERE c.id = o.customer_id)`"
     );
     assert_eq!(w.aliases.len(), 3);
-    // Not a key lookup, or an aggregate: still a subquery.
-    for sql in [
-        "SELECT o.id, (SELECT name FROM customers c WHERE c.region_id = o.customer_id) AS n FROM orders o",
-        "SELECT o.id, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o",
+    // Not a key lookup, or an aggregate (named, C6): still a subquery.
+    for (sql, why) in [
+        (
+            "SELECT o.id, (SELECT name FROM customers c WHERE c.region_id = o.customer_id) AS n FROM orders o",
+            "subquery",
+        ),
+        (
+            "SELECT o.id, (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o",
+            "correlated aggregate subquery in the SELECT list",
+        ),
     ] {
-        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), "subquery", "{sql}");
+        assert_eq!(reason(&format!("CREATE VIEW v AS {sql}")), why, "{sql}");
     }
 }
 
@@ -1776,7 +2610,7 @@ fn join_syntax_normalized() {
     // A LEFT JOIN inside parentheses keeps its own NULL semantics: not flattened.
     assert_eq!(
         reason("CREATE VIEW v AS SELECT o.id FROM orders o JOIN (customers c LEFT JOIN regions r ON r.id = c.region_id) ON c.id = o.customer_id"),
-        "parenthesized join (customers c LEFT JOIN regions r ON r.id = c.region_id) that cannot be flattened into the FROM chain (needs internal views)"
+        "parenthesized join (customers c LEFT JOIN regions r ON r.id = c.region_id) that cannot be flattened into the FROM chain"
     );
 }
 
@@ -1931,4 +2765,489 @@ fn semi_join_views_are_identified_by_their_from_tables() {
     ] {
         assert!(!p(sql).rows_identified(), "{sql}");
     }
+}
+
+/// Catalog for the formulation tests below: `item` is a cascading child of `entity`, `pair_item`
+/// one of `pair` through a composite key; `attr` / `attr_n` reference `entity` without a foreign
+/// key (NOT NULL / nullable column).
+fn formulation_catalog() -> HashMap<TableRef, Arc<TableInfo>> {
+    use crate::catalog::{FkAction, ForeignKey};
+    let mut cat = catalog();
+    let col = |n: &str, nullable: bool| {
+        let mut c = Column::new(n, "int", "int", None, None, None, false);
+        c.nullable = nullable;
+        c
+    };
+    let fk = |parent: &str, child_cols: Vec<usize>, parent_cols: Vec<&str>| ForeignKey {
+        parent: ("db".into(), parent.into()),
+        child_cols,
+        parent_cols: parent_cols.into_iter().map(String::from).collect(),
+        on_delete: FkAction::Cascade,
+        on_update: FkAction::Cascade,
+    };
+    for (name, cols, pk, cascades) in [
+        (
+            "entity",
+            vec![col("id", false), col("v", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "attr",
+            vec![col("id", false), col("ent_id", false), col("v", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "attr_n",
+            vec![col("id", false), col("ent_id", true), col("v", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "link",
+            vec![col("id", false), col("ent_id", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "link2",
+            vec![col("id", false), col("link_id", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "link3",
+            vec![col("id", false), col("link2_id", false)],
+            vec![0],
+            vec![],
+        ),
+        (
+            "item",
+            vec![col("id", false), col("ent_id", false), col("v", false)],
+            vec![0],
+            vec![fk("entity", vec![1], vec!["id"])],
+        ),
+        (
+            "item_n",
+            vec![col("id", false), col("ent_id", true), col("v", false)],
+            vec![0],
+            vec![fk("entity", vec![1], vec!["id"])],
+        ),
+        (
+            "item_part",
+            vec![col("id", false), col("item_id", false), col("v", false)],
+            vec![0],
+            vec![fk("item", vec![1], vec!["id"])],
+        ),
+        (
+            "item_part_sub",
+            vec![col("id", false), col("part_id", false), col("v", false)],
+            vec![0],
+            vec![fk("item_part", vec![1], vec!["id"])],
+        ),
+        (
+            "pair",
+            vec![col("a", false), col("b", false), col("v", false)],
+            vec![0, 1],
+            vec![],
+        ),
+        (
+            "pair_item",
+            vec![
+                col("id", false),
+                col("pa", false),
+                col("pb", false),
+                col("v", false),
+            ],
+            vec![0],
+            vec![fk("pair", vec![1, 2], vec!["a", "b"])],
+        ),
+    ] {
+        let (k, t) = typed(name, cols, &pk);
+        let mut t = (*t).clone();
+        t.cascades = cascades;
+        cat.insert(k, Arc::new(t));
+    }
+    cat
+}
+
+/// Guard R4 on PR #3: `x NOT IN (SELECT k …)` with x and k never NULL is `NOT EXISTS (… AND k = x)`
+/// (direct units) in every formulation where x is a NOT NULL column of the head or an inner-joined
+/// table: written as NOT EXISTS, the outer column on an inner-joined table that is not first in
+/// FROM, a comma join. A NULL side or a nullable k keeps the NULL-aware NOT IN form.
+#[test]
+fn not_in_over_never_null_columns_formulations() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let anti = |sql: &str, tracing: &str| {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.tracing(), tracing, "{sql}");
+        let w = v.where_sql.unwrap_or_default();
+        assert!(
+            w.contains("NOT EXISTS") && !w.contains("IS NULL"),
+            "{sql}: {w}"
+        );
+    };
+    let not_in = |sql: &str, tracing: &str| {
+        let v = plan(sql);
+        assert_eq!(v.tracing(), tracing, "{sql}");
+        let w = v.where_sql.unwrap_or_default();
+        assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
+    };
+    let sub = "(SELECT a.ent_id FROM attr a WHERE a.v > 5)";
+    anti(
+        &format!("SELECT e.id FROM entity e WHERE e.id NOT IN {sub}"),
+        "e:unit,a:unit",
+    );
+    anti(
+        "SELECT e.id FROM entity e WHERE NOT EXISTS (SELECT 1 FROM attr a WHERE a.v > 5 AND a.ent_id = e.id)",
+        "e:unit,a:unit",
+    );
+    // The outer column on an inner-joined table that is not first in FROM, and a comma join (the
+    // unit is the head's key: the subquery table is looked up).
+    anti(
+        &format!(
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id WHERE e.id NOT IN {sub}"
+        ),
+        "l:unit,e:lineage,a:lookup",
+    );
+    anti(
+        &format!("SELECT l.id FROM link l, entity e WHERE e.id = l.ent_id AND e.id NOT IN {sub}"),
+        "l:unit,e:lineage,a:lookup",
+    );
+    // The outer column on a NULL side, a nullable k: NOT IN with its NULL branches.
+    not_in(
+        &format!(
+            "SELECT l.id FROM link l LEFT JOIN entity e ON e.id = l.ent_id WHERE e.id NOT IN {sub}"
+        ),
+        "l:unit,e:lookup,a:lookup",
+    );
+    not_in(
+        "SELECT e.id FROM entity e WHERE e.id NOT IN (SELECT a.ent_id FROM attr_n a WHERE a.v > 5)",
+        "e:unit,a:lookup",
+    );
+    // Through a CTE / derived table with renamed columns, also nested: the derived output is the
+    // inner NOT NULL column, the same NOT EXISTS form and route as the base.
+    for sql in [
+        format!("WITH t AS (SELECT e.id AS eid FROM entity e) SELECT t.eid FROM t WHERE t.eid NOT IN {sub}"),
+        format!("SELECT x.eid FROM (SELECT e.id AS eid FROM entity e) x WHERE x.eid NOT IN {sub}"),
+        format!(
+            "WITH t AS (SELECT e.id AS eid FROM entity e), u AS (SELECT t.eid AS k FROM t) SELECT u.k FROM u WHERE u.k NOT IN {sub}"
+        ),
+    ] {
+        anti(&sql, "e:unit,a:unit");
+    }
+    // A derived output that may be NULL, or is not a plain column, keeps NOT IN: a nullable inner
+    // column, an inner LEFT JOIN's NULL side, the NULL side of a leading RIGHT JOIN (mirrored to a
+    // LEFT JOIN), an expression output.
+    for sql in [
+        format!("SELECT x.k FROM (SELECT a.ent_id AS k FROM attr_n a) x WHERE x.k NOT IN {sub}"),
+        format!(
+            "SELECT x.lid FROM (SELECT l.id AS lid, e.id AS eid FROM link l LEFT JOIN entity e ON e.id = l.ent_id) x WHERE x.eid NOT IN {sub}"
+        ),
+        format!(
+            "SELECT x.lid FROM (SELECT l.id AS lid FROM link l RIGHT JOIN entity e ON e.id = l.ent_id) x WHERE x.lid NOT IN {sub}"
+        ),
+        format!("SELECT x.eid FROM (SELECT e.id + 0 AS eid FROM entity e) x WHERE x.eid NOT IN {sub}"),
+        format!("SELECT x.k FROM (SELECT COALESCE(a.ent_id, 0) AS k FROM attr_n a) x WHERE x.k NOT IN {sub}"),
+    ] {
+        let w = plan(&sql).where_sql.unwrap_or_default();
+        assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
+    }
+    // An aggregated derived block, and a RIGHT JOIN after the column's table, are Full anyway.
+    assert_eq!(
+        plan(&format!("SELECT x.eid FROM (SELECT e.id AS eid FROM entity e GROUP BY e.id) x WHERE x.eid NOT IN {sub}")).mode,
+        Mode::Full("GROUP BY in derived table `x` under an aggregate, DISTINCT, window or LIMIT".into())
+    );
+    assert_eq!(
+        plan(&format!("SELECT x.eid FROM (SELECT e.id AS eid FROM entity e JOIN link l ON l.ent_id = e.id RIGHT JOIN attr a ON a.ent_id = e.id) x WHERE x.eid NOT IN {sub}")).mode,
+        Mode::Full("RIGHT/FULL/other join".into())
+    );
+}
+
+/// Guard R4 on PR #3 (C3): a semi-join over a child of a cascading foreign key takes the parent's
+/// cascade route when it is correlated on the view's unit through the whole key (`^parent:unit`),
+/// in every formulation: swapped sides, IN, a CTE or derived table with renamed outputs, a
+/// composite key, the parent first with other tables after it; otherwise the view is Full.
+#[test]
+fn cascading_child_semi_join_formulations() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    for (sql, tracing) in [
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE e.id = i.ent_id AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE e.id IN (SELECT i.ent_id FROM item i WHERE i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "WITH t AS (SELECT e.id AS eid FROM entity e) SELECT t.eid FROM t WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = t.eid AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT x.eid FROM (SELECT e.id AS eid FROM entity e) x WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = x.eid AND i.v > 5)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT p.a, p.b FROM pair p WHERE EXISTS (SELECT 1 FROM pair_item q WHERE q.pa = p.a AND q.pb = p.b)",
+            "p:unit,q:unit,^pair:unit",
+        ),
+        (
+            "SELECT p.a, p.b FROM pair p WHERE EXISTS (SELECT 1 FROM pair_item q WHERE p.b = q.pb AND p.a = q.pa)",
+            "p:unit,q:unit,^pair:unit",
+        ),
+        // The parent first, another table joined after it (JOIN or comma join).
+        (
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,l:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,l:unit,i:unit,^entity:unit",
+        ),
+        // The parent key not selected.
+        (
+            "SELECT e.v FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        // Anti-joins: NOT EXISTS = NOT IN over never-NULL columns = its CTE / derived forms.
+        (
+            "SELECT e.id FROM entity e WHERE NOT EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE e.id NOT IN (SELECT i.ent_id FROM item i)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "WITH t AS (SELECT e.id AS eid FROM entity e) SELECT t.eid FROM t WHERE t.eid NOT IN (SELECT i.ent_id FROM item i)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+        (
+            "SELECT x.eid FROM (SELECT e.id AS eid FROM entity e) x WHERE x.eid NOT IN (SELECT i.ent_id FROM item i)",
+            "e:unit,i:unit,^entity:unit",
+        ),
+    ] {
+        let v = plan(sql);
+        assert_eq!(v.mode, Mode::Spj, "{sql}");
+        assert_eq!(v.tracing(), tracing, "{sql}");
+    }
+    // NOT IN over a nullable child key keeps its NULL branches (no direct units): the units a
+    // cascade changes are not known.
+    assert_eq!(
+        plan("SELECT e.id FROM entity e WHERE e.id NOT IN (SELECT i.ent_id FROM item_n i)").mode,
+        Mode::Full(
+            "IN subquery over `item_n`: the units a cascade from `entity` changes are not known"
+                .into()
+        )
+    );
+    // A grouped view keyed on the parent key.
+    let v = plan("SELECT e.id, COUNT(*) AS n FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id) GROUP BY e.id");
+    assert_eq!(v.mode, Mode::Grouped);
+    assert_eq!(v.tracing(), "e:unit,i:unit,^entity:unit");
+    // Not correlated on the unit through the whole key, so Full: part of a composite key, a group
+    // key that is an expression of the parent key, a cascade that continues out of the subquery's
+    // child (2 and 3 hops). (The parent after another table: known_limit_unit_follows_from_order.)
+    for (sql, parent, child) in [
+        (
+            "SELECT p.a, p.b FROM pair p WHERE EXISTS (SELECT 1 FROM pair_item q WHERE q.pa = p.a)",
+            "pair",
+            "pair_item",
+        ),
+        // A group key that is an expression of the parent key gives no direct units.
+        (
+            "SELECT e.id + 0 AS k, COUNT(*) AS n FROM entity e WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id) GROUP BY e.id + 0",
+            "entity",
+            "item",
+        ),
+        // A cascade that continues out of the subquery's child (2 and 3 hops).
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i JOIN item_part q ON q.item_id = i.id WHERE i.ent_id = e.id)",
+            "item",
+            "item_part",
+        ),
+        (
+            "SELECT e.id FROM entity e WHERE EXISTS (SELECT 1 FROM item i JOIN item_part q ON q.item_id = i.id JOIN item_part_sub r ON r.part_id = q.id WHERE i.ent_id = e.id)",
+            "item",
+            "item_part",
+        ),
+        (
+            "SELECT i.id FROM item i WHERE EXISTS (SELECT 1 FROM item_part q WHERE q.item_id = i.id)",
+            "entity",
+            "item_part",
+        ),
+    ] {
+        assert_eq!(
+            plan(sql).mode,
+            Mode::Full(format!(
+                "EXISTS subquery over `{child}`: the units a cascade from `{parent}` changes are not known"
+            )),
+            "{sql}"
+        );
+    }
+}
+
+/// KNOWN LIMIT (pre-existing, conservative; tracked for the key-map rewrite): semi- and
+/// anti-joins are extracted from WHERE conjuncts only, so the same predicate in an inner join's ON
+/// stays a subquery and the view is Full, while its WHERE form is incremental. Lifting the limit
+/// flips these assertions on purpose.
+#[test]
+fn known_limit_on_form_semi_join_full() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    for (on, wh) in [
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id AND e.id NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)",
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id WHERE e.id NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)",
+        ),
+        (
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+        ),
+    ] {
+        assert_eq!(plan(on).mode, Mode::Full("subquery".into()), "{on}");
+        assert_eq!(plan(wh).mode, Mode::Spj, "{wh}");
+    }
+}
+
+/// KNOWN LIMIT (pre-existing, conservative; tracked for the key-map rewrite): the unit of a
+/// select/join view is the first table's key, so a semi-join over a cascading child correlated on
+/// a parent that is not first in FROM is not on the unit and the view is Full, while the same view
+/// with the parent first is incremental (`^parent:unit`). Lifting the limit flips these
+/// assertions on purpose.
+#[test]
+fn known_limit_unit_follows_from_order() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    let why =
+        "EXISTS subquery over `item`: the units a cascade from `entity` changes are not known";
+    for (parent_first, parent_later) in [
+        (
+            "SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "SELECT e.id FROM link l JOIN entity e ON l.ent_id = e.id WHERE EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+        ),
+        (
+            "SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+            "SELECT e.id FROM link l, entity e WHERE l.ent_id = e.id AND EXISTS (SELECT 1 FROM item i WHERE i.ent_id = e.id)",
+        ),
+    ] {
+        let v = plan(parent_first);
+        assert_eq!(v.mode, Mode::Spj, "{parent_first}");
+        assert_eq!(v.tracing(), "e:unit,l:unit,i:unit,^entity:unit", "{parent_first}");
+        assert_eq!(plan(parent_later).mode, Mode::Full(why.into()), "{parent_later}");
+    }
+}
+
+/// Guard R4 on 7g: never_null reads the column's own join kind, every later join of its FROM
+/// entry, and (for a derived table / CTE) the derived item's position in the outer FROM and the
+/// output it maps to. Each `x NOT IN (…)` formulation below gets the same NOT EXISTS form and route
+/// as its written NOT EXISTS twin: the column's table followed by an inner, comma or LEFT join;
+/// the cascade forms with another table after the parent; a derived table / CTE inner- or
+/// comma-joined after another table; a multi-table inner block (the column on the head or on an
+/// inner-joined table); the column's table or a derived table in the middle of a chain, two or
+/// three joins from the unit; the NOT IN column not selected and not the first output.
+#[test]
+fn not_in_twins_across_join_placements() {
+    let cat = formulation_catalog();
+    let plan = |sql: &str| {
+        let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
+        analyzer_plan(&d, "db", &cat).unwrap_or_else(|e| panic!("{sql}: {e:#}"))
+    };
+    // (template with {P} for the predicate on x, x, subquery table, its key column, tracing)
+    let attr = ("attr a WHERE a.v > 5", "a.ent_id");
+    let item = ("item i WHERE TRUE", "i.ent_id");
+    for (template, x, (from, key), tracing) in [
+        ("SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE {P}", "e.id", attr, "e:unit,l:unit,a:unit"),
+        ("SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND {P}", "e.id", attr, "e:unit,l:unit,a:unit"),
+        ("SELECT e.id FROM entity e LEFT JOIN link l ON l.ent_id = e.id WHERE {P}", "e.id", attr, "e:unit,l:unit,a:unit"),
+        ("SELECT e.id FROM entity e JOIN link l ON l.ent_id = e.id WHERE {P}", "e.id", item, "e:unit,l:unit,i:unit,^entity:unit"),
+        ("SELECT e.id FROM entity e, link l WHERE l.ent_id = e.id AND {P}", "e.id", item, "e:unit,l:unit,i:unit,^entity:unit"),
+        ("SELECT l.id FROM link l JOIN (SELECT e.id AS eid FROM entity e) x ON x.eid = l.ent_id WHERE {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("SELECT l.id FROM link l, (SELECT e.id AS eid FROM entity e) x WHERE x.eid = l.ent_id AND {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("WITH t AS (SELECT e.id AS eid FROM entity e) SELECT l.id FROM link l JOIN t ON t.eid = l.ent_id WHERE {P}", "t.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("SELECT x.lid FROM (SELECT l.id AS lid, e.id AS eid FROM link l JOIN entity e ON e.id = l.ent_id) x WHERE {P}", "x.eid", attr, "l:unit,e:lineage,a:lookup"),
+        ("SELECT x.eid FROM (SELECT e.id AS eid, l.id AS lid FROM entity e JOIN link l ON l.ent_id = e.id) x WHERE {P}", "x.eid", attr, "e:unit,l:unit,a:unit"),
+        // The column's table (or a derived table) in the middle of a chain: inner-joined and
+        // followed by an inner, comma or LEFT join; and two or three joins away from the unit.
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id JOIN attr b ON b.ent_id = e.id WHERE {P}",
+            "e.id",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id, attr b WHERE b.ent_id = e.id AND {P}",
+            "e.id",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT l.id FROM link l JOIN entity e ON e.id = l.ent_id LEFT JOIN attr b ON b.ent_id = e.id WHERE {P}",
+            "e.id",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT l.id FROM link l JOIN (SELECT e.id AS eid FROM entity e) x ON x.eid = l.ent_id JOIN attr b ON b.ent_id = x.eid WHERE {P}",
+            "x.eid",
+            attr,
+            "l:unit,e:lineage,b:lineage,a:lookup",
+        ),
+        (
+            "SELECT m.id FROM link2 m JOIN link l ON l.id = m.link_id JOIN entity e ON e.id = l.ent_id WHERE {P}",
+            "e.id",
+            attr,
+            "m:unit,l:lineage,e:lineage,a:lookup",
+        ),
+        (
+            "SELECT n.id FROM link3 n JOIN link2 m ON m.id = n.link2_id JOIN link l ON l.id = m.link_id JOIN entity e ON e.id = l.ent_id WHERE {P}",
+            "e.id",
+            attr,
+            "n:unit,m:lineage,l:lineage,e:lineage,a:lookup",
+        ),
+        // The NOT IN column not selected and not the derived block's first output.
+        ("SELECT e.v FROM entity e WHERE {P}", "e.id", attr, "e:unit,a:unit"),
+        ("SELECT x.v FROM (SELECT e.v AS v, e.id AS eid FROM entity e) x WHERE {P}", "x.eid", attr, "e:unit,a:unit"),
+        ("WITH t AS (SELECT e.v AS v, e.id AS eid FROM entity e) SELECT t.v FROM t WHERE {P}", "t.eid", attr, "e:unit,a:unit"),
+    ] {
+        let (table, cond) = from.split_once(" WHERE ").unwrap();
+        let col = key.split_once('.').unwrap();
+        let not_in = template.replace("{P}", &format!("{x} NOT IN (SELECT {key} FROM {table} WHERE {cond})"));
+        let twin = template.replace(
+            "{P}",
+            &format!("NOT EXISTS (SELECT 1 FROM {table} WHERE {cond} AND {}.{} = {x})", col.0, col.1),
+        );
+        let (a, b) = (plan(&not_in), plan(&twin));
+        assert_eq!(a.mode, Mode::Spj, "{not_in}");
+        assert_eq!(b.mode, Mode::Spj, "{twin}");
+        assert_eq!(a.tracing(), tracing, "{not_in}");
+        assert_eq!(b.tracing(), tracing, "{twin}");
+        let w = a.where_sql.unwrap_or_default();
+        assert!(w.contains("NOT EXISTS") && !w.contains("IS NULL"), "{not_in}: {w}");
+    }
+    // A derived table on the NULL side of an outer LEFT JOIN keeps the NULL-aware NOT IN form.
+    let sql = "SELECT l.id FROM link l LEFT JOIN (SELECT e.id AS eid FROM entity e) x ON x.eid = l.ent_id \
+               WHERE x.eid NOT IN (SELECT a.ent_id FROM attr a WHERE a.v > 5)";
+    let w = plan(sql).where_sql.unwrap_or_default();
+    assert!(w.contains("IS NOT NULL AND NOT EXISTS"), "{sql}: {w}");
 }

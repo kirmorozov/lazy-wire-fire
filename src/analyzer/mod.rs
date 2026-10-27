@@ -133,11 +133,7 @@ fn analyze_block(
     let full = |why: &str| lower::full_plan(def, default_schema, tables, why).map(Outcome::Plan);
     let set_op = matches!(def.query.body.as_ref(), SetExpr::SetOperation { .. });
     if !opts.internal_views && !(opts.branch_plans && set_op) && !needs_analysis(&def.query) {
-        // (A group key on the NULL side goes on to name what would trace it.)
-        let p = analyze::plan_block(def, default_schema, tables)?;
-        if !matches!(&p.mode, Mode::Full(r) if r == NULL_SIDE_KEY) {
-            return Ok(Outcome::Plan(p));
-        }
+        return plan_as_written();
     }
     // Spans must point into the text the item names are taken from.
     let Some((mut query, tokens)) = source::parse_query(&def.query_sql) else {
@@ -161,7 +157,7 @@ fn analyze_block(
             _ => String::new(),
         };
         return full(&format!(
-            "inlining {what} reads {} table references in {place} (budget {INLINE_BUDGET}){culprit} (needs internal views)",
+            "inlining {what} reads {} table references in {place} (budget {INLINE_BUDGET}){culprit}",
             size.refs
         ));
     }
@@ -211,12 +207,7 @@ fn analyze_block(
         .find(|i| matches!(i.source, Source::Derived(_)))
     {
         if !opts.internal_views {
-            let why = normalize::unmerged_reason(&b, it);
-            return full(&if internal::isolatable(&b, it) {
-                format!("{why} (needs internal views)")
-            } else {
-                why
-            });
+            return full(&normalize::unmerged_reason(&b, it));
         }
         match internal::isolate(&mut b, default_schema, tables) {
             Ok(missing) if !missing.is_empty() => return Ok(Outcome::NeedsInternal(missing)),
@@ -246,25 +237,12 @@ fn analyze_block(
                 b.outputs.len()
             );
         }
-        loop {
-            match lower::plan_block(def, &b, default_schema, tables)? {
-                Ok(p) => break Ok(p),
-                // A semi-join whose table cannot be traced to the units: over an internal view
-                // of its distinct keys it is an inner join.
-                Err(lower::Refused::Semi(id, why)) if opts.internal_views => {
-                    match internal::semi_view(&mut b, id, default_schema, tables) {
-                        Ok(None) => continue,
-                        Ok(Some(iv)) => return Ok(Outcome::NeedsInternal(vec![iv])),
-                        Err(()) => return full(&why),
-                    }
-                }
-                Err(r) => break Err(r.reason()),
-            }
-        }
+        lower::plan_block(def, &b, default_schema, tables)?.map_err(|r| r.reason())
     };
     let plan = match planned {
         Ok(p) => p,
-        // A group key on the NULL side is traced through the tuple-lineage view.
+        // A group key on the NULL side: the tuple-lineage view, with internal views (shelved:
+        // `plan` never enables them).
         Err(why) if why == NULL_SIDE_KEY => {
             return match internal::tuple_view(&b, default_schema, tables) {
                 Some((iv, None)) if opts.internal_views => Ok(Outcome::NeedsInternal(vec![iv])),
@@ -274,8 +252,7 @@ fn analyze_block(
                         Err(r) => full(&r.reason()),
                     }
                 }
-                Some(_) => full(&format!("{why} (needs internal views)")),
-                None => full(&why),
+                Some(_) | None => full(&why),
             };
         }
         // A subquery that stayed one: the reason the semi-join extraction recorded.
@@ -284,8 +261,8 @@ fn analyze_block(
         }
         Err(why) => return full(&why),
     };
-    // Grouped over two or more lookup tables: the tuple-lineage view where the engine has
-    // internal views (the engine's remembered before-images trace them meanwhile).
+    // Grouped over two or more lookup tables: the tuple-lineage view with internal views
+    // (shelved; the engine's remembered before-images trace them).
     if opts.internal_views && internal::needs_tuple_view(&plan) {
         match internal::tuple_view(&b, default_schema, tables) {
             Some((iv, None)) => return Ok(Outcome::NeedsInternal(vec![iv])),
@@ -299,6 +276,89 @@ fn analyze_block(
         }
     }
     Ok(Outcome::Plan(plan))
+}
+
+/// Checks the analyzer's reading of a definition against the server's. `canonical` is the
+/// `VIEW_DEFINITION` the server stored for the statement as written (the probe view created from
+/// `def`): it must read the same base tables (CTE scoping applied on both sides) and, where the
+/// statement's output columns can be counted from it (`*` over base tables included), return as
+/// many columns. `Err` names the first difference; a canonical text the parser cannot read is
+/// not checked (its printing differs per flavor and version, it is a guard, not an input).
+pub fn validate(
+    def: &ParsedDef,
+    canonical: &str,
+    default_schema: &str,
+    tables: &HashMap<TableRef, Arc<TableInfo>>,
+) -> Result<()> {
+    let Some((server, _)) = source::parse_query(canonical) else {
+        return Ok(());
+    };
+    let ours = referenced_tables(&def.query, default_schema);
+    let theirs = referenced_tables(&server, default_schema);
+    if ours != theirs {
+        let names = |ts: &[TableRef]| {
+            ts.iter()
+                .map(|t| format!("`{}`.`{}`", t.0, t.1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        anyhow::bail!(
+            "the server reads tables {} where lazyview reads {}: the definition is not read the same way",
+            names(&theirs),
+            names(&ours)
+        );
+    }
+    let count = |q: &Query| -> Option<usize> {
+        let SetExpr::Select(s) = q.body.as_ref() else {
+            return None;
+        };
+        let mut from: Vec<(String, Arc<TableInfo>)> = Vec::new();
+        for (_, f) in ast::factors(&s.from) {
+            let TableFactor::Table { name, alias, .. } = f else {
+                return None;
+            };
+            let t = ast::object_table_ref(name, default_schema)?;
+            let info = tables.get(&t)?.clone();
+            let n = alias
+                .as_ref()
+                .map(|a| names::ident_name(&a.name))
+                .unwrap_or(t.1);
+            from.push((n.to_lowercase(), info));
+        }
+        let visible = |t: &TableInfo| t.columns.iter().filter(|c| !c.invisible).count();
+        s.projection.iter().try_fold(0usize, |n, item| {
+            Some(
+                n + match item {
+                    sqlparser::ast::SelectItem::Wildcard(_) => {
+                        if ast::factors(&s.from).len() > 1 {
+                            // (USING / NATURAL joins list shared columns once.)
+                            return None;
+                        }
+                        from.iter().map(|(_, t)| visible(t)).sum()
+                    }
+                    sqlparser::ast::SelectItem::QualifiedWildcard(k, _) => {
+                        let q = k.to_string().to_lowercase();
+                        let q = q
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches('`')
+                            .to_string();
+                        visible(&from.iter().find(|(n, _)| *n == q)?.1)
+                    }
+                    _ => 1,
+                },
+            )
+        })
+    };
+    if let (Some(a), Some(b)) = (count(&def.query), count(&server)) {
+        if a != b {
+            anyhow::bail!(
+                "the server's view has {b} columns where lazyview reads {a}: the definition is not read the same way"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether the statement uses anything the analyzer rewrites (otherwise the block planner sees

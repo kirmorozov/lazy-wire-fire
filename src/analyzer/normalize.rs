@@ -16,21 +16,22 @@ use sqlparser::ast::{
     visit_expressions, visit_expressions_mut, BinaryOperator, Distinct, Expr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
     ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
-    Value,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::ast::{
     and_all, conjuncts, exprs_of, factor_alias, factors, for_each_expr_mut, function_name,
-    has_column_ref, has_subquery, join_constraint, join_constraint_mut, kind_at, nested, qcol,
-    qident, table_factor, JoinKind,
+    has_column_ref, has_subquery, join_constraint, join_constraint_mut, join_kind, kind_at, nested,
+    qcol, qident, table_factor, JoinKind,
 };
 use super::build::{star_with_using, Builder, Res, Resolver};
 use super::ir::{Block, Item, Origin, Rel, Semi, SemiTable, Source};
 use super::names::ident_name;
 use super::scope::Scope;
 use crate::analyze::null_propagating;
+use crate::catalog::{Column, TypeFamily};
 
 pub(crate) const AGGREGATES: &[&str] = &[
     "COUNT",
@@ -543,7 +544,9 @@ fn mergeable_at(inner: &Block, kind: JoinKind) -> bool {
                     .outputs
                     .iter()
                     .all(|o| null_propagating(&o.expr) && has_column_ref(&o.expr))
-                    || inner.items[0].table().is_some_and(|t| !t.pk.is_empty()))
+                    || inner.items[0]
+                        .table()
+                        .is_some_and(|t| t.row_key().is_some()))
         }
         JoinKind::Other => false,
     }
@@ -613,7 +616,11 @@ fn merge_picks(b: &mut Block, picks: &[usize]) -> Result<Vec<Block>> {
         for (c, o) in inner.outputs.iter().enumerate() {
             let e = if null_side && !(null_propagating(&o.expr) && has_column_ref(&o.expr)) {
                 let t = &inner.items[0];
-                let pk = t.table().map(|t| t.columns[t.pk[0]].name.clone()).unwrap();
+                // (A key column is NOT NULL in every real row: NULL only when extended.)
+                let pk = t
+                    .table()
+                    .and_then(|t| t.row_key().map(|k| t.columns[k[0]].name.clone()))
+                    .unwrap();
                 parse_expr(&format!(
                     "IF({} IS NULL, NULL, {})",
                     qcol(&t.alias, &qident(&pk)),
@@ -928,37 +935,39 @@ fn pull_up(b: &mut Block) -> Result<()> {
         agg
     };
     // Key preservation, to a fixpoint: a table is bound when each of its primary-key columns
-    // equals a group key of the derived item or a column of a bound table (same type family).
+    // equals a group key of the derived item or a column of a bound table ([`same_key_type`]).
     let mut bound: HashSet<usize> = [d].into_iter().collect();
     loop {
         let mut grew = false;
         for (ti, it) in b.items.iter().enumerate() {
             let Some(t) = it.table() else { continue };
-            if bound.contains(&ti) || t.pk.is_empty() {
+            if bound.contains(&ti) {
                 continue;
             }
-            let covered = t.pk.iter().all(|&pc| {
-                conds.iter().filter(|c| !refs_agg(c)).any(|c| {
-                    let Expr::BinaryOp {
-                        left,
-                        op: BinaryOperator::Eq,
-                        right,
-                    } = c
-                    else {
-                        return false;
-                    };
-                    [(left, right), (right, left)].iter().any(|(a, z)| {
-                        if r.resolve(a) != Res::Col(ti, pc) {
+            let covered = t.keys().any(|key| {
+                key.iter().all(|&pc| {
+                    conds.iter().filter(|c| !refs_agg(c)).any(|c| {
+                        let Expr::BinaryOp {
+                            left,
+                            op: BinaryOperator::Eq,
+                            right,
+                        } = c
+                        else {
                             return false;
-                        }
-                        let other = match r.resolve(z) {
-                            Res::Col(i, c) if i == d && out_key[c] => out_col[c].clone(),
-                            Res::Col(i, c) if i != ti && bound.contains(&i) => {
-                                b.items[i].table().map(|t| t.columns[c].clone())
-                            }
-                            _ => None,
                         };
-                        other.is_some_and(|o| o.family() == t.columns[pc].family())
+                        [(left, right), (right, left)].iter().any(|(a, z)| {
+                            if r.resolve(a) != Res::Col(ti, pc) {
+                                return false;
+                            }
+                            let other = match r.resolve(z) {
+                                Res::Col(i, c) if i == d && out_key[c] => out_col[c].clone(),
+                                Res::Col(i, c) if i != ti && bound.contains(&i) => {
+                                    b.items[i].table().map(|t| t.columns[c].clone())
+                                }
+                                _ => None,
+                            };
+                            other.is_some_and(|o| same_key_type(&o, &t.columns[pc]))
+                        })
                     })
                 })
             });
@@ -1107,6 +1116,9 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
         joins: &'a mut Vec<(Join, Item)>,
         depth: usize,
         err: Option<anyhow::Error>,
+        /// Where the subqueries being visited sit, and why those that stay subqueries do.
+        place: &'static str,
+        blockers: Vec<String>,
     }
     impl sqlparser::ast::VisitorMut for V<'_, '_> {
         type Break = ();
@@ -1122,11 +1134,14 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
             if self.depth == 0 {
                 if let Expr::Subquery(q) = &*e {
                     match scalar(self.bld, self.outer, q, self.scope, self.taken) {
-                        Ok(Some((x, join, item))) => {
+                        Ok(Ok((x, join, item))) => {
                             *e = x;
                             self.joins.push((join, item));
                         }
-                        Ok(None) => {}
+                        Ok(Err(Some(why))) => {
+                            self.blockers.push(format!("{why} in {}", self.place))
+                        }
+                        Ok(Err(None)) => {}
                         Err(err) => {
                             self.err = Some(err);
                             return ControlFlow::Break(());
@@ -1148,6 +1163,8 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
         joins: &mut joins,
         depth: 0,
         err: None,
+        place: "the SELECT list",
+        blockers: Vec::new(),
     };
     use sqlparser::ast::VisitMut;
     for o in &mut b.outputs {
@@ -1157,12 +1174,14 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
             o.original = None;
         }
     }
+    v.place = "the WHERE clause";
     if let Some(w) = &mut b.select.selection {
         let _ = w.visit(&mut v);
     }
     if let Some(e) = v.err.take() {
         return Err(e);
     }
+    b.semi_blockers.append(&mut v.blockers);
     if joins.is_empty() {
         return Ok(());
     }
@@ -1179,18 +1198,42 @@ fn scalars(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
     relocate(b)
 }
 
-/// The LEFT JOIN replacing one scalar subquery, if it is a unique lookup (see [`scalars`]).
+/// The LEFT JOIN replacing one scalar subquery, if it is a unique lookup (see [`scalars`]);
+/// else why it stays a subquery, where that has a precise reason.
+type ScalarJoin = std::result::Result<(Expr, Join, Item), Option<String>>;
+
 fn scalar(
     bld: &Builder,
     outer: &Resolver,
     q: &Query,
     scope: &Scope,
     taken: &mut HashSet<String>,
-) -> Result<Option<(Expr, Join, Item)>> {
+) -> Result<ScalarJoin> {
     let Rel::Block(sb) = bld.nested(q, scope)? else {
-        return Ok(None);
+        return Ok(Err(None));
     };
     let sb = *sb;
+    // C6: an aggregate over the rows a correlation selects is one row per outer key, an internal
+    // grouped view joined on that key; uncorrelated, one value for every row.
+    if aggregated(&sb) && !windowed(&sb) && !sb.limit {
+        let inner = Resolver::new(&sb);
+        let mut correlated = false;
+        let _ = visit_expressions(&sb.select, |x: &Expr| {
+            if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                && inner.resolve(x) == Res::Unknown
+                && matches!(outer.resolve(x), Res::Col(..))
+            {
+                correlated = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        return Ok(Err(Some(if correlated {
+            "correlated aggregate subquery".to_string()
+        } else {
+            "uncorrelated aggregate subquery".to_string()
+        })));
+    }
     let simple = single_table(&sb)
         && matches!(sb.items[0].source, Source::Table(..))
         && sb.outputs.len() == 1
@@ -1201,13 +1244,13 @@ fn scalar(
         && sb.semis.is_empty()
         && !block_has_subquery(&sb);
     if !simple {
-        return Ok(None);
+        return Ok(Err(None));
     }
     let Source::Table(tref, info) = sb.items[0].source.clone() else {
         unreachable!()
     };
-    if info.pk.is_empty() {
-        return Ok(None);
+    if info.row_key().is_none() {
+        return Ok(Err(None));
     }
     let inner = Resolver::new(&sb);
     // Inner, outer or unknown identifiers of an expression.
@@ -1232,7 +1275,7 @@ fn scalar(
     let mut bound = HashSet::new();
     for c in &conds {
         if scan(c).2 {
-            return Ok(None);
+            return Ok(Err(None));
         }
         if let Expr::BinaryOp {
             left,
@@ -1243,15 +1286,24 @@ fn scalar(
             for (a, z) in [(left, right), (right, left)] {
                 if let Res::Col(_, col) = inner.resolve(a) {
                     let (zi, zo, _) = scan(z);
-                    if zi.is_empty() && zo > 0 {
+                    if zi.is_empty() && zo > 0 && key_exact(&info.columns[col], outer, z) {
                         bound.insert(col);
                     }
                 }
             }
         }
     }
-    if !info.pk.iter().all(|c| bound.contains(c)) || scan(&sb.outputs[0].expr).2 {
-        return Ok(None);
+    // Each outer row matches at most one row: a whole key (the PK or a UNIQUE NOT NULL key) is
+    // bound to outer columns that compare like it (G1).
+    let Some(key) = info
+        .keys()
+        .find(|k| k.iter().all(|c| bound.contains(c)))
+        .map(<[usize]>::to_vec)
+    else {
+        return Ok(Err(None));
+    };
+    if scan(&sb.outputs[0].expr).2 {
+        return Ok(Err(None));
     }
     let mut alias = sb.items[0].alias.clone();
     if taken.contains(&alias.to_lowercase()) {
@@ -1285,7 +1337,7 @@ fn scalar(
     } else {
         parse_expr(&format!(
             "IF({} IS NULL, NULL, {value})",
-            qcol(&alias, &qident(&info.columns[info.pk[0]].name))
+            qcol(&alias, &qident(&info.columns[key[0]].name))
         ))?
     };
     let on = and_all(conds.into_iter().map(localize).collect());
@@ -1306,7 +1358,7 @@ fn scalar(
         origin: Origin::Table,
         source: Source::Table(tref, info),
     };
-    Ok(Some((nested(value), join, item)))
+    Ok(Ok((nested(value), join, item)))
 }
 
 // ------------------------------------------------------------------------------ semi-joins
@@ -1337,24 +1389,6 @@ pub(crate) fn fill_placeholders(e: &mut Expr, args: &[Expr]) {
         }
         ControlFlow::<()>::Continue(())
     });
-}
-
-/// The outer-expression index of a placeholder.
-pub(crate) fn placeholder_of(e: &Expr) -> Option<usize> {
-    placeholder_index(e)
-}
-
-/// Whether `e` contains a placeholder (refers to the outer query).
-pub(crate) fn has_placeholder(e: &Expr) -> bool {
-    let mut found = false;
-    let _ = visit_expressions(e, |x: &Expr| {
-        if placeholder_index(x).is_some() {
-            found = true;
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(())
-    });
-    found
 }
 
 pub(crate) fn marker_name(id: usize) -> String {
@@ -1402,6 +1436,36 @@ pub(crate) fn query_of(select: Select) -> Query {
     }
 }
 
+/// Whether column `c` of `item` (in FROM `from`) is never NULL: NOT NULL in its table, which is
+/// the head or inner-joined (not on the NULL side of a LEFT JOIN: a merge onto a NULL side moves
+/// this WHERE into an ON, refused later) and not followed by a RIGHT / FULL / other join in its
+/// FROM entry (which would NULL-extend it); for a derived table or CTE, the column its output names
+/// in the inner block, recursively (not through aggregation, whose groups may add NULLs).
+fn never_null(from: &[TableWithJoins], item: &Item, c: usize) -> bool {
+    let (t, j) = item.pos;
+    let later = &from[t].joins[j.map_or(0, |j| j + 1)..];
+    if !matches!(kind_at(from, item.pos), JoinKind::Head | JoinKind::Inner)
+        || later
+            .iter()
+            .any(|x| matches!(join_kind(x), JoinKind::Other))
+    {
+        return false;
+    }
+    match &item.source {
+        Source::Table(_, t) => !t.columns[c].nullable,
+        Source::Derived(Rel::Block(inner)) => {
+            !aggregated(inner)
+                && inner.outputs.get(c).is_some_and(|o| {
+                    match Resolver::new(inner).resolve(&o.expr) {
+                        Res::Col(j, d) => never_null(&inner.select.from, &inner.items[j], d),
+                        _ => false,
+                    }
+                })
+        }
+        Source::Derived(_) => false,
+    }
+}
+
 /// Takes semi-/anti-join conjuncts over one table out of WHERE (see [`Semi`]).
 fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
     let Some(w) = &b.select.selection else {
@@ -1415,11 +1479,16 @@ fn extract_semis(bld: &Builder, b: &mut Block, scope: &Scope) -> Result<()> {
         return Ok(());
     }
     let outer = Resolver::new(b);
+    let (items, from) = (&b.items, &b.select.from);
+    let not_null = |e: &Expr| match outer.resolve(e) {
+        Res::Col(i, c) => never_null(from, &items[i], c),
+        _ => false,
+    };
     let mut kept = Vec::new();
     let mut found = false;
     let mut blockers = Vec::new();
     for c in parts {
-        match semi(bld, &outer, &c, scope, &mut blockers)? {
+        match semi(bld, &outer, &not_null, &c, scope, &mut blockers)? {
             Some(s) => {
                 kept.push(s.1);
                 b.semis.push(s.0);
@@ -1446,21 +1515,18 @@ fn semi_blocker(kind: &str, sb: &Block) -> String {
         .iter()
         .find(|i| !matches!(i.source, Source::Table(..)))
     {
-        return format!(
-            "{kind} over {} (needs internal views)",
-            it.origin.describe(&it.alias)
-        );
+        return format!("{kind} over {}", it.origin.describe(&it.alias));
     }
     if sb.limit {
         return format!("{kind} with LIMIT");
     }
     if windowed(sb) {
-        return format!("{kind} with a window function (needs internal views)");
+        return format!("{kind} with a window function");
     }
     if !sb.semis.is_empty() || block_has_subquery(sb) {
-        return format!("{kind} containing a subquery (needs internal views)");
+        return format!("{kind} containing a subquery");
     }
-    format!("{kind} with an aggregate (needs internal views)")
+    format!("{kind} with an aggregate")
 }
 
 /// The ON conditions of a subquery's FROM when its tables are joined by inner joins only (each
@@ -1482,7 +1548,7 @@ fn inner_join_conditions(kind: &str, sb: &Block) -> std::result::Result<Vec<Expr
             }
             // A lookup of the NULL side would have to drop the conditions that keep
             // NULL-extended rows (as the block planner does for the view's own FROM).
-            _ => return Err(format!("{kind} with an outer join (needs internal views)")),
+            _ => return Err(format!("{kind} with an outer join")),
         }
     }
     Ok(on)
@@ -1493,6 +1559,7 @@ fn inner_join_conditions(kind: &str, sb: &Block) -> std::result::Result<Vec<Expr
 fn semi(
     bld: &Builder,
     outer: &Resolver,
+    outer_not_null: &dyn Fn(&Expr) -> bool,
     c: &Expr,
     scope: &Scope,
     blockers: &mut Vec<String>,
@@ -1512,7 +1579,7 @@ fn semi(
         (false, false) => "EXISTS subquery",
         (false, true) => "NOT EXISTS subquery",
     };
-    let not_in = lhs.is_some() && negated;
+    let mut not_in = lhs.is_some() && negated;
     if not_in && matches!(lhs.map(|e| &**e), Some(Expr::Tuple(_))) {
         blockers.push("NOT IN over a row constructor".into());
         return Ok(None);
@@ -1663,6 +1730,20 @@ fn semi(
             placeholder(outer_exprs.len() - 1)
         })
         .collect();
+    // `x NOT IN (SELECT k …)` with x and k never NULL is `NOT EXISTS (… AND k = x)`: no NULL
+    // makes every row relevant, and the correlation can give direct units.
+    let not_null_key = |p: &Expr| match inner.resolve(p) {
+        Res::Col(t, c) => !tables[t].info.columns[c].nullable,
+        _ => false,
+    };
+    let exists_form = not_in
+        && lhs_parts.len() == 1
+        && proj.len() == 1
+        && outer_not_null(&lhs_parts[0])
+        && not_null_key(&proj[0]);
+    if exists_form {
+        not_in = false;
+    }
     if lhs.is_some() {
         if proj.len() != lhs_ph.len() {
             return Ok(None);
@@ -1732,12 +1813,22 @@ fn semi(
     } else {
         sel.selection = where_;
     }
-    sel.projection = if lhs.is_some() {
-        proj.into_iter().map(SelectItem::UnnamedExpr).collect()
-    } else {
-        sel.projection
-    };
+    if exists_form {
+        let eq = Expr::BinaryOp {
+            left: Box::new(proj[0].clone()),
+            op: BinaryOperator::Eq,
+            right: Box::new(lhs_ph[0].clone()),
+        };
+        sel.selection = and_all(sel.selection.take().into_iter().chain([eq]).collect());
+        sel.projection = vec![SelectItem::UnnamedExpr(parse_expr("1")?)];
+    } else if lhs.is_some() {
+        sel.projection = proj.into_iter().map(SelectItem::UnnamedExpr).collect();
+    }
     let predicate = match lhs {
+        Some(_) if exists_form => Expr::Exists {
+            subquery: Box::new(query_of(sel)),
+            negated: true,
+        },
         Some(_) => Expr::InSubquery {
             expr: Box::new(if lhs_ph.len() == 1 {
                 lhs_ph[0].clone()
@@ -1884,22 +1975,86 @@ pub(crate) fn semi_renamed(s: &Semi, taken: &HashSet<String>) -> Semi {
     out
 }
 
-/// Whether the semi-join is over one table and its correlation covers the table's primary key
-/// (each outer row matches at most one row of the table: the semi-join is an inner join).
-fn unique(s: &Semi) -> bool {
+/// Whether `key_col = e` compares like the key, so that distinct key values never equal the
+/// same value of `e` (G1): `e` is a column of the same key type (see [`same_key_type`]), or an
+/// integer expression against an integer key.
+fn key_exact(key_col: &Column, r: &Resolver, e: &Expr) -> bool {
+    match r.column(e) {
+        Some(c) => same_key_type(key_col, c),
+        None => key_col.family() == TypeFamily::Integer && integer_valued(r, e),
+    }
+}
+
+/// Whether an equality of columns `a` and `b` is injective on either one as a key: the same type
+/// family (for strings the same charset and collation: no number against a string, no
+/// `COLLATE`) and no TIMESTAMP (G4: under a time zone with DST, two instants of the fall-back
+/// hour equal one local time).
+fn same_key_type(a: &Column, b: &Column) -> bool {
+    a.family() == b.family() && a.data_type != "timestamp" && b.data_type != "timestamp"
+}
+
+/// Whether `e` is an integer: integer columns and literals under `+ - * DIV %`.
+fn integer_valued(r: &Resolver, e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) => integer_valued(r, x),
+        Expr::Value(v) => matches!(&v.value, Value::Number(n, _) if n.parse::<i64>().is_ok()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => integer_valued(r, expr),
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::MyIntegerDivide
+                | BinaryOperator::Modulo,
+            right,
+        } => integer_valued(r, left) && integer_valued(r, right),
+        _ => r
+            .column(e)
+            .is_some_and(|c| c.family() == TypeFamily::Integer),
+    }
+}
+
+/// Whether the semi-join is over one table and its correlation covers a whole key of it (the
+/// primary key or a UNIQUE NOT NULL key) with key-exact equalities: each outer row matches at
+/// most one row of the table, the semi-join is an inner join.
+fn unique(b: &Block, s: &Semi) -> bool {
     let [t] = s.tables.as_slice() else {
         return false;
     };
+    let Some(args) = b
+        .select
+        .selection
+        .as_ref()
+        .and_then(|w| marker_args(w, s.id))
+    else {
+        return false;
+    };
+    let r = Resolver::new(b);
     !s.negated
-        && !t.info.pk.is_empty()
-        && t.info
-            .pk
-            .iter()
-            .all(|c| s.correlation.iter().any(|(_, sc, _)| sc == c))
+        && t.info.keys().any(|key| {
+            key.iter().all(|&c| {
+                s.correlation.iter().any(|&(_, sc, k)| {
+                    sc == c
+                        && args
+                            .get(k)
+                            .is_some_and(|a| key_exact(&t.info.columns[c], &r, a))
+                })
+            })
+        })
 }
 
 fn semis_to_joins(b: &mut Block) -> Result<()> {
-    if !b.semis.iter().any(unique) {
+    let joinable: HashSet<usize> = b
+        .semis
+        .iter()
+        .filter(|s| unique(b, s))
+        .map(|s| s.id)
+        .collect();
+    if joinable.is_empty() {
         return Ok(());
     }
     qualify(b)?;
@@ -1907,7 +2062,7 @@ fn semis_to_joins(b: &mut Block) -> Result<()> {
     let semis = std::mem::take(&mut b.semis);
     let mut conds_all = Vec::new();
     for s in semis {
-        if !unique(&s) {
+        if !joinable.contains(&s.id) {
             b.semis.push(s);
             continue;
         }
