@@ -10,8 +10,7 @@ House rules for commits, branches and pull requests on this repository.
   `engine: a re-enabled rule replays what it missed instead of resetting`,
   `test servers: pin the MariaDB 13.1.1 RC by digest`.
 - The area is the part of the tool the change touches: `engine`, `binlog`,
-  `vendor`, `ci`, `docs`, `test servers`, and for dependabot bumps the
-  ecosystem prefixes (`deps`, `docker`, `test`, `ci`).
+  `vendor`, `ci`, `docs`, `test servers`.
 - No co-author lines and no "generated with" lines.
 
 ## Branches and pull requests
@@ -56,8 +55,8 @@ base images pinned by digest (`docker`) — bumping the rust image also means
 bumping `RUST_TOOLCHAIN` in `ci.yml` — and the test servers' patch builds
 (`test`).
 
-- Squash-merge a dependabot pull request when its CI is green; its title
-  already carries the house-style prefix.
+- Squash-merge a dependabot pull request when its CI is green, with the
+  subject Bump <what> from <old> to <new> and no area prefix, as in the log.
 - Hold a bump that lazyview shares (for example the `roaring` crate) until
   lazyview itself moves to that version: the vendored copies are built
   against lazyview's pinned dependencies, so this repo follows lazyview.
