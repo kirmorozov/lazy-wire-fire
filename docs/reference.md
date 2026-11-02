@@ -139,15 +139,17 @@ is such a problem.
 | `key` | template over the row image giving the key; one key per line. `{{new.id}}`, `item_{{old.entity_id}}` |
 | `keys_sql` | alternative (or in addition): a query with `:old.<col>`, `:new.<col>` or `:row.<col>` parameters returning `_key` rows, e.g. the parents of a child |
 
-`old` and `new` both name the image being looked at. An insert has the new image, a delete the
-old one, and an update is rendered for both, so a key that moved marks the old and the new key.
-A line referring to a NULL column marks nothing. Simple templates (text and `{{new.col}}`) skip
-Handlebars entirely; others get `old`, `new`, `row`, `op` and `table`.
+An insert looks at the new image only and a delete at the old one only. `old` and `new` both name
+the image being looked at, so on a delete `{{new.id}}` gives the deleted row's id; an update is
+rendered for both images, so a key that moved marks the old and the new key. A line referring to
+a NULL column marks nothing. Simple templates (text and `{{new.col}}`) skip Handlebars entirely;
+others get `old`, `new`, `row`, `op` and `table`.
 
-The same holds for `keys_sql`: `:old.<col>`, `:new.<col>` and `:row.<col>` all bind the image being
-looked at, so an update runs the query with the old image and with the new one. `keys_sql` runs at flush
-time, once per distinct set of parameters, after the changes are visible. It reads the current state: for a delete, rows already gone are not found (have a
-trigger on that table too).
+The same holds for `keys_sql`: `:old.<col>`, `:new.<col>` and `:row.<col>` all bind the image
+being looked at, so on a delete they bind the old row's values, and an update runs the query with
+the old image and with the new one. `keys_sql` runs at flush time, once per distinct set of
+parameters, after the changes are visible. It reads the current state: for a delete, rows already
+gone are not found (have a trigger on that table too).
 
 ## Documents from path-named columns
 
@@ -255,6 +257,19 @@ and resets only when that part of the binlog was purged. An interrupted reset st
 | `server_identity` | `*` only: the server the positions belong to |
 | `updated_at` | written when the position moves, and at least every 30 s |
 
+`/status` is the same per rule (its `rules` map), plus what the table does not hold:
+
+| field | meaning |
+|---|---|
+| `pending_keys` | the keys in memory that still wait for a flush whose actions met `expect` |
+| `firing` | the rule's one lane is busy: a flush or a reset batch |
+| `select_ms` | the time of the rule's selects in its last flush |
+| `events` | the row changes that matched one of the rule's triggers since start (a row matching two triggers counts twice) |
+| `actions_ok`, `actions_failed` | the actions sent since start: one action may carry a batch of keys, so they are not key counts |
+
+The counters are in memory only: they start at 0 at each start and are not written to
+`lazy_wire_fire_status`, which keeps only what a restart needs.
+
 ## Security
 
 Templates are not escaped for you (there is no context the tool could know), so **values from
@@ -309,6 +324,12 @@ INSERT INTO lazy_wire_fire_trigger (rule, source_table, `key`) VALUES
  ('purge', 'stock', 'product_{{new.product_id}}'),
  ('purge', 'category_product', 'category_{{new.category_id}}\nproduct_{{new.product_id}}');
 ```
+
+To check that a purge reached the cache, rely on the target's `expect`, the tool's only check of
+the response (by default a 2xx on http): an action counts in the rule's `actions_ok` in
+`/status`, and its position passes the change, only when `expect` held on every endpoint. A purge
+the cache did not accept shows in `actions_failed` and in `last_error` (transient answers are
+retried; refusals are split down to the offending keys).
 
 **Redis**, one command per key:
 

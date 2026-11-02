@@ -140,11 +140,16 @@ Rules, triggers and targets: [docs/reference.md](docs/reference.md).
   saved, exit 0. A non-zero exit means a real failure (bad configuration, lost instance lock,
   missing privileges).
 * `/livez`: the main loop turns. `/readyz`: this instance is active and streaming. `/status`:
-  per rule the position, lag, pending keys, reset state and errors (JSON). `lazywf healthcheck`
-  probes `/livez` for container health checks.
+  per rule the position, lag, pending keys, reset state, counters and errors (JSON,
+  [the fields](docs/reference.md#status)). `lazywf healthcheck` probes `/livez` for container
+  health checks.
 * `SELECT * FROM lazy_wire_fire_status`: positions, lag, `reset_state`, `last_error`.
 * `UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = …` re-runs a rule's reset
   steps; the tool sets it back to 0 when they succeeded.
+* A new rule's first reset runs its reset steps in the background; a `for_each: snapshot` step
+  reads every key of `snapshot_keys_sql`, so on a large source the destination matches only as
+  that goes. Watch it in the `reset` field of `/status` (`pending: …`, `running: step i/n …`,
+  `done: …`); the log says `reset step N: K keys in the snapshot`.
 
 Under a supervisor: environment for the DSN and secrets, a health address on 127.0.0.1, an
 instance name, SIGTERM to stop.
