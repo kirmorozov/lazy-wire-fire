@@ -1,5 +1,5 @@
 //! Sets of keys, compact for the usual shapes: a key that is an integer (`42`) or a prefix and
-//! an integer (`cat_p_42`) lives in a 64-bit roaring bitmap of its prefix, like lazyview's unit
+//! an integer (`item_42`) lives in a 64-bit roaring bitmap of its prefix, like lazyview's unit
 //! sets; any other key in an ordered set. A million consecutive ids take under 300 KB, not
 //! 60 MB of strings.
 //!
@@ -169,9 +169,9 @@ mod tests {
         let keys = [
             "42",
             "0",
-            "cat_p_42",
-            "cat_p_7",
-            "cat_c_p_7",
+            "item_42",
+            "item_7",
+            "group_item_7",
             "007",
             "sku-ABC",
             "a b",
@@ -184,7 +184,7 @@ mod tests {
         for k in keys {
             assert!(s.contains(k), "{k}");
         }
-        assert!(!s.contains("43") && !s.contains("cat_p_8") && !s.contains("7"));
+        assert!(!s.contains("43") && !s.contains("item_8") && !s.contains("7"));
         let mut got: Vec<String> = s.iter().collect();
         got.sort();
         let mut want: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
@@ -193,7 +193,7 @@ mod tests {
         // Leading zeros and too large numbers are kept as text.
         assert_eq!(split("007"), None);
         assert_eq!(split("18446744073709551616"), None);
-        assert_eq!(split("cat_p_42"), Some(("cat_p_", 42)));
+        assert_eq!(split("item_42"), Some(("item_", 42)));
     }
 
     #[test]

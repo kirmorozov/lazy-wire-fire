@@ -860,7 +860,7 @@ mod tests {
                 enabled: true,
                 source_table: "`Shop`.`T`".into(),
                 on: Some("insert, delete".into()),
-                key: Some("cat_p_{{new.id}}".into()),
+                key: Some("item_{{new.id}}".into()),
                 ..Default::default()
             },
             "app",

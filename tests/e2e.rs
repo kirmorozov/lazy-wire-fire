@@ -653,7 +653,7 @@ async fn valkey_target() {
     .await;
 }
 
-/// Magento-style tag purging through a real Varnish (`LAZYWF_TEST_VARNISH`, compose profile
+/// Tag-based purging through a real Varnish (`LAZYWF_TEST_VARNISH`, compose profile
 /// `varnish`; its backend is this test on 127.0.0.1:34682): pages tagged with a changed key are
 /// banned, other pages stay cached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -669,7 +669,7 @@ async fn varnish_purges_by_tag() {
     backend.headers(|r| {
         let n = r.path.trim_start_matches("/p/").to_string();
         vec![
-            ("X-Magento-Tags".into(), format!("cat_p_{n},cat_c_9")),
+            ("X-Cache-Tags".into(), format!("item_{n},group_9")),
             ("Cache-Control".into(), "public, max-age=3600".into()),
         ]
     });
@@ -690,16 +690,16 @@ async fn varnish_purges_by_tag() {
     db.exec("INSERT INTO stock VALUES (1, 5), (2, 5)").await;
     tables(&db).await;
     db.target("varnish", "http", &varnish, None, "{}").await;
-    let steps = json!([{"once": true, "template": "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Magento-Tags-Pattern: .*\n"}]);
+    let steps = json!([{"once": true, "template": "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Cache-Tags-Pattern: .*\n"}]);
     db.exec_params(
         "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, batch_max_bytes, debounce_ms) VALUES ('purge', 'varnish', ?, ?, 7000, 100)",
         (
-            "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Magento-Tags-Pattern: {{#each keys}}((^|,){{regex_escape this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}\n",
+            "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Cache-Tags-Pattern: {{#each keys}}((^|,){{regex_escape this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}\n",
             steps.to_string(),
         ),
     )
     .await;
-    db.trigger("purge", "stock", Some("cat_p_{{new.product_id}}"), None)
+    db.trigger("purge", "stock", Some("item_{{new.product_id}}"), None)
         .await;
     let inst = Instance::ready(config(&db, &[])).await;
     // The first start purges everything once.
