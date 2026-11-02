@@ -151,6 +151,25 @@ pub struct Instance {
     pub health: Arc<Health>,
 }
 
+/// A replica server id for a test engine, in 4,000,000,000..=4,294,967,294: the range the
+/// shared test servers leave to lazywf (the product's default, [2^30, 2^31), overlaps the
+/// ids another tenant of those servers uses).
+pub fn test_server_id() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const LO: u64 = 4_000_000_000;
+    const SPAN: u64 = 4_294_967_294 - LO + 1;
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.write_u64(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    (LO + h.finish() % SPAN) as u32
+}
+
 pub fn config(db: &Db, extra: &[(&str, &str)]) -> Config {
     let mut vars: Vec<(String, String)> = vec![
         ("LAZYWF_DSN".into(), db.dsn.clone()),
@@ -165,7 +184,14 @@ pub fn config(db: &Db, extra: &[(&str, &str)]) -> Config {
         vars.retain(|(a, _)| a != k);
         vars.push((k.to_string(), v.to_string()));
     }
-    Config::from_lookup(|k| vars.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())).unwrap()
+    let mut cfg =
+        Config::from_lookup(|k| vars.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())).unwrap();
+    // Unless the test fixes LAZYWF_SERVER_ID, the id is random from the test range. It stays
+    // "not fixed", so a collision still re-rolls the id as in production.
+    if !extra.iter().any(|(k, _)| *k == "LAZYWF_SERVER_ID") {
+        cfg.server_id = test_server_id();
+    }
+    cfg
 }
 
 /// Engine logs on the test output (`RUST_LOG`, default `info`).

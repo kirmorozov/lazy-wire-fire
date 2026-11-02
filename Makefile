@@ -30,17 +30,22 @@ servers:
 servers-down:
 	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease down -v
 
+# The integration servers and test threads; override them to run against other servers.
+E2E_DSN ?= mysql://root:root@127.0.0.1:34184
+E2E_DSN_MARIADB ?= mysql://root:root@127.0.0.1:34111
+E2E_THREADS ?= 4
+
 # Integration tests against MySQL 8.4 (GTIDs on).
 test-e2e:
-	LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:34184 $(CARGO) test --test e2e -- --test-threads=4
+	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS)
 
 # The same tests on both servers of the default set (MySQL 8.4, MariaDB 10.11).
 test-e2e-all: test-e2e
-	LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:34111 $(CARGO) test --test e2e -- --test-threads=4
+	LAZYWF_TEST_DSN=$(E2E_DSN_MARIADB) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS)
 
 # The search re-sync against OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (compose profile
 # `search`), one engine at a time: three JVMs at once do not fit on a shared host.
-E2E_DB := LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:34184
+E2E_DB := LAZYWF_TEST_DSN=$(E2E_DSN)
 test-e2e-search:
 	$(COMPOSE) --profile search up -d --wait opensearch
 	$(E2E_DB) LAZYWF_TEST_OPENSEARCH=http://127.0.0.1:34200 $(CARGO) test --test e2e search_opensearch
