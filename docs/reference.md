@@ -117,6 +117,9 @@ ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, doc = EXCLUDED.doc{{/if}}{{
 inside `IN (…)`). Keys are strings; MySQL compares them with integer columns as numbers and still
 uses the index.
 
+Unqualified table names in `selects`, `keys_sql` and `snapshot_keys_sql` resolve in the DSN's
+schema; when the source tables live in another schema, qualify them (`FROM app.orders o`).
+
 Registration problems are reported, not fatal. A rule whose selects, template or target are broken
 keeps marking keys (its position holds) and fires them once fixed. One path written by two selects
 is such a problem.
@@ -133,7 +136,7 @@ is such a problem.
 | `source_table` | `table` (the tool's schema) or `schema.table` |
 | `on` | which events: `insert`, `update`, `delete` (or `*` / `all` for everything), default all |
 | `changed_columns` | optional list: only updates that change one of these columns |
-| `key` | template over the row image giving the key; one key per line. `{{new.id}}`, `cat_p_{{old.entity_id}}` |
+| `key` | template over the row image giving the key; one key per line. `{{new.id}}`, `item_{{old.entity_id}}` |
 | `keys_sql` | alternative (or in addition): a query with `:old.<col>`, `:new.<col>` or `:row.<col>` parameters returning `_key` rows, e.g. the parents of a child |
 
 `old` and `new` both name the image being looked at. An insert has the new image, a delete the
@@ -352,6 +355,11 @@ what the index has and the database does not.
 
 The stray step has no `template`, so the rule's own `_bulk` template renders the deletes (every
 `docs` entry has op `delete`).
+
+The index itself must exist: create it and its mapping before the first action — lazywf does not
+create it, and a search engine that auto-creates indexes would otherwise do so with a dynamic
+mapping. When a target refuses actions instead (auto-creation off), the rule's position holds,
+the keys are retried after backoff, and the error is in `last_error`.
 
 ## Notes
 

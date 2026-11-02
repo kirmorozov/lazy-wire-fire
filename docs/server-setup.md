@@ -33,6 +33,11 @@ its next change. Turn GTIDs on (`gtid_mode=ON`, `enforce_gtid_consistency=ON`) o
 
 lazywf connects as a replica with its own `server_id` (`LAZYWF_SERVER_ID`, random by default).
 
+lazywf creates no triggers and needs no trigger privilege; other applications on the same server
+may. With binary logging on, a `CREATE TRIGGER` by an account without `SUPER` is refused (MySQL
+error 1419) unless `log_bin_trust_function_creators=1` — that is the database administrator's
+decision, and lazywf does not need it.
+
 ## Account
 
 Run once as an admin. `app` is the schema of the DSN, which holds lazywf's tables. Add a
@@ -48,6 +53,17 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON app.* TO 'lazywf'@'%';
 Nothing else, and no admin right (`SUPER`, `SYSTEM_VARIABLES_ADMIN`, …): the integration suite
 runs an account with exactly these grants on every tested server. The replication grants can
 live on a separate account (`LAZYWF_BINLOG_USER`, `LAZYWF_BINLOG_PASSWORD`).
+
+To keep the account's write rights off the source, put the tool's tables in a schema of their
+own: the DSN points at that schema (`app_state` here), and the source gets `SELECT` only.
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON app_state.* TO 'lazywf'@'%';
+GRANT SELECT ON app.* TO 'lazywf'@'%';
+```
+
+The rules' queries then name the source's tables qualified (`FROM app.orders o`), since
+unqualified names resolve in the DSN's schema ([reference](reference.md#rules)).
 
 ## Amazon RDS and Aurora
 

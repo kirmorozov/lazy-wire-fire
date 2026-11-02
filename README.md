@@ -65,6 +65,13 @@ Thirty updates of order 42 within a second become one `_bulk` line for `42`, ren
 state after the last of them. Renaming a customer re-sends that customer's orders. A cancelled or
 deleted order becomes a `delete`. Changes take effect without a restart.
 
+If the source tables live in another schema, qualify their names in the selects and `keys_sql`
+(`FROM app.orders o`): unqualified names resolve in the DSN's schema. And lazywf does not create
+the destination: create the index and its mapping before the first action. A search engine that
+auto-creates indexes would otherwise create it with a dynamic mapping; when a target refuses
+actions instead (auto-creation off), the rule's position holds, the keys are retried after
+backoff, and the error is in `last_error`.
+
 Values from rows go into templates through the helper of the place they land in (`json`,
 `url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
@@ -90,7 +97,7 @@ Example: `LAZYWF_DSN=mysql://lazywf:secret@host.docker.internal:3306/app`.
 | guarantee | how |
 |---|---|
 | after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, else `LAZYWF_VISIBILITY_DELAY_MS`) |
-| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `cat_p_42`) live in 64-bit roaring bitmaps, as in lazyview: a million consecutive ids take under 300 KB |
+| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `item_42`) live in 64-bit roaring bitmaps, as in lazyview: a million consecutive ids take under 300 KB |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
 | at least once | a rule's position in `lazy_wire_fire_status` only passes changes whose actions met `expect` on every endpoint. After a restart the stream resumes from the lowest position; rules ahead skip what they confirmed |
@@ -141,6 +148,11 @@ Rules, triggers and targets: [docs/reference.md](docs/reference.md).
 
 Under a supervisor: environment for the DSN and secrets, a health address on 127.0.0.1, an
 instance name, SIGTERM to stop.
+
+Inside a container, the default health address `127.0.0.1:8081` is the container's own loopback.
+To query `/status` from the host: run with host networking (port 8081 free), or set
+`LAZYWF_HEALTH_ADDR=0.0.0.0:8081` and publish `-p 127.0.0.1:8081:8081`.
+`docker exec <name> /lazywf healthcheck` needs neither.
 
 ## Image
 
@@ -204,7 +216,7 @@ MySQL and Percona publish no pre-release in a registry (MySQL early access ships
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
 its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
 RDS for MySQL's default parameter group, so it also tests the `LAZYWF_VISIBILITY_DELAY_MS` fence.
-On a MySQL source without GTIDs the visibility fence is that delay only: the limitation and its
+On Oracle MySQL without GTIDs the visibility fence is that delay only: the limitation and its
 workarounds are in [server setup](docs/server-setup.md#binlog-settings).
 Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
 2026-12-31.
