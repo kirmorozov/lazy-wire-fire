@@ -12,6 +12,8 @@ lines are in the [README](../README.md#supported-servers).
 | `binlog_format` | `ROW` | at start: refused otherwise |
 | `binlog_row_image` | `FULL` | at start: refused otherwise |
 | `binlog_row_value_options` (MySQL) | empty (no `PARTIAL_JSON`) | at start: refused otherwise |
+| `log_bin_compress` (MariaDB) | `OFF` | at start: refused otherwise |
+| `binlog_storage_engine` (MariaDB 12.3+) | unset | at start: refused otherwise |
 | `binlog_row_metadata` | `FULL` recommended | column names then come from the table map, so an `ALTER` of a watched table never resets its rules; otherwise they come from `information_schema`, and a change in its column count does |
 | `gtid_mode`, `enforce_gtid_consistency` (MySQL, Percona) | `ON` recommended | the visibility fence, below |
 | binlog expiry (`binlog_expire_logs_seconds`) | longer than the longest outage to ride out | a restart after a longer one finds its position purged and runs every rule's reset steps |
@@ -22,6 +24,12 @@ sessions:
 - with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET`, exact;
 - on MariaDB and Percona: the consistent-snapshot binlog position, exact;
 - otherwise: `LAZYWF_VISIBILITY_DELAY_MS`.
+
+On Oracle MySQL without GTIDs there is no exact fence: the flush only sleeps
+`LAZYWF_VISIBILITY_DELAY_MS` (default 20 ms) before reading. Under load a flush can read before
+the transaction that marked its keys is visible, and the document then keeps old values until
+its next change. Turn GTIDs on (`gtid_mode=ON`, `enforce_gtid_consistency=ON`) or raise
+`LAZYWF_VISIBILITY_DELAY_MS`.
 
 lazywf connects as a replica with its own `server_id` (`LAZYWF_SERVER_ID`, random by default).
 
@@ -70,8 +78,8 @@ admin rights), and the startup checks below are unit-tested.
 * **Account.** The master user can create the account above; nothing needs `rds_superuser_role`.
 * **Endpoints.** Connect to the instance endpoint or the Aurora cluster (writer) endpoint
   directly. Two things are not supported:
-  * RDS Proxy: lazywf reads the binlog as a replica and holds a named lock (`GET_LOCK`, one active
-    copy per instance name) for its whole session, and a pooling proxy passes neither through;
+  * RDS Proxy: lazywf reads the binlog as a replica and holds a named lock (`GET_LOCK`, one active copy per
+    schema and instance name) for its whole session, and a pooling proxy passes neither through;
   * a reader endpoint: status writes and the lock need the writer.
 * **Failover.** lazywf compares the server identity (MySQL `@@server_uuid`, MariaDB
   `@@server_id` and `@@gtid_domain_id`) with the one it saved. If a failover changes it, that

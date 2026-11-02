@@ -21,8 +21,8 @@ object.
 | column | meaning |
 |---|---|
 | `name` | referenced by rules |
-| `kind` | `http`, `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` / `pgsql` (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database`. `http.s3`: optional, the service URL; derived from `vars` when empty. An action goes to every endpoint |
+| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. An action goes to every endpoint |
 | `tls` | empty (TLS for `https://` / `rediss://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
@@ -127,21 +127,22 @@ is such a problem.
 
 | column | meaning |
 |---|---|
+| `id` | auto-increment identifier; the trigger cited in errors |
 | `rule` | the rule whose keys it marks; many triggers may feed one rule |
 | `enabled` | switch, default 1 |
 | `source_table` | `table` (the tool's schema) or `schema.table` |
-| `on` | which events: list of `insert`, `update`, `delete` (default all) |
+| `on` | which events: `insert`, `update`, `delete` (or `*` / `all` for everything), default all |
 | `changed_columns` | optional list: only updates that change one of these columns |
 | `key` | template over the row image giving the key; one key per line. `{{new.id}}`, `cat_p_{{old.entity_id}}` |
-| `keys_sql` | alternative (or in addition): a query with `:old.<col>` / `:new.<col>` parameters returning `_key` rows, e.g. the parents of a child |
+| `keys_sql` | alternative (or in addition): a query with `:old.<col>`, `:new.<col>` or `:row.<col>` parameters returning `_key` rows, e.g. the parents of a child |
 
 `old` and `new` both name the image being looked at. An insert has the new image, a delete the
 old one, and an update is rendered for both, so a key that moved marks the old and the new key.
 A line referring to a NULL column marks nothing. Simple templates (text and `{{new.col}}`) skip
 Handlebars entirely; others get `old`, `new`, `row`, `op` and `table`.
 
-The same holds for `keys_sql`: `:old.<col>` and `:new.<col>` both bind the image being looked at,
-so an update runs the query with the old image and with the new one. `keys_sql` runs at flush
+The same holds for `keys_sql`: `:old.<col>`, `:new.<col>` and `:row.<col>` all bind the image being
+looked at, so an update runs the query with the old image and with the new one. `keys_sql` runs at flush
 time, once per distinct set of parameters, after the changes are visible. It reads the current state: for a delete, rows already gone are not found (have a
 trigger on that table too).
 
@@ -173,11 +174,11 @@ Handlebars, never HTML-escaped. Context:
 | variable | content |
 |---|---|
 | `keys` | the batch's keys |
-| `docs` | per key `{key, doc, op}`; `doc` is `{}` when the rule has no selects |
+| `docs` | per key `{key, doc, op}`; empty when the rule has no selects (the keys are the data) |
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis also `db`) of the endpoint the action goes to |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`) of the endpoint the action goes to |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -226,7 +227,7 @@ and resets only when that part of the binlog was purged. An interrupted reset st
   (a SQL target's listing gives its rows as a JSON array in `body`): `keys` the page's keys (a
   JSON array, one value, or NULL for none), `next` the cursor. JSON results (`JSON_EXTRACT`) are
   read as JSON, other text as a string. Paging stops when the cursor is NULL, `null` or `0` /
-  `"0"` (Redis `SCAN`), when an http page brings no new keys, or when a Redis cursor repeats.
+  `"0"` (Redis `SCAN`), when an http page brings no new keys, or when a non-http cursor repeats.
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.

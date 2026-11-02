@@ -33,6 +33,8 @@ UPDATE, DELETE, CREATE` on its own schema, and `REPLICATION SLAVE, REPLICATION C
 LAZYWF_DSN=mysql://lazywf:secret@db:3306/app lazywf
 ```
 
+On macOS or Windows, run that inside Docker or WSL 2: [Platforms](#platforms).
+
 Keep a search index of orders in sync. A target, a rule, and the triggers that mark its keys:
 
 ```sql
@@ -67,6 +69,21 @@ Values from rows go into templates through the helper of the place they land in 
 `url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
 export, reset steps, in [docs/reference.md](docs/reference.md#examples).
+
+## Platforms
+
+lazywf is built for Linux only: the image is `linux/amd64` and `linux/arm64`, with one static
+binary `/lazywf` inside, and there is no native macOS or Windows build.
+
+| host | run |
+|---|---|
+| Linux | the image, or the static binary |
+| macOS | the image with Docker (Docker Desktop or any Docker-compatible runtime); Apple silicon uses the `linux/arm64` image |
+| Windows | inside WSL 2 (the image with Docker inside WSL, or the static binary), or the image with Docker Desktop |
+
+If the database runs on the same Mac or Windows machine, outside Docker, its host in the DSN is
+`host.docker.internal`, not `127.0.0.1`: Docker Desktop resolves that name to the host machine.
+Example: `LAZYWF_DSN=mysql://lazywf:secret@host.docker.internal:3306/app`.
 
 ## How it behaves
 
@@ -187,6 +204,8 @@ MySQL and Percona publish no pre-release in a registry (MySQL early access ships
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
 its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
 RDS for MySQL's default parameter group, so it also tests the `LAZYWF_VISIBILITY_DELAY_MS` fence.
+On a MySQL source without GTIDs the visibility fence is that delay only: the limitation and its
+workarounds are in [server setup](docs/server-setup.md#binlog-settings).
 Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
 2026-12-31.
 
@@ -205,6 +224,9 @@ make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a tim
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
 ```
+
+On macOS the test servers (`make servers`) need Docker. On Windows, develop inside WSL 2, with
+Docker for the test servers.
 
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
 lint, unit tests, the integration suite on the default servers (Varnish included), on every other
