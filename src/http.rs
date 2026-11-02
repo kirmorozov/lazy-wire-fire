@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(r.header("content-type"), Some("application/x-ndjson"));
         assert_eq!(r.body, b"{\"a\":1}\n");
 
-        let r = RawRequest::parse("PURGE / HTTP/1.1\r\nHost: v\r\nX-Magento-Tags-Pattern: .*\r\n")
+        let r = RawRequest::parse("PURGE / HTTP/1.1\r\nHost: v\r\nX-Cache-Tags-Pattern: .*\r\n")
             .unwrap()
             .unwrap();
         assert_eq!(r.headers.len(), 2);
@@ -523,7 +523,7 @@ mod tests {
         let wire = String::from_utf8(r.to_bytes()).unwrap();
         assert_eq!(
             wire,
-            "PURGE / HTTP/1.1\r\nHost: v\r\nX-Magento-Tags-Pattern: .*\r\n\r\n"
+            "PURGE / HTTP/1.1\r\nHost: v\r\nX-Cache-Tags-Pattern: .*\r\n\r\n"
         );
 
         let r = RawRequest::parse("DELETE /p/1.json HTTP/1.1\n\n")

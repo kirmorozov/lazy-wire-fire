@@ -531,14 +531,14 @@ mod tests {
 
     #[test]
     fn varnish_purge() {
-        let src = "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Magento-Tags-Pattern: {{#each keys}}((^|,){{this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}\n";
+        let src = "PURGE / HTTP/1.1\nHost: {{endpoint.host}}\nX-Cache-Tags-Pattern: {{#each keys}}((^|,){{this}}(,|$)){{#unless @last}}|{{/unless}}{{/each}}\n";
         let out = render(
             src,
-            json!({"keys": ["cat_p_1", "cat_c_2"], "endpoint": {"host": "varnish"}}),
+            json!({"keys": ["item_1", "group_2"], "endpoint": {"host": "varnish"}}),
         );
         assert_eq!(
             out,
-            "PURGE / HTTP/1.1\nHost: varnish\nX-Magento-Tags-Pattern: ((^|,)cat_p_1(,|$))|((^|,)cat_c_2(,|$))\n"
+            "PURGE / HTTP/1.1\nHost: varnish\nX-Cache-Tags-Pattern: ((^|,)item_1(,|$))|((^|,)group_2(,|$))\n"
         );
     }
 
@@ -547,11 +547,11 @@ mod tests {
         let src = "EVAL \"for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end\" 0 {{#each keys}}{{target.vars.prefix}}{{upper (replace this \"[^A-Za-z0-9_]\" \"_\")}} {{/each}}";
         let out = render(
             src,
-            json!({"keys": ["cat_p_1", "a-b.c"], "target": {"vars": {"prefix": "69d_"}}}),
+            json!({"keys": ["item_1", "a-b.c"], "target": {"vars": {"prefix": "69d_"}}}),
         );
         assert_eq!(
             out,
-            "EVAL \"for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end\" 0 69d_CAT_P_1 69d_A_B_C "
+            "EVAL \"for _,t in ipairs(ARGV) do redis.call('DEL','zc:ti:'..t) end\" 0 69d_ITEM_1 69d_A_B_C "
         );
     }
 
@@ -560,14 +560,14 @@ mod tests {
         let src = "POST /{{vars.alias}}/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{{#each docs}}{{#if (eq op \"delete\")}}{\"delete\":{\"_id\":\"{{key}}\"}}\n{{else}}{\"update\":{\"_id\":\"{{key}}\"}}\n{\"doc\":{{json doc}},\"doc_as_upsert\":true}\n{{/if}}{{/each}}";
         let out = render(
             src,
-            json!({"vars": {"alias": "magento2_product_1"}, "docs": [
+            json!({"vars": {"alias": "items_1"}, "docs": [
                 {"key": "1", "op": "upsert", "doc": {"sku": "a<b&\"c\"", "price": 1.5}},
                 {"key": "2", "op": "delete", "doc": {}}
             ]}),
         );
         assert_eq!(
             out,
-            "POST /magento2_product_1/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{\"update\":{\"_id\":\"1\"}}\n{\"doc\":{\"sku\":\"a<b&\\\"c\\\"\",\"price\":1.5},\"doc_as_upsert\":true}\n{\"delete\":{\"_id\":\"2\"}}\n"
+            "POST /items_1/_bulk HTTP/1.1\nContent-Type: application/x-ndjson\n\n{\"update\":{\"_id\":\"1\"}}\n{\"doc\":{\"sku\":\"a<b&\\\"c\\\"\",\"price\":1.5},\"doc_as_upsert\":true}\n{\"delete\":{\"_id\":\"2\"}}\n"
         );
     }
 
@@ -730,11 +730,11 @@ mod tests {
     #[test]
     fn key_fast_path() {
         assert_eq!(
-            simple_key_template("cat_p_{{new.product_id}}\n  cat_c_{{ old.category_id }}x\n"),
+            simple_key_template("item_{{new.product_id}}\n  group_{{ old.category_id }}x\n"),
             Some(vec![
-                vec![Seg::Lit("cat_p_".into()), Seg::Col("product_id".into())],
+                vec![Seg::Lit("item_".into()), Seg::Col("product_id".into())],
                 vec![
-                    Seg::Lit("cat_c_".into()),
+                    Seg::Lit("group_".into()),
                     Seg::Col("category_id".into()),
                     Seg::Lit("x".into())
                 ],
