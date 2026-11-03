@@ -37,6 +37,13 @@ roaring = "0.12"
 sqlparser = { version = "0.63", features = ["visitor"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 lapin = { version = "4.12", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
+# AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
+# aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-credential-types = "1"
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-runtime-api = "1"
 
 [dev-dependencies]
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }

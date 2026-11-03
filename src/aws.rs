@@ -1,47 +1,36 @@
-//! AWS credentials for `http.s3` targets: the target's secret references, or the default
-//! credential chain of the environment.
+//! AWS for the `http.s3`, `sqs` and `kinesis` targets: credentials and SigV4 signing.
 //!
-//! The chain, in order (static profiles only, no SSO or role chaining from config files):
+//! Credentials come from a target's references (`access_key_ref`, `secret_key_ref`,
+//! `session_token_ref`), read on every request so that rotated mounted secrets are picked up.
+//! A target without them uses aws-config's default credentials chain: the environment, the
+//! shared credentials and config files, web identity (EKS IRSA), container credentials (ECS, EKS
+//! Pod Identity) and EC2 instance metadata (IMDSv2, unless `AWS_EC2_METADATA_DISABLED=true`).
+//! The chain's own HTTP calls use a rustls-ring client, so the build needs neither aws-lc, cmake
+//! nor OpenSSL. Credentials that expire are fetched again five minutes before they do.
 //!
-//! 1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`;
-//! 2. the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE`, default
-//!    `~/.aws/credentials`), profile `AWS_PROFILE` (default `default`);
-//! 3. web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, e.g. EKS IRSA) through
-//!    STS `AssumeRoleWithWebIdentity`;
-//! 4. container credentials (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, with
-//!    `AWS_CONTAINER_AUTHORIZATION_TOKEN[_FILE]`; ECS, EKS Pod Identity);
-//! 5. EC2 instance metadata (IMDSv2), unless `AWS_EC2_METADATA_DISABLED=true`.
-//!
-//! Temporary credentials are cached until five minutes before they expire.
+//! Signing is aws-sigv4. lazywf canonicalises the target itself (`canonical_target`), and the
+//! signer signs that wire form as it is sent, so the signed path is the path on the wire.
 
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::provider_config::ProviderConfig;
+use aws_config::Region;
+use aws_credential_types::provider::{error::CredentialsError, future, ProvideCredentials};
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    sign as sigv4_sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest,
+    SigningSettings, UriPathNormalizationMode,
+};
+use aws_sigv4::sign::v4::SigningParams;
+use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
+use aws_smithy_runtime_api::client::identity::Identity;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
-use crate::http::{BaseUrl, Client, RawRequest};
+use crate::http::{BaseUrl, RawRequest};
 use crate::secrets;
-use crate::tls::TlsSpec;
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct Credentials {
-    pub access_key: String,
-    pub secret_key: String,
-    pub session_token: Option<String>,
-    /// Unix seconds.
-    pub expires: Option<u64>,
-}
-
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials")
-            .field("access_key", &self.access_key)
-            .field("expires", &self.expires)
-            .finish_non_exhaustive()
-    }
-}
 
 /// The target's references (`access_key_ref`, `secret_key_ref`, `session_token_ref`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,47 +40,100 @@ pub struct Refs {
     pub session_token: Option<String>,
 }
 
+impl Refs {
+    /// The credentials the references name, read now.
+    fn resolve(&self) -> Result<Credentials> {
+        let session_token = self
+            .session_token
+            .as_deref()
+            .map(|t| secrets::resolve_reference("session_token_ref", t))
+            .transpose()?;
+        Ok(Credentials::new(
+            secrets::resolve_reference("access_key_ref", &self.access_key)?,
+            secrets::resolve_reference("secret_key_ref", &self.secret_key)?,
+            session_token,
+            None,
+            "lazywf-references",
+        ))
+    }
+}
+
+/// The references as a credentials provider. Every call reads them again: a mounted secret
+/// file that is rewritten is picked up at the next request.
+impl ProvideCredentials for Refs {
+    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        future::ProvideCredentials::ready(self.resolve().map_err(CredentialsError::provider_error))
+    }
+}
+
+/// Temporary credentials are fetched again this many seconds before they expire.
+const REFRESH_BEFORE: u64 = 300;
+
+/// The credentials of one target's requests: its references, or the default chain.
 pub struct Provider {
     refs: Option<Refs>,
     region: String,
+    /// aws-config's default chain, built on first use (the loader is asynchronous).
+    chain: OnceCell<DefaultCredentialsChain>,
+    /// The chain's last answer, while it is still good.
     cache: Mutex<Option<Credentials>>,
 }
-
-const REFRESH_BEFORE: u64 = 300;
 
 impl Provider {
     pub fn new(refs: Option<Refs>, region: &str) -> Provider {
         Provider {
             refs,
             region: region.to_string(),
+            chain: OnceCell::new(),
             cache: Mutex::new(None),
         }
     }
 
     pub async fn get(&self) -> Result<Credentials> {
-        if let Some(r) = &self.refs {
-            // Read every time: mounted secret files rotate.
-            return Ok(Credentials {
-                access_key: secrets::resolve_reference("access_key_ref", &r.access_key)?,
-                secret_key: secrets::resolve_reference("secret_key_ref", &r.secret_key)?,
-                session_token: r
-                    .session_token
-                    .as_deref()
-                    .map(|t| secrets::resolve_reference("session_token_ref", t))
-                    .transpose()?,
-                expires: None,
-            });
+        if let Some(refs) = &self.refs {
+            return refs.provide_credentials().await.map_err(credentials_error);
         }
         let mut cache = self.cache.lock().await;
         let now = crate::time::unix_now();
         if let Some(c) = cache.as_ref() {
-            if c.expires.is_none_or(|e| e > now + REFRESH_BEFORE) {
+            let fresh = c.expiry().is_none_or(|e| {
+                e.duration_since(UNIX_EPOCH)
+                    .is_ok_and(|d| d.as_secs() > now + REFRESH_BEFORE)
+            });
+            if fresh {
                 return Ok(c.clone());
             }
         }
-        let c = chain(&self.region).await?;
+        let chain = self.chain.get_or_init(|| default_chain(&self.region)).await;
+        let c = chain
+            .provide_credentials()
+            .await
+            .map_err(missing_credentials)?;
         *cache = Some(c.clone());
         Ok(c)
+    }
+}
+
+/// aws-config's default chain, over the rustls-ring client. Its own calls (web identity's STS)
+/// take the region of the environment (`AWS_REGION`, `AWS_DEFAULT_REGION`), else the target's;
+/// with neither, the profile's.
+async fn default_chain(region: &str) -> DefaultCredentialsChain {
+    let http = HttpClientBuilder::new()
+        .tls_provider(tls::Provider::rustls(
+            tls::rustls_provider::CryptoMode::Ring,
+        ))
+        .build_https();
+    let builder = DefaultCredentialsChain::builder()
+        .configure(ProviderConfig::empty().with_http_client(http));
+    let region = env("AWS_REGION")
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .or_else(|| (!region.is_empty()).then(|| region.to_string()));
+    match region {
+        Some(r) => builder.region(Region::new(r)).build().await,
+        None => builder.build().await,
     }
 }
 
@@ -99,279 +141,38 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-async fn chain(region: &str) -> Result<Credentials> {
-    let mut tried = Vec::new();
-    if let (Some(a), Some(s)) = (env("AWS_ACCESS_KEY_ID"), env("AWS_SECRET_ACCESS_KEY")) {
-        return Ok(Credentials {
-            access_key: a,
-            secret_key: s,
-            session_token: env("AWS_SESSION_TOKEN"),
-            expires: None,
-        });
+/// An error and its causes, joined by `: `.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        msg.push_str(": ");
+        msg.push_str(&c.to_string());
+        cause = c.source();
     }
-    tried.push("environment");
-    match profile_file() {
-        Ok(Some(c)) => return Ok(c),
-        Ok(None) => tried.push("shared credentials file"),
-        Err(e) => return Err(e),
-    }
-    if let (Some(token_file), Some(role)) =
-        (env("AWS_WEB_IDENTITY_TOKEN_FILE"), env("AWS_ROLE_ARN"))
-    {
-        return web_identity(&token_file, &role, region)
-            .await
-            .context("web identity (STS AssumeRoleWithWebIdentity)");
-    }
-    tried.push("web identity");
-    if env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
-        || env("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
-    {
-        return container().await.context("container credentials endpoint");
-    }
-    tried.push("container");
-    if !env("AWS_EC2_METADATA_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-        match imds().await {
-            Ok(c) => return Ok(c),
-            Err(e) => tracing::debug!("EC2 instance metadata: {e:#}"),
-        }
-        tried.push("EC2 instance metadata");
-    }
-    bail!(
-        "no AWS credentials: set access_key_ref / secret_key_ref in the target's vars, or provide them \
-         through the environment (tried: {})",
-        tried.join(", ")
-    )
+    msg
 }
 
-fn profile_file() -> Result<Option<Credentials>> {
-    let path = match env("AWS_SHARED_CREDENTIALS_FILE") {
-        Some(p) => p,
-        None => match env("HOME") {
-            Some(h) => format!("{h}/.aws/credentials"),
-            None => return Ok(None),
-        },
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
-    };
-    let profile = env("AWS_PROFILE").unwrap_or_else(|| "default".into());
-    let mut in_profile = false;
-    let (mut a, mut s, mut t) = (None, None, None);
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
-            continue;
-        }
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_profile = name.trim() == profile;
-            continue;
-        }
-        if !in_profile {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let v = Some(v.trim().to_string());
-            match k.trim().to_ascii_lowercase().as_str() {
-                "aws_access_key_id" => a = v,
-                "aws_secret_access_key" => s = v,
-                "aws_session_token" => t = v,
-                _ => {}
-            }
-        }
-    }
-    Ok(match (a, s) {
-        (Some(access_key), Some(secret_key)) => Some(Credentials {
-            access_key,
-            secret_key,
-            session_token: t,
-            expires: None,
-        }),
-        _ => None,
-    })
+/// A failed credentials lookup, with the causes it carries.
+fn credentials_error(e: CredentialsError) -> anyhow::Error {
+    anyhow!("AWS credentials: {}", error_chain(&e))
 }
 
-async fn get(
-    url: &str,
-    headers: &[(&str, String)],
-    method: &str,
-    timeout: Duration,
-) -> Result<(u16, Vec<u8>)> {
-    let (base, path) = match url
-        .find("://")
-        .and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j))
-    {
-        Some(i) => (&url[..i], &url[i..]),
-        None => (url, "/"),
-    };
-    let base = BaseUrl::parse(base)?;
-    let client = Client::new(base.clone(), &TlsSpec::parse(None)?)?;
-    let mut req = RawRequest {
-        method: method.into(),
-        target: path.to_string(),
-        headers: Vec::new(),
-        body: Vec::new(),
-    };
-    req.set_header("Host", base.host_header());
-    for (n, v) in headers {
-        req.set_header(n, v.clone());
-    }
-    let r = client.send(&req, timeout).await?;
-    Ok((r.status, r.body))
-}
-
-fn from_json(body: &[u8], what: &str) -> Result<Credentials> {
-    let v: Value =
-        serde_json::from_slice(body).with_context(|| format!("{what}: response is not JSON"))?;
-    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-    Ok(Credentials {
-        access_key: s("AccessKeyId").ok_or_else(|| anyhow!("{what}: no AccessKeyId"))?,
-        secret_key: s("SecretAccessKey").ok_or_else(|| anyhow!("{what}: no SecretAccessKey"))?,
-        session_token: s("Token"),
-        expires: s("Expiration").and_then(|e| crate::time::parse_iso8601(&e)),
-    })
-}
-
-fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&format!("</{tag}>"))? + start;
-    Some(xml[start..end].trim())
-}
-
-async fn web_identity(token_file: &str, role: &str, region: &str) -> Result<Credentials> {
-    let token =
-        std::fs::read_to_string(token_file).with_context(|| format!("reading `{token_file}`"))?;
-    let region = env("AWS_REGION")
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|| region.to_string());
-    let session = env("AWS_ROLE_SESSION_NAME").unwrap_or_else(|| "lazywf".into());
-    let enc = |s: &str| crate::template::url_encode(s);
-    let url = format!(
-        "https://sts.{region}.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={}&RoleSessionName={}&WebIdentityToken={}",
-        enc(role),
-        enc(&session),
-        enc(token.trim())
-    );
-    let (status, body) = get(
-        &url,
-        &[("Accept", "application/xml".into())],
-        "GET",
-        Duration::from_secs(10),
-    )
-    .await?;
-    let xml = String::from_utf8_lossy(&body);
-    if status != 200 {
-        bail!(
-            "STS answered {status}: {}",
-            xml_tag(&xml, "Message").unwrap_or(&xml)
-        );
-    }
-    Ok(Credentials {
-        access_key: xml_tag(&xml, "AccessKeyId")
-            .ok_or_else(|| anyhow!("STS: no AccessKeyId"))?
-            .to_string(),
-        secret_key: xml_tag(&xml, "SecretAccessKey")
-            .ok_or_else(|| anyhow!("STS: no SecretAccessKey"))?
-            .to_string(),
-        session_token: xml_tag(&xml, "SessionToken").map(str::to_string),
-        expires: xml_tag(&xml, "Expiration").and_then(crate::time::parse_iso8601),
-    })
-}
-
-async fn container() -> Result<Credentials> {
-    let url = match env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
-        Some(rel) => format!("http://169.254.170.2{rel}"),
-        None => env("AWS_CONTAINER_CREDENTIALS_FULL_URI").expect("checked by the caller"),
-    };
-    let token = match env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
-        Some(f) => Some(
-            std::fs::read_to_string(&f)
-                .with_context(|| format!("reading `{f}`"))?
-                .trim()
-                .to_string(),
-        ),
-        None => env("AWS_CONTAINER_AUTHORIZATION_TOKEN"),
-    };
-    let headers: Vec<(&str, String)> = token.into_iter().map(|t| ("Authorization", t)).collect();
-    let (status, body) = get(&url, &headers, "GET", Duration::from_secs(5)).await?;
-    if status != 200 {
-        bail!("{url} answered {status}");
-    }
-    from_json(&body, "container credentials")
-}
-
-async fn imds() -> Result<Credentials> {
-    const BASE: &str = "http://169.254.169.254";
-    let t = Duration::from_secs(1);
-    let (status, token) = get(
-        &format!("{BASE}/latest/api/token"),
-        &[("X-aws-ec2-metadata-token-ttl-seconds", "21600".into())],
-        "PUT",
-        t,
-    )
-    .await?;
-    if status != 200 {
-        bail!("IMDSv2 token request answered {status}");
-    }
-    let tok = vec![(
-        "X-aws-ec2-metadata-token",
-        String::from_utf8_lossy(&token).trim().to_string(),
-    )];
-    let (status, role) = get(
-        &format!("{BASE}/latest/meta-data/iam/security-credentials/"),
-        &tok,
-        "GET",
-        t,
-    )
-    .await?;
-    if status != 200 {
-        bail!("no instance role ({status})");
-    }
-    let role = String::from_utf8_lossy(&role)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let (status, body) = get(
-        &format!("{BASE}/latest/meta-data/iam/security-credentials/{role}"),
-        &tok,
-        "GET",
-        t,
-    )
-    .await?;
-    if status != 200 {
-        bail!("instance role credentials answered {status}");
-    }
-    from_json(&body, "instance metadata")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_json_and_xml() {
-        let c = from_json(
-            br#"{"AccessKeyId":"A","SecretAccessKey":"S","Token":"T","Expiration":"2030-01-01T00:00:00Z"}"#,
-            "t",
+/// The default chain found no credentials. The message names the sources it tried and the
+/// references that take their place, and carries the chain's own error. Other failures (a
+/// source that was tried and broke) keep their text.
+fn missing_credentials(e: CredentialsError) -> anyhow::Error {
+    if matches!(e, CredentialsError::CredentialsNotLoaded(_)) {
+        anyhow!(
+            "no AWS credentials: set access_key_ref / secret_key_ref in the target's vars, or provide them \
+             through the environment (tried: environment, shared credentials and config files, web identity, \
+             container credentials, EC2 instance metadata unless AWS_EC2_METADATA_DISABLED=true): {}",
+            error_chain(&e)
         )
-        .unwrap();
-        assert_eq!(
-            (c.access_key.as_str(), c.session_token.as_deref()),
-            ("A", Some("T"))
-        );
-        assert_eq!(
-            c.expires,
-            crate::time::parse_iso8601("2030-01-01T00:00:00Z")
-        );
-        let xml = "<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId> AK </AccessKeyId></Credentials></AssumeRoleWithWebIdentityResponse>";
-        assert_eq!(xml_tag(xml, "AccessKeyId"), Some("AK"));
-        assert_eq!(xml_tag(xml, "Nope"), None);
+    } else {
+        credentials_error(e)
     }
 }
-
-// ---- SigV4 (generic over the AWS service; moved from s3.rs) ----
 
 /// SigV4 URI encoding: unreserved characters stay, `/` stays unless `encode_slash`.
 pub fn uri_encode(s: &str, encode_slash: bool) -> String {
@@ -441,24 +242,8 @@ fn percent_decode_path(s: &str) -> String {
     percent_decode(&s.replace('+', "%2B"))
 }
 
-pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        k[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Sha256::new();
-    inner.update(k.map(|b| b ^ 0x36));
-    inner.update(msg);
-    let mut outer = Sha256::new();
-    outer.update(k.map(|b| b ^ 0x5c));
-    outer.update(inner.finalize());
-    outer.finalize().into()
-}
-
-/// Headers that are signed when present, besides `host` and every `x-amz-*`.
+/// Headers that are signed when present, besides `host` and every `x-amz-*`. This is the set
+/// lazywf has always signed, so a request's signature does not depend on the signer.
 const SIGNED: &[&str] = &["content-type", "content-md5", "range", "date"];
 
 /// Signs `req` for `service` in `region`: rewrites the target in canonical form (prefixed by
@@ -473,159 +258,73 @@ pub fn sign(
     creds: &Credentials,
     unix_now: u64,
 ) -> Result<()> {
-    if creds.access_key.is_empty() || creds.secret_key.is_empty() {
+    if creds.access_key_id().is_empty() || creds.secret_access_key().is_empty() {
         bail!("empty AWS credentials");
     }
-    let (date, stamp) = crate::time::amz_dates(unix_now);
     let (path, query) = canonical_target(&format!("{prefix}{}", req.target));
     req.target = if query.is_empty() {
-        path.clone()
+        path
     } else {
         format!("{path}?{query}")
     };
-    let payload = hex::encode(Sha256::digest(&req.body));
     req.set_header("Host", host_header.to_string());
-    req.set_header("x-amz-date", stamp.clone());
-    req.set_header("x-amz-content-sha256", payload.clone());
-    match &creds.session_token {
-        Some(t) => req.set_header("x-amz-security-token", t.clone()),
-        None => req.remove_header("x-amz-security-token"),
+    // Computed by the signer below; whatever the request carries is discarded.
+    for name in [
+        "authorization",
+        "x-amz-date",
+        "x-amz-content-sha256",
+        "x-amz-security-token",
+    ] {
+        req.remove_header(name);
     }
-    req.remove_header("authorization");
-    let mut signed: Vec<(String, String)> = req
+    let signed: Vec<(String, String)> = req
         .headers
         .iter()
-        .map(|(n, v)| {
-            (
-                n.to_ascii_lowercase(),
-                v.split_whitespace().collect::<Vec<_>>().join(" "),
-            )
+        .filter_map(|(n, v)| {
+            let n = n.to_ascii_lowercase();
+            (n == "host" || n.starts_with("x-amz-") || SIGNED.contains(&n.as_str()))
+                .then(|| (n, v.split_whitespace().collect::<Vec<_>>().join(" ")))
         })
-        .filter(|(n, _)| n == "host" || n.starts_with("x-amz-") || SIGNED.contains(&n.as_str()))
         .collect();
-    signed.sort();
-    let canonical_headers: String = signed.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
-    let signed_names = signed
-        .iter()
-        .map(|(n, _)| n.as_str())
-        .collect::<Vec<_>>()
-        .join(";");
-    let canonical = format!(
-        "{}\n{path}\n{query}\n{canonical_headers}\n{signed_names}\n{payload}",
-        req.method.to_ascii_uppercase()
-    );
-    let scope = format!("{date}/{region}/{service}/aws4_request");
-    let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
-        hex::encode(Sha256::digest(canonical.as_bytes()))
-    );
-    let k_date = hmac_sha256(
-        format!("AWS4{}", creds.secret_key).as_bytes(),
-        date.as_bytes(),
-    );
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    let k_signing = hmac_sha256(&k_service, b"aws4_request");
-    let signature = hex::encode(hmac_sha256(&k_signing, to_sign.as_bytes()));
-    req.set_header(
-        "Authorization",
-        format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_names}, Signature={signature}",
-            creds.access_key
-        ),
-    );
+
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    // The target is in wire form already (see `canonical_target`): sign it as it is sent, with
+    // no second encoding, and no path normalisation (an S3 key may hold `.` or `..` segments).
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    let identity: Identity = creds.clone().into();
+    let params: aws_sigv4::http_request::SigningParams<'_> = SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name(service)
+        .time(UNIX_EPOCH + Duration::from_secs(unix_now))
+        .settings(settings)
+        .build()
+        .map_err(|e| anyhow!("SigV4 parameters: {e}"))?
+        .into();
+
+    let method = req.method.to_ascii_uppercase();
+    let added: Vec<(String, String)> = {
+        let request = SignableRequest::new(
+            method.as_str(),
+            req.target.as_str(),
+            signed.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+            SignableBody::Bytes(req.body.as_slice()),
+        )
+        .map_err(|e| anyhow!("SigV4 request: {e}"))?;
+        let (instructions, _signature) = sigv4_sign(request, &params)
+            .map_err(|e| anyhow!("SigV4: {e}"))?
+            .into_parts();
+        instructions
+            .headers()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    };
+    for (name, value) in added {
+        req.set_header(&name, value);
+    }
     Ok(())
-}
-
-#[cfg(test)]
-mod sigv4_tests {
-    use super::*;
-
-    fn creds() -> Credentials {
-        Credentials {
-            access_key: "AKIAIOSFODNN7EXAMPLE".into(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
-            session_token: None,
-            expires: None,
-        }
-    }
-
-    // Examples from the AWS S3 docs ("Signature Calculations for the Authorization Header:
-    // Transferring Payload in a Single Chunk").
-    #[test]
-    fn aws_get_object_example() {
-        let mut r = RawRequest::parse("GET /test.txt HTTP/1.1\nRange: bytes=0-9\n\n")
-            .unwrap()
-            .unwrap();
-        sign(
-            &mut r,
-            "examplebucket.s3.amazonaws.com",
-            "",
-            "us-east-1",
-            "s3",
-            &creds(),
-            1_369_353_600,
-        )
-        .unwrap();
-        assert_eq!(
-            r.header("authorization").unwrap(),
-            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
-             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
-             Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
-        );
-    }
-
-    #[test]
-    fn aws_put_object_example() {
-        let mut r = RawRequest::parse(
-            "PUT /test$file.text HTTP/1.1\nDate: Fri, 24 May 2013 00:00:00 GMT\nx-amz-storage-class: REDUCED_REDUNDANCY\n\nWelcome to Amazon S3.",
-        )
-        .unwrap()
-        .unwrap();
-        sign(
-            &mut r,
-            "examplebucket.s3.amazonaws.com",
-            "",
-            "us-east-1",
-            "s3",
-            &creds(),
-            1_369_353_600,
-        )
-        .unwrap();
-        assert_eq!(r.target, "/test%24file.text");
-        assert!(r.header("authorization").unwrap().ends_with(
-            "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, \
-             Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
-        ));
-    }
-
-    #[test]
-    fn aws_list_objects_example() {
-        let mut r = RawRequest::parse("GET /?max-keys=2&prefix=J HTTP/1.1\n\n")
-            .unwrap()
-            .unwrap();
-        sign(
-            &mut r,
-            "examplebucket.s3.amazonaws.com",
-            "",
-            "us-east-1",
-            "s3",
-            &creds(),
-            1_369_353_600,
-        )
-        .unwrap();
-        assert!(r.header("authorization").unwrap().ends_with(
-            "Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
-        ));
-    }
-
-    #[test]
-    fn hmac_rfc4231_case2() {
-        assert_eq!(
-            hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
 }
 
 /// The regional endpoint of an AWS service: `https://<service>.<region>.amazonaws.com`.
@@ -908,6 +607,427 @@ pub fn transient_code(code: &str) -> bool {
             | "ServiceUnavailable"
             | "InternalFailure"
     )
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use std::path::{Path, PathBuf};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use super::*;
+    use crate::secrets::ENV_LOCK;
+
+    /// The environment of one test. Holds `ENV_LOCK`, clears every `AWS_*` variable and `HOME`
+    /// (so no shared file or instance of the host is read), then sets `vars`. Restored on drop.
+    struct Env {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl Env {
+        async fn set(vars: &[(&str, &str)]) -> Env {
+            let lock = ENV_LOCK.lock().await;
+            let mut env = Env {
+                _lock: lock,
+                saved: Vec::new(),
+            };
+            let names: Vec<String> = std::env::vars()
+                .map(|(k, _)| k)
+                .filter(|k| k.starts_with("AWS_"))
+                .collect();
+            for k in names {
+                env.touch(&k);
+                std::env::remove_var(&k);
+            }
+            env.touch("HOME");
+            std::env::set_var("HOME", scratch("home"));
+            for (k, v) in vars {
+                env.touch(k);
+                std::env::set_var(k, v);
+            }
+            env
+        }
+
+        fn touch(&mut self, k: &str) {
+            if !self.saved.iter().any(|(n, _)| n == k) {
+                self.saved.push((k.to_string(), std::env::var(k).ok()));
+            }
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.iter().rev() {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// A scratch directory of this test run under the repository's `tmp/`.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tmp")
+            .join("unit")
+            .join(format!("aws-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Reads one HTTP request (head and body) from `s`: its method and its path without query.
+    async fn read_request(s: &mut TcpStream) -> Option<(String, String)> {
+        let mut buf = Vec::new();
+        let head_end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = s.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+        let mut len = 0usize;
+        for line in head.lines() {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().ok()?;
+            }
+        }
+        while buf.len() < head_end + len {
+            let mut chunk = [0u8; 4096];
+            let n = s.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let mut parts = head.lines().next()?.split(' ');
+        let method = parts.next()?.to_string();
+        let path = parts.next()?.split('?').next()?.to_string();
+        Some((method, path))
+    }
+
+    /// A plain-HTTP stand-in on 127.0.0.1. Answers each request whose method (`*` for any) and
+    /// path (without query) match a route with `200` and the route's body, else `404`. Returns
+    /// its base URL.
+    async fn stub(routes: Vec<(&'static str, &'static str, &'static str)>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let Some((method, path)) = read_request(&mut s).await else {
+                        return;
+                    };
+                    let hit = routes
+                        .iter()
+                        .find(|(m, p, _)| (*m == "*" || *m == method) && *p == path);
+                    let (status, body) = match hit {
+                        Some((_, _, body)) => ("200 OK", *body),
+                        None => ("404 Not Found", ""),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn access_key(c: &Credentials) -> &str {
+        c.access_key_id()
+    }
+
+    #[tokio::test]
+    async fn environment_credentials() {
+        let _env = Env::set(&[
+            ("AWS_ACCESS_KEY_ID", "AKIDENV"),
+            ("AWS_SECRET_ACCESS_KEY", "envsecret"),
+            ("AWS_SESSION_TOKEN", "envtoken"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ])
+        .await;
+        let c = Provider::new(None, "eu-west-1").get().await.unwrap();
+        assert_eq!(access_key(&c), "AKIDENV");
+        assert_eq!(c.secret_access_key(), "envsecret");
+        assert_eq!(c.session_token(), Some("envtoken"));
+    }
+
+    #[tokio::test]
+    async fn shared_profile_credentials() {
+        let dir = scratch("profile");
+        let file = dir.join("credentials");
+        std::fs::write(
+            &file,
+            "[default]\naws_access_key_id = AKIDDEF\naws_secret_access_key = defsecret\n\
+             [lwf]\naws_access_key_id = AKIDPROF\naws_secret_access_key = profsecret\n",
+        )
+        .unwrap();
+        let file = file.display().to_string();
+        let no_config = dir.join("no-config").display().to_string();
+        {
+            let _env = Env::set(&[
+                ("AWS_SHARED_CREDENTIALS_FILE", file.as_str()),
+                ("AWS_CONFIG_FILE", no_config.as_str()),
+                ("AWS_PROFILE", "lwf"),
+                ("AWS_EC2_METADATA_DISABLED", "true"),
+            ])
+            .await;
+            let c = Provider::new(None, "eu-west-1").get().await.unwrap();
+            assert_eq!(access_key(&c), "AKIDPROF");
+            assert_eq!(c.secret_access_key(), "profsecret");
+        }
+        {
+            let _env = Env::set(&[
+                ("AWS_SHARED_CREDENTIALS_FILE", file.as_str()),
+                ("AWS_CONFIG_FILE", no_config.as_str()),
+                ("AWS_EC2_METADATA_DISABLED", "true"),
+            ])
+            .await;
+            let c = Provider::new(None, "eu-west-1").get().await.unwrap();
+            assert_eq!(access_key(&c), "AKIDDEF", "the default profile");
+        }
+    }
+
+    #[tokio::test]
+    async fn container_credentials() {
+        let base = stub(vec![(
+            "GET",
+            "/creds",
+            r#"{"AccessKeyId":"AKIDCTR","SecretAccessKey":"ctrsecret","Token":"ctrtoken","Expiration":"2030-01-01T00:00:00Z"}"#,
+        )])
+        .await;
+        let _env = Env::set(&[
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                format!("{base}/creds").as_str(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ])
+        .await;
+        let c = Provider::new(None, "eu-west-1").get().await.unwrap();
+        assert_eq!(access_key(&c), "AKIDCTR");
+        assert_eq!(c.secret_access_key(), "ctrsecret");
+        assert_eq!(c.session_token(), Some("ctrtoken"));
+    }
+
+    #[tokio::test]
+    async fn instance_metadata_credentials() {
+        let base = stub(vec![
+            ("PUT", "/latest/api/token", "imds-token"),
+            ("GET", "/latest/meta-data/iam/security-credentials/", "lwf-role"),
+            (
+                "GET",
+                "/latest/meta-data/iam/security-credentials/lwf-role",
+                r#"{"AccessKeyId":"AKIDIMDS","SecretAccessKey":"imdssecret","Token":"imdstoken","Expiration":"2030-01-01T00:00:00Z"}"#,
+            ),
+        ])
+        .await;
+        let _env = Env::set(&[("AWS_EC2_METADATA_SERVICE_ENDPOINT", base.as_str())]).await;
+        let c = Provider::new(None, "eu-west-1").get().await.unwrap();
+        assert_eq!(access_key(&c), "AKIDIMDS");
+        assert_eq!(c.session_token(), Some("imdstoken"));
+    }
+
+    #[tokio::test]
+    async fn web_identity_credentials_over_the_passed_client() {
+        let base = stub(vec![(
+            "*",
+            "/",
+            "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>ASIAWEBID</AccessKeyId><SecretAccessKey>webidsecret</SecretAccessKey><SessionToken>webidtoken</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>",
+        )])
+        .await;
+        let dir = scratch("web-identity");
+        let token = dir.join("token");
+        std::fs::write(&token, "oidc-token").unwrap();
+        let token = token.display().to_string();
+        let _env = Env::set(&[
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", token.as_str()),
+            ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/lwf-test"),
+            ("AWS_ENDPOINT_URL_STS", base.as_str()),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ])
+        .await;
+        let c = Provider::new(None, "eu-west-1").get().await.unwrap();
+        assert_eq!(access_key(&c), "ASIAWEBID");
+        assert_eq!(c.session_token(), Some("webidtoken"));
+    }
+
+    #[tokio::test]
+    async fn no_source_is_an_error() {
+        let _env = Env::set(&[("AWS_EC2_METADATA_DISABLED", "true")]).await;
+        assert!(Provider::new(None, "eu-west-1").get().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_message() {
+        let _env = Env::set(&[("AWS_EC2_METADATA_DISABLED", "true")]).await;
+        let err = Provider::new(None, "eu-west-1").get().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("no AWS credentials: "), "{msg}");
+        assert!(msg.contains("access_key_ref / secret_key_ref"), "{msg}");
+        assert!(
+            msg.contains("(tried: environment, shared credentials and config files, web identity"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("EC2 instance metadata unless AWS_EC2_METADATA_DISABLED=true): "),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn references_are_read_on_every_call() {
+        let dir = scratch("refs");
+        let key_file = dir.join("secret-key");
+        std::fs::write(&key_file, "first-secret\n").unwrap();
+        let key_file = key_file.display().to_string();
+        let dir_str = dir.display().to_string();
+        let _env = Env::set(&[
+            ("LWF_AWS_TEST_AK", "AKIDREF"),
+            ("LAZYWF_SECRET_DIRS", dir_str.as_str()),
+            // Would be used if the references were ignored.
+            ("AWS_ACCESS_KEY_ID", "AKIDCHAIN"),
+            ("AWS_SECRET_ACCESS_KEY", "chainsecret"),
+        ])
+        .await;
+        let p = Provider::new(
+            Some(Refs {
+                access_key: "env:LWF_AWS_TEST_AK".into(),
+                secret_key: format!("file:{key_file}"),
+                session_token: None,
+            }),
+            "eu-west-1",
+        );
+        let first = p.get().await.unwrap();
+        assert_eq!(access_key(&first), "AKIDREF");
+        assert_eq!(first.secret_access_key(), "first-secret");
+
+        std::fs::write(&key_file, "second-secret\n").unwrap();
+        let second = p.get().await.unwrap();
+        assert_eq!(
+            second.secret_access_key(),
+            "second-secret",
+            "rotated file is read"
+        );
+
+        std::env::set_var("LWF_AWS_TEST_AK", "AKIDNEW");
+        assert_eq!(access_key(&p.get().await.unwrap()), "AKIDNEW");
+        std::env::remove_var("LWF_AWS_TEST_AK");
+    }
+
+    #[tokio::test]
+    async fn a_literal_where_a_reference_belongs_is_an_error() {
+        let _env = Env::set(&[]).await;
+        let p = Provider::new(
+            Some(Refs {
+                access_key: "AKIDLITERAL".into(),
+                secret_key: "env:LWF_AWS_TEST_SK".into(),
+                session_token: None,
+            }),
+            "eu-west-1",
+        );
+        let err = p.get().await.unwrap_err().to_string();
+        assert!(err.contains("must be a reference"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod sigv4_tests {
+    use super::*;
+
+    fn creds() -> Credentials {
+        Credentials::new(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
+            None,
+            "test",
+        )
+    }
+
+    // Examples from the AWS S3 docs ("Signature Calculations for the Authorization Header:
+    // Transferring Payload in a Single Chunk").
+    #[test]
+    fn aws_get_object_example() {
+        let mut r = RawRequest::parse("GET /test.txt HTTP/1.1\nRange: bytes=0-9\n\n")
+            .unwrap()
+            .unwrap();
+        sign(
+            &mut r,
+            "examplebucket.s3.amazonaws.com",
+            "",
+            "us-east-1",
+            "s3",
+            &creds(),
+            1_369_353_600,
+        )
+        .unwrap();
+        assert_eq!(
+            r.header("authorization").unwrap(),
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
+             Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
+    }
+
+    #[test]
+    fn aws_put_object_example() {
+        let mut r = RawRequest::parse(
+            "PUT /test$file.text HTTP/1.1\nDate: Fri, 24 May 2013 00:00:00 GMT\nx-amz-storage-class: REDUCED_REDUNDANCY\n\nWelcome to Amazon S3.",
+        )
+        .unwrap()
+        .unwrap();
+        sign(
+            &mut r,
+            "examplebucket.s3.amazonaws.com",
+            "",
+            "us-east-1",
+            "s3",
+            &creds(),
+            1_369_353_600,
+        )
+        .unwrap();
+        assert_eq!(r.target, "/test%24file.text");
+        assert!(r.header("authorization").unwrap().ends_with(
+            "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, \
+             Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
+        ));
+    }
+
+    #[test]
+    fn aws_list_objects_example() {
+        let mut r = RawRequest::parse("GET /?max-keys=2&prefix=J HTTP/1.1\n\n")
+            .unwrap()
+            .unwrap();
+        sign(
+            &mut r,
+            "examplebucket.s3.amazonaws.com",
+            "",
+            "us-east-1",
+            "s3",
+            &creds(),
+            1_369_353_600,
+        )
+        .unwrap();
+        assert!(r.header("authorization").unwrap().ends_with(
+            "Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
+        ));
+    }
 }
 
 #[cfg(test)]
