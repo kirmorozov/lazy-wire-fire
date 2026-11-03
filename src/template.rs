@@ -6,6 +6,7 @@
 //!
 //! * `join list sep` (default `,`), `upper s`, `lower s`;
 //! * `regex_escape s`, `url_encode s` (RFC 3986 unreserved kept), `json v` (compact JSON);
+//! * `base64 s` (standard alphabet, padded; a Kinesis record's `Data`);
 //! * `replace s regex replacement` (all matches, `$1` groups), `redis_quote s…` (its arguments,
 //!   concatenated, as one double-quoted redis-cli argument).
 
@@ -102,6 +103,14 @@ fn h_url_encode(h: &Helper<'_>) -> Result<Value, RenderError> {
 fn h_json(h: &Helper<'_>) -> Result<Value, RenderError> {
     let v = h.param(0).map(|p| p.value().clone()).unwrap_or(Value::Null);
     Ok(Value::String(v.to_string()))
+}
+
+fn h_base64(h: &Helper<'_>) -> Result<Value, RenderError> {
+    use base64::Engine as _;
+    let s = text(param(h, 0, "base64")?);
+    Ok(Value::String(
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes()),
+    ))
 }
 
 fn h_redis_quote(h: &Helper<'_>) -> Result<Value, RenderError> {
@@ -407,13 +416,14 @@ impl Templates {
         hb.register_escape_fn(neutralize);
         hb.set_strict_mode(false);
         hb.set_prevent_indent(true);
-        let simple: [(&str, HelperFn); 7] = [
+        let simple: [(&str, HelperFn); 8] = [
             ("join", h_join),
             ("upper", h_upper),
             ("lower", h_lower),
             ("regex_escape", h_regex_escape),
             ("url_encode", h_url_encode),
             ("json", h_json),
+            ("base64", h_base64),
             ("redis_quote", h_redis_quote),
         ];
         for (name, f) in simple {
@@ -623,6 +633,29 @@ mod tests {
             "y"
         );
         assert_eq!(render("{{x}}", json!({"x": "<&>"})), "<&>");
+    }
+
+    #[test]
+    fn base64_helper() {
+        // Standard alphabet with padding; the text form of the value is encoded.
+        assert_eq!(render("{{base64 x}}", json!({"x": "hello"})), "aGVsbG8=");
+        assert_eq!(render("{{base64 x}}", json!({"x": "a?b>c"})), "YT9iPmM=");
+        assert_eq!(render("{{base64 x}}", json!({"x": "ab"})), "YWI=");
+        assert_eq!(render("{{base64 x}}", json!({"x": ""})), "");
+        // Non-ASCII: the UTF-8 bytes are encoded.
+        assert_eq!(render("{{base64 x}}", json!({"x": "ü"})), "w7w=");
+        // A document, as a Kinesis record would carry it.
+        assert_eq!(
+            render("{{base64 (json doc)}}", json!({"doc": {"a": 1}})),
+            "eyJhIjoxfQ=="
+        );
+        // Decodes back to the same text.
+        use base64::Engine as _;
+        let enc = render("{{base64 x}}", json!({"x": "{\"k\":\"v/+=\"}"}));
+        let dec = base64::engine::general_purpose::STANDARD
+            .decode(enc)
+            .unwrap();
+        assert_eq!(String::from_utf8(dec).unwrap(), "{\"k\":\"v/+=\"}");
     }
 
     #[test]

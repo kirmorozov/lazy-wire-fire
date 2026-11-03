@@ -114,6 +114,8 @@ pub enum Kind {
     HttpS3,
     /// Amazon SQS `SendMessageBatch` (one request per action, an answer per entry).
     Sqs,
+    /// Amazon Kinesis `PutRecords` (one request per action, an answer per record).
+    Kinesis,
     Redis,
     MySql,
     PgSql,
@@ -128,11 +130,12 @@ impl Kind {
             "http.header" => Kind::HttpHeader,
             "http.s3" => Kind::HttpS3,
             "sqs" => Kind::Sqs,
+            "kinesis" => Kind::Kinesis,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, redis, mysql or pgsql)"
             ),
         })
     }
@@ -150,6 +153,7 @@ impl Kind {
             Kind::HttpHeader => "http.header",
             Kind::HttpS3 => "http.s3",
             Kind::Sqs => "sqs",
+            Kind::Kinesis => "kinesis",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -159,19 +163,22 @@ impl Kind {
     /// Kinds whose answer says, per item of a batch, which items went through (see
     /// `Target::send_items`). The others answer per action.
     pub fn reports_items(self) -> bool {
-        self == Kind::Sqs
+        matches!(self, Kind::Sqs | Kind::Kinesis)
     }
 
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
     /// stray cleanup and purge-like reset actions are refused at rule load (decision D9 / D7).
     pub fn append_only(self) -> bool {
-        self == Kind::Sqs
+        matches!(self, Kind::Sqs | Kind::Kinesis)
     }
 
     /// The largest request body the service takes, when the kind has a fixed one.
     pub fn batch_bytes_limit(self) -> Option<usize> {
         match self {
             Kind::Sqs => Some(262_144),
+            // PutRecords: 5 MiB per request, partition keys included (the rendered request
+            // holds the base64 `Data`, so the count includes the 4/3 inflation).
+            Kind::Kinesis => Some(5_242_880),
             _ => None,
         }
     }
@@ -193,7 +200,9 @@ impl Kind {
             Kind::HttpBasic => &["password"],
             Kind::HttpBearer => &["token"],
             Kind::HttpHeader => &["value"],
-            Kind::HttpS3 | Kind::Sqs => &["access_key_ref", "secret_key_ref", "session_token_ref"],
+            Kind::HttpS3 | Kind::Sqs | Kind::Kinesis => {
+                &["access_key_ref", "secret_key_ref", "session_token_ref"]
+            }
             Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
         }
     }
@@ -294,6 +303,26 @@ impl TargetDef {
                 need("region")?;
                 aws_refs(&vars)?;
             }
+            Kind::Kinesis => {
+                // The endpoint is the regional service URL (optional: derived from `region`).
+                // The stream is named by exactly one of `stream_name` or `stream_arn`.
+                if endpoints.len() > 1 {
+                    bail!("kind kinesis takes at most one endpoint: the service URL");
+                }
+                if let Some(url) = endpoints.first() {
+                    if !(url.starts_with("https://") || url.starts_with("http://")) {
+                        bail!("the kinesis endpoint must be an http(s) service URL, e.g. https://kinesis.eu-west-1.amazonaws.com");
+                    }
+                }
+                need("region")?;
+                match (var_str(&vars, "stream_name"), var_str(&vars, "stream_arn")) {
+                    (Some(_), None) | (None, Some(_)) => {}
+                    _ => bail!(
+                        "kind kinesis needs exactly one of `vars.stream_name` or `vars.stream_arn`"
+                    ),
+                }
+                aws_refs(&vars)?;
+            }
             Kind::Sqs => {
                 // The endpoint is the queue URL; the POST goes to the service root (`/`).
                 if endpoints.len() != 1 {
@@ -308,7 +337,7 @@ impl TargetDef {
             }
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
-        if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
+        if endpoints.is_empty() && !matches!(kind, Kind::HttpS3 | Kind::Kinesis) {
             bail!("`endpoints` is empty");
         }
         let timeout = Duration::from_millis(match r.timeout_ms {
@@ -938,6 +967,88 @@ mod tests {
             ..Default::default()
         };
         assert!(TriggerDef::from_row(&bad, "app", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod kinesis_tests {
+    use super::*;
+
+    const URL: &str = "https://kinesis.eu-west-1.amazonaws.com";
+
+    fn row(endpoints: Option<&str>, vars: &str) -> RawTarget {
+        RawTarget {
+            name: "k".into(),
+            kind: Some("kinesis".into()),
+            endpoints: endpoints.map(str::to_string),
+            vars: Some(vars.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accepts_a_stream_name_or_arn_with_region_and_references() {
+        let t = TargetDef::from_row(&row(
+            Some(URL),
+            r#"{"region":"eu-west-1","stream_name":"orders","access_key_ref":"env:AK","secret_key_ref":"env:SK"}"#,
+        ))
+        .unwrap();
+        assert_eq!(t.kind, Kind::Kinesis);
+        assert_eq!(t.endpoints, vec![URL.to_string()]);
+        // Credentials never reach templates.
+        assert_eq!(
+            t.template_vars(),
+            serde_json::json!({"region": "eu-west-1", "stream_name": "orders"})
+        );
+        // The regional endpoint is derived when none is given.
+        assert!(TargetDef::from_row(&row(
+            None,
+            r#"{"region":"eu-west-1","stream_name":"orders"}"#
+        ))
+        .is_ok());
+        // An ARN names the stream instead of a name.
+        assert!(TargetDef::from_row(&row(
+            None,
+            r#"{"region":"eu-west-1","stream_arn":"arn:aws:kinesis:eu-west-1:123456789012:stream/orders"}"#
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn refuses_bad_stream_targets() {
+        let ok = r#"{"region":"eu-west-1","stream_name":"orders"}"#;
+        // the stream: exactly one of name or ARN
+        assert!(TargetDef::from_row(&row(Some(URL), r#"{"region":"eu-west-1"}"#)).is_err());
+        assert!(TargetDef::from_row(&row(
+            Some(URL),
+            r#"{"region":"eu-west-1","stream_name":"a","stream_arn":"arn:x"}"#
+        ))
+        .is_err());
+        // at most one endpoint, and an http(s) URL
+        assert!(TargetDef::from_row(&row(Some(&format!("{URL},{URL}")), ok)).is_err());
+        assert!(TargetDef::from_row(&row(Some("kinesis-host"), ok)).is_err());
+        // region is required
+        assert!(TargetDef::from_row(&row(Some(URL), r#"{"stream_name":"orders"}"#)).is_err());
+        // credentials are references, never literals, and come in pairs
+        assert!(TargetDef::from_row(&row(
+            Some(URL),
+            r#"{"region":"r","stream_name":"s","access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
+        ))
+        .is_err());
+        assert!(TargetDef::from_row(&row(
+            Some(URL),
+            r#"{"region":"r","stream_name":"s","access_key_ref":"env:AK"}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn kind_properties() {
+        assert_eq!(Kind::parse("kinesis").unwrap(), Kind::Kinesis);
+        assert!(Kind::Kinesis.reports_items());
+        assert!(Kind::Kinesis.append_only());
+        assert_eq!(Kind::Kinesis.batch_bytes_limit(), Some(5_242_880));
+        assert!(Kind::Kinesis.is_http());
     }
 }
 

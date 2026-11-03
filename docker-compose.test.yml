@@ -64,6 +64,14 @@ services:
     profiles: ["sqs"]
     ports: ["127.0.0.1:34561:9324"]
 
+  # The Kinesis API for the `kinesis` target tests (kinesis-mock, JVM). Not started by `make
+  # servers`: `docker compose -f docker-compose.test.yml --profile kinesis up -d --wait kinesis-mock`.
+  # Plain HTTP on 4568 (4567 is TLS; it does not check signatures); the tests create their own streams.
+  kinesis-mock:
+    image: ghcr.io/etspaceman/kinesis-mock:0.2.2@sha256:23c2ff9b225e74fdb52cb426352130e74a65445b3d4b1391f0cf566ab8336d8f
+    profiles: ["kinesis"]
+    ports: ["127.0.0.1:34562:4568"]
+
   opensearch:
     image: opensearchproject/opensearch:2.19.7
     profiles: ["search"]

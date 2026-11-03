@@ -660,12 +660,16 @@ pub fn error_code(headers: &[(String, String)], body: &[u8]) -> Option<String> {
 /// AWS error codes that say "not now" (throttling, or the service is unavailable), whatever the
 /// HTTP status they come with. Sources (AWS API reference, Common Errors): `ThrottlingException`
 /// and `ServiceUnavailable` (all AWS services); `InternalFailure` (all services, HTTP 500);
-/// `ProvisionedThroughputExceededException` (Kinesis PutRecords, HTTP 400 in its error list).
+/// `ProvisionedThroughputExceededException` (Kinesis PutRecords, HTTP 400 in its error list);
+/// `RequestThrottled` (SQS SendMessageBatch, HTTP 400: "The request was denied due to request
+/// throttling. Exceeds the permitted request rate for the queue or for the recipient of the
+/// request."). Source: docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
 pub fn transient_code(code: &str) -> bool {
     matches!(
         code,
         "ThrottlingException"
             | "ProvisionedThroughputExceededException"
+            | "RequestThrottled"
             | "ServiceUnavailable"
             | "InternalFailure"
     )
@@ -706,6 +710,7 @@ mod classify_tests {
         for c in [
             "ThrottlingException",
             "ProvisionedThroughputExceededException",
+            "RequestThrottled",
             "ServiceUnavailable",
             "InternalFailure",
         ] {
@@ -715,7 +720,6 @@ mod classify_tests {
             "AccessDeniedException",
             "ValidationError",
             "InvalidParameterValue",
-            "RequestThrottled",
             "SlowDown",
         ] {
             assert!(!transient_code(c), "{c}");

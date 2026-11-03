@@ -2413,3 +2413,255 @@ async fn sqs_batch_with_one_bad_entry_retries_only_that_key() {
     assert_eq!(ids, vec![1, 2, 3]);
     inst.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// `kinesis` targets, against kinesis-mock (`LAZYWF_TEST_KINESIS`, e.g. http://127.0.0.1:34562;
+// the `kinesis` compose profile). The tests read the streams back through the same JSON API.
+// A record's `Data` is the document (base64, `base64` in the template); a delete's is
+// `{"op":"delete"}`. The key is the `PartitionKey`.
+
+const KINESIS_PUT: &str = r#"POST / HTTP/1.1
+X-Amz-Target: Kinesis_20131202.PutRecords
+Content-Type: application/x-amz-json-1.1
+
+{"StreamName": {{json target.vars.stream_name}}, "Records": [{{#each docs}}{"Data": "{{#if (eq op "delete")}}{{base64 '{"op":"delete"}'}}{{else}}{{base64 (json doc)}}{{/if}}", "PartitionKey": {{json key}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+fn kinesis_root() -> Option<String> {
+    std::env::var("LAZYWF_TEST_KINESIS")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+macro_rules! need_kinesis {
+    () => {
+        match kinesis_root() {
+            Some(u) => u,
+            None => {
+                eprintln!("LAZYWF_TEST_KINESIS not set: skipping (docker compose --profile kinesis up -d kinesis-mock)");
+                return;
+            }
+        }
+    };
+}
+
+/// The Kinesis JSON API of the store (kinesis-mock).
+struct Kinesis {
+    root: String,
+    client: lazy_wire_fire::http::Client,
+}
+
+impl Kinesis {
+    fn new(root: &str) -> Kinesis {
+        Kinesis {
+            root: root.to_string(),
+            client: lazy_wire_fire::http::Client::new(
+                lazy_wire_fire::http::BaseUrl::parse(root).unwrap(),
+                &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    async fn call(&self, action: &str, body: Value) -> Value {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header("Content-Type", "application/x-amz-json-1.1".into());
+        req.set_header("X-Amz-Target", format!("Kinesis_20131202.{action}"));
+        // kinesis-mock wants a SigV4-shaped Authorization and a date; it does not check the
+        // signature. The test reads the streams back, it does not sign them for AWS.
+        req.set_header("X-Amz-Date", "20260101T000000Z".into());
+        req.set_header(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=lazywf/20260101/us-east-1/kinesis/aws4_request, SignedHeaders=host;x-amz-date, Signature=00".into(),
+        );
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            resp.status == 200,
+            "{action}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+        if resp.body.is_empty() {
+            // CreateStream answers 200 with no body.
+            return Value::Null;
+        }
+        serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    async fn create_stream(&self, name: &str) {
+        self.call("CreateStream", json!({"StreamName": name, "ShardCount": 1}))
+            .await;
+    }
+
+    /// Every record of the stream, shard by shard, in the order they were put: the partition
+    /// key and the decoded `Data`.
+    async fn records(&self, stream: &str) -> Vec<(String, Vec<u8>)> {
+        use base64::Engine as _;
+        let shards = self.call("ListShards", json!({"StreamName": stream})).await;
+        let mut out = Vec::new();
+        for shard in shards["Shards"].as_array().cloned().unwrap_or_default() {
+            let shard_id = shard["ShardId"].as_str().unwrap().to_string();
+            let it = self
+                .call(
+                    "GetShardIterator",
+                    json!({"StreamName": stream, "ShardId": shard_id,
+                           "ShardIteratorType": "TRIM_HORIZON"}),
+                )
+                .await;
+            let mut iterator = it["ShardIterator"].as_str().unwrap().to_string();
+            loop {
+                let got = self
+                    .call(
+                        "GetRecords",
+                        json!({"ShardIterator": iterator, "Limit": 1000}),
+                    )
+                    .await;
+                let recs = got["Records"].as_array().cloned().unwrap_or_default();
+                if recs.is_empty() {
+                    break;
+                }
+                for r in recs {
+                    let key = r["PartitionKey"].as_str().unwrap().to_string();
+                    let data = base64::engine::general_purpose::STANDARD
+                        .decode(r["Data"].as_str().unwrap())
+                        .unwrap();
+                    out.push((key, data));
+                }
+                iterator = got["NextShardIterator"].as_str().unwrap().to_string();
+            }
+        }
+        out
+    }
+}
+
+fn kinesis_creds(stream: &str) -> String {
+    std::env::set_var("LWF_TEST_KINESIS_AK", "lazywf");
+    std::env::set_var("LWF_TEST_KINESIS_SK", "lazywfsecret");
+    json!({"region": "us-east-1", "stream_name": stream,
+           "access_key_ref": "env:LWF_TEST_KINESIS_AK",
+           "secret_key_ref": "env:LWF_TEST_KINESIS_SK"})
+    .to_string()
+}
+
+/// A customers table, and the rule `stream` that puts each changed row to `stream` (one
+/// PutRecords per flush, `PartitionKey` = the row's key).
+async fn kinesis_rule(db: &Db, endpoint: &str, stream: &str, selects: &str) {
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), active TINYINT NOT NULL DEFAULT 1)")
+        .await;
+    tables(db).await;
+    db.target(
+        "stream",
+        "kinesis",
+        endpoint,
+        Some("JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL"),
+        &kinesis_creds(stream),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('stream', 'stream', 'batch', 500, ?, ?, 100)",
+        (selects, KINESIS_PUT),
+    )
+    .await;
+    db.trigger("stream", "customers", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// Every changed key arrives once, as a record: `PartitionKey` = the key, `Data` = the document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinesis_every_changed_key_arrives_as_a_record() {
+    let root = need_db!();
+    let endpoint = need_kinesis!();
+    let kin = Kinesis::new(&endpoint);
+    let stream = format!("lwf_kin_every_{}", std::process::id());
+    kin.create_stream(&stream).await;
+    let db = Db::fresh(&root, "kin_every").await;
+    kinesis_rule(
+        &db,
+        &endpoint,
+        &stream,
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec(
+        "INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy'),(4,'Di'),(5,'Ed')",
+    )
+    .await;
+    wait_for(Duration::from_secs(20), "five records", || async {
+        (kin.records(&stream).await.len() == 5).then_some(())
+    })
+    .await;
+    sleep_ms(2000).await;
+    let mut recs = kin.records(&stream).await;
+    assert_eq!(recs.len(), 5, "a key was sent twice");
+    recs.sort_by(|a, b| a.0.cmp(&b.0));
+    let names = ["Ann", "Bob", "Cy", "Di", "Ed"];
+    for (i, (key, data)) in recs.iter().enumerate() {
+        assert_eq!(
+            key,
+            &(i + 1).to_string(),
+            "the partition key is the row key"
+        );
+        let doc: Value = serde_json::from_slice(data).unwrap();
+        assert_eq!(doc, json!({"id": i + 1, "name": names[i]}), "the document");
+    }
+    inst.stop().await;
+}
+
+/// A deleted row arrives as `op` delete (`{"op":"delete"}`), under its key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinesis_delete_arrives_as_op_delete() {
+    let root = need_db!();
+    let endpoint = need_kinesis!();
+    let kin = Kinesis::new(&endpoint);
+    let stream = format!("lwf_kin_delete_{}", std::process::id());
+    kin.create_stream(&stream).await;
+    let db = Db::fresh(&root, "kin_delete").await;
+    kinesis_rule(
+        &db,
+        &endpoint,
+        &stream,
+        "SELECT c.id AS _key, c.id, c.name, IF(c.active, NULL, 'delete') AS _op FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob')")
+        .await;
+    wait_for(Duration::from_secs(20), "two records", || async {
+        (kin.records(&stream).await.len() == 2).then_some(())
+    })
+    .await;
+    db.exec("UPDATE customers SET active = 0 WHERE id = 2")
+        .await;
+    wait_for(Duration::from_secs(20), "the delete record", || async {
+        (kin.records(&stream).await.len() == 3).then_some(())
+    })
+    .await;
+    sleep_ms(2000).await;
+    let recs = kin.records(&stream).await;
+    assert_eq!(recs.len(), 3, "a key was sent twice");
+    let deletes: Vec<&(String, Vec<u8>)> = recs
+        .iter()
+        .filter(|(_, d)| d.as_slice() == br#"{"op":"delete"}"#)
+        .collect();
+    assert_eq!(deletes.len(), 1, "one delete record");
+    assert_eq!(deletes[0].0, "2", "the delete carries the row's key");
+    // The live row is still an upsert with its document.
+    let upserts: Vec<&(String, Vec<u8>)> = recs
+        .iter()
+        .filter(|(_, d)| d.as_slice() != br#"{"op":"delete"}"#)
+        .collect();
+    assert_eq!(upserts.len(), 2);
+    assert!(upserts.iter().all(|(k, _)| k == "1" || k == "2"));
+    inst.stop().await;
+}
