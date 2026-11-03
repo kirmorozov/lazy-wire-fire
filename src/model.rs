@@ -116,6 +116,8 @@ pub enum Kind {
     Sqs,
     /// Amazon Kinesis `PutRecords` (one request per action, an answer per record).
     Kinesis,
+    /// RabbitMQ: one publish with a confirm per action (see `amqp.rs`).
+    Amqp,
     Redis,
     MySql,
     PgSql,
@@ -131,17 +133,18 @@ impl Kind {
             "http.s3" => Kind::HttpS3,
             "sqs" => Kind::Sqs,
             "kinesis" => Kind::Kinesis,
+            "amqp" => Kind::Amqp,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, amqp, redis, mysql or pgsql)"
             ),
         })
     }
 
     pub fn is_http(self) -> bool {
-        !matches!(self, Kind::Redis | Kind::MySql | Kind::PgSql)
+        !matches!(self, Kind::Amqp | Kind::Redis | Kind::MySql | Kind::PgSql)
     }
 
     /// The name of the kind, as written in `kind`.
@@ -154,6 +157,7 @@ impl Kind {
             Kind::HttpS3 => "http.s3",
             Kind::Sqs => "sqs",
             Kind::Kinesis => "kinesis",
+            Kind::Amqp => "amqp",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -169,7 +173,7 @@ impl Kind {
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
     /// stray cleanup and purge-like reset actions are refused at rule load (decision D9 / D7).
     pub fn append_only(self) -> bool {
-        matches!(self, Kind::Sqs | Kind::Kinesis)
+        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Amqp)
     }
 
     /// The largest request body the service takes, when the kind has a fixed one.
@@ -203,7 +207,7 @@ impl Kind {
             Kind::HttpS3 | Kind::Sqs | Kind::Kinesis => {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
-            Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
+            Kind::Amqp | Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
         }
     }
 }
@@ -335,6 +339,7 @@ impl TargetDef {
                 need("region")?;
                 aws_refs(&vars)?;
             }
+            Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3 | Kind::Kinesis) {

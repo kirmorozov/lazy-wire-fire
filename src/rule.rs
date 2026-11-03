@@ -174,6 +174,9 @@ pub fn kind_errors(
             }
         }
     }
+    if kind == Kind::Amqp {
+        out.extend(crate::amqp::rule_errors(def.fire_per));
+    }
     if matches!(kind, Kind::Sqs | Kind::Kinesis) {
         // Purge-like `once` actions: a queue purge (`PurgeQueue`) or a stream delete
         // (`DeleteStream`, which drops every record). Recognized by text, as the only names of
@@ -472,6 +475,22 @@ mod kind_tests {
         assert_eq!(e.len(), 1, "{e:?}");
         assert!(e[0].contains("only appends"));
         assert!(kind_errors(&d, Kind::Http, &["https://h".into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn amqp_refuses_stray_steps_and_batches() {
+        let mut d = def();
+        d.fire_per = FirePer::Key;
+        d.reset_steps = vec![step(stray(), None)];
+        let e = kind_errors(&d, Kind::Amqp, &["amqp://broker".into()], &cols(&["_key"]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("only appends"));
+        d.reset_steps = Vec::new();
+        d.fire_per = FirePer::Batch;
+        let e = kind_errors(&d, Kind::Amqp, &["amqp://broker".into()], &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        d.fire_per = FirePer::Key;
+        assert!(kind_errors(&d, Kind::Amqp, &["amqp://broker".into()], &[]).is_empty());
     }
 
     #[test]

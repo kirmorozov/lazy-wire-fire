@@ -4,6 +4,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod action;
+pub mod amqp;
 pub mod analyze;
 pub mod analyzer;
 pub mod aws;
