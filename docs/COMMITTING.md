@@ -24,6 +24,18 @@ House rules for commits, branches and pull requests on this repository.
 - Merge by squashing, so `main` stays a linear history of one commit per
   change, and delete the branch afterwards.
 
+## Hand-offs from workers
+
+- A worker hands over a branch that is ready to merge: one commit on it,
+  rebased onto the tip of `main`, and its own checks green. The git keeper
+  pushes it as is, opens the pull request and squash-merges it when CI is
+  green.
+- The keeper never edits code and never resolves a conflict. It rebases the
+  branch onto `main` only while the rebase is clean; when it stops on a
+  conflict the keeper runs `git rebase --abort`, marks the branch "needs
+  refresh" and stops. Refreshing the branch onto the new `main` — including
+  any porting of its code — is the worker's job.
+
 ## Checks before a commit
 
 - `make lint` — `cargo fmt --check`, `clippy -D warnings`, and the lazyview
