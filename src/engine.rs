@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use crate::action::{self, Env, FenceSpec, Fired, KeyQuery};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position, RowsKind};
 use crate::config::Config;
+use crate::fence;
 use crate::health::Health;
 use crate::lock;
 use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
@@ -506,6 +507,7 @@ pub async fn run(
 ) -> Result<()> {
     // The reader names lazyview in its messages unless told otherwise (main does it earlier).
     binlog::set_product("lazywf", "LAZYWF_");
+    fence::set_table(model::FENCE);
     let opts = binlog::replica_opts(&cfg.dsn)?;
     let binlog_opts = binlog::replica_opts(&cfg.binlog_dsn)?;
     let Some(mut control) = connect_wait(&opts, &health, &mut shutdown).await? else {
@@ -1378,7 +1380,10 @@ impl Engine {
                 ..
             } => {
                 self.in_txn = true;
-                if !(schema == self.cfg.schema && table == model::STATUS) {
+                // The tool's own bookkeeping (status, commit fence) moves no position.
+                let own = schema == self.cfg.schema
+                    && matches!(table.as_str(), model::STATUS | model::FENCE);
+                if !own {
                     self.txn_foreign = true;
                 }
                 let route = self.route(reader, table_id, &schema, &table).await?;
