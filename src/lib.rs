@@ -14,6 +14,7 @@ pub mod config;
 pub mod datum;
 pub mod docs;
 pub mod engine;
+pub mod fence;
 pub mod health;
 pub mod http;
 pub mod keyset;
