@@ -375,17 +375,21 @@ async fn send_all(
         futures_util::future::join_all(rendered.iter().map(|(i, r)| target.send(*i, r))).await;
     let mut sent = Sent::Skipped;
     let mut transient = None;
+    let mut rejected = None;
     for r in results {
         match r {
             Ok(Sent::Ok) => sent = Sent::Ok,
             Ok(Sent::Skipped) => {}
-            Err(e) if crate::target::is_rejected(&e) => return Err((e, Fail::Rejected)),
+            Err(e) if crate::target::is_rejected(&e) => rejected = rejected.or(Some(e)),
             Err(e) => transient = transient.or(Some(e)),
         }
     }
-    match transient {
-        Some(e) => Err((e, Fail::Transient)),
-        None => Ok(sent),
+    // A refusal is judged only once every endpoint has answered: an endpoint that is unavailable
+    // may still accept the action, so it makes the failure transient (no strike for the key).
+    match (transient, rejected) {
+        (Some(e), _) => Err((e, Fail::Transient)),
+        (None, Some(e)) => Err((e, Fail::Rejected)),
+        (None, None) => Ok(sent),
     }
 }
 

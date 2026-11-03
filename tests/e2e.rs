@@ -3,11 +3,15 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
 use mysql_async::prelude::*;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 const BULK: &str = "POST /orders/_bulk HTTP/1.1
 Content-Type: application/x-ndjson
@@ -2663,5 +2667,223 @@ async fn kinesis_delete_arrives_as_op_delete() {
         .collect();
     assert_eq!(upserts.len(), 2);
     assert!(upserts.iter().all(|(k, _)| k == "1" || k == "2"));
+    inst.stop().await;
+}
+
+/// Two endpoints of one target disagree about a key: `refuser` refuses key 2 (400) while
+/// `flaky` is unavailable for it (503). Key 1 shares its batch. A transient failure on any
+/// endpoint means the action may pass later, so key 2 must not collect strikes (and be dropped)
+/// while `flaky` is still unavailable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transient_on_one_endpoint_is_not_a_refusal() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "mixed").await;
+    shop(&db).await;
+    let refuser = Mock::start().await;
+    refuser.respond(|r| {
+        if r.body.contains('2') {
+            (400, "refused".into())
+        } else {
+            (200, "{}".into())
+        }
+    });
+    let flaky = Mock::start().await;
+    flaky.respond(|r| {
+        if r.body.contains('2') {
+            (503, "unavailable".into())
+        } else {
+            (200, "{}".into())
+        }
+    });
+    db.target(
+        "both",
+        "http",
+        &format!("{}, {}", refuser.url(), flaky.url()),
+        None,
+        "{}",
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('m', 'both', 'POST /m HTTP/1.1\n\n{{join keys \",\"}}', 100)",
+        (),
+    )
+    .await;
+    db.trigger("m", "orders", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 1), (2, 1, 'n', 1)")
+        .await;
+    // Ten attempts at key 2 (a key that gets five strikes is dropped after the sixth).
+    let dropped = wait_for(Duration::from_secs(30), "key 2 attempts", || async {
+        let (_, _, _, err) = db.status("m").await?;
+        if err.as_deref().is_some_and(|e| e.contains("dropped")) {
+            return Some(true);
+        }
+        (flaky
+            .requests()
+            .iter()
+            .filter(|r| r.body.contains('2'))
+            .count()
+            >= 10)
+            .then_some(false)
+    })
+    .await;
+    let (_, _, _, err) = db.status("m").await.unwrap();
+    assert!(
+        !dropped,
+        "key 2 was dropped while `flaky` was unavailable: {err:?}"
+    );
+    inst.stop().await;
+}
+
+/// An endpoint whose first request is held until `open` is called and then answered 503 (the
+/// flush that sent it fails); every other request is answered 200 at once. `arrived` and
+/// `confirmed` record the keys of the requests received and of those answered 200.
+struct Gate {
+    url: String,
+    open_tx: watch::Sender<bool>,
+    arrived: Arc<Mutex<Vec<String>>>,
+    confirmed: Arc<Mutex<Vec<String>>>,
+}
+
+impl Gate {
+    async fn start() -> Gate {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (open_tx, open_rx) = watch::channel(false);
+        let arrived = Arc::new(Mutex::new(Vec::new()));
+        let confirmed = Arc::new(Mutex::new(Vec::new()));
+        let (arrived2, confirmed2) = (arrived.clone(), confirmed.clone());
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let hold = std::mem::replace(&mut first, false);
+                let (mut open, arrived, confirmed) =
+                    (open_rx.clone(), arrived2.clone(), confirmed2.clone());
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let head_end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        let mut chunk = [0u8; 8192];
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        let mut chunk = [0u8; 8192];
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string();
+                    arrived.lock().unwrap().push(body.clone());
+                    let status = if hold {
+                        while !*open.borrow() {
+                            if open.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        503
+                    } else {
+                        200
+                    };
+                    if status == 200 {
+                        confirmed.lock().unwrap().push(body);
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        Gate {
+            url,
+            open_tx,
+            arrived,
+            confirmed,
+        }
+    }
+
+    fn open(&self) {
+        self.open_tx.send(true).unwrap();
+    }
+
+    /// The keys of the requests with the given record (comma-separated bodies), as a set.
+    fn keys(record: &Mutex<Vec<String>>) -> std::collections::BTreeSet<String> {
+        record
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|b| b.split(',').map(String::from).collect::<Vec<_>>())
+            .collect()
+    }
+}
+
+/// A rule removed while its flush waits on the target, and added back (with its reset steps)
+/// before the target answers: every key of the table still reaches the target. The old flush
+/// fails once released, and its result is discarded; the re-added rule covers the keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_and_added_back_mid_flush_loses_no_key() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "readd").await;
+    shop(&db).await;
+    let gate = Gate::start().await;
+    db.target("slow", "http", &gate.url, None, "{}").await;
+    let steps = json!([{"for_each": "snapshot"}]).to_string();
+    let add = "INSERT INTO lazy_wire_fire_rule (name, target, template, snapshot_keys_sql, reset_steps, debounce_ms) \
+               VALUES ('o', 'slow', 'POST /o HTTP/1.1\n\n{{join keys \",\"}}', 'SELECT id AS _key FROM orders', ?, 50)";
+    db.exec_params(add, (steps.clone(),)).await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 1), (2, 1, 'n', 1)")
+        .await;
+    wait_for(Duration::from_secs(10), "the flush in flight", || async {
+        Gate::keys(&gate.arrived).contains("1").then_some(())
+    })
+    .await;
+    db.exec("DELETE FROM lazy_wire_fire_rule WHERE name = 'o'")
+        .await;
+    wait_for(Duration::from_secs(10), "the rule removed", || async {
+        inst.health.status()["rules"]
+            .get("o")
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    db.exec_params(add, (steps,)).await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO orders VALUES (3, 1, 'n', 1)").await;
+    wait_for(Duration::from_secs(10), "the rule back", || async {
+        inst.health.status()["rules"]
+            .get("o")
+            .is_some()
+            .then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(20), "every key confirmed", || async {
+        let k = Gate::keys(&gate.confirmed);
+        (["1", "2", "3"].iter().all(|x| k.contains(*x))).then_some(())
+    })
+    .await;
+    gate.open();
+    sleep_ms(300).await;
+    let (_, _, _, err) = db.status("o").await.unwrap();
+    assert!(!err.as_deref().unwrap_or("").contains("dropped"), "{err:?}");
     inst.stop().await;
 }
