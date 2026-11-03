@@ -8,6 +8,7 @@
 #   make test-prerelease     # the advisory MariaDB RC and preview (profile `prerelease`)
 #   docker compose -f docker-compose.test.yml --profile search up -d --wait    # + OpenSearch, Elasticsearch 8 / 7
 #   docker compose -f docker-compose.test.yml --profile varnish up -d --wait   # + Varnish (host network)
+#   docker compose -f docker-compose.test.yml --profile amqp up -d --wait      # + RabbitMQ (the amqp target tests)
 #   make servers-down        # every profile, volumes included
 #
 # MySQL and Percona run with GTIDs on except MySQL 8.0 (off, as in RDS for MySQL's default
@@ -71,6 +72,15 @@ services:
     image: ghcr.io/etspaceman/kinesis-mock:0.2.2@sha256:23c2ff9b225e74fdb52cb426352130e74a65445b3d4b1391f0cf566ab8336d8f
     profiles: ["kinesis"]
     ports: ["127.0.0.1:34562:4568"]
+
+  # The AMQP broker for the `amqp` target tests (RabbitMQ 4.x, AMQP 0-9-1). Not started by `make
+  # servers`: `docker compose -f docker-compose.test.yml --profile amqp up -d --wait rabbitmq`.
+  rabbitmq:
+    image: rabbitmq:4.3.7
+    profiles: ["amqp"]
+    environment: { RABBITMQ_DEFAULT_USER: lwftest, RABBITMQ_DEFAULT_PASS: lwftest }
+    ports: ["127.0.0.1:34560:5672"]
+    healthcheck: { test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"], interval: 3s, retries: 60 }
 
   opensearch:
     image: opensearchproject/opensearch:2.19.7

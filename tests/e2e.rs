@@ -2887,3 +2887,343 @@ async fn removed_and_added_back_mid_flush_loses_no_key() {
     assert!(!err.as_deref().unwrap_or("").contains("dropped"), "{err:?}");
     inst.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The amqp kind against RabbitMQ (`LAZYWF_TEST_AMQP=127.0.0.1:34560`, compose profile `amqp`).
+
+/// The broker's `host:port`, when the suite has one.
+fn amqp_broker() -> Option<String> {
+    std::env::var("LAZYWF_TEST_AMQP").ok()
+}
+
+/// One message as the test consumer reads it.
+#[derive(Debug, Clone)]
+struct Got {
+    routing_key: String,
+    message_id: String,
+    content_type: String,
+    persistent: bool,
+    body: Value,
+}
+
+/// The test's own connection to the broker: an exchange, a durable queue bound to `order.changed`,
+/// and everything read from the queue so far.
+struct Amqp {
+    _conn: lapin::Connection,
+    chan: lapin::Channel,
+    queue: String,
+    got: std::sync::Mutex<Vec<Got>>,
+}
+
+impl Amqp {
+    async fn setup(broker: &str, exchange: &str, queue: &str) -> Amqp {
+        use lapin::{options::*, types::FieldTable, ConnectionProperties, ExchangeKind};
+        let url = format!("amqp://lwftest:lwftest@{broker}/%2f");
+        let conn = lapin::Connection::connect(&url, ConnectionProperties::default())
+            .await
+            .unwrap();
+        let chan = conn.create_channel().await.unwrap();
+        // A fresh queue: a rerun does not see the messages of an earlier one.
+        chan.queue_delete(queue.into(), QueueDeleteOptions::default())
+            .await
+            .ok();
+        chan.exchange_declare(
+            exchange.into(),
+            ExchangeKind::Direct,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        chan.queue_declare(
+            queue.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        chan.queue_bind(
+            queue.into(),
+            exchange.into(),
+            "order.changed".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        Amqp {
+            _conn: conn,
+            chan,
+            queue: queue.into(),
+            got: Default::default(),
+        }
+    }
+
+    /// Reads every message waiting on the queue into `got`.
+    async fn pull(&self) {
+        use lapin::options::BasicGetOptions;
+        loop {
+            let Some(m) = self
+                .chan
+                .basic_get(self.queue.as_str().into(), BasicGetOptions { no_ack: true })
+                .await
+                .unwrap()
+            else {
+                return;
+            };
+            let d = m.delivery;
+            let p = &d.properties;
+            self.got.lock().unwrap().push(Got {
+                routing_key: d.routing_key.to_string(),
+                message_id: p
+                    .message_id()
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                content_type: p
+                    .content_type()
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                persistent: *p.delivery_mode() == Some(2),
+                body: serde_json::from_slice(&d.data).unwrap_or(Value::Null),
+            });
+        }
+    }
+
+    /// Waits until at least `n` messages have been read, and returns all of them so far.
+    async fn at_least(&self, n: usize) -> Vec<Got> {
+        wait_for(
+            Duration::from_secs(30),
+            &format!("{n} AMQP messages"),
+            || async {
+                self.pull().await;
+                let all = self.got.lock().unwrap().clone();
+                (all.len() >= n).then_some(all)
+            },
+        )
+        .await
+    }
+}
+
+/// The envelope template: one message per key, to `exchange` / `order.changed`, with the key as
+/// the message id and the JSON envelope `{key, op, doc}` as the body.
+fn amqp_envelope(exchange: &str) -> String {
+    format!(
+        "{{{{#each docs}}}}PUBLISH /{exchange}/order.changed\nMessage-Id: {{{{key}}}}\n\n\
+         {{\"key\":{{{{json key}}}},\"op\":{{{{json op}}}},\"doc\":{{{{json doc}}}}}}{{{{/each}}}}"
+    )
+}
+
+/// The `amqp` kind as a message producer: one persistent JSON message per changed key on a bound
+/// queue; a delete arrives as op delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn amqp_target() {
+    let root = need_db!();
+    let Some(broker) = amqp_broker() else {
+        return eprintln!("LAZYWF_TEST_AMQP not set: skipping");
+    };
+    let db = Db::fresh(&root, "amqp_target").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let (ex, q) = ("lwf.amqp_target", "lwf.amqp_target.q");
+    let admin = Amqp::setup(&broker, ex, q).await;
+
+    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    db.target(
+        "bus",
+        "amqp",
+        &format!("amqp://{broker}/"),
+        None,
+        &vars.to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            amqp_envelope(ex),
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    let got = admin.at_least(2).await;
+    assert_eq!(got.len(), 2, "one message per key: {got:?}");
+    let by_id = |id: &str| got.iter().find(|g| g.message_id == id).unwrap().clone();
+    for (id, sku, qty) in [("1", "A-1", 3), ("2", "B-2", 1)] {
+        let g = by_id(id);
+        assert_eq!(g.routing_key, "order.changed");
+        assert_eq!(g.content_type, "application/json");
+        assert!(g.persistent, "{g:?}");
+        assert_eq!(
+            g.body,
+            json!({"key": id, "op": "upsert", "doc": {"sku": sku, "qty": qty}})
+        );
+    }
+
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    let got = admin.at_least(3).await;
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got[2].body,
+        json!({"key": "1", "op": "upsert", "doc": {"sku": "A-1", "qty": 4}})
+    );
+
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    let got = admin.at_least(4).await;
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[3].message_id, "2");
+    assert_eq!(got[3].body["key"], "2");
+    assert_eq!(got[3].body["op"], "delete", "{:?}", got[3]);
+    inst.stop().await;
+}
+
+/// A key whose message has no bound queue comes back as basic.return (312). It is refused,
+/// struck and dropped after its strikes, because the other keys went through; the position
+/// moves on, and `last_error` says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn amqp_refusal() {
+    let root = need_db!();
+    let Some(broker) = amqp_broker() else {
+        return eprintln!("LAZYWF_TEST_AMQP not set: skipping");
+    };
+    let db = Db::fresh(&root, "amqp_refusal").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let (ex, q) = ("lwf.amqp_refusal", "lwf.amqp_refusal.q");
+    let admin = Amqp::setup(&broker, ex, q).await;
+
+    // Orders with the sku NOROUTE go to a routing key nothing is bound to.
+    let template = amqp_envelope(ex).replace(
+        "/order.changed",
+        "/{{#if (eq doc.sku \"NOROUTE\")}}no.such.key{{else}}order.changed{{/if}}",
+    );
+    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    db.target(
+        "bus",
+        "amqp",
+        &format!("amqp://{broker}/"),
+        None,
+        &vars.to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            template,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'NOROUTE', 1)")
+        .await;
+    let err = wait_for(
+        Duration::from_secs(60),
+        "the unroutable key dropped",
+        || async {
+            let (f, p, _, err) = db.status("orders").await?;
+            let err = err?;
+            (err.contains("`2` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(err.contains("312") && err.contains("NO_ROUTE"), "{err}");
+
+    let got = admin.at_least(1).await;
+    assert_eq!(got.len(), 1, "only the routable key arrives: {got:?}");
+    assert_eq!(got[0].message_id, "1");
+    assert_eq!(got[0].body["doc"]["sku"], "A-1");
+    inst.stop().await;
+}
+
+/// The broker drops every connection and refuses new ones (a restart, seen from lazywf). The
+/// keys changed meanwhile are retried, and each arrives; a message the broker took before the cut
+/// may arrive again (at-least-once), but none is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn amqp_restart() {
+    let root = need_db!();
+    let Some(broker) = amqp_broker() else {
+        return eprintln!("LAZYWF_TEST_AMQP not set: skipping");
+    };
+    let db = Db::fresh(&root, "amqp_restart").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let (ex, q) = ("lwf.amqp_restart", "lwf.amqp_restart.q");
+    let admin = Amqp::setup(&broker, ex, q).await;
+
+    let upstream: &'static str = Box::leak(broker.clone().into_boxed_str());
+    let proxy = Flaky::start(upstream).await;
+    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    db.target(
+        "bus",
+        "amqp",
+        &format!("amqp://127.0.0.1:{}/", proxy.port),
+        None,
+        &vars.to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            amqp_envelope(ex),
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    assert_eq!(admin.at_least(2).await.len(), 2);
+
+    proxy.cut();
+    db.exec("INSERT INTO orders VALUES (3, 'C-3', 7)").await;
+    wait_for(Duration::from_secs(30), "a refused connection", || async {
+        (proxy.refused() >= 1).then_some(())
+    })
+    .await;
+    admin.pull().await;
+    assert!(
+        !admin
+            .got
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|g| g.message_id == "3"),
+        "key 3 arrived while the broker was cut off"
+    );
+    proxy.heal();
+
+    let got = admin.at_least(3).await;
+    let mut keys: Vec<&str> = got.iter().map(|g| g.message_id.as_str()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys, vec!["1", "2", "3"], "every key arrives: {got:?}");
+    let g3 = got.iter().find(|g| g.message_id == "3").unwrap();
+    assert_eq!(
+        g3.body,
+        json!({"key": "3", "op": "upsert", "doc": {"sku": "C-3", "qty": 7}})
+    );
+    inst.stop().await;
+}
