@@ -2181,7 +2181,16 @@ impl Sqs {
         serde_json::from_slice(&resp.body).unwrap()
     }
 
-    /// Creates a queue; the URL the target uses.
+    /// The `aws-sqs://` endpoint of a queue this store holds: the region in the URL, the
+    /// store as `?endpoint=` (ElasticMQ answers as the account 000000000000).
+    fn target(&self, queue_url: &str) -> String {
+        let path = queue_url
+            .strip_prefix(&self.root)
+            .expect("a queue of this store");
+        format!("aws-sqs://us-east-1{path}?endpoint={}", self.root)
+    }
+
+    /// Creates a queue; its queue URL.
     async fn create(&self, name: &str, fifo: bool) -> String {
         let attributes = if fifo {
             json!({"FifoQueue": "true", "ContentBasedDeduplication": "false"})
@@ -2236,7 +2245,7 @@ impl Sqs {
 fn sqs_creds() -> String {
     std::env::set_var("LWF_TEST_SQS_AK", "lazywf");
     std::env::set_var("LWF_TEST_SQS_SK", "lazywfsecret");
-    json!({"region": "us-east-1", "access_key_ref": "env:LWF_TEST_SQS_AK",
+    json!({"access_key_ref": "env:LWF_TEST_SQS_AK",
            "secret_key_ref": "env:LWF_TEST_SQS_SK"})
     .to_string()
 }
@@ -2275,7 +2284,7 @@ async fn sqs_standard_queue_every_key_once() {
         .await;
     sqs_rule(
         &db,
-        &url,
+        &sqs.target(&url),
         SQS_STANDARD,
         "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
     )
@@ -2317,7 +2326,7 @@ async fn sqs_fifo_group_is_the_key_and_dedupe_is_the_version() {
         .await;
     sqs_rule(
         &db,
-        &url,
+        &sqs.target(&url),
         SQS_FIFO,
         "SELECT c.id AS _key, c.id, c.name, CONCAT(c.id, '#', c.rev) AS version FROM customers c WHERE c.id IN (:keys)",
     )
@@ -2374,7 +2383,7 @@ async fn sqs_batch_with_one_bad_entry_retries_only_that_key() {
         .await;
     sqs_rule(
         &db,
-        &url,
+        &sqs.target(&url),
         SQS_FIFO,
         "SELECT c.id AS _key, c.id, c.name, CONCAT(c.id, '#', c.rev) AS version FROM customers c WHERE c.id IN (:keys)",
     )
@@ -2428,7 +2437,7 @@ const KINESIS_PUT: &str = r#"POST / HTTP/1.1
 X-Amz-Target: Kinesis_20131202.PutRecords
 Content-Type: application/x-amz-json-1.1
 
-{"StreamName": {{json target.vars.stream_name}}, "Records": [{{#each docs}}{"Data": "{{#if (eq op "delete")}}{{base64 '{"op":"delete"}'}}{{else}}{{base64 (json doc)}}{{/if}}", "PartitionKey": {{json key}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+{"StreamName": {{json endpoint.stream}}, "Records": [{{#each docs}}{"Data": "{{#if (eq op "delete")}}{{base64 '{"op":"delete"}'}}{{else}}{{base64 (json doc)}}{{/if}}", "PartitionKey": {{json key}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
 
 fn kinesis_root() -> Option<String> {
     std::env::var("LAZYWF_TEST_KINESIS")
@@ -2547,17 +2556,17 @@ impl Kinesis {
     }
 }
 
-fn kinesis_creds(stream: &str) -> String {
+fn kinesis_creds() -> String {
     std::env::set_var("LWF_TEST_KINESIS_AK", "lazywf");
     std::env::set_var("LWF_TEST_KINESIS_SK", "lazywfsecret");
-    json!({"region": "us-east-1", "stream_name": stream,
-           "access_key_ref": "env:LWF_TEST_KINESIS_AK",
+    json!({"access_key_ref": "env:LWF_TEST_KINESIS_AK",
            "secret_key_ref": "env:LWF_TEST_KINESIS_SK"})
     .to_string()
 }
 
 /// A customers table, and the rule `stream` that puts each changed row to `stream` (one
-/// PutRecords per flush, `PartitionKey` = the row's key).
+/// PutRecords per flush, `PartitionKey` = the row's key). The target's endpoint names the stream
+/// and the region, and sends to the store at `endpoint`.
 async fn kinesis_rule(db: &Db, endpoint: &str, stream: &str, selects: &str) {
     db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), active TINYINT NOT NULL DEFAULT 1)")
         .await;
@@ -2565,9 +2574,9 @@ async fn kinesis_rule(db: &Db, endpoint: &str, stream: &str, selects: &str) {
     db.target(
         "stream",
         "kinesis",
-        endpoint,
+        &format!("aws-kinesis://us-east-1/{stream}?endpoint={endpoint}"),
         Some("JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL"),
-        &kinesis_creds(stream),
+        &kinesis_creds(),
     )
     .await;
     db.exec_params(

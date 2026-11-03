@@ -13,6 +13,7 @@ use mysql_async::prelude::*;
 use mysql_async::{Conn, Row};
 use serde_json::{Map, Value};
 
+use crate::aws;
 use crate::sql;
 use crate::tls::TlsSpec;
 
@@ -264,6 +265,16 @@ fn var_str<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Keys that a kind no longer takes in `vars` (its region and stream come from the endpoint).
+fn refuse_vars(vars: &Map<String, Value>, keys: &[&str], kind: Kind, hint: &str) -> Result<()> {
+    for k in keys {
+        if vars.contains_key(*k) {
+            bail!("`vars.{k}` is not used by kind {}: {hint}", kind.name());
+        }
+    }
+    Ok(())
+}
+
 /// AWS credentials in a target's `vars`: references only, and an access key with its secret.
 fn aws_refs(vars: &Map<String, Value>) -> Result<()> {
     for k in ["access_key_ref", "secret_key_ref", "session_token_ref"] {
@@ -308,41 +319,51 @@ impl TargetDef {
                 aws_refs(&vars)?;
             }
             Kind::Kinesis => {
-                // The endpoint is the regional service URL (optional: derived from `region`).
-                // The stream is named by exactly one of `stream_name` or `stream_arn`.
-                if endpoints.len() > 1 {
-                    bail!("kind kinesis takes at most one endpoint: the service URL");
-                }
-                if let Some(url) = endpoints.first() {
-                    if !(url.starts_with("https://") || url.starts_with("http://")) {
-                        bail!("the kinesis endpoint must be an http(s) service URL, e.g. https://kinesis.eu-west-1.amazonaws.com");
+                // `aws-kinesis://[<region>/]<stream>`: the stream and the region are in the URL.
+                match endpoints.as_slice() {
+                    [url] => {
+                        aws::KinesisUrl::parse(url)?;
                     }
-                }
-                need("region")?;
-                match (var_str(&vars, "stream_name"), var_str(&vars, "stream_arn")) {
-                    (Some(_), None) | (None, Some(_)) => {}
                     _ => bail!(
-                        "kind kinesis needs exactly one of `vars.stream_name` or `vars.stream_arn`"
+                        "kind kinesis takes exactly one endpoint: aws-kinesis://[<region>/]<stream-name>"
                     ),
                 }
+                refuse_vars(&vars, &["region", "stream_name", "stream_arn"], kind, "the region and the stream go in the endpoint: aws-kinesis://[<region>/]<stream-name>")?;
                 aws_refs(&vars)?;
             }
             Kind::Sqs => {
-                // The endpoint is the queue URL; the POST goes to the service root (`/`).
-                if endpoints.len() != 1 {
-                    bail!("kind sqs takes exactly one endpoint: the queue URL");
+                // `aws-sqs://[<region>/]<account>/<queue>`: the queue and the region are in the URL.
+                match endpoints.as_slice() {
+                    [url] => {
+                        aws::SqsUrl::parse(url)?;
+                    }
+                    _ => bail!(
+                        "kind sqs takes exactly one endpoint: aws-sqs://[<region>/]<account-id>/<queue-name>"
+                    ),
                 }
-                let url = &endpoints[0];
-                if !(url.starts_with("https://") || url.starts_with("http://")) {
-                    bail!("the sqs endpoint must be an http(s) queue URL, e.g. https://sqs.eu-west-1.amazonaws.com/123456789012/orders");
-                }
-                need("region")?;
+                refuse_vars(
+                    &vars,
+                    &["region"],
+                    kind,
+                    "the region goes in the endpoint: aws-sqs://<region>/<account-id>/<queue-name>",
+                )?;
                 aws_refs(&vars)?;
             }
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
-        if endpoints.is_empty() && !matches!(kind, Kind::HttpS3 | Kind::Kinesis) {
+        if !matches!(kind, Kind::Sqs | Kind::Kinesis) {
+            if let Some(e) = endpoints
+                .iter()
+                .find(|e| crate::aws::scheme_of(e).is_some_and(|s| s.starts_with("aws-")))
+            {
+                bail!(
+                    "`{e}` is an endpoint of kind sqs or kinesis, not of kind {}",
+                    kind.name()
+                );
+            }
+        }
+        if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }
         let timeout = Duration::from_millis(match r.timeout_ms {
@@ -976,75 +997,148 @@ mod tests {
 }
 
 #[cfg(test)]
-mod kinesis_tests {
+mod aws_endpoint_tests {
     use super::*;
 
-    const URL: &str = "https://kinesis.eu-west-1.amazonaws.com";
-
-    fn row(endpoints: Option<&str>, vars: &str) -> RawTarget {
+    fn row(kind: &str, endpoints: Option<&str>, vars: &str) -> RawTarget {
         RawTarget {
-            name: "k".into(),
-            kind: Some("kinesis".into()),
+            name: "t".into(),
+            kind: Some(kind.into()),
             endpoints: endpoints.map(str::to_string),
             vars: Some(vars.into()),
             ..Default::default()
         }
     }
 
+    const QUEUE: &str = "aws-sqs://eu-west-1/123456789012/orders";
+    const STREAM: &str = "aws-kinesis://eu-west-1/orders";
+    const CREDS: &str = r#""access_key_ref":"env:AK","secret_key_ref":"env:SK""#;
+
     #[test]
-    fn accepts_a_stream_name_or_arn_with_region_and_references() {
-        let t = TargetDef::from_row(&row(
-            Some(URL),
-            r#"{"region":"eu-west-1","stream_name":"orders","access_key_ref":"env:AK","secret_key_ref":"env:SK"}"#,
-        ))
-        .unwrap();
-        assert_eq!(t.kind, Kind::Kinesis);
-        assert_eq!(t.endpoints, vec![URL.to_string()]);
-        // Credentials never reach templates.
-        assert_eq!(
-            t.template_vars(),
-            serde_json::json!({"region": "eu-west-1", "stream_name": "orders"})
-        );
-        // The regional endpoint is derived when none is given.
+    fn sqs_accepts_the_url_forms_with_references() {
+        let t = TargetDef::from_row(&row("sqs", Some(QUEUE), &format!("{{{CREDS}}}"))).unwrap();
+        assert_eq!(t.kind, Kind::Sqs);
+        assert_eq!(t.endpoints, vec![QUEUE.to_string()]);
+        // Credentials never reach templates; the region is in the URL.
+        assert_eq!(t.template_vars(), serde_json::json!({}));
         assert!(TargetDef::from_row(&row(
-            None,
-            r#"{"region":"eu-west-1","stream_name":"orders"}"#
+            "sqs",
+            Some("aws-sqs://123456789012/orders.fifo"),
+            "{}"
         ))
         .is_ok());
-        // An ARN names the stream instead of a name.
         assert!(TargetDef::from_row(&row(
-            None,
-            r#"{"region":"eu-west-1","stream_arn":"arn:aws:kinesis:eu-west-1:123456789012:stream/orders"}"#
+            "sqs",
+            Some("aws-sqs://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34561"),
+            "{}"
         ))
         .is_ok());
     }
 
     #[test]
-    fn refuses_bad_stream_targets() {
-        let ok = r#"{"region":"eu-west-1","stream_name":"orders"}"#;
-        // the stream: exactly one of name or ARN
-        assert!(TargetDef::from_row(&row(Some(URL), r#"{"region":"eu-west-1"}"#)).is_err());
+    fn sqs_refuses_bad_endpoints() {
+        let ok = "{}";
+        // exactly one endpoint
+        assert!(TargetDef::from_row(&row("sqs", None, ok)).is_err());
+        assert!(TargetDef::from_row(&row("sqs", Some(&format!("{QUEUE},{QUEUE}")), ok)).is_err());
+        // the scheme: aws-sqs://, never a plain URL or another aws- scheme
         assert!(TargetDef::from_row(&row(
-            Some(URL),
-            r#"{"region":"eu-west-1","stream_name":"a","stream_arn":"arn:x"}"#
+            "sqs",
+            Some("https://sqs.eu-west-1.amazonaws.com/123456789012/orders"),
+            ok
         ))
         .is_err());
-        // at most one endpoint, and an http(s) URL
-        assert!(TargetDef::from_row(&row(Some(&format!("{URL},{URL}")), ok)).is_err());
-        assert!(TargetDef::from_row(&row(Some("kinesis-host"), ok)).is_err());
-        // region is required
-        assert!(TargetDef::from_row(&row(Some(URL), r#"{"stream_name":"orders"}"#)).is_err());
+        assert!(TargetDef::from_row(&row("sqs", Some(STREAM), ok)).is_err());
+        // the region is not in vars any more
+        assert!(
+            TargetDef::from_row(&row("sqs", Some(QUEUE), r#"{"region":"eu-west-1"}"#)).is_err()
+        );
+        // userinfo is never in the URL
+        assert!(TargetDef::from_row(&row(
+            "sqs",
+            Some("aws-sqs://eu-west-1/u:p@123456789012/orders"),
+            ok
+        ))
+        .is_err());
         // credentials are references, never literals, and come in pairs
         assert!(TargetDef::from_row(&row(
-            Some(URL),
-            r#"{"region":"r","stream_name":"s","access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
+            "sqs",
+            Some(QUEUE),
+            r#"{"access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
         ))
         .is_err());
+        assert!(
+            TargetDef::from_row(&row("sqs", Some(QUEUE), r#"{"access_key_ref":"env:AK"}"#))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn kinesis_accepts_the_url_forms_with_references() {
+        let t =
+            TargetDef::from_row(&row("kinesis", Some(STREAM), &format!("{{{CREDS}}}"))).unwrap();
+        assert_eq!(t.kind, Kind::Kinesis);
+        assert_eq!(t.endpoints, vec![STREAM.to_string()]);
+        assert_eq!(t.template_vars(), serde_json::json!({}));
+        assert!(TargetDef::from_row(&row("kinesis", Some("aws-kinesis://orders"), "{}")).is_ok());
         assert!(TargetDef::from_row(&row(
-            Some(URL),
-            r#"{"region":"r","stream_name":"s","access_key_ref":"env:AK"}"#
+            "kinesis",
+            Some("aws-kinesis://orders?endpoint=http://127.0.0.1:34562"),
+            "{}"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn kinesis_refuses_bad_endpoints() {
+        let ok = "{}";
+        assert!(TargetDef::from_row(&row("kinesis", None, ok)).is_err());
+        assert!(
+            TargetDef::from_row(&row("kinesis", Some(&format!("{STREAM},{STREAM}")), ok)).is_err()
+        );
+        // the scheme, and no plain service URL
+        assert!(TargetDef::from_row(&row(
+            "kinesis",
+            Some("https://kinesis.eu-west-1.amazonaws.com"),
+            ok
         ))
         .is_err());
+        assert!(TargetDef::from_row(&row("kinesis", Some(QUEUE), ok)).is_err());
+        // the stream and region are not in vars any more
+        for v in [
+            r#"{"stream_name":"orders"}"#,
+            r#"{"stream_arn":"arn:aws:kinesis:eu-west-1:123456789012:stream/orders"}"#,
+            r#"{"region":"eu-west-1"}"#,
+        ] {
+            assert!(
+                TargetDef::from_row(&row("kinesis", Some(STREAM), v)).is_err(),
+                "{v}"
+            );
+        }
+        // userinfo and literal credentials are refused
+        assert!(
+            TargetDef::from_row(&row("kinesis", Some("aws-kinesis://u:p@orders"), ok)).is_err()
+        );
+        assert!(TargetDef::from_row(&row(
+            "kinesis",
+            Some(STREAM),
+            r#"{"access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn the_scheme_must_match_the_kind() {
+        // an aws- scheme on a kind that does not take it
+        assert!(TargetDef::from_row(&row("http", Some(QUEUE), "{}")).is_err());
+        assert!(TargetDef::from_row(&row(
+            "http.s3",
+            Some(STREAM),
+            r#"{"bucket":"b","region":"r"}"#
+        ))
+        .is_err());
+        // a plain URL for http is still fine
+        assert!(TargetDef::from_row(&row("http", Some("https://example.com"), "{}")).is_ok());
     }
 
     #[test]
@@ -1054,62 +1148,5 @@ mod kinesis_tests {
         assert!(Kind::Kinesis.append_only());
         assert_eq!(Kind::Kinesis.batch_bytes_limit(), Some(5_242_880));
         assert!(Kind::Kinesis.is_http());
-    }
-}
-
-#[cfg(test)]
-mod sqs_tests {
-    use super::*;
-
-    const QUEUE: &str = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders";
-
-    fn row(endpoints: Option<&str>, vars: &str) -> RawTarget {
-        RawTarget {
-            name: "q".into(),
-            kind: Some("sqs".into()),
-            endpoints: endpoints.map(str::to_string),
-            vars: Some(vars.into()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn accepts_a_queue_url_with_region_and_references() {
-        let t = TargetDef::from_row(&row(
-            Some(QUEUE),
-            r#"{"region":"eu-west-1","access_key_ref":"env:AK","secret_key_ref":"env:SK"}"#,
-        ))
-        .unwrap();
-        assert_eq!(t.kind, Kind::Sqs);
-        assert_eq!(t.endpoints, vec![QUEUE.to_string()]);
-        // Credentials never reach templates.
-        assert_eq!(
-            t.template_vars(),
-            serde_json::json!({"region": "eu-west-1"})
-        );
-        assert!(TargetDef::from_row(&row(Some(QUEUE), r#"{"region":"eu-west-1"}"#)).is_ok());
-    }
-
-    #[test]
-    fn refuses_bad_queue_targets() {
-        let ok_vars = r#"{"region":"eu-west-1"}"#;
-        // exactly one endpoint: the queue URL
-        assert!(TargetDef::from_row(&row(None, ok_vars)).is_err());
-        assert!(TargetDef::from_row(&row(Some(&format!("{QUEUE},{QUEUE}")), ok_vars)).is_err());
-        // a URL, not a host name
-        assert!(TargetDef::from_row(&row(Some("sqs-queue"), ok_vars)).is_err());
-        // region is required
-        assert!(TargetDef::from_row(&row(Some(QUEUE), "{}")).is_err());
-        // credentials are references, never literals, and come in pairs
-        assert!(TargetDef::from_row(&row(
-            Some(QUEUE),
-            r#"{"region":"r","access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
-        ))
-        .is_err());
-        assert!(TargetDef::from_row(&row(
-            Some(QUEUE),
-            r#"{"region":"r","access_key_ref":"env:AK"}"#
-        ))
-        .is_err());
     }
 }

@@ -74,7 +74,8 @@ pub enum Item {
 pub enum RecordVerdict {
     /// No `ErrorCode`: the record was stored. `expect` decides, with the record as `body`.
     Stored(Vec<u8>),
-    /// `ProvisionedThroughputExceededException` or `InternalFailure`: try again later.
+    /// `ProvisionedThroughputExceededException`, `InternalFailure` or `ServiceUnavailable`: try
+    /// again later.
     Transient(String),
     /// Any other `ErrorCode`: refused for this record.
     Rejected(String),
@@ -82,8 +83,10 @@ pub enum RecordVerdict {
     Missing,
 }
 
-/// The per-record mapping of a Kinesis `PutRecords` answer (decision of the kinesis PR: the
-/// transient set is exactly these two codes; every other code is a refusal of that record).
+/// The per-record mapping of a Kinesis `PutRecords` answer. The transient codes are
+/// `ProvisionedThroughputExceededException`, `InternalFailure` and `ServiceUnavailable` (the
+/// service is unwell: keep retrying, as for a whole-request 503); every other code is a refusal
+/// of that record.
 pub fn kinesis_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
     let Some(e) = entry else {
         return RecordVerdict::Missing;
@@ -100,9 +103,9 @@ pub fn kinesis_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
                 e.get("ErrorMessage").and_then(Value::as_str).unwrap_or("")
             );
             match code {
-                "ProvisionedThroughputExceededException" | "InternalFailure" => {
-                    RecordVerdict::Transient(msg)
-                }
+                "ProvisionedThroughputExceededException"
+                | "InternalFailure"
+                | "ServiceUnavailable" => RecordVerdict::Transient(msg),
                 _ => RecordVerdict::Rejected(msg),
             }
         }
@@ -245,14 +248,16 @@ impl Target {
                 });
             }
             Kind::Kinesis => {
-                // from_row: at most one endpoint, the regional service URL (default: derived
-                // from `region`). The stream is named in the body (`StreamName` / `StreamARN`).
-                let region = var(&def, "region").unwrap_or_default().to_string();
-                let mut base = match def.endpoints.first() {
-                    Some(url) => BaseUrl::parse(url)?,
-                    None => aws::endpoint("kinesis", &region),
-                };
-                let ctx = json!({"host": base.host, "port": base.port, "url": base.url()});
+                // from_row: exactly one `aws-kinesis://[<region>/]<stream>` endpoint. The request
+                // goes to the service root; the stream is named in the body (`endpoint.stream`).
+                let url =
+                    aws::KinesisUrl::parse(def.endpoints.first().ok_or_else(|| {
+                        anyhow!("kind kinesis needs its aws-kinesis:// endpoint")
+                    })?)?;
+                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
+                let mut base = aws::address("kinesis", url.endpoint.as_deref(), &region)?;
+                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
+                                 "region": region, "stream": url.stream});
                 base.base = String::new();
                 let host_header = base.host_header();
                 let client = HttpClient::new(base, &def.tls)?;
@@ -272,14 +277,18 @@ impl Target {
                 });
             }
             Kind::Sqs => {
-                // from_row: exactly one endpoint, the queue URL. The request goes to the
-                // service root (`/`); the queue is named in the body.
-                let url = def
-                    .endpoints
-                    .first()
-                    .ok_or_else(|| anyhow!("kind sqs needs the queue URL as its endpoint"))?;
-                let mut base = BaseUrl::parse(url)?;
-                let ctx = json!({"host": base.host, "port": base.port, "url": url});
+                // from_row: exactly one `aws-sqs://[<region>/]<account>/<queue>` endpoint. The
+                // request goes to the service root (`/`); the queue URL is `endpoint.url`.
+                let url = aws::SqsUrl::parse(
+                    def.endpoints
+                        .first()
+                        .ok_or_else(|| anyhow!("kind sqs needs its aws-sqs:// endpoint"))?,
+                )?;
+                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
+                let mut base = aws::address("sqs", url.endpoint.as_deref(), &region)?;
+                let queue_url = format!("{}/{}/{}", base.url(), url.account, url.queue);
+                let ctx = json!({"host": base.host, "port": base.port, "url": queue_url,
+                                 "region": region, "queue": url.queue});
                 base.base = String::new();
                 let host_header = base.host_header();
                 let client = HttpClient::new(base, &def.tls)?;
@@ -291,7 +300,6 @@ impl Target {
                         host_header,
                     },
                 });
-                let region = var(&def, "region").unwrap_or_default().to_string();
                 let provider = aws::Provider::new(aws_refs(&def), &region);
                 aws_rt = Some(AwsSign {
                     service: "sqs",
@@ -721,7 +729,7 @@ mod kinesis_verdict_tests {
     }
 
     #[test]
-    fn throttling_and_internal_failure_are_transient() {
+    fn throttling_internal_failure_and_unavailable_are_transient() {
         let e = json!({"ErrorCode": "ProvisionedThroughputExceededException", "ErrorMessage": "Rate exceeded for shard"});
         assert_eq!(
             kinesis_verdict(Some(&e), 3),
@@ -734,6 +742,12 @@ mod kinesis_verdict_tests {
             kinesis_verdict(Some(&e), 0),
             RecordVerdict::Transient(_)
         ));
+        // the owner's "keep retrying": a record the service could not take now is retried
+        let e = json!({"ErrorCode": "ServiceUnavailable", "ErrorMessage": "try later"});
+        assert_eq!(
+            kinesis_verdict(Some(&e), 1),
+            RecordVerdict::Transient("record 1: ServiceUnavailable: try later".into())
+        );
     }
 
     #[test]
@@ -743,7 +757,8 @@ mod kinesis_verdict_tests {
             kinesis_verdict(Some(&e), 2),
             RecordVerdict::Rejected("record 2: ValidationException: too big".into())
         );
-        let e = json!({"ErrorCode": "ServiceUnavailable"});
+        // a service code that is not "not now" refuses the record
+        let e = json!({"ErrorCode": "AccessDeniedException"});
         assert!(matches!(
             kinesis_verdict(Some(&e), 0),
             RecordVerdict::Rejected(_)
