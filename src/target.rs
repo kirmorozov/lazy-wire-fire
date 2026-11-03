@@ -36,6 +36,8 @@ enum Transport {
     Amqp(Box<crate::amqp::Client>),
     MySql(crate::sqlwire::MySqlClient),
     Pg(crate::sqlwire::PgClient),
+    /// Google Cloud Pub/Sub (`src/pubsub.rs`): one publish per action.
+    PubSub(Box<crate::pubsub::Client>),
 }
 
 pub struct Target {
@@ -262,6 +264,14 @@ impl Target {
                     service: "s3",
                     region: spec.region.clone(),
                     provider,
+                });
+            }
+            Kind::PubSub => {
+                // from_row: exactly one `gc-pubsub://` endpoint (the publish path is built from it).
+                let client = crate::pubsub::Client::new(&def)?;
+                endpoints.push(Endpoint {
+                    ctx: client.ctx(),
+                    transport: Transport::PubSub(Box::new(client)),
                 });
             }
             Kind::Kinesis => {
@@ -590,6 +600,10 @@ impl Target {
                     .map_err(|e| rejected(format!("{name} on {}: {e}", client.addr.url())))?;
                 Ok(Sent::Ok)
             }
+            Transport::PubSub(client) => {
+                crate::pubsub::send(client, rendered, self.def.timeout, &self.expect, &self.pool)
+                    .await
+            }
             Transport::MySql(_) | Transport::Pg(_) => {
                 let sql = match crate::sqlwire::single_statement(rendered) {
                     Ok(Some(s)) => s,
@@ -660,6 +674,9 @@ impl Target {
                     bail!("{e}");
                 }
                 Ok(Row::reply(uses, &reply))
+            }
+            Transport::PubSub(_) => {
+                bail!("pubsub targets only publish: a listing is refused")
             }
             Transport::MySql(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?

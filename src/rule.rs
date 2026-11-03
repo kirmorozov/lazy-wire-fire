@@ -232,6 +232,9 @@ pub fn kind_errors(
             }
         }
     }
+    if kind == Kind::PubSub {
+        out.extend(crate::pubsub::rule_errors(def));
+    }
     if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
         match def.batch_max_keys {
             None => out.push(
@@ -640,5 +643,89 @@ mod kind_tests {
             Some("POST / HTTP/1.1\nX-Amz-Target: Kinesis_20131202.PutRecords\n\n{}"),
         )];
         assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pubsub_kind_tests {
+    use super::*;
+    use crate::model::{Kind, RawRule, ResetStep};
+
+    const TOPIC: &str = "gc-pubsub://lwf-test/orders";
+
+    fn def() -> RuleDef {
+        let mut d = RuleDef::placeholder(&RawRule {
+            name: "r".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        d.fire_per = FirePer::Batch;
+        d.batch_max_keys = Some(1000);
+        d
+    }
+
+    fn step(kind: StepKind, template: &str) -> ResetStep {
+        ResetStep {
+            name: "s".into(),
+            kind,
+            template: Some(template.to_string()),
+        }
+    }
+
+    #[test]
+    fn pubsub_refuses_stray_steps_purges_and_oversized_batches() {
+        let d = def();
+        assert!(kind_errors(&d, Kind::PubSub, &[TOPIC.into()], &[]).is_empty());
+        // Stray cleanup: the kind only appends (the append-only check).
+        let mut s = def();
+        s.reset_steps.push(step(
+            StepKind::Stray {
+                list_template: "GET /".into(),
+                keys: "JSON_EXTRACT(body, '$.ids')".into(),
+                next: None,
+            },
+            "POST /",
+        ));
+        assert_eq!(kind_errors(&s, Kind::PubSub, &[TOPIC.into()], &[]).len(), 1);
+        // A seek, a delete or a subscription-level request in a once/snapshot step is refused.
+        for bad in [
+            "POST /v1/projects/p/topics/t:publish\n\n:seek",
+            "DELETE /v1/projects/p/topics/t",
+            "POST /v1/projects/p/subscriptions/s:seek",
+            "POST /v1/projects/p/topics/t:detach",
+            "POST /v1/projects/p/topics/other:publish HTTP/1.1 purge",
+        ] {
+            let mut r = def();
+            r.reset_steps.push(step(StepKind::Once, bad));
+            assert!(
+                !kind_errors(&r, Kind::PubSub, &[TOPIC.into()], &[]).is_empty(),
+                "accepted {bad}"
+            );
+        }
+        let mut ok = def();
+        ok.reset_steps.push(step(
+            StepKind::Once,
+            "POST /v1/projects/p/topics/t:publish HTTP/1.1",
+        ));
+        assert!(kind_errors(&ok, Kind::PubSub, &[TOPIC.into()], &[]).is_empty());
+        // Batch limits: 1000 messages and 10 MB per publish.
+        let mut none = def();
+        none.batch_max_keys = None;
+        assert_eq!(
+            kind_errors(&none, Kind::PubSub, &[TOPIC.into()], &[]).len(),
+            1
+        );
+        let mut over = def();
+        over.batch_max_keys = Some(1001);
+        assert_eq!(
+            kind_errors(&over, Kind::PubSub, &[TOPIC.into()], &[]).len(),
+            1
+        );
+        let mut bytes = def();
+        bytes.batch_max_bytes = Some(10_000_001);
+        assert_eq!(
+            kind_errors(&bytes, Kind::PubSub, &[TOPIC.into()], &[]).len(),
+            1
+        );
     }
 }

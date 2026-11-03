@@ -123,6 +123,8 @@ pub enum Kind {
     Lambda,
     /// RabbitMQ: one publish with a confirm per action (see `amqp.rs`).
     Amqp,
+    /// Google Cloud Pub/Sub `topics.publish` (one request per action, a whole-action answer).
+    PubSub,
     Redis,
     MySql,
     PgSql,
@@ -140,11 +142,12 @@ impl Kind {
             "kinesis" => Kind::Kinesis,
             "lambda" => Kind::Lambda,
             "amqp" => Kind::Amqp,
+            "pubsub" => Kind::PubSub,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, pubsub, redis, mysql or pgsql)"
             ),
         })
     }
@@ -165,6 +168,7 @@ impl Kind {
             Kind::Kinesis => "kinesis",
             Kind::Lambda => "lambda",
             Kind::Amqp => "amqp",
+            Kind::PubSub => "pubsub",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -180,7 +184,7 @@ impl Kind {
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
     /// stray cleanup and purge-like reset actions are refused at rule load (decision D9 / D7).
     pub fn append_only(self) -> bool {
-        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Amqp)
+        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Amqp | Kind::PubSub)
     }
 
     /// The largest request body the service takes, when the kind has a fixed one.
@@ -190,6 +194,8 @@ impl Kind {
             // PutRecords: 5 MiB per request, partition keys included (the rendered request
             // holds the base64 `Data`, so the count includes the 4/3 inflation).
             Kind::Kinesis => Some(5_242_880),
+            // topics.publish: 10 MB per request (base64 `data` is in the rendered text).
+            Kind::PubSub => Some(10_000_000),
             _ => None,
         }
     }
@@ -214,6 +220,7 @@ impl Kind {
             Kind::HttpS3 | Kind::Sqs | Kind::Kinesis | Kind::Lambda => {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
+            Kind::PubSub => &["credentials_ref"],
             Kind::Amqp | Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
         }
     }
@@ -375,6 +382,7 @@ impl TargetDef {
                 aws_refs(&vars)?;
             }
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         if !matches!(kind, Kind::Sqs | Kind::Kinesis | Kind::Lambda) {
@@ -388,6 +396,7 @@ impl TargetDef {
                 );
             }
         }
+        crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }
