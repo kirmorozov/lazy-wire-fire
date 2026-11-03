@@ -7,8 +7,8 @@
 Change-triggered actions from the MySQL binlog. Row changes in the tables you register mark
 **keys**. For the changed keys a rule runs its queries concurrently, merges the rows into one JSON
 document per key, renders one Handlebars template and fires the result at a target: an HTTP
-endpoint (any method, a whole raw request), Redis (one command), or MySQL / PostgreSQL (one SQL
-statement).
+endpoint (any method, a whole raw request), an Amazon SQS queue (one `SendMessageBatch` per
+action), Redis (one command), or MySQL / PostgreSQL (one SQL statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
 knows nothing about any application: everything it does is rows in four tables. It reads the
@@ -75,7 +75,7 @@ backoff, and the error is in `last_error`.
 Values from rows go into templates through the helper of the place they land in (`json`,
 `url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
-export, reset steps, in [docs/reference.md](docs/reference.md#examples).
+export, an SQS queue, reset steps, in [docs/reference.md](docs/reference.md#examples).
 
 ## Platforms
 
