@@ -13,7 +13,7 @@ use crate::http::{BaseUrl, Client as HttpClient, RawRequest};
 use crate::model::{Kind, TargetDef};
 use crate::redis::{self, Client as RedisClient, RedisAddr, Reply};
 use crate::response::{Expect, Row, Uses};
-use crate::s3::{self, S3Spec};
+use crate::s3::S3Spec;
 use crate::secrets;
 
 const USER_AGENT: &str = concat!("lazywf/", env!("CARGO_PKG_VERSION"));
@@ -42,9 +42,39 @@ pub struct Target {
     pub ctx: Value,
     pub endpoints: Vec<Endpoint>,
     pub expect: Expect,
-    s3: Option<(S3Spec, aws::Provider)>,
+    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`).
+    aws: Option<AwsSign>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
+}
+
+/// How an AWS kind signs its requests.
+struct AwsSign {
+    service: &'static str,
+    region: String,
+    provider: aws::Provider,
+}
+
+/// The outcome of one item of a batch request (see [`Target::send_items`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Ok,
+    /// Refused on its own (`expect` not met, or the service rejected the entry).
+    Rejected(String),
+    /// Not sent for a reason that may pass (the service was unwell).
+    Transient(String),
+}
+
+/// The AWS credentials of a target's `vars`, when it gives any.
+fn aws_refs(def: &TargetDef) -> Option<aws::Refs> {
+    match (var(def, "access_key_ref"), var(def, "secret_key_ref")) {
+        (Some(a), Some(s)) => Some(aws::Refs {
+            access_key: a.to_string(),
+            secret_key: s.to_string(),
+            session_token: var(def, "session_token_ref").map(str::to_string),
+        }),
+        _ => None,
+    }
 }
 
 /// The target refused an action; sending it again would not help.
@@ -79,7 +109,7 @@ impl Target {
     pub fn new(def: TargetDef, pool: Pool) -> Result<Arc<Target>> {
         let expect = Expect::new(def.expect.as_deref()).context("`expect`")?;
         let mut endpoints = Vec::new();
-        let mut s3_rt = None;
+        let mut aws_rt = None;
         match def.kind {
             Kind::MySql | Kind::PgSql => {
                 use crate::sqlwire::{Credentials, MySqlClient, PgClient, SqlAddr};
@@ -154,16 +184,40 @@ impl Target {
                         },
                     });
                 }
-                let refs = match (var(&def, "access_key_ref"), var(&def, "secret_key_ref")) {
-                    (Some(a), Some(s)) => Some(aws::Refs {
-                        access_key: a.to_string(),
-                        secret_key: s.to_string(),
-                        session_token: var(&def, "session_token_ref").map(str::to_string),
-                    }),
-                    _ => None,
-                };
-                let provider = aws::Provider::new(refs, &spec.region);
-                s3_rt = Some((spec, provider));
+                let provider = aws::Provider::new(aws_refs(&def), &spec.region);
+                aws_rt = Some(AwsSign {
+                    service: "s3",
+                    region: spec.region.clone(),
+                    provider,
+                });
+            }
+            Kind::Sqs => {
+                // from_row: exactly one endpoint, the queue URL. The request goes to the
+                // service root (`/`); the queue is named in the body.
+                let url = def
+                    .endpoints
+                    .first()
+                    .ok_or_else(|| anyhow!("kind sqs needs the queue URL as its endpoint"))?;
+                let mut base = BaseUrl::parse(url)?;
+                let ctx = json!({"host": base.host, "port": base.port, "url": url});
+                base.base = String::new();
+                let host_header = base.host_header();
+                let client = HttpClient::new(base, &def.tls)?;
+                endpoints.push(Endpoint {
+                    ctx,
+                    transport: Transport::Http {
+                        client,
+                        prefix: String::new(),
+                        host_header,
+                    },
+                });
+                let region = var(&def, "region").unwrap_or_default().to_string();
+                let provider = aws::Provider::new(aws_refs(&def), &region);
+                aws_rt = Some(AwsSign {
+                    service: "sqs",
+                    region,
+                    provider,
+                });
             }
             _ => {
                 for e in &def.endpoints {
@@ -189,9 +243,21 @@ impl Target {
             ctx,
             endpoints,
             expect,
-            s3: s3_rt,
+            aws: aws_rt,
             pool,
         }))
+    }
+
+    /// Whether this kind's answer to a batch says per item what happened (see `send_items`).
+    pub fn reports_items(&self) -> bool {
+        self.def.kind.reports_items()
+    }
+
+    /// A non-2xx answer of an AWS kind whose error code says "not now" (throttling,
+    /// unavailable), whatever the status (AWS JSON errors come as HTTP 400).
+    fn aws_throttled(&self, headers: &[(String, String)], body: &[u8]) -> bool {
+        self.aws.is_some()
+            && aws::error_code(headers, body).is_some_and(|c| aws::transient_code(&c))
     }
 
     pub fn is_http(&self) -> bool {
@@ -236,8 +302,11 @@ impl Target {
                         req.target,
                         resp.body_snippet()
                     );
-                    // 5xx, 408 and 429 say "not now"; other refusals are about this request.
-                    let transient = resp.status >= 500 || matches!(resp.status, 408 | 429);
+                    // 5xx, 408 and 429 say "not now", and so do AWS throttling codes; other
+                    // refusals are about this request.
+                    let transient = resp.status >= 500
+                        || matches!(resp.status, 408 | 429)
+                        || self.aws_throttled(&resp.headers, &resp.body);
                     return Err(if transient {
                         anyhow!(msg)
                     } else {
@@ -355,6 +424,110 @@ impl Target {
         }
     }
 
+    /// Sends one batch request whose answer says per item (`SendMessageBatch`-style: `Successful`
+    /// and `Failed` entries with the `Id` of the item, the index of its key). Returns one
+    /// [`Item`] per item, in order. `Err`: the whole request was refused (rejected) or failed
+    /// (transient), as for [`Target::send`]; the items then have no outcome of their own.
+    pub async fn send_items(&self, ep: usize, rendered: &str, n: usize) -> Result<Vec<Item>> {
+        let Some(endpoint) = self.endpoints.get(ep) else {
+            bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+        };
+        let Transport::Http {
+            client,
+            prefix,
+            host_header,
+        } = &endpoint.transport
+        else {
+            bail!("target `{}` does not answer per item", self.def.name);
+        };
+        let req = match RawRequest::parse(rendered) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(vec![Item::Ok; n]),
+            Err(e) => return Err(rejected(format!("the rendered request: {e:#}"))),
+        };
+        let req = self.prepare(req, prefix, host_header).await?;
+        let resp = client
+            .send(&req, self.def.timeout)
+            .await
+            .with_context(|| format!("{} {}", req.method, client.base.url()))?;
+        if !(200..300).contains(&resp.status) {
+            let msg = format!(
+                "{} {}{}: status {}: {}",
+                req.method,
+                client.base.url(),
+                req.target,
+                resp.status,
+                resp.body_snippet()
+            );
+            let transient = resp.status >= 500
+                || matches!(resp.status, 408 | 429)
+                || self.aws_throttled(&resp.headers, &resp.body);
+            return Err(if transient {
+                anyhow!(msg)
+            } else {
+                rejected(msg)
+            });
+        }
+        let answer: Value = serde_json::from_slice(&resp.body).with_context(|| {
+            format!(
+                "{} {}: the answer is not JSON: {}",
+                req.method,
+                client.base.url(),
+                resp.body_snippet()
+            )
+        })?;
+        let entries = |field: &str| -> Vec<Value> {
+            answer
+                .get(field)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let index = |e: &Value| -> Result<usize> {
+            let id = e.get("Id").and_then(|v| match v {
+                Value::String(s) => s.parse::<usize>().ok(),
+                Value::Number(n) => n.as_u64().map(|n| n as usize),
+                _ => None,
+            });
+            match id {
+                Some(i) if i < n => Ok(i),
+                _ => bail!("the answer names item {:?}, not one of {n}", e.get("Id")),
+            }
+        };
+        let mut out: Vec<Option<Item>> = vec![None; n];
+        for e in entries("Successful") {
+            let i = index(&e)?;
+            // `expect` per item: `status` is the batch's, `body` the entry.
+            let bytes = serde_json::to_vec(&e)?;
+            let item = match self
+                .expect
+                .http(&self.pool, resp.status, &resp.headers, &bytes)
+                .await
+                .with_context(|| format!("item {i} of {}", client.base.url()))?
+            {
+                Ok(()) => Item::Ok,
+                Err(why) => Item::Rejected(format!("item {i}: {why}")),
+            };
+            out[i] = Some(item);
+        }
+        for e in entries("Failed") {
+            let i = index(&e)?;
+            let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            let why = format!("item {i}: {}: {}", text("Code"), text("Message"));
+            // Only a `SenderFault: true` entry is refused. Without a clear answer, the item
+            // is retried (nothing is lost by waiting).
+            out[i] = Some(match e.get("SenderFault").and_then(Value::as_bool) {
+                Some(true) => Item::Rejected(why),
+                _ => Item::Transient(why),
+            });
+        }
+        Ok(out
+            .into_iter()
+            .enumerate()
+            .map(|(i, it)| it.unwrap_or_else(|| Item::Transient(format!("item {i}: no answer"))))
+            .collect())
+    }
+
     async fn prepare(
         &self,
         mut req: RawRequest,
@@ -364,14 +537,14 @@ impl Target {
         if req.header("user-agent").is_none() {
             req.set_header("User-Agent", USER_AGENT.to_string());
         }
-        if let Some((spec, creds)) = &self.s3 {
-            let c = creds.get().await?;
-            s3::sign(
+        if let Some(a) = &self.aws {
+            let c = a.provider.get().await?;
+            aws::sign(
                 &mut req,
                 host_header,
                 prefix,
-                &spec.region,
-                "s3",
+                &a.region,
+                a.service,
                 &c,
                 crate::time::unix_now(),
             )?;

@@ -112,6 +112,8 @@ pub enum Kind {
     HttpBearer,
     HttpHeader,
     HttpS3,
+    /// Amazon SQS `SendMessageBatch` (one request per action, an answer per entry).
+    Sqs,
     Redis,
     MySql,
     PgSql,
@@ -125,17 +127,53 @@ impl Kind {
             "http.bearer" => Kind::HttpBearer,
             "http.header" => Kind::HttpHeader,
             "http.s3" => Kind::HttpS3,
+            "sqs" => Kind::Sqs,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, redis, mysql or pgsql)"
             ),
         })
     }
 
     pub fn is_http(self) -> bool {
         !matches!(self, Kind::Redis | Kind::MySql | Kind::PgSql)
+    }
+
+    /// The name of the kind, as written in `kind`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Http => "http",
+            Kind::HttpBasic => "http.basic",
+            Kind::HttpBearer => "http.bearer",
+            Kind::HttpHeader => "http.header",
+            Kind::HttpS3 => "http.s3",
+            Kind::Sqs => "sqs",
+            Kind::Redis => "redis",
+            Kind::MySql => "mysql",
+            Kind::PgSql => "pgsql",
+        }
+    }
+
+    /// Kinds whose answer says, per item of a batch, which items went through (see
+    /// `Target::send_items`). The others answer per action.
+    pub fn reports_items(self) -> bool {
+        self == Kind::Sqs
+    }
+
+    /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
+    /// stray cleanup and purge-like reset actions are refused at rule load (decision D9 / D7).
+    pub fn append_only(self) -> bool {
+        self == Kind::Sqs
+    }
+
+    /// The largest request body the service takes, when the kind has a fixed one.
+    pub fn batch_bytes_limit(self) -> Option<usize> {
+        match self {
+            Kind::Sqs => Some(262_144),
+            _ => None,
+        }
     }
 
     /// The SQL dialect templates quote for (`sql_quote`, `sql_ident`): PostgreSQL for `pgsql`,
@@ -155,7 +193,7 @@ impl Kind {
             Kind::HttpBasic => &["password"],
             Kind::HttpBearer => &["token"],
             Kind::HttpHeader => &["value"],
-            Kind::HttpS3 => &["access_key_ref", "secret_key_ref", "session_token_ref"],
+            Kind::HttpS3 | Kind::Sqs => &["access_key_ref", "secret_key_ref", "session_token_ref"],
             Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
         }
     }
@@ -213,6 +251,23 @@ fn var_str<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// AWS credentials in a target's `vars`: references only, and an access key with its secret.
+fn aws_refs(vars: &Map<String, Value>) -> Result<()> {
+    for k in ["access_key_ref", "secret_key_ref", "session_token_ref"] {
+        if let Some(v) = var_str(vars, k) {
+            if !crate::secrets::is_reference(v) {
+                bail!(
+                    "`vars.{k}` must be a reference (`env:NAME` or `file:/path`), never a literal"
+                );
+            }
+        }
+    }
+    if var_str(vars, "access_key_ref").is_some() != var_str(vars, "secret_key_ref").is_some() {
+        bail!("`vars.access_key_ref` and `vars.secret_key_ref` go together");
+    }
+    Ok(())
+}
+
 impl TargetDef {
     pub fn from_row(r: &RawTarget) -> Result<TargetDef> {
         let kind = Kind::parse(r.kind.as_deref().unwrap_or("http"))?;
@@ -237,23 +292,23 @@ impl TargetDef {
             Kind::HttpS3 => {
                 need("bucket")?;
                 need("region")?;
-                let refs = ["access_key_ref", "secret_key_ref", "session_token_ref"];
-                for k in refs {
-                    if let Some(v) = var_str(&vars, k) {
-                        if !crate::secrets::is_reference(v) {
-                            bail!("`vars.{k}` must be a reference (`env:NAME` or `file:/path`), never a literal");
-                        }
-                    }
+                aws_refs(&vars)?;
+            }
+            Kind::Sqs => {
+                // The endpoint is the queue URL; the POST goes to the service root (`/`).
+                if endpoints.len() != 1 {
+                    bail!("kind sqs takes exactly one endpoint: the queue URL");
                 }
-                if var_str(&vars, "access_key_ref").is_some()
-                    != var_str(&vars, "secret_key_ref").is_some()
-                {
-                    bail!("`vars.access_key_ref` and `vars.secret_key_ref` go together");
+                let url = &endpoints[0];
+                if !(url.starts_with("https://") || url.starts_with("http://")) {
+                    bail!("the sqs endpoint must be an http(s) queue URL, e.g. https://sqs.eu-west-1.amazonaws.com/123456789012/orders");
                 }
+                need("region")?;
+                aws_refs(&vars)?;
             }
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
-        if endpoints.is_empty() && kind != Kind::HttpS3 {
+        if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }
         let timeout = Duration::from_millis(match r.timeout_ms {
@@ -883,5 +938,62 @@ mod tests {
             ..Default::default()
         };
         assert!(TriggerDef::from_row(&bad, "app", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sqs_tests {
+    use super::*;
+
+    const QUEUE: &str = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders";
+
+    fn row(endpoints: Option<&str>, vars: &str) -> RawTarget {
+        RawTarget {
+            name: "q".into(),
+            kind: Some("sqs".into()),
+            endpoints: endpoints.map(str::to_string),
+            vars: Some(vars.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accepts_a_queue_url_with_region_and_references() {
+        let t = TargetDef::from_row(&row(
+            Some(QUEUE),
+            r#"{"region":"eu-west-1","access_key_ref":"env:AK","secret_key_ref":"env:SK"}"#,
+        ))
+        .unwrap();
+        assert_eq!(t.kind, Kind::Sqs);
+        assert_eq!(t.endpoints, vec![QUEUE.to_string()]);
+        // Credentials never reach templates.
+        assert_eq!(
+            t.template_vars(),
+            serde_json::json!({"region": "eu-west-1"})
+        );
+        assert!(TargetDef::from_row(&row(Some(QUEUE), r#"{"region":"eu-west-1"}"#)).is_ok());
+    }
+
+    #[test]
+    fn refuses_bad_queue_targets() {
+        let ok_vars = r#"{"region":"eu-west-1"}"#;
+        // exactly one endpoint: the queue URL
+        assert!(TargetDef::from_row(&row(None, ok_vars)).is_err());
+        assert!(TargetDef::from_row(&row(Some(&format!("{QUEUE},{QUEUE}")), ok_vars)).is_err());
+        // a URL, not a host name
+        assert!(TargetDef::from_row(&row(Some("sqs-queue"), ok_vars)).is_err());
+        // region is required
+        assert!(TargetDef::from_row(&row(Some(QUEUE), "{}")).is_err());
+        // credentials are references, never literals, and come in pairs
+        assert!(TargetDef::from_row(&row(
+            Some(QUEUE),
+            r#"{"region":"r","access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
+        ))
+        .is_err());
+        assert!(TargetDef::from_row(&row(
+            Some(QUEUE),
+            r#"{"region":"r","access_key_ref":"env:AK"}"#
+        ))
+        .is_err());
     }
 }

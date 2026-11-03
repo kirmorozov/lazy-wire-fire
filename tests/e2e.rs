@@ -993,7 +993,7 @@ async fn s3_target() {
         let mut r = RawRequest::parse(&format!("{method} {path} HTTP/1.1\n\n"))
             .unwrap()
             .unwrap();
-        lazy_wire_fire::s3::sign(
+        lazy_wire_fire::aws::sign(
             &mut r,
             "127.0.0.1:34070",
             "",
@@ -2098,5 +2098,318 @@ async fn sql_targets() {
         (my == vec![1, 3] && pg_ok).then_some(())
     })
     .await;
+    inst.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// `sqs` targets, against ElasticMQ (`LAZYWF_TEST_SQS`, e.g. http://127.0.0.1:34561; the
+// `sqs` compose profile). The tests read the queues back through the same SQS JSON API.
+
+const SQS_STANDARD: &str = r#"POST / HTTP/1.1
+X-Amz-Target: AmazonSQS.SendMessageBatch
+Content-Type: application/x-amz-json-1.0
+
+{"QueueUrl": {{json endpoint.url}}, "Entries": [{{#each docs}}{"Id": "{{@index}}", "MessageBody": {{json (json doc)}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+const SQS_FIFO: &str = r#"POST / HTTP/1.1
+X-Amz-Target: AmazonSQS.SendMessageBatch
+Content-Type: application/x-amz-json-1.0
+
+{"QueueUrl": {{json endpoint.url}}, "Entries": [{{#each docs}}{"Id": "{{@index}}", "MessageBody": {{json (json doc)}}, "MessageGroupId": {{json key}}{{#if doc.version}}, "MessageDeduplicationId": {{json doc.version}}{{/if}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+fn sqs_root() -> Option<String> {
+    std::env::var("LAZYWF_TEST_SQS")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+macro_rules! need_sqs {
+    () => {
+        match sqs_root() {
+            Some(u) => u,
+            None => {
+                eprintln!("LAZYWF_TEST_SQS not set: skipping (docker compose --profile sqs up -d elasticmq)");
+                return;
+            }
+        }
+    };
+}
+
+/// The SQS JSON API of the store (ElasticMQ).
+struct Sqs {
+    root: String,
+    client: lazy_wire_fire::http::Client,
+}
+
+impl Sqs {
+    fn new(root: &str) -> Sqs {
+        Sqs {
+            root: root.to_string(),
+            client: lazy_wire_fire::http::Client::new(
+                lazy_wire_fire::http::BaseUrl::parse(root).unwrap(),
+                &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    async fn call(&self, action: &str, body: Value) -> Value {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header("Content-Type", "application/x-amz-json-1.0".into());
+        req.set_header("X-Amz-Target", format!("AmazonSQS.{action}"));
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            resp.status == 200,
+            "{action}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+        serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    /// Creates a queue; the URL the target uses.
+    async fn create(&self, name: &str, fifo: bool) -> String {
+        let attributes = if fifo {
+            json!({"FifoQueue": "true", "ContentBasedDeduplication": "false"})
+        } else {
+            json!({})
+        };
+        self.call(
+            "CreateQueue",
+            json!({"QueueName": name, "Attributes": attributes}),
+        )
+        .await;
+        format!("{}/000000000000/{name}", self.root)
+    }
+
+    async fn count(&self, url: &str) -> u64 {
+        let v = self
+            .call(
+                "GetQueueAttributes",
+                json!({"QueueUrl": url, "AttributeNames": ["ApproximateNumberOfMessages"]}),
+            )
+            .await;
+        v["Attributes"]["ApproximateNumberOfMessages"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Every message of the queue, each received once (received messages stay hidden).
+    async fn drain(&self, url: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        loop {
+            let v = self
+                .call(
+                    "ReceiveMessage",
+                    json!({"QueueUrl": url, "MaxNumberOfMessages": 10, "WaitTimeSeconds": 0,
+                           "VisibilityTimeout": 600, "AttributeNames": ["All"]}),
+                )
+                .await;
+            let got = v
+                .get("Messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if got.is_empty() {
+                return out;
+            }
+            out.extend(got);
+        }
+    }
+}
+
+fn sqs_creds() -> String {
+    std::env::set_var("LWF_TEST_SQS_AK", "lazywf");
+    std::env::set_var("LWF_TEST_SQS_SK", "lazywfsecret");
+    json!({"region": "us-east-1", "access_key_ref": "env:LWF_TEST_SQS_AK",
+           "secret_key_ref": "env:LWF_TEST_SQS_SK"})
+    .to_string()
+}
+
+/// A customers table with the rule `queue` that sends each changed row to `url`.
+async fn sqs_rule(db: &Db, url: &str, template: &str, selects: &str) {
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL)")
+        .await;
+    tables(db).await;
+    db.target(
+        "queue",
+        "sqs",
+        url,
+        Some("JSON_EXTRACT(body, '$.MessageId') IS NOT NULL"),
+        &sqs_creds(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('queue', 'queue', 'batch', 10, ?, ?, 100)",
+        (selects, template),
+    )
+    .await;
+    db.trigger("queue", "customers", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// Every changed key arrives once, as a message on a standard queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqs_standard_queue_every_key_once() {
+    let root = need_db!();
+    let sqs = Sqs::new(&need_sqs!());
+    let db = Db::fresh(&root, "sqs_std").await;
+    let url = sqs
+        .create(&format!("lwf_std_{}", std::process::id()), false)
+        .await;
+    sqs_rule(
+        &db,
+        &url,
+        SQS_STANDARD,
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec(
+        "INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy'),(4,'Di'),(5,'Ed')",
+    )
+    .await;
+    wait_for(Duration::from_secs(20), "five messages", || async {
+        (sqs.count(&url).await == 5).then_some(())
+    })
+    .await;
+    sleep_ms(2000).await;
+    assert_eq!(sqs.count(&url).await, 5, "a key was sent twice");
+    let mut ids: Vec<i64> = sqs
+        .drain(&url)
+        .await
+        .iter()
+        .map(|m| {
+            let body: Value = serde_json::from_str(m["Body"].as_str().unwrap()).unwrap();
+            body["id"].as_i64().unwrap()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    inst.stop().await;
+}
+
+/// FIFO: the group id is the key, the dedupe id is the rule's `version` column (key and
+/// revision), so a changed row is a new message and an unchanged one is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqs_fifo_group_is_the_key_and_dedupe_is_the_version() {
+    let root = need_db!();
+    let sqs = Sqs::new(&need_sqs!());
+    let db = Db::fresh(&root, "sqs_fifo").await;
+    let url = sqs
+        .create(&format!("lwf_fifo_{}.fifo", std::process::id()), true)
+        .await;
+    sqs_rule(
+        &db,
+        &url,
+        SQS_FIFO,
+        "SELECT c.id AS _key, c.id, c.name, CONCAT(c.id, '#', c.rev) AS version FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1)")
+        .await;
+    wait_for(Duration::from_secs(20), "three messages", || async {
+        (sqs.count(&url).await == 3).then_some(())
+    })
+    .await;
+    db.exec("UPDATE customers SET name = 'Bobby', rev = 2 WHERE id = 2")
+        .await;
+    wait_for(Duration::from_secs(20), "the changed row", || async {
+        (sqs.count(&url).await == 4).then_some(())
+    })
+    .await;
+    let mut seen: Vec<(String, String, String)> = sqs
+        .drain(&url)
+        .await
+        .iter()
+        .map(|m| {
+            let body: Value = serde_json::from_str(m["Body"].as_str().unwrap()).unwrap();
+            let attr = |k: &str| m["Attributes"][k].as_str().unwrap_or("").to_string();
+            (
+                body["id"].to_string(),
+                attr("MessageGroupId"),
+                attr("MessageDeduplicationId"),
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("1".to_string(), "1".to_string(), "1#1".to_string()),
+            ("2".to_string(), "2".to_string(), "2#1".to_string()),
+            ("2".to_string(), "2".to_string(), "2#2".to_string()),
+            ("3".to_string(), "3".to_string(), "3#1".to_string()),
+        ]
+    );
+    inst.stop().await;
+}
+
+/// A batch with one bad entry: the refused key is retried and then dropped (a strike per
+/// refusal), the others are confirmed once and not sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqs_batch_with_one_bad_entry_retries_only_that_key() {
+    let root = need_db!();
+    let sqs = Sqs::new(&need_sqs!());
+    let db = Db::fresh(&root, "sqs_bad").await;
+    let url = sqs
+        .create(&format!("lwf_bad_{}.fifo", std::process::id()), true)
+        .await;
+    sqs_rule(
+        &db,
+        &url,
+        SQS_FIFO,
+        "SELECT c.id AS _key, c.id, c.name, CONCAT(c.id, '#', c.rev) AS version FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // Row 4 has no revision: its version (the dedupe id) is NULL, so the queue refuses that
+    // entry alone (SenderFault true).
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1),(4,'Di',NULL)")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "the three good messages",
+        || async { (sqs.count(&url).await == 3).then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(60),
+        "key 4 dropped after its strikes",
+        || async {
+            db.status("queue")
+                .await
+                .and_then(|s| s.3)
+                .filter(|e| e.contains("key `4`"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    sleep_ms(1000).await;
+    assert_eq!(sqs.count(&url).await, 3, "a confirmed key was sent again");
+    let mut ids: Vec<i64> = sqs
+        .drain(&url)
+        .await
+        .iter()
+        .map(|m| {
+            let body: Value = serde_json::from_str(m["Body"].as_str().unwrap()).unwrap();
+            body["id"].as_i64().unwrap()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3]);
     inst.stop().await;
 }
