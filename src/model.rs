@@ -119,6 +119,8 @@ pub enum Kind {
     Sqs,
     /// Amazon Kinesis `PutRecords` (one request per action, an answer per record).
     Kinesis,
+    /// AWS Lambda `Invoke` (one invocation per action; `batchItemFailures` per item).
+    Lambda,
     /// RabbitMQ: one publish with a confirm per action (see `amqp.rs`).
     Amqp,
     Redis,
@@ -136,12 +138,13 @@ impl Kind {
             "http.s3" => Kind::HttpS3,
             "sqs" => Kind::Sqs,
             "kinesis" => Kind::Kinesis,
+            "lambda" => Kind::Lambda,
             "amqp" => Kind::Amqp,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, amqp, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, redis, mysql or pgsql)"
             ),
         })
     }
@@ -160,6 +163,7 @@ impl Kind {
             Kind::HttpS3 => "http.s3",
             Kind::Sqs => "sqs",
             Kind::Kinesis => "kinesis",
+            Kind::Lambda => "lambda",
             Kind::Amqp => "amqp",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
@@ -170,7 +174,7 @@ impl Kind {
     /// Kinds whose answer says, per item of a batch, which items went through (see
     /// `Target::send_items`). The others answer per action.
     pub fn reports_items(self) -> bool {
-        matches!(self, Kind::Sqs | Kind::Kinesis)
+        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Lambda)
     }
 
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
@@ -207,7 +211,7 @@ impl Kind {
             Kind::HttpBasic => &["password"],
             Kind::HttpBearer => &["token"],
             Kind::HttpHeader => &["value"],
-            Kind::HttpS3 | Kind::Sqs | Kind::Kinesis => {
+            Kind::HttpS3 | Kind::Sqs | Kind::Kinesis | Kind::Lambda => {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
             Kind::Amqp | Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
@@ -351,16 +355,35 @@ impl TargetDef {
                 )?;
                 aws_refs(&vars)?;
             }
+            Kind::Lambda => {
+                // `aws-lambda://[<region>/]<function>[:<qualifier>][?invocation=…]`: the function,
+                // the region and the invocation are in the URL.
+                match endpoints.as_slice() {
+                    [url] => {
+                        aws::LambdaUrl::parse(url)?;
+                    }
+                    _ => bail!(
+                        "kind lambda takes exactly one endpoint: aws-lambda://[<region>/]<function-name>[:<qualifier>]"
+                    ),
+                }
+                refuse_vars(
+                    &vars,
+                    &["region"],
+                    kind,
+                    "the region goes in the endpoint: aws-lambda://<region>/<function-name>",
+                )?;
+                aws_refs(&vars)?;
+            }
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
-        if !matches!(kind, Kind::Sqs | Kind::Kinesis) {
+        if !matches!(kind, Kind::Sqs | Kind::Kinesis | Kind::Lambda) {
             if let Some(e) = endpoints
                 .iter()
                 .find(|e| crate::aws::scheme_of(e).is_some_and(|s| s.starts_with("aws-")))
             {
                 bail!(
-                    "`{e}` is an endpoint of kind sqs or kinesis, not of kind {}",
+                    "`{e}` is an endpoint of kind sqs, kinesis or lambda, not of kind {}",
                     kind.name()
                 );
             }
@@ -1150,5 +1173,37 @@ mod aws_endpoint_tests {
         assert!(Kind::Kinesis.append_only());
         assert_eq!(Kind::Kinesis.batch_bytes_limit(), Some(5_242_880));
         assert!(Kind::Kinesis.is_http());
+    }
+
+    #[test]
+    fn lambda_properties_and_endpoints() {
+        assert_eq!(Kind::parse("lambda").unwrap(), Kind::Lambda);
+        assert_eq!(Kind::Lambda.name(), "lambda");
+        assert!(Kind::Lambda.reports_items());
+        // Not append-only: the stray refusal is a rule check (`rule::kind_errors`), not this.
+        assert!(!Kind::Lambda.append_only());
+        assert_eq!(Kind::Lambda.batch_bytes_limit(), None);
+        let ok =
+            |url: &str, vars: &str| TargetDef::from_row(&row("lambda", Some(url), vars)).is_ok();
+        assert!(ok("aws-lambda://orders", r#"{}"#));
+        assert!(ok(
+            "aws-lambda://eu-west-1/orders:live?invocation=event",
+            r#"{}"#
+        ));
+        assert!(ok(
+            "aws-lambda://orders",
+            r#"{"access_key_ref":"env:AK","secret_key_ref":"env:SK"}"#
+        ));
+        // one endpoint, the aws-lambda:// form, no region var, references only
+        assert!(!ok("https://example.com/orders", "{}"));
+        assert!(!ok("aws-sqs://123456789012/orders", "{}"));
+        assert!(!ok("aws-lambda://orders", r#"{"region":"eu-west-1"}"#));
+        assert!(!ok(
+            "aws-lambda://orders",
+            r#"{"access_key_ref":"AKIAEXAMPLE","secret_key_ref":"env:SK"}"#
+        ));
+        assert!(!ok("aws-lambda://orders?invocation=batch", "{}"));
+        // the other kinds refuse an aws-lambda:// endpoint
+        assert!(TargetDef::from_row(&row("http", Some("aws-lambda://orders"), "{}")).is_err());
     }
 }

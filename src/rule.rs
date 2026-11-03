@@ -163,13 +163,39 @@ pub fn kind_errors(
 ) -> Vec<String> {
     use crate::model::Kind;
     let mut out = Vec::new();
-    if kind.append_only() {
+    if kind.append_only() || kind == Kind::Lambda {
+        // A Lambda function cannot list what it was invoked with, so a stray listing has nothing
+        // to find (it is not append-only by nature, but the listing does not exist).
         for s in &def.reset_steps {
             if matches!(s.kind, StepKind::Stray { .. }) {
+                let why = if kind == Kind::Lambda {
+                    "a stray cleanup needs a target that can list keys; kind lambda cannot"
+                        .to_string()
+                } else {
+                    format!(
+                        "a stray cleanup needs a target that can delete keys; kind {} only appends",
+                        kind.name()
+                    )
+                };
+                out.push(format!("reset step `{}`: {why}", s.name));
+            }
+        }
+    }
+    if kind == Kind::Lambda {
+        // The payload limit is set by the invocation (6 MB sync, 1 MB event), so a larger
+        // `batch_max_bytes` is refused at load.
+        if let Some(u) = endpoints
+            .first()
+            .and_then(|e| crate::aws::LambdaUrl::parse(e).ok())
+        {
+            if def.batch_max_bytes.is_some_and(|n| n > u.payload_limit()) {
                 out.push(format!(
-                    "reset step `{}`: a stray cleanup needs a target that can delete keys; kind {} only appends",
-                    s.name,
-                    kind.name()
+                    "`batch_max_bytes` is over {} bytes, the most a {} Invoke payload takes",
+                    u.payload_limit(),
+                    match u.invocation {
+                        crate::aws::Invocation::Sync => "synchronous",
+                        crate::aws::Invocation::Event => "asynchronous (event)",
+                    }
                 ));
             }
         }
@@ -461,6 +487,33 @@ mod kind_tests {
             kind,
             template: template.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn lambda_refuses_strays_and_oversized_payloads() {
+        const FN: &str = "aws-lambda://eu-west-1/orders";
+        const EVENT: &str = "aws-lambda://eu-west-1/orders?invocation=event";
+        // a stray listing does not exist for a function
+        let mut d = def();
+        d.reset_steps = vec![step(stray(), None)];
+        let e = kind_errors(&d, Kind::Lambda, &[FN.into()], &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("can list keys; kind lambda cannot"), "{e:?}");
+        // the sync payload limit is 6 MB; the event limit is 1 MB
+        let mut d = def();
+        d.batch_max_bytes = Some(6_291_456);
+        assert!(kind_errors(&d, Kind::Lambda, &[FN.into()], &[]).is_empty());
+        d.batch_max_bytes = Some(6_291_457);
+        assert_eq!(kind_errors(&d, Kind::Lambda, &[FN.into()], &[]).len(), 1);
+        let mut d = def();
+        d.batch_max_bytes = Some(1_048_577);
+        assert_eq!(kind_errors(&d, Kind::Lambda, &[EVENT.into()], &[]).len(), 1);
+        d.batch_max_bytes = Some(1_048_576);
+        assert!(kind_errors(&d, Kind::Lambda, &[EVENT.into()], &[]).is_empty());
+        // no batch_max_keys is needed: a batch is bounded by bytes
+        let mut d = def();
+        d.batch_max_keys = None;
+        assert!(kind_errors(&d, Kind::Lambda, &[FN.into()], &[]).is_empty());
     }
 
     #[test]

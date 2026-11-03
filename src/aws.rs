@@ -510,6 +510,297 @@ impl KinesisUrl {
     }
 }
 
+// ---- `aws-lambda://` endpoints ----
+//
+// `aws-lambda://[<region>/]<function-name>[:<qualifier>]`, with `?invocation=sync` (the default,
+// RequestResponse) or `?invocation=event` (Event), and the same optional `?endpoint=`. The region
+// and credential rules are those of `aws-sqs://`.
+
+/// How a function is invoked: the caller waits for its result, or the call is queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invocation {
+    /// `RequestResponse`: the answer is the function's result.
+    Sync,
+    /// `Event`: queued, answered with 202 before the function runs.
+    Event,
+}
+
+/// The largest Invoke payload, in bytes, for a synchronous call: 6 MB. Lambda's MB is 1,024 KB.
+/// Source: AWS Lambda quotas, "Invocation payload" (docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html)
+/// and the Invoke API, Request Body (docs.aws.amazon.com/lambda/latest/api/API_Invoke.html).
+pub const LAMBDA_SYNC_PAYLOAD: usize = 6 * 1024 * 1024;
+/// The largest Invoke payload for an asynchronous (`Event`) call: 1 MB. Same sources.
+pub const LAMBDA_EVENT_PAYLOAD: usize = 1024 * 1024;
+
+/// An `aws-lambda://` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LambdaUrl {
+    pub region: Option<String>,
+    pub function: String,
+    /// A version or alias (`live`), or `$LATEST`, `$LATEST.PUBLISHED`.
+    pub qualifier: Option<String>,
+    pub invocation: Invocation,
+    /// `?endpoint=`, as written (a validated http(s) URL).
+    pub endpoint: Option<String>,
+}
+
+impl LambdaUrl {
+    /// `aws-lambda://<function>[:<qualifier>]` or `aws-lambda://<region>/<function>[:<qualifier>]`,
+    /// with `?invocation=sync|event` and `?endpoint=`.
+    pub fn parse(url: &str) -> Result<LambdaUrl> {
+        // `invocation` is this kind's own parameter; `split_aws_url` takes `endpoint` only, so the
+        // rest of the query is passed on to it.
+        let (base, query) = match url.split_once('?') {
+            Some((b, q)) => (b, q),
+            None => (url, ""),
+        };
+        let mut invocation = None;
+        let mut rest = Vec::new();
+        for part in query.split('&').filter(|p| !p.is_empty()) {
+            match part.strip_prefix("invocation=") {
+                Some(v) => {
+                    if invocation.is_some() {
+                        bail!("`{url}`: `invocation` is given twice");
+                    }
+                    invocation = Some(match v {
+                        "sync" => Invocation::Sync,
+                        "event" => Invocation::Event,
+                        other => bail!("`{url}`: `invocation` is `sync` or `event`, not `{other}`"),
+                    });
+                }
+                None => rest.push(part),
+            }
+        }
+        let shared = if rest.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", rest.join("&"))
+        };
+        let (segs, endpoint) = split_aws_url(&shared, "lambda")?;
+        let (region, last) = match segs.as_slice() {
+            [f] => (None, f.as_str()),
+            [r, f] => (Some(r.as_str()), f.as_str()),
+            _ => bail!(
+                "`{url}`: kind lambda takes `aws-lambda://<function-name>[:<qualifier>]` or `aws-lambda://<region>/<function-name>[:<qualifier>]`"
+            ),
+        };
+        if let Some(r) = region {
+            if !valid_region(r) {
+                bail!("`{url}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+            }
+        }
+        let (function, qualifier) = match last.split_once(':') {
+            Some((f, q)) => (f, Some(q)),
+            None => (last, None),
+        };
+        // A function name: 1 to 64 letters, digits, `-`, `_` or `.` (Invoke, FunctionName).
+        let name_ok = (1..=64).contains(&function.len())
+            && function
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
+        if !name_ok {
+            bail!("`{url}`: a function name is 1 to 64 letters, digits, `-`, `_` or `.`, optionally followed by `:<qualifier>`");
+        }
+        // A qualifier: `$LATEST`, `$LATEST.PUBLISHED`, a version number or an alias (Invoke, Qualifier).
+        if let Some(q) = qualifier {
+            let q_ok = q == "$LATEST"
+                || q == "$LATEST.PUBLISHED"
+                || ((1..=128).contains(&q.len())
+                    && q.bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')));
+            if !q_ok {
+                bail!("`{url}`: the qualifier is `$LATEST`, a version or an alias (letters, digits, `-`, `_`)");
+            }
+        }
+        Ok(LambdaUrl {
+            region: region.map(str::to_string),
+            function: function.to_string(),
+            qualifier: qualifier.map(str::to_string),
+            invocation: invocation.unwrap_or(Invocation::Sync),
+            endpoint,
+        })
+    }
+
+    /// The largest payload this invocation takes (`LAMBDA_SYNC_PAYLOAD` or `LAMBDA_EVENT_PAYLOAD`).
+    pub fn payload_limit(&self) -> usize {
+        match self.invocation {
+            Invocation::Sync => LAMBDA_SYNC_PAYLOAD,
+            Invocation::Event => LAMBDA_EVENT_PAYLOAD,
+        }
+    }
+
+    /// The Invoke request path: `/2015-03-31/functions/<function>/invocations`, with
+    /// `?Qualifier=<qualifier>` when the URL gives one.
+    pub fn path(&self) -> String {
+        let mut p = format!("/2015-03-31/functions/{}/invocations", self.function);
+        if let Some(q) = &self.qualifier {
+            p.push_str("?Qualifier=");
+            p.push_str(q);
+        }
+        p
+    }
+}
+
+/// The `X-Amz-Function-Error` header of an Invoke answer (`Handled` or `Unhandled`), when the
+/// function raised an error. Header names are matched case-insensitively.
+pub fn function_error(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("x-amz-function-error"))
+        .map(|(_, v)| v.clone())
+}
+
+/// The item identifiers a function lists in `batchItemFailures`, the common partial-batch
+/// answer: `{"batchItemFailures": [{"itemIdentifier": "<key>"}]}`. A result without the field
+/// lists none (the whole batch is met); a malformed list is an error.
+pub fn lambda_failed_items(body: &[u8]) -> Result<Vec<String>> {
+    let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = obj.get("batchItemFailures") else {
+        return Ok(Vec::new());
+    };
+    let entries = list
+        .as_array()
+        .ok_or_else(|| anyhow!("`batchItemFailures` is not a list"))?;
+    entries
+        .iter()
+        .map(|e| {
+            e.get("itemIdentifier")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    anyhow!("a `batchItemFailures` entry has no `itemIdentifier` string")
+                })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod lambda_tests {
+    use super::*;
+
+    fn lam(url: &str) -> Result<LambdaUrl> {
+        LambdaUrl::parse(url)
+    }
+
+    #[test]
+    fn lambda_url_forms() {
+        let u = lam("aws-lambda://orders").unwrap();
+        assert_eq!(u.region, None);
+        assert_eq!(u.function, "orders");
+        assert_eq!(u.qualifier, None);
+        assert_eq!(u.invocation, Invocation::Sync);
+        assert_eq!(u.endpoint, None);
+        assert_eq!(u.path(), "/2015-03-31/functions/orders/invocations");
+
+        let u = lam("aws-lambda://eu-west-1/orders:live?invocation=event").unwrap();
+        assert_eq!(u.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(u.qualifier.as_deref(), Some("live"));
+        assert_eq!(u.invocation, Invocation::Event);
+        assert_eq!(
+            u.path(),
+            "/2015-03-31/functions/orders/invocations?Qualifier=live"
+        );
+
+        let u = lam("aws-lambda://orders:$LATEST").unwrap();
+        assert_eq!(u.qualifier.as_deref(), Some("$LATEST"));
+        assert_eq!(
+            u.path(),
+            "/2015-03-31/functions/orders/invocations?Qualifier=$LATEST"
+        );
+
+        let u = lam("aws-lambda://us-east-1/orders?endpoint=http://127.0.0.1:9&invocation=sync")
+            .unwrap();
+        assert_eq!(u.endpoint.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(u.invocation, Invocation::Sync);
+        let u = lam("aws-lambda://us-east-1/orders?invocation=sync&endpoint=http://127.0.0.1:9")
+            .unwrap();
+        assert_eq!(u.endpoint.as_deref(), Some("http://127.0.0.1:9"));
+    }
+
+    #[test]
+    fn lambda_refuses_bad_urls() {
+        for bad in [
+            "https://example.com/orders",
+            "aws-sqs://123456789012/orders",
+            "aws-kinesis://orders",
+            "aws-lambda://user@orders",
+            "aws-lambda://",
+            "aws-lambda://a/b/c",
+            "aws-lambda://Eu/orders",
+            "aws-lambda://orders:",
+            "aws-lambda://orders:bad*qualifier",
+            "aws-lambda://bad name",
+            "aws-lambda://arn:aws:lambda:us-east-1:123456789012:function:orders",
+            "aws-lambda://orders?invocation=batch",
+            "aws-lambda://orders?invocation=sync&invocation=event",
+            "aws-lambda://orders?region=eu-west-1",
+            "aws-lambda://orders?endpoint=http://127.0.0.1:9/path",
+            "aws-lambda://orders?endpoint=http://user@127.0.0.1:9",
+        ] {
+            assert!(lam(bad).is_err(), "accepted `{bad}`");
+        }
+        let e = lam("aws-sqs://123456789012/orders")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("aws-lambda://"), "{e}");
+        let e = lam("https://example.com/orders").unwrap_err().to_string();
+        assert!(e.contains("aws-lambda://"), "{e}");
+    }
+
+    #[test]
+    fn lambda_payload_limits_are_the_documented_ones() {
+        assert_eq!(
+            lam("aws-lambda://orders").unwrap().payload_limit(),
+            6_291_456
+        );
+        assert_eq!(
+            lam("aws-lambda://orders?invocation=event")
+                .unwrap()
+                .payload_limit(),
+            1_048_576
+        );
+    }
+
+    #[test]
+    fn function_error_header_is_read_case_insensitively() {
+        let h = |n: &str, v: &str| vec![(n.to_string(), v.to_string())];
+        assert_eq!(
+            function_error(&h("X-Amz-Function-Error", "Unhandled")).as_deref(),
+            Some("Unhandled")
+        );
+        assert_eq!(
+            function_error(&h("x-amz-function-error", "Handled")).as_deref(),
+            Some("Handled")
+        );
+        assert_eq!(function_error(&h("X-Amz-Log-Result", "x")), None);
+    }
+
+    #[test]
+    fn batch_item_failures_list_the_failed_keys() {
+        assert_eq!(lambda_failed_items(b"{}").unwrap(), Vec::<String>::new());
+        assert_eq!(lambda_failed_items(b"[1,2]").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            lambda_failed_items(b"not json").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            lambda_failed_items(br#"{"batchItemFailures":[]}"#).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            lambda_failed_items(
+                br#"{"batchItemFailures":[{"itemIdentifier":"2"},{"itemIdentifier":"7"}]}"#
+            )
+            .unwrap(),
+            vec!["2".to_string(), "7".to_string()]
+        );
+        assert!(lambda_failed_items(br#"{"batchItemFailures":"2"}"#).is_err());
+        assert!(lambda_failed_items(br#"{"batchItemFailures":[{"id":"2"}]}"#).is_err());
+    }
+}
+
 /// The region of an AWS endpoint: the URL's, else `AWS_REGION`, else `AWS_DEFAULT_REGION`, else
 /// `region` in the shared config file's profile (`config`, read only when the others are unset).
 pub fn region_from(
