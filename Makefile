@@ -5,8 +5,8 @@ IMAGE ?= lazywf:dev
 # Keep in step with the FROM lines of the Dockerfile.
 BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
-.PHONY: build release test lint servers servers-down test-e2e test-e2e-all test-e2e-search test-matrix \
-	test-prerelease docker-smoke docker-e2e image-digests
+.PHONY: build release test lint servers servers-down test-e2e test-e2e-all test-e2e-search \
+	test-e2e-queues test-matrix test-prerelease docker-smoke docker-e2e image-digests
 
 build:
 	$(CARGO) build
@@ -28,7 +28,8 @@ servers:
 	$(COMPOSE) up -d --wait
 
 servers-down:
-	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease down -v
+	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease \
+	  --profile sqs --profile kinesis --profile amqp --profile pubsub down -v
 
 # The integration servers and test threads; override them to run against other servers.
 E2E_DSN ?= mysql://root:root@127.0.0.1:34184
@@ -57,6 +58,22 @@ test-e2e-search:
 	mkdir -p tmp/out && docker cp lazywf-test-es8-1:/usr/share/elasticsearch/config/certs/http_ca.crt tmp/out/es8-ca.crt
 	$(E2E_DB) LAZYWF_TEST_ES8=https://127.0.0.1:34202 LAZYWF_TEST_ES8_CA=$(CURDIR)/tmp/out/es8-ca.crt $(CARGO) test --test e2e search_elasticsearch8
 	$(COMPOSE) --profile search stop es8
+
+# The queue kinds against their emulators (sqs: ElasticMQ, kinesis: kinesis-mock, amqp:
+# RabbitMQ, pubsub: Google's emulator; compose profiles of the same names). The four are small
+# enough to run together on the host; the tests are run per kind with their env vars, and the
+# services are stopped even when a test fails.
+QUEUE_PROFILES := --profile sqs --profile kinesis --profile amqp --profile pubsub
+QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator
+test-e2e-queues:
+	$(COMPOSE) $(QUEUE_PROFILES) up -d --wait $(QUEUE_SERVICES); rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	  $(E2E_DB) LAZYWF_TEST_SQS=http://127.0.0.1:34561 $(CARGO) test --test e2e sqs_ || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 $(CARGO) test --test e2e kinesis_ || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_AMQP=127.0.0.1:34560 $(CARGO) test --test e2e amqp_ || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 $(CARGO) test --test e2e pubsub_ || rc=1; \
+	fi; \
+	$(COMPOSE) $(QUEUE_PROFILES) stop $(QUEUE_SERVICES); exit $$rc
 
 # The integration tests on every other required line (README "Supported servers"), one server
 # at a time (service:port; the targets of `make servers` must be up). MariaDB 10.6 goes after

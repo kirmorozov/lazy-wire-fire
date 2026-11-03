@@ -9,13 +9,15 @@ name: ci
 #                26.10; Percona 8.4, 9.7; MariaDB 10.6, 11.4, 11.8, 12.3, 13.0) and, advisory
 #                (continue-on-error, never blocking), the MariaDB 13.1 RC and 13.2 preview
 #   search       make test-e2e-search: OpenSearch 2.19, Elasticsearch 7.17 and 8.17
+#   queues       make test-e2e-queues: the sqs, kinesis, amqp and pubsub targets against ElasticMQ,
+#                kinesis-mock, RabbitMQ and Google's Pub/Sub emulator
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, then make docker-e2e on amd64
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
 #
 # Images go to ghcr.io/kirmorozov/lazy-wire-fire (publish-image.yml) only for pushes:
 #   main -> edge    needs lint + unit + integration + matrix (required servers) + image
-#   v*   -> release needs those and search
+#   v*   -> release needs those and search and queues
 # Pull requests never get registry credentials and never push.
 on:
   push:
@@ -304,6 +306,62 @@ jobs:
         if: always()
         run: make servers-down
 
+  queues:
+    # make test-e2e-queues starts the four emulators together (they fit the shared runner) and
+    # runs each kind's tests by name; the pull runs in the background like the search job's.
+    name: queues (ElasticMQ, kinesis-mock, RabbitMQ, Pub/Sub emulator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start MySQL 8.4, pull the emulators (in the background)
+        run: |
+          docker compose up -d --quiet-pull mysql84
+          nohup docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub pull --quiet elasticmq kinesis-mock rabbitmq pubsub-emulator > pull.log 2>&1 &
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: e2e
+          save-if: false
+      - name: build the integration tests
+        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --no-run
+      - name: wait for MySQL 8.4
+        run: docker compose up -d --wait --wait-timeout 300 mysql84
+      - name: server versions
+        run: scripts/ci-summary.sh versions mysql84 | tee versions.md
+      - name: make test-e2e-queues
+        timeout-minutes: 30
+        run: make test-e2e-queues 2>&1 | tee e2e.log
+      - name: summary
+        if: always()
+        run: |
+          scripts/ci-summary.sh report "Queues: ElasticMQ (SQS), kinesis-mock, RabbitMQ (AMQP), Pub/Sub emulator" e2e.log versions.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          cp pull.log server-logs/ 2>/dev/null || true
+          docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: queues-logs
+          path: |
+            server-logs/
+            e2e.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: make servers-down
+
   image:
     name: image (build, smoke, end to end)
     runs-on: ubuntu-24.04
@@ -414,7 +472,7 @@ jobs:
 
   publish-release:
     name: publish release
-    needs: [lint, unit, integration, matrix, search, image]
+    needs: [lint, unit, integration, matrix, search, queues, image]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
