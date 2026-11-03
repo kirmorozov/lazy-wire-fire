@@ -67,12 +67,17 @@ pub fn is_secret_dir(dir: &Path) -> bool {
     std::fs::canonicalize(dir).is_ok_and(|d| secret_dirs().contains(&d))
 }
 
+/// Serialises the tests that set environment variables (`LAZYWF_SECRET_DIRS`, `AWS_*`, `HOME`).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn forms() {
+        let _env = ENV_LOCK.blocking_lock();
         assert_eq!(resolve("plain").unwrap(), "plain");
         std::env::set_var("LWF_UNIT_SECRET_X", "s3cret");
         assert_eq!(resolve("env:LWF_UNIT_SECRET_X").unwrap(), "s3cret");

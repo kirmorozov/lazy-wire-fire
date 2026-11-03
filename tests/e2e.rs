@@ -971,7 +971,7 @@ async fn varnish_purges_by_tag() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_target() {
-    use lazy_wire_fire::aws::Credentials;
+    use aws_credential_types::Credentials;
     use lazy_wire_fire::http::{BaseUrl, Client, RawRequest};
     use lazy_wire_fire::tls::TlsSpec;
     let root = need_db!();
@@ -981,12 +981,7 @@ async fn s3_target() {
     tables(&db).await;
     std::env::set_var("LWF_TEST_S3_AK", "lazywfaccess");
     std::env::set_var("LWF_TEST_S3_SK", "lazywfsecret");
-    let creds = Credentials {
-        access_key: "lazywfaccess".into(),
-        secret_key: "lazywfsecret".into(),
-        session_token: None,
-        expires: None,
-    };
+    let creds = Credentials::new("lazywfaccess", "lazywfsecret", None, None, "e2e");
     let client = Client::new(
         BaseUrl::parse("http://127.0.0.1:34070").unwrap(),
         &TlsSpec::parse(None).unwrap(),
