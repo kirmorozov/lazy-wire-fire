@@ -65,6 +65,48 @@ pub enum Item {
     Transient(String),
 }
 
+/// What one `Records[i]` of a `PutRecords` answer says, before `expect` (see
+/// [`kinesis_verdict`]). Kinesis answers by position: the i-th record of the answer is the i-th
+/// record of the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordVerdict {
+    /// No `ErrorCode`: the record was stored. `expect` decides, with the record as `body`.
+    Stored(Vec<u8>),
+    /// `ProvisionedThroughputExceededException` or `InternalFailure`: try again later.
+    Transient(String),
+    /// Any other `ErrorCode`: refused for this record.
+    Rejected(String),
+    /// The answer has no entry for this record: it is not known to be stored, so it waits.
+    Missing,
+}
+
+/// The per-record mapping of a Kinesis `PutRecords` answer (decision of the kinesis PR: the
+/// transient set is exactly these two codes; every other code is a refusal of that record).
+pub fn kinesis_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
+    let Some(e) = entry else {
+        return RecordVerdict::Missing;
+    };
+    match e
+        .get("ErrorCode")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+    {
+        None => RecordVerdict::Stored(serde_json::to_vec(e).unwrap_or_default()),
+        Some(code) => {
+            let msg = format!(
+                "record {i}: {code}: {}",
+                e.get("ErrorMessage").and_then(Value::as_str).unwrap_or("")
+            );
+            match code {
+                "ProvisionedThroughputExceededException" | "InternalFailure" => {
+                    RecordVerdict::Transient(msg)
+                }
+                _ => RecordVerdict::Rejected(msg),
+            }
+        }
+    }
+}
+
 /// The AWS credentials of a target's `vars`, when it gives any.
 fn aws_refs(def: &TargetDef) -> Option<aws::Refs> {
     match (var(def, "access_key_ref"), var(def, "secret_key_ref")) {
@@ -188,6 +230,33 @@ impl Target {
                 aws_rt = Some(AwsSign {
                     service: "s3",
                     region: spec.region.clone(),
+                    provider,
+                });
+            }
+            Kind::Kinesis => {
+                // from_row: at most one endpoint, the regional service URL (default: derived
+                // from `region`). The stream is named in the body (`StreamName` / `StreamARN`).
+                let region = var(&def, "region").unwrap_or_default().to_string();
+                let mut base = match def.endpoints.first() {
+                    Some(url) => BaseUrl::parse(url)?,
+                    None => aws::endpoint("kinesis", &region),
+                };
+                let ctx = json!({"host": base.host, "port": base.port, "url": base.url()});
+                base.base = String::new();
+                let host_header = base.host_header();
+                let client = HttpClient::new(base, &def.tls)?;
+                endpoints.push(Endpoint {
+                    ctx,
+                    transport: Transport::Http {
+                        client,
+                        prefix: String::new(),
+                        host_header,
+                    },
+                });
+                let provider = aws::Provider::new(aws_refs(&def), &region);
+                aws_rt = Some(AwsSign {
+                    service: "kinesis",
+                    region,
                     provider,
                 });
             }
@@ -476,6 +545,33 @@ impl Target {
                 resp.body_snippet()
             )
         })?;
+        if self.def.kind == Kind::Kinesis {
+            // `Records[i]` answers item i. `expect` per record, as for the entries below.
+            let records = answer
+                .get("Records")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let item = match kinesis_verdict(records.get(i), i) {
+                    RecordVerdict::Stored(bytes) => match self
+                        .expect
+                        .http(&self.pool, resp.status, &resp.headers, &bytes)
+                        .await
+                        .with_context(|| format!("record {i} of {}", client.base.url()))?
+                    {
+                        Ok(()) => Item::Ok,
+                        Err(why) => Item::Rejected(format!("record {i}: {why}")),
+                    },
+                    RecordVerdict::Transient(m) => Item::Transient(m),
+                    RecordVerdict::Rejected(m) => Item::Rejected(m),
+                    RecordVerdict::Missing => Item::Transient(format!("record {i}: no answer")),
+                };
+                out.push(item);
+            }
+            return Ok(out);
+        }
         let entries = |field: &str| -> Vec<Value> {
             answer
                 .get(field)
@@ -579,5 +675,79 @@ impl Target {
             _ => {}
         }
         Ok(req)
+    }
+}
+
+#[cfg(test)]
+mod kinesis_verdict_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_record_without_error_code_is_stored_and_checked_by_expect() {
+        let e = json!({"SequenceNumber": "49590", "ShardId": "shardId-000000000000"});
+        match kinesis_verdict(Some(&e), 0) {
+            RecordVerdict::Stored(bytes) => {
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), e)
+            }
+            other => panic!("{other:?}"),
+        }
+        // an empty or null code is no code
+        let e = json!({"ErrorCode": null, "SequenceNumber": "1"});
+        assert!(matches!(
+            kinesis_verdict(Some(&e), 1),
+            RecordVerdict::Stored(_)
+        ));
+        let e = json!({"ErrorCode": "", "SequenceNumber": "1"});
+        assert!(matches!(
+            kinesis_verdict(Some(&e), 1),
+            RecordVerdict::Stored(_)
+        ));
+    }
+
+    #[test]
+    fn throttling_and_internal_failure_are_transient() {
+        let e = json!({"ErrorCode": "ProvisionedThroughputExceededException", "ErrorMessage": "Rate exceeded for shard"});
+        assert_eq!(
+            kinesis_verdict(Some(&e), 3),
+            RecordVerdict::Transient(
+                "record 3: ProvisionedThroughputExceededException: Rate exceeded for shard".into()
+            )
+        );
+        let e = json!({"ErrorCode": "InternalFailure", "ErrorMessage": "x"});
+        assert!(matches!(
+            kinesis_verdict(Some(&e), 0),
+            RecordVerdict::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn any_other_code_is_a_refusal_of_that_record() {
+        let e = json!({"ErrorCode": "ValidationException", "ErrorMessage": "too big"});
+        assert_eq!(
+            kinesis_verdict(Some(&e), 2),
+            RecordVerdict::Rejected("record 2: ValidationException: too big".into())
+        );
+        let e = json!({"ErrorCode": "ServiceUnavailable"});
+        assert!(matches!(
+            kinesis_verdict(Some(&e), 0),
+            RecordVerdict::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_entry_waits() {
+        assert_eq!(kinesis_verdict(None, 5), RecordVerdict::Missing);
+    }
+
+    #[test]
+    fn the_data_of_a_record_is_base64_of_the_document() {
+        // What the `base64` template helper produces for a document, decoded back.
+        let doc = br#"{"id":1}"#;
+        let data = base64::engine::general_purpose::STANDARD.encode(doc);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(decoded, doc);
     }
 }

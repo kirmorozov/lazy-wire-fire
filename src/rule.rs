@@ -174,19 +174,52 @@ pub fn kind_errors(
             }
         }
     }
-    if kind == Kind::Sqs {
+    if matches!(kind, Kind::Sqs | Kind::Kinesis) {
+        // Purge-like `once` actions: a queue purge (`PurgeQueue`) or a stream delete
+        // (`DeleteStream`, which drops every record). Recognized by text, as the only names of
+        // such actions the templates can show us.
+        let purge_words: &[&str] = if kind == Kind::Sqs {
+            &["purgequeue"]
+        } else {
+            &["deletestream"]
+        };
         for s in &def.reset_steps {
             let purge = s.kind == StepKind::Once
-                && s.template
-                    .as_deref()
-                    .is_some_and(|t| t.to_ascii_lowercase().contains("purgequeue"));
+                && s.template.as_deref().is_some_and(|t| {
+                    let t = t.to_ascii_lowercase();
+                    purge_words.iter().any(|w| t.contains(w))
+                });
             if purge {
                 out.push(format!(
-                    "reset step `{}`: purging a queue is refused (kind sqs)",
-                    s.name
+                    "reset step `{}`: purging is refused (kind {}: {} would drop the records)",
+                    s.name,
+                    kind.name(),
+                    if kind == Kind::Sqs {
+                        "PurgeQueue"
+                    } else {
+                        "DeleteStream"
+                    }
                 ));
             }
         }
+    }
+    if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
+        match def.batch_max_keys {
+            None => out.push(
+                "kind kinesis needs `batch_max_keys` (1 to 500: records per PutRecords)".into(),
+            ),
+            Some(n) if n > 500 => out.push(format!(
+                "`batch_max_keys` {n} is over 500, the most records a PutRecords takes"
+            )),
+            Some(_) => {}
+        }
+        if def.batch_max_bytes.is_some_and(|n| n > 5_242_880) {
+            out.push(
+                "`batch_max_bytes` is over 5242880 (5 MiB), the most a PutRecords takes".into(),
+            );
+        }
+    }
+    if kind == Kind::Sqs {
         if def.fire_per == FirePer::Batch {
             match def.batch_max_keys {
                 None => out.push(
@@ -484,5 +517,60 @@ mod kind_tests {
         assert!(kind_errors(&d, Kind::Sqs, &[FIFO.into()], &cols(&["_key", "version"])).is_empty());
         // A standard queue does not need one.
         assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+    }
+
+    const STREAM: &str = "https://kinesis.eu-west-1.amazonaws.com";
+
+    #[test]
+    fn kinesis_batches_hold_at_most_500_records_and_5_mib() {
+        let mut d = def();
+        d.batch_max_keys = None;
+        assert_eq!(
+            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            1
+        );
+        d.batch_max_keys = Some(501);
+        assert_eq!(
+            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            1
+        );
+        d.batch_max_keys = Some(500);
+        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+        d.batch_max_bytes = Some(5_242_881);
+        assert_eq!(
+            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            1
+        );
+        d.batch_max_bytes = Some(5_242_880);
+        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+        // One key per action has no batch to size.
+        d.fire_per = FirePer::Key;
+        d.batch_max_keys = None;
+        d.batch_max_bytes = None;
+        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn kinesis_refuses_stray_and_stream_delete_resets() {
+        let mut d = def();
+        d.reset_steps = vec![step(stray(), None)];
+        let e = kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("only appends"));
+
+        d.reset_steps = vec![step(
+            StepKind::Once,
+            Some("POST / HTTP/1.1\nX-Amz-Target: Kinesis_20131202.DeleteStream\n\n{}"),
+        )];
+        assert_eq!(
+            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            1
+        );
+        // An announce record is a legitimate `once` action.
+        d.reset_steps = vec![step(
+            StepKind::Once,
+            Some("POST / HTTP/1.1\nX-Amz-Target: Kinesis_20131202.PutRecords\n\n{}"),
+        )];
+        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
     }
 }
