@@ -132,6 +132,25 @@ enum Lane {
 /// A key the target refused this many times (while others went through) is dropped.
 const STRIKES: u32 = 5;
 
+/// Event target of a dropped key: `LAZYWF_LOG_FORMAT=json` lines with this `target` are the
+/// undelivered keys (one event per key, fields as in [`log_undelivered`]).
+const UNDELIVERED: &str = "lazywf::undelivered";
+
+/// Logs one key given up after [`STRIKES`] refusals. Fields: `rule`, `target` (the target's
+/// name), `key`, `reason` (the last refusal), `strikes`. `op` is not recorded: a flush merges
+/// the keys of all triggers, so the insert/update/delete of a key is not known here.
+fn log_undelivered(rule: &str, target: &str, key: &str, reason: &str, strikes: u32) {
+    warn!(
+        target: UNDELIVERED,
+        rule = %rule,
+        target = %target,
+        key = %key,
+        reason = %reason,
+        strikes,
+        "undelivered key dropped"
+    );
+}
+
 /// Splits refused keys into those to try again and those dropped (strikes in `strikes`). A
 /// refusal counts against a key when other keys of the same action went through (or it was
 /// singled out before): when everything is refused, the template or the target is at fault,
@@ -236,10 +255,16 @@ impl RuleState {
         judge_strikes(&mut self.strikes, rejected, others_ok)
     }
 
-    fn report_dropped(&mut self, rule: &str, dropped: &[(String, String)], now_ms: u64) {
+    fn report_dropped(
+        &mut self,
+        rule: &str,
+        target: &str,
+        dropped: &[(String, String)],
+        now_ms: u64,
+    ) {
         for (k, why) in dropped {
             let k: String = k.chars().take(200).collect();
-            warn!(rule = %rule, "key `{k}` was refused {STRIKES} times and is dropped: {why}");
+            log_undelivered(rule, target, &k, why, STRIKES);
             self.last_error = Some((
                 format!("key `{k}` refused {STRIKES} times, dropped: {why}"),
                 now_ms,
@@ -2106,7 +2131,7 @@ impl Engine {
                     && fired.failed_keys.is_empty()
                     && fired.rejected.is_empty();
                 let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
-                st.report_dropped(&d.rule, &dropped, now_ms);
+                st.report_dropped(&d.rule, &target, &dropped, now_ms);
                 let mut again: KeySet = fired.failed_keys.into_iter().collect();
                 for k in &retry {
                     again.insert(k);
@@ -2165,7 +2190,7 @@ impl Engine {
                     && fired.failed_keys.is_empty()
                     && fired.rejected.is_empty();
                 let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
-                st.report_dropped(&d.rule, &dropped, now_ms);
+                st.report_dropped(&d.rule, &target, &dropped, now_ms);
                 let done = !keyless && fired.failed_keys.is_empty() && retry.is_empty();
                 let run = st.reset.as_mut().expect("checked above");
                 match fired.error {
@@ -2524,6 +2549,55 @@ async fn flush_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `MakeWriter` into a shared buffer, for reading back what a subscriber wrote.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// The drop event is one JSON line on `lazywf::undelivered` with the fields a pipeline
+    /// filters on, and no `op` (not known where the drop is decided).
+    #[test]
+    fn undelivered_event_carries_its_fields() {
+        let out = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .json()
+            .with_writer(out.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            log_undelivered("orders_sync", "search", "42", "400 bad document", STRIKES);
+        });
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "one event per key: {text}");
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["level"], "WARN");
+        assert_eq!(v["target"], UNDELIVERED);
+        assert_eq!(v["fields"]["message"], "undelivered key dropped");
+        assert_eq!(v["fields"]["rule"], "orders_sync");
+        assert_eq!(v["fields"]["target"], "search");
+        assert_eq!(v["fields"]["key"], "42");
+        assert_eq!(v["fields"]["reason"], "400 bad document");
+        assert_eq!(v["fields"]["strikes"], STRIKES);
+        assert!(v["fields"].get("op").is_none());
+    }
 
     #[test]
     fn managed_service_notes() {
