@@ -57,6 +57,13 @@ services:
     tmpfs: ["/data"]
     ports: ["127.0.0.1:34070:7070"]
 
+  # The SQS API for the `sqs` target tests (ElasticMQ, native build). Not started by `make
+  # servers`: `docker compose -f docker-compose.test.yml --profile sqs up -d --wait elasticmq`.
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.12
+    profiles: ["sqs"]
+    ports: ["127.0.0.1:34561:9324"]
+
   opensearch:
     image: opensearchproject/opensearch:2.19.7
     profiles: ["search"]

@@ -17,7 +17,7 @@ use crate::docs::{self, Doc, Merger, Plan};
 use crate::keyset::KeySet;
 use crate::model::{FirePer, StepKind};
 use crate::rule::{self, Rule};
-use crate::target::{Sent, Target};
+use crate::target::{Item, Sent, Target};
 
 pub struct Env {
     pub pool: Pool,
@@ -402,6 +402,9 @@ async fn send_group(
     only: Option<usize>,
     f: &mut Fired,
 ) -> Result<(), ()> {
+    if target.reports_items() {
+        return send_items_group(rule, target, template, keys, docs, reset, only, f).await;
+    }
     let mut todo = vec![(0, keys.len())];
     while let Some((a, b)) = todo.pop() {
         if a == b {
@@ -454,7 +457,135 @@ async fn send_group(
     Ok(())
 }
 
-/// Splits a group so each rendered action stays within `batch_max_bytes`.
+/// One batch request for `keys`, answered per item (see [`Target::send_items`]).
+async fn send_batch_items(
+    rule: &Rule,
+    target: &Target,
+    template: &str,
+    keys: &[String],
+    docs: &[Doc],
+    reset: &Value,
+    only: Option<usize>,
+) -> Result<Vec<Item>, (anyhow::Error, Fail)> {
+    let ep = only.unwrap_or(0);
+    let Some(endpoint) = target.endpoints.get(ep) else {
+        return Err((
+            anyhow!("endpoint {ep} of target `{}` is gone", target.def.name),
+            Fail::Transient,
+        ));
+    };
+    let ctx = context(rule, target, keys, docs, &endpoint.ctx, reset);
+    let rendered = rule
+        .templates
+        .render(template, &ctx)
+        .map_err(|e| (e, Fail::Rejected))?;
+    target
+        .send_items(ep, &rendered, keys.len())
+        .await
+        .map_err(|e| {
+            let fail = if crate::target::is_rejected(&e) {
+                Fail::Rejected
+            } else {
+                Fail::Transient
+            };
+            (e, fail)
+        })
+}
+
+/// Books the answer of one batch request, item by item (`keys[i]` is item `i`). Confirmed items
+/// are done, refused items go to `rejected`, items that may pass to `failed_keys`. Returns
+/// whether some item may pass (the batches not yet sent then wait).
+pub fn book_items(keys: &[String], items: Vec<Item>, f: &mut Fired) -> bool {
+    let mut waiting = false;
+    for (k, item) in keys.iter().zip(items) {
+        match item {
+            Item::Ok => f.keys_done += 1,
+            Item::Rejected(why) => {
+                f.failed += 1;
+                if f.error.is_none() {
+                    f.error = Some(why.clone());
+                }
+                f.rejected.push((k.clone(), why));
+            }
+            Item::Transient(why) => {
+                f.failed += 1;
+                f.error = Some(why);
+                f.target_error = true;
+                f.failed_keys.push(k.clone());
+                waiting = true;
+            }
+        }
+    }
+    waiting
+}
+
+/// [`send_group`] for a target that answers per item. A confirmed item is done (`keys_done`);
+/// a refused one goes to `rejected` (strikes, no bisect: the service said which one it is);
+/// one that may pass again goes to `failed_keys`, and the batches not yet sent wait with it.
+/// A whole-request refusal is bisected, as in `send_group`. Keys of a batch are never sent
+/// again once their item was confirmed.
+async fn send_items_group(
+    rule: &Rule,
+    target: &Target,
+    template: &str,
+    keys: &[String],
+    docs: &[Doc],
+    reset: &Value,
+    only: Option<usize>,
+    f: &mut Fired,
+) -> Result<(), ()> {
+    let mut todo = vec![(0, keys.len())];
+    while let Some((a, b)) = todo.pop() {
+        if a == b {
+            continue;
+        }
+        match send_batch_items(
+            rule,
+            target,
+            template,
+            &keys[a..b],
+            &docs[a..b],
+            reset,
+            only,
+        )
+        .await
+        {
+            Ok(items) => {
+                f.ok += 1;
+                if book_items(&keys[a..b], items, f) {
+                    return Err(());
+                }
+            }
+            Err((e, Fail::Transient)) => {
+                f.failed += 1;
+                f.error = Some(format!("{e:#}"));
+                f.target_error = true;
+                f.failed_keys.extend(keys[a..b].iter().cloned());
+                for (a, b) in todo {
+                    f.failed_keys.extend(keys[a..b].iter().cloned());
+                }
+                return Err(());
+            }
+            Err((e, Fail::Rejected)) => {
+                f.failed += 1;
+                if f.error.is_none() {
+                    f.error = Some(format!("{e:#}"));
+                }
+                if b - a == 1 {
+                    f.rejected.push((keys[a].clone(), format!("{e:#}")));
+                } else {
+                    let mid = a + (b - a) / 2;
+                    todo.push((mid, b));
+                    todo.push((a, mid));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splits a group so each rendered action stays within `batch_max_bytes` (the kind's own
+/// limit when the rule sets none).
 fn split_by_bytes(
     rule: &Rule,
     target: &Target,
@@ -463,7 +594,11 @@ fn split_by_bytes(
     docs: &[Doc],
     reset: &Value,
 ) -> Result<Vec<(usize, usize)>> {
-    let Some(max) = rule.def.batch_max_bytes else {
+    let Some(max) = rule
+        .def
+        .batch_max_bytes
+        .or(target.def.kind.batch_bytes_limit())
+    else {
         return Ok(vec![(0, keys.len())]);
     };
     let ep = target

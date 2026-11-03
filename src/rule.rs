@@ -120,9 +120,11 @@ pub fn expand_keys(sql: &str, n: usize) -> String {
     sql::expand(sql, |_| n).0
 }
 
-async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<Vec<Select>> {
+/// The selects, and every column they return (for [`kind_errors`]).
+async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>, Vec<String>)> {
     let mut plans = Vec::new();
     let mut out = Vec::new();
+    let mut all_columns = Vec::new();
     for s in &def.selects {
         for p in sql::placeholders(&s.sql) {
             if p.name != "keys" {
@@ -134,13 +136,87 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<Vec<Select>> 
             .with_context(|| format!("{} does not prepare", s.name))?;
         let plan = Plan::new(&names).with_context(|| s.name.clone())?;
         plans.push((s.name.clone(), plan));
+        all_columns.extend(names);
         out.push(Select {
             name: s.name.clone(),
             sql: s.sql.clone(),
         });
     }
     docs::check_owners(&plans)?;
-    Ok(out)
+    Ok((out, all_columns))
+}
+
+/// Refusals that depend on the target's kind, checked when the rule loads (`columns`: every
+/// column the rule's selects return).
+///
+/// - Append-only kinds (`sqs`): no `for_each: stray` step (a sent message cannot be recalled),
+///   and no `once` step that purges the queue (`PurgeQueue`; the only purge-like action named
+///   in the templates we can recognize, see the report).
+/// - `sqs`: a batch holds at most 10 keys (`batch_max_keys`, required) and 256 KiB.
+/// - A FIFO queue (the URL names a `.fifo` queue) needs a `version` column: it is the
+///   `MessageDeduplicationId` (decision D5).
+pub fn kind_errors(
+    def: &RuleDef,
+    kind: crate::model::Kind,
+    endpoints: &[String],
+    columns: &[String],
+) -> Vec<String> {
+    use crate::model::Kind;
+    let mut out = Vec::new();
+    if kind.append_only() {
+        for s in &def.reset_steps {
+            if matches!(s.kind, StepKind::Stray { .. }) {
+                out.push(format!(
+                    "reset step `{}`: a stray cleanup needs a target that can delete keys; kind {} only appends",
+                    s.name,
+                    kind.name()
+                ));
+            }
+        }
+    }
+    if kind == Kind::Sqs {
+        for s in &def.reset_steps {
+            let purge = s.kind == StepKind::Once
+                && s.template
+                    .as_deref()
+                    .is_some_and(|t| t.to_ascii_lowercase().contains("purgequeue"));
+            if purge {
+                out.push(format!(
+                    "reset step `{}`: purging a queue is refused (kind sqs)",
+                    s.name
+                ));
+            }
+        }
+        if def.fire_per == FirePer::Batch {
+            match def.batch_max_keys {
+                None => out.push(
+                    "kind sqs needs `batch_max_keys` (1 to 10: entries per SendMessageBatch)"
+                        .into(),
+                ),
+                Some(n) if n > 10 => out.push(format!(
+                    "`batch_max_keys` {n} is over 10, the most entries a SendMessageBatch takes"
+                )),
+                Some(_) => {}
+            }
+        }
+        if def.batch_max_bytes.is_some_and(|n| n > 262_144) {
+            out.push("`batch_max_bytes` is over 262144, the most a SendMessageBatch takes".into());
+        }
+        let fifo = endpoints.iter().any(|e| {
+            e.split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .ends_with(".fifo")
+        });
+        if fifo && !columns.iter().any(|c| c == "version") {
+            out.push(
+                "a FIFO queue (a `.fifo` URL) needs a `version` column in a select: it is the MessageDeduplicationId"
+                    .into(),
+            );
+        }
+    }
+    out
 }
 
 async fn compile_trigger(
@@ -231,11 +307,11 @@ pub async fn compile(
             add(&mut templates, &list_template(i), l);
         }
     }
-    let selects = match compile_selects(conn, &def).await {
+    let (selects, select_columns) = match compile_selects(conn, &def).await {
         Ok(s) => s,
         Err(e) => {
             errors.push(format!("selects: {e:#}"));
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
     if let Some(q) = &def.snapshot_keys_sql {
@@ -260,6 +336,12 @@ pub async fn compile(
         if t.endpoints.is_empty() {
             errors.push(format!("target `{}` has no endpoints", def.target));
         }
+        errors.extend(kind_errors(
+            &def,
+            t.def.kind,
+            &t.def.endpoints,
+            &select_columns,
+        ));
         if let Err(e) = t.expect.validate(conn).await {
             errors.push(format!("target `{}` `expect`: {e:#}", def.target));
         }
@@ -308,4 +390,99 @@ pub async fn compile(
 /// A trigger definition error for a row that did not even parse.
 pub fn trigger_parse_error(id: u64, e: &anyhow::Error) -> anyhow::Error {
     anyhow!("trigger {id}: {e:#}")
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use crate::model::{Kind, RawRule, ResetStep};
+
+    const QUEUE: &str = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders";
+    const FIFO: &str = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders.fifo";
+
+    fn def() -> RuleDef {
+        let mut d = RuleDef::placeholder(&RawRule {
+            name: "r".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        d.fire_per = FirePer::Batch;
+        d.batch_max_keys = Some(10);
+        d
+    }
+
+    fn cols(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn stray() -> StepKind {
+        StepKind::Stray {
+            list_template: "GET /".into(),
+            keys: "JSON_EXTRACT(body, '$.ids')".into(),
+            next: None,
+        }
+    }
+
+    fn step(kind: StepKind, template: Option<&str>) -> ResetStep {
+        ResetStep {
+            name: "s".into(),
+            kind,
+            template: template.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stray_steps_are_refused_for_append_only_kinds_only() {
+        let mut d = def();
+        d.reset_steps = vec![step(stray(), None)];
+        let e = kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &cols(&["version"]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("only appends"));
+        assert!(kind_errors(&d, Kind::Http, &["https://h".into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn purge_once_steps_are_refused_for_sqs() {
+        let mut d = def();
+        d.reset_steps = vec![step(
+            StepKind::Once,
+            Some("X-Amz-Target: AmazonSQS.PurgeQueue\n\n{}"),
+        )];
+        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        d.reset_steps = vec![step(
+            StepKind::Once,
+            Some("POST / HTTP/1.1\n\n{\"announce\":true}"),
+        )];
+        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn sqs_batches_hold_at_most_ten_keys_and_256_kib() {
+        let mut d = def();
+        d.batch_max_keys = None;
+        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        d.batch_max_keys = Some(11);
+        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        d.batch_max_keys = Some(10);
+        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+        d.batch_max_bytes = Some(262_145);
+        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        // One key per action has no batch to size.
+        d.fire_per = FirePer::Key;
+        d.batch_max_keys = None;
+        d.batch_max_bytes = None;
+        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn fifo_queues_need_a_version_column() {
+        let d = def();
+        assert_eq!(
+            kind_errors(&d, Kind::Sqs, &[FIFO.into()], &cols(&["_key"])).len(),
+            1
+        );
+        assert!(kind_errors(&d, Kind::Sqs, &[FIFO.into()], &cols(&["_key", "version"])).is_empty());
+        // A standard queue does not need one.
+        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+    }
 }
