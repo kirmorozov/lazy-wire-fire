@@ -653,6 +653,230 @@ async fn valkey_target() {
     .await;
 }
 
+/// A TCP stand-in in front of a Redis: `cut` aborts the live connections and refuses new ones
+/// until `heal`, so the engine sees its connection drop, as it does when Redis restarts.
+struct Flaky {
+    port: u16,
+    down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    refused: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    live: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Flaky {
+    async fn start(upstream: &'static str) -> Flaky {
+        use std::sync::atomic::Ordering::SeqCst;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let f = Flaky {
+            port: listener.local_addr().unwrap().port(),
+            down: Default::default(),
+            refused: Default::default(),
+            live: Default::default(),
+        };
+        let (down, refused, live) = (f.down.clone(), f.refused.clone(), f.live.clone());
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                if down.load(SeqCst) {
+                    refused.fetch_add(1, SeqCst);
+                    continue; // the socket closes here: the engine reads end of stream
+                }
+                let task = tokio::spawn(async move {
+                    if let Ok(mut server) = tokio::net::TcpStream::connect(upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                });
+                live.lock().unwrap().push(task.abort_handle());
+            }
+        });
+        f
+    }
+
+    fn cut(&self) {
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        for h in self.live.lock().unwrap().drain(..) {
+            h.abort();
+        }
+    }
+
+    fn heal(&self) {
+        self.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn refused(&self) -> usize {
+        self.refused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One stream entry: its id and fields.
+type Entry = (String, std::collections::BTreeMap<String, String>);
+
+fn bulk(r: &lazy_wire_fire::redis::Reply) -> String {
+    match r {
+        lazy_wire_fire::redis::Reply::Bulk(Some(b)) => String::from_utf8(b.clone()).unwrap(),
+        other => panic!("not a bulk string: {other:?}"),
+    }
+}
+
+/// `XRANGE` reply as entries, in stream order.
+fn stream_entries(reply: lazy_wire_fire::redis::Reply) -> Vec<Entry> {
+    use lazy_wire_fire::redis::Reply;
+    let Reply::Array(Some(list)) = reply else {
+        panic!("XRANGE reply: {reply:?}")
+    };
+    list.iter()
+        .map(|e| {
+            let Reply::Array(Some(parts)) = e else {
+                panic!("stream entry: {e:?}")
+            };
+            let Reply::Array(Some(fields)) = &parts[1] else {
+                panic!("stream fields: {:?}", parts[1])
+            };
+            let map = fields
+                .chunks(2)
+                .map(|kv| (bulk(&kv[0]), bulk(&kv[1])))
+                .collect();
+            (bulk(&parts[0]), map)
+        })
+        .collect()
+}
+
+/// The entries of a stream, once there are at least `n`.
+async fn entries_at_least(redis: &lazy_wire_fire::redis::Client, n: usize) -> Vec<Entry> {
+    let t = Duration::from_secs(3);
+    wait_for(
+        Duration::from_secs(30),
+        &format!("{n} stream entries"),
+        || async {
+            let r = redis
+                .command(
+                    &[
+                        b"XRANGE".to_vec(),
+                        b"orders:changes".to_vec(),
+                        b"-".to_vec(),
+                        b"+".to_vec(),
+                    ],
+                    t,
+                )
+                .await
+                .ok()?;
+            let e = stream_entries(r);
+            (e.len() >= n).then_some(e)
+        },
+    )
+    .await
+}
+
+/// A stream entry as (key, op, document).
+fn change(f: &std::collections::BTreeMap<String, String>) -> (String, String, Value) {
+    (
+        f["key"].clone(),
+        f["op"].clone(),
+        serde_json::from_str(&f["doc"]).unwrap(),
+    )
+}
+
+/// The redis kind as a stream producer: one `XADD` per changed key (its key, op and JSON
+/// document) to `orders:changes` on db 6. A dropped connection is retried, and the entry arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_stream_target() {
+    let root = need_db!();
+    use lazy_wire_fire::redis::{Client, RedisAddr};
+    use lazy_wire_fire::tls::TlsSpec;
+    let db = Db::fresh(&root, "redis_stream").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let proxy = Flaky::start("127.0.0.1:34379").await;
+    let pw_var = "LWF_TEST_REDIS_STREAM_PW";
+    std::env::set_var(pw_var, "redispw");
+    let direct = Client::new(
+        RedisAddr::parse("127.0.0.1:34379/6").unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        None,
+        Some("redispw".into()),
+    )
+    .unwrap();
+    let t = Duration::from_secs(3);
+    direct.command(&[b"FLUSHDB".to_vec()], t).await.unwrap();
+
+    let vars = json!({"password": format!("env:{pw_var}")});
+    db.target(
+        "stream",
+        "redis",
+        &format!("127.0.0.1:{}/6", proxy.port),
+        None,
+        &vars.to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('changes', 'stream', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            "{{#each docs}}XADD orders:changes * key {{redis_quote key}} op {{op}} doc {{redis_quote (json doc)}}{{/each}}",
+        ),
+    )
+    .await;
+    db.trigger("changes", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // Two inserts in one transaction: one entry per key, in no fixed order.
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    let first = entries_at_least(&direct, 2).await;
+    let mut got: Vec<_> = first.iter().map(|(_, f)| change(f)).collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("1".into(), "upsert".into(), json!({"sku": "A-1", "qty": 3})),
+            ("2".into(), "upsert".into(), json!({"sku": "B-2", "qty": 1})),
+        ]
+    );
+
+    // Each later change, waited for, is one more entry.
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    let s = entries_at_least(&direct, 3).await;
+    assert_eq!(s.len(), 3);
+    assert_eq!(
+        change(&s[2].1),
+        ("1".into(), "upsert".into(), json!({"sku": "A-1", "qty": 4}))
+    );
+
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    let s = entries_at_least(&direct, 4).await;
+    assert_eq!(s.len(), 4);
+    assert_eq!(
+        (change(&s[3].1).0, change(&s[3].1).1),
+        ("2".into(), "delete".into())
+    );
+
+    // Redis drops every connection and refuses new ones: the change is retried, and its
+    // entry arrives once Redis answers again.
+    proxy.cut();
+    db.exec("INSERT INTO orders VALUES (3, 'C-3', 7)").await;
+    wait_for(Duration::from_secs(30), "a refused connection", || async {
+        (proxy.refused() >= 1).then_some(())
+    })
+    .await;
+    assert_eq!(
+        entries_at_least(&direct, 0).await.len(),
+        4,
+        "nothing lands while Redis is cut off"
+    );
+    proxy.heal();
+    let s = entries_at_least(&direct, 5).await;
+    assert_eq!(
+        s.len(),
+        5,
+        "the retried change arrives once, nothing is lost"
+    );
+    assert_eq!(
+        change(&s[4].1),
+        ("3".into(), "upsert".into(), json!({"sku": "C-3", "qty": 7}))
+    );
+    inst.stop().await;
+}
+
 /// Tag-based purging through a real Varnish (`LAZYWF_TEST_VARNISH`, compose profile
 /// `varnish`; its backend is this test on 127.0.0.1:34682): pages tagged with a changed key are
 /// banned, other pages stay cached.
