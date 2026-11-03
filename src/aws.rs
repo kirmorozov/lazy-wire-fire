@@ -638,6 +638,241 @@ pub fn endpoint(service: &str, region: &str) -> BaseUrl {
     }
 }
 
+// ---- `aws-sqs://` and `aws-kinesis://` endpoints ----
+//
+// `aws-sqs://[<region>/]<account-id>/<queue-name>` and `aws-kinesis://[<region>/]<stream-name>`,
+// each with an optional `?endpoint=http(s)://host:port` (emulators, VPC endpoints). The region is
+// in the URL, or else from the default chain (`region_from`). Credentials never go in the URL.
+
+/// The scheme of a URL (`aws-sqs` for `aws-sqs://…`), when it has one.
+pub fn scheme_of(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once("://")?;
+    let valid = !scheme.is_empty()
+        && scheme
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.');
+    valid.then_some(scheme)
+}
+
+/// `aws-sqs://…` for kind sqs and `aws-kinesis://…` for kind kinesis (`service` is both the
+/// kind name and the scheme suffix). Any other URL is refused, with the reason.
+fn scheme_error(url: &str, service: &str) -> anyhow::Error {
+    let want = format!("aws-{service}://");
+    if url.starts_with("https://") || url.starts_with("http://") {
+        anyhow!("kind {service} takes `{want}` endpoints, not a plain http(s) URL")
+    } else if let Some(other) = scheme_of(url).filter(|s| s.starts_with("aws-")) {
+        anyhow!("kind {service} takes `{want}` endpoints, not `{other}://`")
+    } else {
+        anyhow!("kind {service} takes `{want}` endpoints, not `{url}`")
+    }
+}
+
+/// The path segments of an `aws-<service>://` URL, and its `?endpoint=` override (validated).
+fn split_aws_url(url: &str, service: &str) -> Result<(Vec<String>, Option<String>)> {
+    let rest = url
+        .strip_prefix(&format!("aws-{service}://"))
+        .ok_or_else(|| scheme_error(url, service))?;
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    if path.contains('@') {
+        bail!("`{url}`: credentials belong in the target's vars (secret references), never in the URL");
+    }
+    if path.is_empty() || path.split('/').any(str::is_empty) {
+        bail!("`{url}`: the path has an empty segment");
+    }
+    let mut endpoint = None;
+    for part in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let Some(value) = part.strip_prefix("endpoint=") else {
+            let name = part.split('=').next().unwrap_or(part);
+            bail!("`{url}`: unknown query parameter `{name}` (the only one is `endpoint`)");
+        };
+        if endpoint.is_some() {
+            bail!("`{url}`: `endpoint` is given twice");
+        }
+        let value = percent_decode(value);
+        let base = BaseUrl::parse(&value)
+            .with_context(|| format!("`{url}`: `endpoint` must be http(s)://host:port"))?;
+        if !base.base.is_empty() {
+            bail!("`{url}`: `endpoint` must be http(s)://host:port, without a path");
+        }
+        endpoint = Some(value);
+    }
+    Ok((path.split('/').map(str::to_string).collect(), endpoint))
+}
+
+fn valid_region(r: &str) -> bool {
+    // `eu-west-1`, `us-gov-west-1`: lowercase letters and digits, hyphens, ending in a digit.
+    r.contains('-')
+        && r.starts_with(|c: char| c.is_ascii_lowercase())
+        && r.ends_with(|c: char| c.is_ascii_digit())
+        && r.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
+/// The regional address of a service, or the `?endpoint=` override when the URL gives one.
+pub fn address(service: &str, endpoint_override: Option<&str>, region: &str) -> Result<BaseUrl> {
+    match endpoint_override {
+        Some(e) => BaseUrl::parse(e),
+        None => Ok(endpoint(service, region)),
+    }
+}
+
+/// An `aws-sqs://` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqsUrl {
+    pub region: Option<String>,
+    pub account: String,
+    pub queue: String,
+    /// `?endpoint=`, as written (a validated http(s) URL).
+    pub endpoint: Option<String>,
+}
+
+impl SqsUrl {
+    /// `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`.
+    pub fn parse(url: &str) -> Result<SqsUrl> {
+        let (segs, endpoint) = split_aws_url(url, "sqs")?;
+        let (region, account, queue) = match segs.as_slice() {
+            [a, q] => (None, a, q),
+            [r, a, q] => (Some(r), a, q),
+            _ => bail!(
+                "`{url}`: kind sqs takes `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`"
+            ),
+        };
+        if let Some(r) = region {
+            if !valid_region(r) {
+                bail!("`{url}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+            }
+        }
+        if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("`{url}`: the account id is twelve digits");
+        }
+        let stem = queue.strip_suffix(".fifo").unwrap_or(queue);
+        let name_ok = !stem.is_empty()
+            && queue.len() <= 80
+            && stem
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+        if !name_ok {
+            bail!("`{url}`: the queue name is 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo`");
+        }
+        Ok(SqsUrl {
+            region: region.cloned(),
+            account: account.clone(),
+            queue: queue.clone(),
+            endpoint,
+        })
+    }
+
+    /// A FIFO queue: its name ends in `.fifo`.
+    pub fn fifo(&self) -> bool {
+        self.queue.ends_with(".fifo")
+    }
+}
+
+/// An `aws-kinesis://` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KinesisUrl {
+    pub region: Option<String>,
+    pub stream: String,
+    /// `?endpoint=`, as written (a validated http(s) URL).
+    pub endpoint: Option<String>,
+}
+
+impl KinesisUrl {
+    /// `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`.
+    pub fn parse(url: &str) -> Result<KinesisUrl> {
+        let (segs, endpoint) = split_aws_url(url, "kinesis")?;
+        let (region, stream) = match segs.as_slice() {
+            [s] => (None, s),
+            [r, s] => (Some(r), s),
+            _ => bail!(
+                "`{url}`: kind kinesis takes `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`"
+            ),
+        };
+        if let Some(r) = region {
+            if !valid_region(r) {
+                bail!("`{url}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+            }
+        }
+        let ok = (1..=128).contains(&stream.len())
+            && stream
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
+        if !ok {
+            bail!("`{url}`: a stream name is 1 to 128 letters, digits, `-`, `_` or `.`");
+        }
+        Ok(KinesisUrl {
+            region: region.cloned(),
+            stream: stream.clone(),
+            endpoint,
+        })
+    }
+}
+
+/// The region of an AWS endpoint: the URL's, else `AWS_REGION`, else `AWS_DEFAULT_REGION`, else
+/// `region` in the shared config file's profile (`config`, read only when the others are unset).
+pub fn region_from(
+    from_url: Option<&str>,
+    env_var: impl Fn(&str) -> Option<String>,
+    config: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    from_url
+        .map(str::to_string)
+        .or_else(|| env_var("AWS_REGION"))
+        .or_else(|| env_var("AWS_DEFAULT_REGION"))
+        .or_else(config)
+}
+
+/// The region of an AWS endpoint, resolved through `region_from` with the process environment.
+pub fn resolve_region(from_url: Option<&str>) -> Result<String> {
+    region_from(from_url, env, || {
+        let profile = env("AWS_PROFILE").unwrap_or_else(|| "default".into());
+        config_region(&config_file_text()?, &profile)
+    })
+    .ok_or_else(|| {
+        anyhow!(
+            "no AWS region: give it in the endpoint (`aws-sqs://<region>/…` or `aws-kinesis://<region>/…`), \
+             or set AWS_REGION or AWS_DEFAULT_REGION (or `region` in the profile of the shared config file)"
+        )
+    })
+}
+
+fn config_file_text() -> Option<String> {
+    let path = match env("AWS_CONFIG_FILE") {
+        Some(p) => p,
+        None => format!("{}/.aws/config", env("HOME")?),
+    };
+    std::fs::read_to_string(path).ok()
+}
+
+/// `region` of `profile` in the text of a shared config file (`[default]`, `[profile <name>]`).
+pub fn config_region(text: &str, profile: &str) -> Option<String> {
+    let wanted = if profile == "default" {
+        "default".to_string()
+    } else {
+        format!("profile {profile}")
+    };
+    let mut in_profile = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_profile = name.trim() == wanted;
+            continue;
+        }
+        if let (true, Some((k, v))) = (in_profile, line.split_once('=')) {
+            if k.trim().eq_ignore_ascii_case("region") && !v.trim().is_empty() {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// The error code of an AWS JSON-protocol answer: the `x-amzn-ErrorType` header, else the
 /// `__type` field of a JSON body. The namespace (`com.amazonaws.sqs#`) and any `:<uri>` suffix
 /// are dropped.
@@ -737,6 +972,178 @@ mod classify_tests {
         assert_eq!(
             canonical_target("/a b/c%2Fd+e?z=1&a=x%20y&b"),
             ("/a%20b/c%2Fd%2Be".into(), "a=x%20y&b=&z=1".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    fn sqs(url: &str) -> Result<SqsUrl> {
+        SqsUrl::parse(url)
+    }
+
+    fn kin(url: &str) -> Result<KinesisUrl> {
+        KinesisUrl::parse(url)
+    }
+
+    #[test]
+    fn sqs_url_forms() {
+        let u = sqs("aws-sqs://123456789012/orders").unwrap();
+        assert_eq!(u.region, None);
+        assert_eq!(
+            (u.account.as_str(), u.queue.as_str()),
+            ("123456789012", "orders")
+        );
+        assert_eq!(u.endpoint, None);
+        assert!(!u.fifo());
+        let u = sqs("aws-sqs://eu-west-1/123456789012/orders.fifo").unwrap();
+        assert_eq!(u.region.as_deref(), Some("eu-west-1"));
+        assert!(u.fifo());
+        // the emulator's override, raw and percent-encoded
+        let u = sqs("aws-sqs://us-east-1/000000000000/q?endpoint=http://127.0.0.1:34561").unwrap();
+        assert_eq!(u.endpoint.as_deref(), Some("http://127.0.0.1:34561"));
+        let u = sqs("aws-sqs://us-east-1/000000000000/q?endpoint=http%3A%2F%2F127.0.0.1%3A34561")
+            .unwrap();
+        assert_eq!(u.endpoint.as_deref(), Some("http://127.0.0.1:34561"));
+        // a VPC endpoint is https, with a trailing slash allowed
+        assert!(
+            sqs("aws-sqs://eu-west-1/123456789012/q?endpoint=https://vpce.example:443/").is_ok()
+        );
+    }
+
+    #[test]
+    fn sqs_refuses_bad_urls() {
+        for url in [
+            // the scheme: aws-sqs:// only
+            "https://sqs.eu-west-1.amazonaws.com/123456789012/orders",
+            "aws-kinesis://eu-west-1/orders",
+            "sqs://123456789012/orders",
+            // the path: two or three segments, no empty ones
+            "aws-sqs://orders",
+            "aws-sqs://eu-west-1/123456789012/a/b",
+            "aws-sqs://123456789012/orders/",
+            "aws-sqs://",
+            // the account and the region
+            "aws-sqs://12345678901/orders",
+            "aws-sqs://eu-west-1/12345678901a/orders",
+            "aws-sqs://EU-WEST-1/123456789012/orders",
+            "aws-sqs://arn:aws:sqs:eu-west-1/123456789012/orders",
+            // the queue name
+            "aws-sqs://123456789012/.fifo",
+            "aws-sqs://123456789012/a.b",
+            "aws-sqs://123456789012/x.fifo.fifo",
+            // userinfo, in the path or in the override
+            "aws-sqs://u:p@123456789012/orders",
+            "aws-sqs://123456789012/orders?endpoint=http://u:p@127.0.0.1:34561",
+            // the query: `endpoint` only, once, http(s), no path
+            "aws-sqs://123456789012/orders?region=eu-west-1",
+            "aws-sqs://123456789012/orders?endpoint=ftp://127.0.0.1:21",
+            "aws-sqs://123456789012/orders?endpoint=http://127.0.0.1:34561/path",
+            "aws-sqs://123456789012/orders?endpoint=http://a:1&endpoint=http://b:2",
+        ] {
+            assert!(sqs(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn kinesis_url_forms() {
+        let u = kin("aws-kinesis://orders").unwrap();
+        assert_eq!((u.region, u.stream.as_str()), (None, "orders"));
+        let u = kin("aws-kinesis://eu-west-1/orders.v2_a-b").unwrap();
+        assert_eq!(u.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(u.stream, "orders.v2_a-b");
+        let u = kin("aws-kinesis://orders?endpoint=http://127.0.0.1:34562").unwrap();
+        assert_eq!(u.endpoint.as_deref(), Some("http://127.0.0.1:34562"));
+    }
+
+    #[test]
+    fn kinesis_refuses_bad_urls() {
+        for url in [
+            "https://kinesis.eu-west-1.amazonaws.com",
+            "aws-sqs://123456789012/orders",
+            "aws-kinesis://",
+            "aws-kinesis://eu-west-1/a/b",
+            "aws-kinesis://orders/",
+            "aws-kinesis://eu-west-1/bad name",
+            "aws-kinesis://u:p@orders",
+            "aws-kinesis://orders?endpoint=https://k.example/x",
+            "aws-kinesis://orders?stream=x",
+            // an ARN does not fit the URL form (its slash and colons split the path)
+            "aws-kinesis://arn:aws:kinesis:eu-west-1:123456789012:stream/orders",
+        ] {
+            assert!(kin(url).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn scheme_errors_name_the_scheme() {
+        let e = sqs("https://sqs.eu-west-1.amazonaws.com/123456789012/q").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("not a plain http(s) URL"),
+            "{e:#}"
+        );
+        let e = kin("aws-sqs://123456789012/q").unwrap_err();
+        assert!(format!("{e:#}").contains("not `aws-sqs://`"), "{e:#}");
+    }
+
+    #[test]
+    fn region_comes_from_the_url_then_the_environment_then_the_profile() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |n: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == n)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let config = || Some("ap-south-1".to_string());
+        // the URL wins
+        assert_eq!(
+            region_from(
+                Some("eu-west-1"),
+                env(&[("AWS_REGION", "us-east-1")]),
+                config
+            )
+            .as_deref(),
+            Some("eu-west-1")
+        );
+        // AWS_REGION, then AWS_DEFAULT_REGION
+        assert_eq!(
+            region_from(
+                None,
+                env(&[("AWS_REGION", "us-east-1"), ("AWS_DEFAULT_REGION", "x-y-1")]),
+                config
+            )
+            .as_deref(),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            region_from(None, env(&[("AWS_DEFAULT_REGION", "us-west-2")]), config).as_deref(),
+            Some("us-west-2")
+        );
+        // the shared config profile, only when the environment has none
+        assert_eq!(
+            region_from(None, env(&[]), config).as_deref(),
+            Some("ap-south-1")
+        );
+        // none of them: no region
+        assert_eq!(region_from(None, env(&[]), || None), None);
+    }
+
+    #[test]
+    fn config_region_reads_the_named_profile() {
+        let text = "# shared config\n[default]\nregion = us-east-2\n\n[profile work]\noutput = json\nregion=eu-central-1\n";
+        assert_eq!(config_region(text, "default").as_deref(), Some("us-east-2"));
+        assert_eq!(config_region(text, "work").as_deref(), Some("eu-central-1"));
+        assert_eq!(config_region(text, "missing"), None);
+        // a `region` under another profile is not this one's
+        assert_eq!(
+            config_region(
+                "[profile a]\nregion = x-y-1\n[default]\noutput=json\n",
+                "default"
+            ),
+            None
         );
     }
 }

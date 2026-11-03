@@ -153,7 +153,7 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>,
 ///   and no `once` step that purges the queue (`PurgeQueue`; the only purge-like action named
 ///   in the templates we can recognize, see the report).
 /// - `sqs`: a batch holds at most 10 keys (`batch_max_keys`, required) and 256 KiB.
-/// - A FIFO queue (the URL names a `.fifo` queue) needs a `version` column: it is the
+/// - A FIFO queue (the endpoint names a `.fifo` queue) needs a `version` column: it is the
 ///   `MessageDeduplicationId` (decision D5).
 pub fn kind_errors(
     def: &RuleDef,
@@ -238,16 +238,12 @@ pub fn kind_errors(
         if def.batch_max_bytes.is_some_and(|n| n > 262_144) {
             out.push("`batch_max_bytes` is over 262144, the most a SendMessageBatch takes".into());
         }
-        let fifo = endpoints.iter().any(|e| {
-            e.split(['?', '#'])
-                .next()
-                .unwrap_or("")
-                .trim_end_matches('/')
-                .ends_with(".fifo")
-        });
+        let fifo = endpoints
+            .iter()
+            .any(|e| crate::aws::SqsUrl::parse(e).is_ok_and(|u| u.fifo()));
         if fifo && !columns.iter().any(|c| c == "version") {
             out.push(
-                "a FIFO queue (a `.fifo` URL) needs a `version` column in a select: it is the MessageDeduplicationId"
+                "a FIFO queue (a queue name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
                     .into(),
             );
         }
@@ -433,8 +429,8 @@ mod kind_tests {
     use super::*;
     use crate::model::{Kind, RawRule, ResetStep};
 
-    const QUEUE: &str = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders";
-    const FIFO: &str = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders.fifo";
+    const QUEUE: &str = "aws-sqs://eu-west-1/123456789012/orders";
+    const FIFO: &str = "aws-sqs://eu-west-1/123456789012/orders.fifo";
 
     fn def() -> RuleDef {
         let mut d = RuleDef::placeholder(&RawRule {
@@ -538,7 +534,7 @@ mod kind_tests {
         assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
     }
 
-    const STREAM: &str = "https://kinesis.eu-west-1.amazonaws.com";
+    const STREAM: &str = "aws-kinesis://eu-west-1/orders";
 
     #[test]
     fn kinesis_batches_hold_at_most_500_records_and_5_mib() {
