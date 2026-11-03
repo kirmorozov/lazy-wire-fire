@@ -21,8 +21,10 @@ object.
 | column | meaning |
 |---|---|
 | `name` | referenced by rules |
-| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. An action goes to every endpoint |
+| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
+SQS queue, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one, the queue
+URL. An action goes to every endpoint |
 | `tls` | empty (TLS for `https://` / `rediss://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
@@ -41,6 +43,15 @@ Identity), EC2 instance metadata. The template renders paths inside the bucket
 (`PUT /products/1.json`); the tool adds `Host`, `x-amz-date`, `x-amz-content-sha256`,
 `Authorization` (and `x-amz-security-token`), and the bucket for path style.
 
+**`sqs`**: the endpoint is the queue URL, and one action is one `SendMessageBatch` request to the
+service root (`POST /`): the template names the action (`X-Amz-Target:
+AmazonSQS.SendMessageBatch`) and the queue in the body (`QueueUrl`, from `{{json endpoint.url}}`).
+`vars.region` is required; `vars.access_key_ref`, `vars.secret_key_ref` (a pair) and optional
+`vars.session_token_ref` must be references, and without them the default AWS chain is used, as
+for `http.s3`; the tool signs the request SigV4 for service `sqs` (adds `Host`, `x-amz-date`,
+`x-amz-content-sha256`, `Authorization`, and `x-amz-security-token` with a session token). One
+entry per key, the answer per entry: [below](#sqs-targets).
+
 **`expect`**: a SQL condition the source database evaluates over the response, as the row `r`
 of a derived table (`SELECT 1 FROM (SELECT … ) AS r WHERE (<expect>)`). The action succeeded
 when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` functions, `CASE`, …
@@ -57,6 +68,14 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
   ran. A condition that does not name `status` keeps the 2xx rule; one that does replaces it.
 * Redis error replies always fail. An unmet condition on an http 5xx, 408 or 429 is transient
   (retried); on any other answer it is a refusal.
+* For `sqs`, the answer of one `SendMessageBatch` names its entries, so `expect` runs once per
+  entry: `status` is the request's HTTP status and `body` is the entry's own JSON (its record in
+  `Successful`). An entry whose `expect` is not met is refused on its own.
+* On `http.s3` and `sqs`, an error answer is transient when its code (the
+  `x-amzn-errortype` header, else the body's `__type`) is `ThrottlingException`,
+  `RequestThrottled`, `ProvisionedThroughputExceededException`, `ServiceUnavailable` or
+  `InternalFailure`, whatever the status (AWS JSON errors come as HTTP 400); every other error
+  code is a refusal.
 * Comparisons follow SQL: NULL is not met (a missing JSON field gives NULL), text compares in
   the connection's collation. `JSON_VALUE` of a JSON boolean differs between MySQL (`true`) and
   MariaDB (`1`); `JSON_CONTAINS` and `JSON_UNQUOTE(JSON_EXTRACT(…))` behave alike on both.
@@ -72,6 +91,7 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 |---|---|
 | search `_bulk` | `JSON_CONTAINS(body, 'false', '$.errors')` |
 | S3 `PUT` / `DELETE` | `status IN (200, 204)` |
+| SQS `SendMessageBatch` (per entry) | `JSON_EXTRACT(body, '$.MessageId') IS NOT NULL` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
 | an API that answers 200 with a state | `JSON_UNQUOTE(JSON_EXTRACT(body, '$.state')) = 'stored'` |
 | a header | `JSON_UNQUOTE(JSON_EXTRACT(headers, '$."x-ack"')) = 'yes'` |
@@ -95,6 +115,42 @@ needs.
 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, doc = EXCLUDED.doc{{/if}}{{/each}}
 ```
 
+### SQS targets
+
+`sqs` sends to an Amazon SQS queue: one `SendMessageBatch` per action, one entry per key (`Id` is
+the key's index in the batch), and the answer reports each entry by that `Id` — the kind's answer
+is per item, not per action.
+
+* **Batch limits.** With `fire_per = batch`, `batch_max_keys` is required and holds 1 to 10 (the
+  most entries a `SendMessageBatch` takes); a rule without it, or with more, does not load.
+  `batch_max_bytes` defaults to 262144 (256 KiB, the most a request takes) and cannot be set
+  higher. With `fire_per = key` each key is its own one-entry request, so no batch is sized.
+* **Outcomes.** An entry in `Successful` whose `expect` is met is confirmed, and its key is never
+  sent again. An entry in `Failed` with `SenderFault: true` is refused on its own (no bisection:
+  the answer names the entry); five such refusals, while other keys went through, drop the key and
+  name it in `last_error`. Any other `Failed` entry, and an entry the answer does not name, is
+  retried — only the entries that did not go through wait, and the batches not yet sent wait with
+  them. A whole-request refusal (an error code that is not transient) is bisected down to the key
+  that fails alone, as with `http`.
+* **FIFO queues.** A queue whose URL ends in `.fifo` is FIFO: the rule's selects must return a
+  `version` column (refused at load without it), which the template writes as the entry's
+  `MessageDeduplicationId`; the key is the `MessageGroupId` (`{{json key}}`). Use a version that
+  changes with each state you want delivered: the queue's deduplication drops an entry whose id it
+  already saw, so a version shared by two keys drops one of them; a NULL version leaves the entry
+  without an id, which the queue refuses on its own (and drops after five refusals).
+* **Reset steps.** The kind only appends: a sent message cannot be recalled or deleted by key. A
+  `for_each: stray` step does not load ("a stray cleanup needs a target that can delete keys; kind
+  sqs only appends"), and neither does a `once` step whose template purges the queue
+  (`PurgeQueue`; recognized by text, so a purge built from variables is not caught). Still
+  allowed: `once` (an announcement message), `for_each: snapshot` (every key is sent again;
+  consumers must tolerate that) and `reset_requested`.
+* **Contract.** The queue receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: an entry can arrive twice (a retry after a lost answer; a snapshot
+  reset), and only a FIFO queue's deduplication filters repeats. Consumers apply an entry as the
+  key's current state and drop what they applied already. On a FIFO queue one key's entries keep
+  their order (they share its `MessageGroupId`); across keys, and on a standard queue, no order is
+  guaranteed.
+
 ## Rules
 
 `lazy_wire_fire_rule`
@@ -107,7 +163,7 @@ ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, doc = EXCLUDED.doc{{/if}}{{
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
 | `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry) |
-| `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys |
+| `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
 | `reset_steps` | JSON array, [below](#reset-steps) |
 | `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded |
@@ -236,6 +292,8 @@ and resets only when that part of the binlog was purged. An interrupted reset st
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
+* An append-only kind such as `sqs` refuses two of these at load: a `for_each: stray` step, and a
+  `once` step that purges what it has sent — [SQS targets](#sqs-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
@@ -341,6 +399,27 @@ INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template) VALU
  '{{#each docs}}{{#if (eq op "delete")}}DEL {{redis_quote target.vars.prefix key}}{{else}}SET {{redis_quote target.vars.prefix key}} {{redis_quote (json doc)}}{{/if}}{{/each}}');
 ```
 
+**Redis Streams**, one `XADD` per key — a consumer reads the stream as a feed of changes:
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, vars)
+VALUES ('stream', 'redis', 'redis:6379/1', '{"password": "env:REDIS_PASSWORD"}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders_changes', 'stream', 'key',
+ 'SELECT id AS _key, status, total, NULL AS _op FROM orders WHERE id IN (:keys)',
+ '{{#each docs}}XADD orders:changes * key {{redis_quote key}} op {{op}} doc {{redis_quote (json doc)}}{{/each}}', 100);
+```
+
+A trigger on `orders` marks `{{new.id}}`; a deleted order reaches the consumer as `op = delete`
+(because the select carries `NULL AS _op`). Each entry has the fields `key`, `op` and `doc`. The
+reply to `XADD` is the new entry id, which `expect` would see in `text` (`body` holds it as a JSON
+string); here `expect` is empty, which confirms any reply that is not an error.
+
+The delivery contract is latest state per key, at-least-once: the select runs at flush time, so
+the last entry for a key is its current state; and a consumer may see an entry twice — when the
+reply is lost after the server stored the `XADD`, the key stays pending and is re-sent. Within
+one rule, entries for one key come in change order (the rule's single lane); entries for
+different keys in the same flush have no defined order.
+
 **JSON objects in S3**, kept in sync (a `PUT` overwrites, a `DELETE` of a missing object succeeds):
 
 ```sql
@@ -361,6 +440,31 @@ Content-Type: application/json
 
 The `_op` column is what turns a deleted customer into a `DELETE`: a key that no select returns,
 while a select has `_op`, is deleted.
+
+**Messages to an SQS queue**, one entry per key (a consumer applies each message as the key's
+latest state):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, vars) VALUES ('queue', 'sqs',
+ 'https://sqs.eu-west-1.amazonaws.com/123456789012/orders',
+ 'JSON_EXTRACT(body, '$.MessageId') IS NOT NULL',
+ '{"region": "eu-west-1", "access_key_ref": "env:ORDERS_AK", "secret_key_ref": "env:ORDERS_SK"}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template) VALUES
+ ('orders_queue', 'queue', 'batch', 10,
+  'SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)',
+  'POST / HTTP/1.1
+X-Amz-Target: AmazonSQS.SendMessageBatch
+Content-Type: application/x-amz-json-1.0
+
+{"QueueUrl": {{json endpoint.url}}, "Entries": [{{#each docs}}{"Id": "{{@index}}", "MessageBody": {{json (json doc)}}}{{#unless @last}}, {{/unless}}{{/each}}]}');
+```
+
+A trigger on `customers` marks `{{new.id}}`. Up to 10 keys go out as one `SendMessageBatch`, and
+the answer's entries are checked one by one: `expect` runs per entry with the entry's own JSON as
+`body` (here it confirms the `MessageId` SQS returns for the message). For a FIFO queue (a `.fifo`
+URL) the select adds a `version` column, one value per state you want delivered (`CONCAT(c.id,
+'#', c.rev) AS version` here), and the entry carries `"MessageGroupId": {{json key}}` and
+`"MessageDeduplicationId": {{json doc.version}}`.
 
 **Search index re-sync in place** (OpenSearch / Elasticsearch): upsert everything, then delete
 what the index has and the database does not.
