@@ -3647,3 +3647,573 @@ async fn commit_fence_writes_per_flush_and_moves_no_position() {
     );
     inst.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// `pubsub` targets, against Google's Pub/Sub emulator (`LAZYWF_TEST_PUBSUB`, e.g.
+// http://127.0.0.1:34563; the `pubsub` compose profile). The tests read the messages back
+// through a subscription on the emulator (its REST API, project `lwf-test`).
+
+const PUBSUB_PUBLISH: &str = r#"POST /v1/projects/{{endpoint.project}}/topics/{{endpoint.topic}}:publish HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"data": {{json (base64 (json doc))}}, "attributes": {"key": {{json key}}, "op": {{json op}}}{{#if @root.target.vars.ordering}}, "orderingKey": {{json key}}{{/if}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+fn pubsub_root() -> Option<String> {
+    std::env::var("LAZYWF_TEST_PUBSUB")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+macro_rules! need_pubsub {
+    () => {
+        match pubsub_root() {
+            Some(u) => u,
+            None => {
+                eprintln!("LAZYWF_TEST_PUBSUB not set: skipping (docker compose --profile pubsub up -d --wait pubsub-emulator)");
+                return;
+            }
+        }
+    };
+}
+
+/// The Pub/Sub REST API of the emulator.
+struct Pubsub {
+    host: String,
+    client: lazy_wire_fire::http::Client,
+}
+
+impl Pubsub {
+    fn new(root: &str) -> Pubsub {
+        Pubsub {
+            host: root.trim_start_matches("http://").to_string(),
+            client: lazy_wire_fire::http::Client::new(
+                lazy_wire_fire::http::BaseUrl::parse(root).unwrap(),
+                &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    async fn call(&self, method: &str, path: &str, body: Value) -> Value {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: method.into(),
+            target: path.into(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("Host", self.host.clone());
+        req.set_header("Content-Type", "application/json".into());
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            (200..300).contains(&resp.status),
+            "{method} {path}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+        serde_json::from_slice(&resp.body).unwrap_or(Value::Null)
+    }
+
+    /// Creates a topic; the endpoint the target uses is `gc-pubsub://lwf-test/<topic>`.
+    async fn topic(&self, name: &str) {
+        self.call(
+            "PUT",
+            &format!("/v1/projects/lwf-test/topics/{name}"),
+            json!({}),
+        )
+        .await;
+    }
+
+    async fn subscription(&self, topic: &str, name: &str, ordering: bool) {
+        // The emulator keeps subscriptions across runs: start each test from an empty one.
+        let path = format!("/v1/projects/lwf-test/subscriptions/{name}");
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "DELETE".into(),
+            target: path.clone(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        req.set_header("Host", self.host.clone());
+        self.client
+            .send(&req, Duration::from_secs(10))
+            .await
+            .unwrap();
+        self.call(
+            "PUT",
+            &path,
+            json!({"topic": format!("projects/lwf-test/topics/{topic}"), "enableMessageOrdering": ordering}),
+        )
+        .await;
+    }
+
+    /// The messages the subscription holds now; they are acknowledged, so each comes once.
+    async fn pull(&self, sub: &str) -> Vec<Value> {
+        let v = self
+            .call(
+                "POST",
+                &format!("/v1/projects/lwf-test/subscriptions/{sub}:pull"),
+                // The emulator holds an empty pull for ~10 s unless told to return at once.
+                json!({"maxMessages": 100, "returnImmediately": true}),
+            )
+            .await;
+        let got = v
+            .get("receivedMessages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<Value> = got.iter().filter_map(|m| m.get("ackId").cloned()).collect();
+        if !ids.is_empty() {
+            self.call(
+                "POST",
+                &format!("/v1/projects/lwf-test/subscriptions/{sub}:acknowledge"),
+                json!({"ackIds": ids}),
+            )
+            .await;
+        }
+        got.into_iter()
+            .filter_map(|m| m.get("message").cloned())
+            .collect()
+    }
+}
+
+/// Pulls until `n` messages have arrived (or the time is up).
+async fn pubsub_pull_until(ps: &Pubsub, sub: &str, n: usize, secs: u64) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut got = Vec::new();
+    loop {
+        got.extend(ps.pull(sub).await);
+        if got.len() >= n {
+            return got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out with {} of {n} messages",
+            got.len()
+        );
+        sleep_ms(100).await;
+    }
+}
+
+/// A message's document, key and op (`data` is base64 of the document's JSON).
+fn pubsub_decoded(m: &Value) -> (Value, String, String) {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(m["data"].as_str().unwrap())
+        .unwrap();
+    let doc: Value = serde_json::from_slice(&data).unwrap();
+    let key = m["attributes"]["key"].as_str().unwrap().to_string();
+    let op = m["attributes"]["op"].as_str().unwrap().to_string();
+    (doc, key, op)
+}
+
+/// A customers table, a topic with a subscription, and the rule `queue` that publishes each
+/// changed row to the topic (`ordering`: the key is the ordering key).
+async fn pubsub_rule(
+    db: &Db,
+    ps: &Pubsub,
+    topic: &str,
+    sub: &str,
+    ordering: bool,
+    selects: &str,
+) -> String {
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL)")
+        .await;
+    tables(db).await;
+    ps.topic(topic).await;
+    ps.subscription(topic, sub, ordering).await;
+    let vars = if ordering {
+        r#"{"ordering": true}"#
+    } else {
+        "{}"
+    };
+    db.target(
+        "queue",
+        "pubsub",
+        &format!(
+            "gc-pubsub://lwf-test/{topic}?endpoint={}",
+            pubsub_root().unwrap()
+        ),
+        Some("JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0"),
+        vars,
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('queue', 'queue', 'batch', 1000, ?, ?, 100)",
+        (selects, PUBSUB_PUBLISH),
+    )
+    .await;
+    db.trigger("queue", "customers", Some("{{new.id}}"), None)
+        .await;
+    pubsub_root().unwrap()
+}
+
+const PUBSUB_SELECT: &str =
+    "SELECT c.id AS _key, c.id, c.name, c.rev, NULL AS _op FROM customers c WHERE c.id IN (:keys)";
+
+/// Every changed key arrives once, with its document as `data` and `key` / `op` attributes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_every_key_arrives_with_data_and_attributes() {
+    let root = need_db!();
+    let ps = Pubsub::new(&need_pubsub!());
+    let db = Db::fresh(&root, "pubsub_all").await;
+    let topic = format!("lwf_all_{}", std::process::id());
+    pubsub_rule(&db, &ps, &topic, "all-s", false, PUBSUB_SELECT).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1)")
+        .await;
+    let got = pubsub_pull_until(&ps, "all-s", 3, 30).await;
+    sleep_ms(1000).await;
+    let more = ps.pull("all-s").await;
+    assert!(more.is_empty(), "a key was sent twice: {more:?}");
+    let mut keys: Vec<String> = got
+        .iter()
+        .map(|m| {
+            let (doc, key, op) = pubsub_decoded(m);
+            assert_eq!(
+                doc["id"].as_i64().unwrap().to_string(),
+                key,
+                "key attribute"
+            );
+            assert_eq!(op, "upsert");
+            assert_eq!(
+                doc["name"].as_str().unwrap(),
+                match key.as_str() {
+                    "1" => "Ann",
+                    "2" => "Bob",
+                    _ => "Cy",
+                }
+            );
+            key
+        })
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["1", "2", "3"]);
+    inst.stop().await;
+}
+
+/// An update is a new message with the new document; a delete arrives with `op` delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_update_and_delete_arrive_as_ops() {
+    let root = need_db!();
+    let ps = Pubsub::new(&need_pubsub!());
+    let db = Db::fresh(&root, "pubsub_upd").await;
+    let topic = format!("lwf_upd_{}", std::process::id());
+    pubsub_rule(&db, &ps, &topic, "upd-s", false, PUBSUB_SELECT).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1)")
+        .await;
+    let first = pubsub_pull_until(&ps, "upd-s", 1, 30).await;
+    assert_eq!(pubsub_decoded(&first[0]).2, "upsert");
+    db.exec("UPDATE customers SET name = 'Anna', rev = 2 WHERE id = 1")
+        .await;
+    let second = pubsub_pull_until(&ps, "upd-s", 1, 30).await;
+    let (doc, key, op) = pubsub_decoded(&second[0]);
+    assert_eq!(
+        (key.as_str(), op.as_str(), doc["name"].as_str()),
+        ("1", "upsert", Some("Anna"))
+    );
+    db.exec("DELETE FROM customers WHERE id = 1").await;
+    let third = pubsub_pull_until(&ps, "upd-s", 1, 30).await;
+    let (_, key, op) = pubsub_decoded(&third[0]);
+    assert_eq!(
+        (key.as_str(), op.as_str()),
+        ("1", "delete"),
+        "third pull: {third:?}"
+    );
+    inst.stop().await;
+}
+
+/// With `ordering` on, the messages of one key arrive in the order they were sent, and the
+/// newest state is the last one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_ordering_keeps_the_order_of_a_key() {
+    let root = need_db!();
+    let ps = Pubsub::new(&need_pubsub!());
+    let db = Db::fresh(&root, "pubsub_ord").await;
+    let topic = format!("lwf_ord_{}", std::process::id());
+    pubsub_rule(&db, &ps, &topic, "ord-s", true, PUBSUB_SELECT).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'v1',1)")
+        .await;
+    pubsub_pull_until(&ps, "ord-s", 1, 30).await;
+    db.exec("UPDATE customers SET name = 'v2', rev = 2 WHERE id = 1")
+        .await;
+    pubsub_pull_until(&ps, "ord-s", 1, 30).await;
+    db.exec("UPDATE customers SET name = 'v3', rev = 3 WHERE id = 1")
+        .await;
+    let last = pubsub_pull_until(&ps, "ord-s", 1, 30).await;
+    let (doc, _, _) = pubsub_decoded(last.last().unwrap());
+    assert_eq!(doc["rev"].as_i64(), Some(3), "the newest state is not last");
+    inst.stop().await;
+}
+
+/// An outage of the endpoint is retried: keys changed during it are not lost, and arrive
+/// after the heal. Nothing is delivered while the stand-in refuses connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_retry_after_an_outage_loses_nothing() {
+    let root = need_db!();
+    let direct = need_pubsub!();
+    let ps = Pubsub::new(&direct);
+    let upstream: &'static str = Box::leak(
+        direct
+            .trim_start_matches("http://")
+            .to_string()
+            .into_boxed_str(),
+    );
+    let flaky = Flaky::start(upstream).await;
+    let db = Db::fresh(&root, "pubsub_retry").await;
+    let topic = format!("lwf_retry_{}", std::process::id());
+    ps.topic(&topic).await;
+    ps.subscription(&topic, "retry-s", false).await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL)")
+        .await;
+    tables(&db).await;
+    db.target(
+        "queue",
+        "pubsub",
+        &format!(
+            "gc-pubsub://lwf-test/{topic}?endpoint=http://127.0.0.1:{}",
+            flaky.port
+        ),
+        Some("JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0"),
+        "{}",
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('queue', 'queue', 'batch', 1000, ?, ?, 100)",
+        (PUBSUB_SELECT, PUBSUB_PUBLISH),
+    )
+    .await;
+    db.trigger("queue", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    flaky.cut();
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1)")
+        .await;
+    wait_for(Duration::from_secs(20), "refused connections", || async {
+        (flaky.refused() > 0).then_some(())
+    })
+    .await;
+    assert!(
+        ps.pull("retry-s").await.is_empty(),
+        "delivered during the outage"
+    );
+    flaky.heal();
+    let got = pubsub_pull_until(&ps, "retry-s", 2, 60).await;
+    let mut keys: Vec<String> = got.iter().map(|m| pubsub_decoded(m).1).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["1", "2"]);
+    inst.stop().await;
+}
+
+/// A publish the service refuses (here: a document over the 10 MB request limit) is bisected:
+/// the other keys arrive, and the refused key alone takes the strikes and is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_oversized_key_is_refused_alone() {
+    let root = need_db!();
+    let ps = Pubsub::new(&need_pubsub!());
+    let db = Db::fresh(&root, "pubsub_big").await;
+    let topic = format!("lwf_big_{}", std::process::id());
+    let selects = "SELECT c.id AS _key, c.id, CASE WHEN c.id = 99 THEN REPEAT('x', 10500000) ELSE c.name END AS name, c.rev, NULL AS _op FROM customers c WHERE c.id IN (:keys)";
+    pubsub_rule(&db, &ps, &topic, "big-s", false, selects).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(99,'Big',1)")
+        .await;
+    let got = pubsub_pull_until(&ps, "big-s", 2, 30).await;
+    let mut keys: Vec<String> = got.iter().map(|m| pubsub_decoded(m).1).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["1", "2"]);
+    wait_for(
+        Duration::from_secs(90),
+        "key 99 dropped after its strikes",
+        || async {
+            db.status("queue")
+                .await
+                .and_then(|s| s.3)
+                .filter(|e| e.contains("key `99`"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    assert!(
+        ps.pull("big-s").await.is_empty(),
+        "the refused key was sent"
+    );
+    inst.stop().await;
+}
+
+/// Reads one HTTP request (head and body by Content-Length) from a connection.
+async fn pubsub_read_request(s: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p;
+        }
+        let n = s.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let len = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    while buf.len() < head_end + 4 + len {
+        let n = s.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Some((head, buf[head_end + 4..head_end + 4 + len].to_vec()))
+}
+
+/// A TCP stand-in in front of the emulator. The `nth` publish request is answered 500 and never
+/// forwarded; every other request is forwarded on its own connection (closed after the answer).
+struct PubsubInject {
+    port: u16,
+}
+
+impl PubsubInject {
+    async fn start(upstream: &'static str, nth: usize) -> PubsubInject {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let publishes = publishes.clone();
+                tokio::spawn(PubsubInject::serve(client, upstream, nth, publishes));
+            }
+        });
+        PubsubInject { port }
+    }
+
+    async fn serve(
+        mut client: tokio::net::TcpStream,
+        upstream: &'static str,
+        nth: usize,
+        publishes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let Some((head, body)) = pubsub_read_request(&mut client).await else {
+            return;
+        };
+        let first = head.lines().next().unwrap_or("").to_string();
+        if first.contains(":publish") {
+            let n = publishes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == nth {
+                let text = r#"{"error":{"code":500,"status":"INTERNAL","message":"injected"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                );
+                let _ = client.write_all(resp.as_bytes()).await;
+                let _ = client.shutdown().await;
+                return;
+            }
+        }
+        let Ok(mut up) = tokio::net::TcpStream::connect(upstream).await else {
+            return;
+        };
+        let rest = head.split_once("\r\n").map(|(_, r)| r).unwrap_or("");
+        let mut fwd = format!("{first}\r\nConnection: close\r\n{rest}\r\n\r\n").into_bytes();
+        fwd.extend_from_slice(&body);
+        if up.write_all(&fwd).await.is_err() {
+            return;
+        }
+        // The answer by its Content-Length (the emulator keeps the connection open otherwise).
+        let Some((rhead, rbody)) = pubsub_read_request(&mut up).await else {
+            return;
+        };
+        let mut answer = format!("{rhead}\r\n\r\n").into_bytes();
+        answer.extend_from_slice(&rbody);
+        let _ = client.write_all(&answer).await;
+        let _ = client.shutdown().await;
+    }
+}
+
+/// With ordering on, a transient failure of one ordered publish is retried, and the messages of
+/// the key still arrive in publish order (the newest state last). No resume call is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_ordering_survives_a_transient_failure_in_order() {
+    let root = need_db!();
+    let direct = need_pubsub!();
+    let ps = Pubsub::new(&direct);
+    let upstream: &'static str = Box::leak(
+        direct
+            .trim_start_matches("http://")
+            .to_string()
+            .into_boxed_str(),
+    );
+    // The second publish request of the rule fails once (the second update of the key).
+    let proxy = PubsubInject::start(upstream, 2).await;
+    let db = Db::fresh(&root, "pubsub_ordfail").await;
+    let topic = format!("lwf_ordfail_{}", std::process::id());
+    ps.topic(&topic).await;
+    ps.subscription(&topic, "ordfail-s", true).await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL)")
+        .await;
+    tables(&db).await;
+    db.target(
+        "queue",
+        "pubsub",
+        &format!(
+            "gc-pubsub://lwf-test/{topic}?endpoint=http://127.0.0.1:{}",
+            proxy.port
+        ),
+        Some("JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0"),
+        r#"{"ordering": true}"#,
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('queue', 'queue', 'batch', 1000, ?, ?, 100)",
+        (PUBSUB_SELECT, PUBSUB_PUBLISH),
+    )
+    .await;
+    db.trigger("queue", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // One change at a time: each is delivered before the next is made, so the second publish
+    // (v2) is the one the proxy refuses, and v3 waits behind its retry.
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'v1',1)")
+        .await;
+    let mut got = pubsub_pull_until(&ps, "ordfail-s", 1, 60).await;
+    db.exec("UPDATE customers SET name = 'v2', rev = 2 WHERE id = 1")
+        .await;
+    got.extend(pubsub_pull_until(&ps, "ordfail-s", 1, 60).await);
+    db.exec("UPDATE customers SET name = 'v3', rev = 3 WHERE id = 1")
+        .await;
+    got.extend(pubsub_pull_until(&ps, "ordfail-s", 1, 60).await);
+    let revs: Vec<i64> = got
+        .iter()
+        .map(|m| {
+            let (doc, key, _) = pubsub_decoded(m);
+            assert_eq!(key, "1");
+            doc["rev"].as_i64().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        revs,
+        vec![1, 2, 3],
+        "the messages of the key are out of order"
+    );
+    assert!(
+        ps.pull("ordfail-s").await.is_empty(),
+        "a key was sent twice"
+    );
+    inst.stop().await;
+}

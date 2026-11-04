@@ -82,6 +82,15 @@ services:
     ports: ["127.0.0.1:34560:5672"]
     healthcheck: { test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"], interval: 3s, retries: 60 }
 
+  # Google's Pub/Sub emulator for the `pubsub` target tests (Google Cloud SDK `emulators` image,
+  # pinned by digest; ~1.1 GB). Not started by `make servers`: `docker compose -f
+  # docker-compose.test.yml --profile pubsub up -d --wait pubsub-emulator`. REST and gRPC on 8085.
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:c3b114528245d315af73d92d95d8e2fed9747ce29003ad46232f22b4542da036
+    profiles: ["pubsub"]
+    command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=lwf-test"]
+    ports: ["127.0.0.1:34563:8085"]
+
   opensearch:
     image: opensearchproject/opensearch:2.19.7
     profiles: ["search"]
