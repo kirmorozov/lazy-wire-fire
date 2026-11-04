@@ -3570,13 +3570,20 @@ async fn binlog_events(db: &Db, file: &str, from: u64) -> Vec<(u64, String, Stri
     rows.into_iter().map(|r| (r.1, r.2, r.5)).collect()
 }
 
-/// A binlog event of a transaction the engine reads as foreign: any table but its own status
-/// and fence tables, or a statement other than the `BEGIN` of an autocommit transaction.
-fn foreign(event: &(u64, String, String)) -> bool {
+/// The Table_map info of `table` in `schema` (`table_id: 12 (schema.table)`).
+fn table_info(schema: &str, table: &str) -> String {
+    format!("({schema}.{table})")
+}
+
+/// A binlog event of a transaction the engine reads as foreign for the instance in `schema`: a
+/// table but its own status and fence tables (the same table names in another schema are another
+/// instance's, and foreign), or a statement other than the `BEGIN` of an autocommit transaction.
+fn foreign(event: &(u64, String, String), schema: &str) -> bool {
     let (_, kind, info) = event;
     match kind.as_str() {
         "Table_map" => {
-            !(info.contains("lazy_wire_fire_status") || info.contains("lazy_wire_fire_fence"))
+            !(info.contains(&table_info(schema, "lazy_wire_fire_status"))
+                || info.contains(&table_info(schema, "lazy_wire_fire_fence")))
         }
         "Query" => !info.starts_with("BEGIN"),
         _ => false,
@@ -3628,16 +3635,18 @@ async fn commit_fence_writes_per_flush_and_moves_no_position() {
     let n1 = fence_count(&db).await;
     assert_eq!(n1 - n0, 5, "one fence write per flush");
 
-    // The rule's position may pass a fence write only over a foreign transaction. The suite runs
-    // other tests on this server at the same time, and their transactions are foreign too, so
-    // the check is on the binlog: a position past a fence write with nothing foreign in between
-    // would mean the fence moved it.
+    // The rule's position may pass this instance's fence write only over a foreign transaction. The
+    // suite runs other instances on this server at the same time (in other schemas, with the same
+    // table names): their transactions are foreign to this one, and the engine moves past them.
+    // So the check is on the binlog, for this schema's tables only: a position past one of our
+    // fence writes with nothing foreign in between would mean the fence moved it.
     let (file, p1, _, _) = db.status("i").await.expect("status row");
     assert_eq!(file, start.0, "the test window stays in one binlog file");
     let events = binlog_events(&db, &start.0, start.1).await;
+    let fence_table = table_info(&db.schema, "lazy_wire_fire_fence");
     let fences: Vec<u64> = events
         .iter()
-        .filter(|e| e.1 == "Table_map" && e.2.contains("lazy_wire_fire_fence"))
+        .filter(|e| e.1 == "Table_map" && e.2.contains(&fence_table))
         .map(|e| e.0)
         .collect();
     assert!(
@@ -3645,10 +3654,21 @@ async fn commit_fence_writes_per_flush_and_moves_no_position() {
         "the fence writes are in the binlog: {fences:?}"
     );
     if let Some(last) = fences.iter().copied().filter(|&f| f < p1).max() {
-        assert!(
-            events.iter().any(|e| e.0 > last && e.0 < p1 && foreign(e)),
-            "the position {p1} passed the fence write at {last} with no foreign transaction between"
-        );
+        if !events
+            .iter()
+            .any(|e| e.0 > last && e.0 < p1 && foreign(e, &db.schema))
+        {
+            // Diagnostic (kept for the next failure): every event from the fence write to the
+            // position, and the fence writes the binlog holds (all schemas).
+            eprintln!("fence writes in the binlog (table_map positions): {fences:?}");
+            eprintln!("events from {last} to {p1} (position, type, info):");
+            for e in events.iter().filter(|e| e.0 >= last && e.0 <= p1) {
+                eprintln!("  {} {} {}", e.0, e.1, e.2);
+            }
+            panic!(
+                "the position {p1} passed the fence write at {last} with no foreign transaction between"
+            );
+        }
     }
 
     // A foreign change does move it past the fence writes.
