@@ -418,6 +418,35 @@ impl Client {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transient_error_replies() {
+        for e in [
+            "LOADING Redis is loading the dataset in memory",
+            "BUSY Redis is busy running a script",
+            "TRYAGAIN Multiple keys request during rehashing",
+            "CLUSTERDOWN The cluster is down",
+            "MASTERDOWN Link with MASTER is down",
+            "READONLY You can't write against a read only replica.",
+            "NOAUTH Authentication required.",
+            "OOM command not allowed when used memory > 'maxmemory'.",
+            "MISCONF Redis is configured to save RDB snapshots",
+            "NOREPLICAS Not enough good replicas to write.",
+            "MOVED 3999 127.0.0.1:6381",
+            "ASK 3999 127.0.0.1:6381",
+        ] {
+            assert!(transient_error(e), "{e} should be transient");
+        }
+        for e in [
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+            "ERR syntax error",
+            "NOSCRIPT No matching script",
+            "loading is not an error code in lower case",
+            "",
+        ] {
+            assert!(!transient_error(e), "{e} should be a refusal");
+        }
+    }
+
     fn t(s: &str) -> Vec<String> {
         tokenize(s)
             .unwrap()

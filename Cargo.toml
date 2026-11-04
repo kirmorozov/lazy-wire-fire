@@ -48,6 +48,7 @@ aws-smithy-http-client = { version = "1", default-features = false, features = [
 aws-smithy-runtime-api = "1"
 
 [dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
 [profile.release]

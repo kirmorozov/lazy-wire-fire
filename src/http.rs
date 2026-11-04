@@ -503,6 +503,72 @@ async fn read_chunked(c: &mut Conn) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A connection whose peer sends `bytes` and then closes, over loopback.
+    async fn conn_with(bytes: &[u8]) -> Conn {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bytes = bytes.to_vec();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            s.write_all(&bytes).await.unwrap();
+            let _ = s.shutdown().await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        Conn {
+            stream: Stream::Plain(stream),
+            buf: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_body_joins_its_chunks() {
+        let mut c = conn_with(b"4\r\nWiki\r\n5\r\npedia\r\n1\r\n!\r\n0\r\n\r\n").await;
+        assert_eq!(read_chunked(&mut c).await.unwrap(), b"Wikipedia!");
+    }
+
+    #[tokio::test]
+    async fn chunked_body_skips_chunk_extensions() {
+        let mut c =
+            conn_with(b"4;name=val\r\nWiki\r\n5 ; x=\"y\"\r\npedia\r\n0;final\r\n\r\n").await;
+        assert_eq!(read_chunked(&mut c).await.unwrap(), b"Wikipedia");
+    }
+
+    #[tokio::test]
+    async fn chunked_body_reads_and_drops_trailers() {
+        let mut c = conn_with(b"4\r\nWiki\r\n0\r\nX-Checksum: abc\r\nX-Other: 1\r\n\r\n").await;
+        assert_eq!(read_chunked(&mut c).await.unwrap(), b"Wiki");
+    }
+
+    #[tokio::test]
+    async fn chunked_empty_body() {
+        let mut c = conn_with(b"0\r\n\r\n").await;
+        assert_eq!(read_chunked(&mut c).await.unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn chunked_malformed_size_is_an_error() {
+        for bytes in [&b"zz\r\nabc\r\n0\r\n\r\n"[..], b"-1\r\n", b"\r\n"] {
+            let mut c = conn_with(bytes).await;
+            let err = read_chunked(&mut c).await.unwrap_err().to_string();
+            assert!(err.starts_with("invalid chunk size `"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_size_over_the_body_limit_is_refused_before_reading_it() {
+        // 0x10000001 bytes is one more than MAX_BODY (256 MiB); the size alone is enough.
+        let mut c = conn_with(b"10000001\r\n").await;
+        let err = read_chunked(&mut c).await.unwrap_err().to_string();
+        assert_eq!(err, "chunked response body too large");
+    }
+
+    #[tokio::test]
+    async fn chunked_body_cut_short_is_an_error() {
+        let mut c = conn_with(b"5\r\nab").await;
+        let err = read_chunked(&mut c).await.unwrap_err().to_string();
+        assert_eq!(err, "connection closed inside the response body");
+    }
+
     #[test]
     fn parse_requests() {
         let r = RawRequest::parse(

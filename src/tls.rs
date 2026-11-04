@@ -375,6 +375,169 @@ impl AsyncWrite for Stream {
 mod tests {
     use super::*;
 
+    use rcgen::{
+        date_time_ymd, BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair,
+    };
+    use rustls::CertificateError;
+
+    /// A test certificate authority, generated at run time: nothing is written to disk.
+    struct Ca {
+        params: CertificateParams,
+        key: KeyPair,
+        cert: rcgen::Certificate,
+    }
+
+    fn new_ca(name: &str) -> Ca {
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        Ca { params, key, cert }
+    }
+
+    /// A leaf certificate for `names`, signed by `ca`; `expired` makes it valid in 2001 only.
+    fn leaf(names: &[&str], ca: &Ca, expired: bool) -> rcgen::Certificate {
+        let mut params =
+            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        if expired {
+            params.not_before = date_time_ymd(2001, 1, 1);
+            params.not_after = date_time_ymd(2002, 1, 1);
+        }
+        let key = KeyPair::generate().unwrap();
+        let issuer = Issuer::from_params(&ca.params, &ca.key);
+        params.signed_by(&key, &issuer).unwrap()
+    }
+
+    /// A certificate for `names` that signs itself (not a CA).
+    fn self_signed(names: &[&str]) -> rcgen::Certificate {
+        let params =
+            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        params.self_signed(&KeyPair::generate().unwrap()).unwrap()
+    }
+
+    /// The `verify-full` verifier: the chain must lead to one of `trusted`, and the name matches.
+    fn webpki(trusted: &[&Ca]) -> Arc<WebPkiServerVerifier> {
+        let mut store = RootCertStore::empty();
+        for ca in trusted {
+            store.add(ca.cert.der().clone()).unwrap();
+        }
+        WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider())
+            .build()
+            .unwrap()
+    }
+
+    fn check(
+        v: &impl ServerCertVerifier,
+        cert: &rcgen::Certificate,
+        host: &str,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        let name = ServerName::try_from(host).unwrap();
+        v.verify_server_cert(cert.der(), &[], &name, &[], UnixTime::now())
+    }
+
+    fn rejection(r: std::result::Result<ServerCertVerified, rustls::Error>) -> CertificateError {
+        match r {
+            Err(rustls::Error::InvalidCertificate(e)) => e,
+            other => panic!("expected a certificate rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_full_accepts_a_chain_to_a_trusted_root_for_its_name() {
+        let ca = new_ca("Test Root A");
+        let cert = leaf(&["db.example.test"], &ca, false);
+        assert!(check(&*webpki(&[&ca]), &cert, "db.example.test").is_ok());
+    }
+
+    #[test]
+    fn verify_full_rejects_a_wrong_host_name() {
+        let ca = new_ca("Test Root A");
+        let cert = leaf(&["other.example.test"], &ca, false);
+        let e = rejection(check(&*webpki(&[&ca]), &cert, "db.example.test"));
+        assert!(
+            matches!(
+                e,
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn verify_full_rejects_an_unknown_ca() {
+        let trusted = new_ca("Test Root A");
+        let other = new_ca("Test Root B");
+        let cert = leaf(&["db.example.test"], &other, false);
+        let e = rejection(check(&*webpki(&[&trusted]), &cert, "db.example.test"));
+        assert_eq!(e, CertificateError::UnknownIssuer);
+    }
+
+    #[test]
+    fn verify_full_rejects_a_self_signed_certificate() {
+        let trusted = new_ca("Test Root A");
+        let cert = self_signed(&["db.example.test"]);
+        let e = rejection(check(&*webpki(&[&trusted]), &cert, "db.example.test"));
+        assert_eq!(e, CertificateError::UnknownIssuer);
+    }
+
+    #[test]
+    fn verify_full_rejects_an_expired_certificate() {
+        let ca = new_ca("Test Root A");
+        let cert = leaf(&["db.example.test"], &ca, true);
+        let e = rejection(check(&*webpki(&[&ca]), &cert, "db.example.test"));
+        assert!(
+            matches!(
+                e,
+                CertificateError::Expired | CertificateError::ExpiredContext { .. }
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn verify_ca_checks_the_chain_but_not_the_name() {
+        let ca = new_ca("Test Root A");
+        let v = AnyName {
+            inner: webpki(&[&ca]),
+        };
+        // Right chain, wrong name: accepted.
+        let cert = leaf(&["other.example.test"], &ca, false);
+        assert!(check(&v, &cert, "db.example.test").is_ok());
+        // Right name, right chain: accepted.
+        let cert = leaf(&["db.example.test"], &ca, false);
+        assert!(check(&v, &cert, "db.example.test").is_ok());
+        // The chain is still checked.
+        let other = new_ca("Test Root B");
+        let cert = leaf(&["db.example.test"], &other, false);
+        assert_eq!(
+            rejection(check(&v, &cert, "db.example.test")),
+            CertificateError::UnknownIssuer
+        );
+        let cert = self_signed(&["db.example.test"]);
+        assert_eq!(
+            rejection(check(&v, &cert, "db.example.test")),
+            CertificateError::UnknownIssuer
+        );
+        let cert = leaf(&["db.example.test"], &ca, true);
+        assert!(matches!(
+            rejection(check(&v, &cert, "db.example.test")),
+            CertificateError::Expired | CertificateError::ExpiredContext { .. }
+        ));
+    }
+
+    #[test]
+    fn required_accepts_anything() {
+        // `required` encrypts without checks: even a self-signed certificate for another name.
+        let v = NoCheck {
+            provider: provider(),
+        };
+        let cert = self_signed(&["other.example.test"]);
+        assert!(check(&v, &cert, "db.example.test").is_ok());
+    }
+
     #[test]
     fn specs() {
         assert_eq!(TlsSpec::parse(None).unwrap().mode, Mode::Auto);
