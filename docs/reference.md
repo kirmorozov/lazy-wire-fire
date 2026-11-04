@@ -22,9 +22,10 @@ object.
 |---|---|
 | `name` | referenced by rules |
 | `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
-SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `amqp` (an AMQP 0-9-1
-broker with publisher confirms, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>` (the `aws-` URL form, `?endpoint=` and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). An action goes to every endpoint |
+SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
+Lambda function, below), `amqp` (an AMQP 0-9-1
+broker with publisher confirms, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). An action goes to every endpoint |
 | `tls` | empty (TLS for `https://` / `rediss://` / `amqps://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
@@ -36,74 +37,127 @@ can read the database.
 
 **`http.s3`**: `vars.bucket`, `vars.region`, optional `vars.endpoint` (MinIO, R2, …),
 `vars.path_style` (default false: virtual-hosted, `bucket.host`), `vars.access_key_ref`,
-`vars.secret_key_ref`, optional `vars.session_token_ref`. The refs must be references. Without
-them the default AWS chain is used: environment, shared credentials file (`AWS_PROFILE`), web
-identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`), container credentials (ECS, EKS Pod
-Identity), EC2 instance metadata. The template renders paths inside the bucket
-(`PUT /products/1.json`); the tool adds `Host`, `x-amz-date`, `x-amz-content-sha256`,
-`Authorization` (and `x-amz-security-token`), and the bucket for path style.
+`vars.secret_key_ref`, optional `vars.session_token_ref` ([AWS credentials](#aws-credentials)).
+The template renders paths inside the bucket (`PUT /products/1.json`); the tool adds `Host`,
+`x-amz-date`, `x-amz-content-sha256`, `Authorization` (and `x-amz-security-token`), and the
+bucket for path style.
 
 **`sqs`**: the endpoint is the queue, as `aws-sqs://[<region>/]<account-id>/<queue-name>` (the
 `aws-` URL form: below), and one action is one `SendMessageBatch` request to the service root
 (`POST /`): the template names the action (`X-Amz-Target: AmazonSQS.SendMessageBatch`) and the
 queue in the body (`QueueUrl`, from `{{json endpoint.url}}` — the queue URL built from the
 address). `vars.access_key_ref`, `vars.secret_key_ref` (a pair) and optional
-`vars.session_token_ref` must be references, and without them the default AWS chain is used, as
-for `http.s3`; the tool signs the request SigV4 for service `sqs` (adds `Host`, `x-amz-date`,
-`x-amz-content-sha256`, `Authorization`, and `x-amz-security-token` with a session token). One
-entry per key, the answer per entry: [below](#sqs-targets).
+`vars.session_token_ref` must be references, and without them the [AWS credentials](#aws-credentials)
+default chain is used; the tool signs the request SigV4 for service `sqs` (adds `Host`,
+`x-amz-date`, `x-amz-content-sha256`, `Authorization`, and `x-amz-security-token` with a session
+token). One entry per key, the answer per entry: [below](#sqs-targets).
 
 **`kinesis`**: the endpoint is the stream, as `aws-kinesis://[<region>/]<stream-name>` (the
 `aws-` URL form: below). One action is one `PutRecords` request to the service root (`POST /`):
 the template names the action (`X-Amz-Target: Kinesis_20131202.PutRecords`) and the stream in
 the body (`StreamName`, from `{{json endpoint.stream}}`). `vars.access_key_ref`,
 `vars.secret_key_ref` (a pair) and optional `vars.session_token_ref` must be references, and
-without them the default AWS chain is used, as for `http.s3`; the tool signs the request SigV4
-for service `kinesis` (adds `Host`, `x-amz-date`, `x-amz-content-sha256`, `Authorization`, and
-`x-amz-security-token` with a session token). One record per key, the answer per record:
-[below](#kinesis-targets).
+without them the [AWS credentials](#aws-credentials) default chain is used; the tool signs the
+request SigV4 for service `kinesis` (adds `Host`, `x-amz-date`, `x-amz-content-sha256`,
+`Authorization`, and `x-amz-security-token` with a session token). One record per key, the
+answer per record: [below](#kinesis-targets).
+
+**`lambda`**: the endpoint is the function, as
+`aws-lambda://[<region>/]<function-name>[:<qualifier>]` (`?invocation=sync|event`, the `aws-`
+URL form: below). One action is one `Invoke`: the template renders the payload only (the request
+body); the tool writes the request (`POST /2015-03-31/functions/<function>/invocations`,
+`X-Amz-Invocation-Type`), signs it SigV4 for service `lambda` and sends it. Credentials as
+`sqs` and `kinesis`: [AWS credentials](#aws-credentials). One invocation per action, the answer
+per item when the function lists `batchItemFailures`: [below](#lambda-targets).
+
+**`pubsub`**: the endpoint is the topic, as `gc-pubsub://<project>/<topic>` (`?endpoint=` for
+the emulator, below). Credentials: `vars.credentials_ref`, a reference to a service-account key
+(never a literal), else [Application Default Credentials](#pubsub-targets). One action is one
+`topics.publish` request, rendered by the template: [below](#pubsub-targets).
 
 **`amqp`**: the endpoint is `amqp(s)://host[:port][/vhost]` (default ports 5672 / 5671; the
 vhost is the path, `/` the default vhost), without credentials: `vars.username` and
 `vars.password`, references or literals (as `redis` takes them), resolved on each connect. One
 message per action with a publisher confirm: [below](#amqp-targets).
 
-**The `aws-sqs://` and `aws-kinesis://` URL form** (the `endpoints` of the kinds `sqs` and
-`kinesis`, and of no other kind):
+**The `aws-sqs://`, `aws-kinesis://` and `aws-lambda://` URL form** (the `endpoints` of the kinds
+`sqs`, `kinesis` and `lambda`, and of no other kind):
 
 * `sqs`: `aws-sqs://[<region>/]<account-id>/<queue-name>` — the account id is twelve digits, the
   queue name 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo` (a FIFO queue).
 * `kinesis`: `aws-kinesis://[<region>/]<stream-name>` — the stream name is 1 to 128 letters,
   digits, `-`, `_` or `.`.
+* `lambda`: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` — the function name is 1 to
+  64 letters, digits, `-`, `_` or `.` (a function ARN does not fit the form and is refused); the
+  qualifier is a version or an alias (letters, digits, `-`, `_`), `$LATEST` or
+  `$LATEST.PUBLISHED`. `?invocation=sync` (the default: the answer is the function's result) or
+  `?invocation=event` (queued; answered 202 before the function runs), once each.
 * The region comes from the URL when the URL gives one; otherwise from the AWS default settings:
   `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `region` in the shared config file's profile
   (`AWS_CONFIG_FILE`, default `~/.aws/config`; the profile is `AWS_PROFILE`, default
   `default`). When none of these gives a region, the target does not load (the error names both
-  ways to set one). `vars.region` is refused by both kinds (`vars.stream_name` and
+  ways to set one). `vars.region` is refused by the three kinds (`vars.stream_name` and
   `vars.stream_arn` by `kinesis`); `http.s3` is unchanged and still takes `vars.region`.
-* `?endpoint=http(s)://host:port` (the only query parameter, once, no path) sends the request to
-  that address instead of the regional one — an emulator or a VPC endpoint. The signing still
-  uses the region and the service name; for `sqs`, `endpoint.url` is the queue URL built from
-  that address.
+* `?endpoint=http(s)://host:port` (the only other query parameter, once, no path) sends the
+  request to that address instead of the regional one — an emulator or a VPC endpoint. The
+  signing still uses the region and the service name; for `sqs`, `endpoint.url` is the queue URL
+  built from that address.
 * Credentials never go in the URL: a `user:password@` in it is a load error, as is a scheme that
-  does not match the kind (`https://` for `sqs` or `kinesis`, `aws-kinesis://` for `sqs`, any
+  does not match the kind (`https://` for `sqs` or `kinesis`, `aws-kinesis://` for `sqs`, an
   `aws-` URL for any other kind); each refusal names the expected form.
+
+The same rules, minus the region in the URL, hold for `pubsub`'s `gc-pubsub://` endpoint: no
+userinfo, and a `gc-pubsub://` URL is for `kind pubsub` only (and `pubsub` takes only that
+scheme); `?endpoint=` there is the only query parameter.
+
+### AWS credentials
+
+The kinds `http.s3`, `sqs`, `kinesis` and `lambda` sign their requests SigV4 with one of two
+sources, chosen per target:
+
+* **References in the target's `vars`**: `vars.access_key_ref` and `vars.secret_key_ref`
+  (together; `vars.session_token_ref` optional). They must be references (`env:NAME` or
+  `file:/path`, the `file:` rule of `LAZYWF_SECRET_DIRS`), never literals, and they are read on
+  every use — a rotated mounted secret file applies at the next request, without a restart.
+* **The default credentials chain**, when the target gives no references. It is tried in this
+  order; the first source that yields credentials wins:
+
+  | # | source | settings |
+  |---|---|---|
+  | 1 | environment | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (optional) |
+  | 2 | shared credentials and config files | `AWS_SHARED_CREDENTIALS_FILE` (default `~/.aws/credentials`) and `AWS_CONFIG_FILE` (default `~/.aws/config`), profile `AWS_PROFILE` (default `default`); an assume-role profile (`role_arn` with `source_profile`) is followed |
+  | 3 | web identity (for example EKS IRSA) | `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`; the role is assumed through STS |
+  | 4 | container credentials (for example ECS, EKS Pod Identity) | `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `AWS_CONTAINER_CREDENTIALS_FULL_URI`, with `AWS_CONTAINER_AUTHORIZATION_TOKEN` or `…_TOKEN_FILE` |
+  | 5 | EC2 instance metadata (IMDSv2) | off with `AWS_EC2_METADATA_DISABLED=true` |
+
+  `credential_process` and SSO profiles are not part of this build (compiled out). Temporary
+  credentials are fetched again five minutes before they expire. When no source yields
+  credentials, the first request fails: `no AWS credentials: set access_key_ref /
+  secret_key_ref in the target's vars, or provide them through the environment (tried: …)`.
+
+The chain's own TLS calls (the STS call of web identity) trust the system's root CAs, not the
+Mozilla roots lazywf's own HTTP client uses; the instance-metadata and container-credentials
+calls are plain HTTP to link-local or task addresses and need none. The published image's
+distroless base ships the CA bundle; a custom runtime image needs one for web identity. The region of the chain's own calls (the STS call of web identity) is `AWS_REGION`, then
+`AWS_DEFAULT_REGION`, then the target's region; with none of these, the profile's. The signing
+region is always the target's.
 
 **`expect`**: a SQL condition the source database evaluates over the response, as the row `r`
 of a derived table (`SELECT 1 FROM (SELECT … ) AS r WHERE (<expect>)`). The action succeeded
 when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` functions, `CASE`, …
 
-| column | http | redis | amqp | mysql / pgsql |
-|---|---|---|---|---|
-| `status` | status code | NULL | 200 on an ack, 312 on a return | NULL |
-| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL | NULL |
-| `body` | the body when it is JSON, else NULL | the reply as JSON | the return as JSON | NULL |
-| `text` | the body as text | a string or integer reply as text, else NULL | `ack`, `return` or `nack` | NULL |
-| `affected_rows` | NULL | NULL | NULL | rows the statement changed |
+| column | http | redis | amqp | lambda | pubsub | mysql / pgsql |
+|---|---|---|---|---|---|---|
+| `status` | status code | NULL | 200 on an ack, 312 on a return | 200 on a sync answer, 202 on an event | status code | NULL |
+| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL | JSON object | JSON object | NULL |
+| `body` | the body when it is JSON, else NULL | the reply as JSON | the return as JSON | the function's result, when it is JSON | the publish answer, when it is JSON | NULL |
+| `text` | the body as text | a string or integer reply as text, else NULL | `ack`, `return` or `nack` | the result as text | the answer as text | NULL |
+| `affected_rows` | NULL | NULL | NULL | NULL | NULL | rows the statement changed |
 
-* Empty: http needs a 2xx status, redis any reply but an error, amqp an ack, a SQL target a
-  statement that ran. A condition that does not name `status` keeps the 2xx rule; one that does
-  replaces it.
+* Empty: http needs a 2xx status, redis any reply but an error, amqp an ack, lambda a 200
+  without a function error (an event is met on its 202), pubsub a 2xx whose `messageIds` reach
+  every message, a SQL target a statement that ran. A condition that does not name `status`
+  keeps the 2xx rule; one that does replaces it.
 * Redis error replies always fail. An unmet condition on an http 5xx, 408 or 429 is transient
   (retried); on any other answer it is a refusal.
 * For `sqs`, the answer of one `SendMessageBatch` names its entries, so `expect` runs once per
@@ -115,7 +169,13 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 * For `amqp`, `expect` is a condition over the broker's confirm ([the rows](#amqp-targets)): an
   ack with an unmet condition is refused on its own; a returned message (312) is refused and a
   nack is transient, whatever the condition says.
-* On `http.s3`, `sqs` and `kinesis`, an error answer is transient when its code (the
+* For `lambda`, a synchronous invocation's `expect` runs over the result (`body` the result,
+  `status` 200); a function error (`X-Amz-Function-Error`) refuses the invocation whatever the
+  condition says, and an event invocation is met on its 202 with no `expect`
+  ([below](#lambda-targets)).
+* For `pubsub`, `expect` runs over the whole publish answer (`status`, `headers`, `body` the
+  `{"messageIds": […]}` object); the outcome is whole-action ([below](#pubsub-targets)).
+* On `http.s3`, `sqs`, `kinesis` and `lambda`, an error answer is transient when its code (the
   `x-amzn-errortype` header, else the body's `__type`) is `ThrottlingException`,
   `RequestThrottled`, `ProvisionedThroughputExceededException`, `ServiceUnavailable` or
   `InternalFailure`, whatever the status (AWS JSON errors come as HTTP 400); every other error
@@ -138,6 +198,8 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | SQS `SendMessageBatch` (per entry) | `JSON_EXTRACT(body, '$.MessageId') IS NOT NULL` |
 | Kinesis `PutRecords` (per record) | `JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL` |
 | an AMQP publish (an ack) | `status = 200 AND text = 'ack'` |
+| a Lambda invoke (the result names the stored id) | `JSON_EXTRACT(body, '$.id') IS NOT NULL` |
+| a Pub/Sub publish (at least one message id) | `JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
 | an API that answers 200 with a state | `JSON_UNQUOTE(JSON_EXTRACT(body, '$.state')) = 'stored'` |
 | a header | `JSON_UNQUOTE(JSON_EXTRACT(headers, '$."x-ack"')) = 'yes'` |
@@ -211,8 +273,8 @@ the request, so the kind's answer is per item, not per action.
 * **Outcomes.** A record without an `ErrorCode` was stored, and `expect` is evaluated for it: met,
   its key is confirmed and never sent again; not met, the record is refused on its own. A record
   whose `ErrorCode` is `ProvisionedThroughputExceededException`, `InternalFailure` or
-  `ServiceUnavailable` is transient:
-  its key waits and is sent again later with its newest document. Any other `ErrorCode` refuses
+  `ServiceUnavailable` is transient: its key waits and is sent again later with its newest
+  document. Any other `ErrorCode` refuses
   that record on its own (no bisection: the answer names it by position); five such refusals,
   while other keys went through, drop the key and name it in `last_error`. A record the answer
   does not name is retried — only the records that did not go through wait, and the requests not
@@ -229,6 +291,41 @@ the request, so the kind's answer is per item, not per action.
   reset). With `PartitionKey` set to the key, one key's records land on one shard, in order;
   across keys, no order is guaranteed. The key must be 1 to 256 bytes. Consumers apply a record
   as the key's state as of the time it was put, and tolerate repeats.
+
+### Lambda targets
+
+`lambda` invokes an AWS Lambda function: one `Invoke` per action, signed SigV4 for service
+`lambda` to `/2015-03-31/functions/<function>/invocations` (with `?Qualifier=` when the endpoint
+gives one). The template renders the payload only — the request body; the tool writes the
+request line and headers (`X-Amz-Invocation-Type: RequestResponse` or `Event`), signs it and
+sends it. The kind's answer is per item: a synchronous result may name the items that do not go
+through in `batchItemFailures`.
+
+* **The endpoint and invocation.** `aws-lambda://[<region>/]<function-name>[:<qualifier>]`
+  (`?invocation=sync` the default — RequestResponse, the answer is the function's result;
+  `?invocation=event` — Event, queued, answered 202 before the function runs), and
+  `?endpoint=` for emulators and VPC endpoints, as for `sqs` and `kinesis`. A function given as
+  an ARN is refused: name it in the endpoint.
+* **Payload limits.** One synchronous Invoke takes 6 MB, one event Invoke 1 MB (Lambda's MB is
+  1,024 KB). `batch_max_bytes` cannot be set above the invocation's limit (refused at rule
+  load), and a batch is split to it when unset; a payload over the limit is refused on its own.
+* **Outcomes.** Synchronous: a 200 without `X-Amz-Function-Error` is judged by `expect` over the
+  result (`body` the result); a function error (`Handled` or `Unhandled`) refuses the invocation
+  on its own (strikes; a batch is bisected down to the failing key). `batchItemFailures` in the
+  result lists the items that do not go through: only those keys wait (they are retried with
+  their newest state), the others are met. An identifier the function lists that is not a key of
+  the batch is a wrong answer: nothing from it is trusted. Event: a 202 is met (no `expect`;
+  fire-and-forget — Lambda may deliver the event more than once, so the function must be
+  idempotent). A non-2xx answer follows the usual rules: 5xx, 408, 429 and the AWS throttling
+  codes are transient, every other error is a refusal.
+* **Reset steps.** A `for_each: stray` step does not load ("a stray cleanup needs a target that
+  can list keys; kind lambda cannot"): a function cannot list what it was invoked with. Still
+  allowed: `once` (one invocation, an announcement for example), `for_each: snapshot` (every
+  key is invoked again; the function must tolerate that) and `reset_requested`.
+* **Contract.** The function receives what the template renders, at least once: a synchronous
+  invocation whose answer was lost is sent again with the newest state, and an event invocation
+  may be delivered more than once. A long function raises the target's `timeout_ms`
+  (synchronous invocations wait for their result).
 
 ### AMQP targets
 
@@ -284,6 +381,55 @@ and a nack or a lost confirm is transient.
   keeps the newest message per key. Several changes of one key within the debounce window arrive
   as one message, and a delete is the key's last state. Across keys no order is guaranteed.
 
+### Pub/Sub targets
+
+`pubsub` sends to a Google Cloud Pub/Sub topic: one `topics.publish` request per action, rendered
+by the template. The outcome is whole-action: the publish answer names its messages by order,
+not by key, so one publish is either met, refused or transient for all of its messages.
+
+* **The endpoint.** `gc-pubsub://<project>/<topic>` (each name 1 to 255 letters, digits or
+  `._~+-`), exactly one. `?endpoint=http(s)://host:port` (the only query parameter) is the
+  service address — the emulator or a private endpoint. Credentials never go in the URL (a
+  `@` is a load error); a `gc-pubsub://` endpoint is for `kind pubsub` only, and `pubsub` takes
+  only `gc-pubsub://` endpoints.
+* **Credentials.** `vars.credentials_ref` (optional): a reference (`env:NAME` or `file:/path`)
+  to a service-account key (JSON), read on every use — never a literal key. Without it,
+  Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS` (a service-account key or an
+  `external_account` file), then the gcloud ADC file, then the metadata server (GCE, GKE,
+  Workload Identity). With `?endpoint=` and no reference, no credentials are sent (the emulator
+  takes anonymous requests). The access token is reused until 300 s before its one-hour
+  lifetime ends; a 401 from the service drops it.
+* **The rendered request.** The tool sends only `POST
+  /v1/projects/<project>/topics/<topic>:publish` for the endpoint's own project and topic (any
+  other rendered request is refused); the template gives the rest: `Content-Type:
+  application/json` and a `{"messages": […]}` body. Each message's `data` is the document's JSON
+  in base64 (the `base64` helper), its `attributes` carry `key` and `op` (strings, checked), and
+  `orderingKey` is the key only when `vars.ordering` is `true` (a boolean, checked at load). The
+  endpoint's project and topic are `endpoint.project` / `endpoint.topic`.
+* **Batch limits.** `topics.publish` takes at most 1000 messages and 10 MB per request: with
+  `fire_per = batch`, `batch_max_keys` is required and holds 1 to 1000; `batch_max_bytes` cannot
+  exceed 10000000. A rendered body over the limits is refused on its own.
+* **Ordering.** With `vars.ordering`, the key is the message's `orderingKey`, and a subscriber
+  with message ordering on receives one key's messages in publish order. lazywf keeps that order
+  across retries: one lane per rule, and a failed publish is retried with the same key and the
+  same `orderingKey` (there is no resume step: `resumePublish` is a client-library method, and
+  lazywf publishes over REST). Without `vars.ordering`, no per-key order is promised.
+* **Outcomes.** A 2xx whose `messageIds` list reaches every message sent is judged by `expect`
+  over the answer (a shorter list waits — it is not known to be stored). A 400
+  `INVALID_ARGUMENT` is the only refusal: it is bisected down to the failing key (strikes; five
+  drop the key). 401 / 403 / 404, 429, 5xx, a 400 `FAILED_PRECONDITION` and every other non-2xx
+  answer, and a transport error, are transient (retried with backoff, indefinitely).
+* **Reset steps.** The topic only appends: a `for_each: stray` step does not load ("a stray
+  cleanup needs a target that can delete keys; kind pubsub only appends"), and neither does a
+  `once` or `snapshot` step whose template names a seek, a detach, a delete, a purge, a
+  subscription, or a topic other than the publish path ("pubsub targets only publish"). Still
+  allowed: `once` (it publishes one message, an announcement for example) and `for_each:
+  snapshot` (every key is published again; consumers dedupe by the `key` attribute).
+* **Contract.** The topic receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: a publish whose answer was lost is sent again, so a consumer
+  dedupes by the `key` attribute and keeps the newest message per key. Several changes of one
+  key within the debounce window arrive as one message, and a delete is the key's last state.
+
 ## Rules
 
 `lazy_wire_fire_rule`
@@ -298,7 +444,9 @@ and a nack or a lost confirm is transient.
 | `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` takes `key` only (one message per action: [AMQP targets](#amqp-targets)) |
 | `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
 is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
-5242880 ([Kinesis targets](#kinesis-targets)) |
+5242880 ([Kinesis targets](#kinesis-targets)). `pubsub`: `batch_max_keys` is required with
+`fire_per = batch` and holds 1 to 1000, and `batch_max_bytes` cannot exceed 10000000
+([Pub/Sub targets](#pubsub-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
 | `reset_steps` | JSON array, [below](#reset-steps) |
 | `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded |
@@ -374,7 +522,7 @@ Handlebars, never HTML-escaped. Context:
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`) of the endpoint the action goes to |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `pubsub` also `project` and `topic`) of the endpoint the action goes to |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -382,7 +530,8 @@ compat mode), so `{{target.vars.prefix}}` works inside `{{#each keys}}`. A field
 element with one of these names is `this.<name>`.
 
 Helpers: `join list sep`, `upper`, `lower`, `regex_escape`, `url_encode`, `json`,
-`base64 s` (the standard base64 alphabet, padded; a Kinesis record's `Data`),
+`base64 s` (the standard base64 alphabet, padded: a Kinesis record's `Data`, a Pub/Sub
+message's `data`),
 `replace s regex replacement`, `redis_quote s…` (its arguments concatenated, as one Redis
 argument), `sql_quote v`, `sql_ident name` (in the dialect of the rule's target: PostgreSQL for
 `pgsql`, MySQL otherwise), plus the built-ins `if`, `unless`, `each`, `with`,
@@ -399,6 +548,10 @@ What a template renders:
 * **mysql / pgsql**: one SQL statement. Blank output sends nothing.
 * **amqp**: one message: `PUBLISH /<exchange>/<routing-key>`, a `Message-Id` header (the key), a
   blank line, a JSON body. Blank output sends nothing.
+* **lambda**: the Invoke payload only (one JSON value); the tool writes and signs the request.
+  Blank output sends nothing.
+* **pubsub**: the raw request as for `http`, but only the topic's `:publish` path is sent
+  ([Pub/Sub targets](#pubsub-targets)). Blank output sends nothing.
 
 ## Reset steps
 
@@ -430,10 +583,13 @@ and resets only when that part of the binlog was purged. An interrupted reset st
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
-* An append-only kind (`sqs`, `kinesis`, `amqp`) refuses a `for_each: stray` step at load (a sent
-  message cannot be recalled), and `sqs` and `kinesis` refuse a `once` step that purges what it
-  has sent (a queue's `PurgeQueue`, a stream's `DeleteStream`) — [SQS targets](#sqs-targets),
-  [Kinesis targets](#kinesis-targets), [AMQP targets](#amqp-targets).
+* An append-only kind (`sqs`, `kinesis`, `amqp`, `pubsub`) refuses a `for_each: stray` step at
+  load (a sent message cannot be recalled), `lambda` refuses one too (a function cannot list
+  what it was invoked with), `sqs` and `kinesis` refuse a `once` step that purges what it has
+  sent (a queue's `PurgeQueue`, a stream's `DeleteStream`), and `pubsub` a step that does
+  anything but publish — [SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets),
+  [Lambda targets](#lambda-targets), [AMQP targets](#amqp-targets),
+  [Pub/Sub targets](#pubsub-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
@@ -661,6 +817,51 @@ JSON body. A deleted row arrives with `"op": "delete"`, an upsert with `null`. T
 confirm decides: `expect` is empty, so an ack confirms the key; a `basic.return` (312, no queue
 is bound to the routing key) refuses the key on its own; a nack is retried with backoff. The
 consumer binds a durable queue to the `orders` exchange with the routing key `order.changed`.
+
+**Invoking a Lambda function**, one invocation per key (the function applies each payload as the
+key's latest state):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, vars) VALUES
+ ('order-sync', 'lambda', 'aws-lambda://eu-west-1/order-sync:live',
+  '{"access_key_ref": "env:AWS_ACCESS_KEY_ID", "secret_key_ref": "env:AWS_SECRET_ACCESS_KEY"}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES
+ ('orders', 'order-sync', 'key',
+  'SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)',
+  '{"orders": [{{#each docs}}{"key": {{json key}}, "doc": {{json doc}}}{{#unless @last}}, {{/unless}}{{/each}}]}',
+  100);
+```
+
+A trigger on `customers` marks `{{new.id}}`. The template is the Invoke payload only (here: the
+key and its document); the tool writes and signs the request, so the function is invoked for
+each key on the qualifier `live`. With `fire_per = batch` one invocation carries the whole batch
+(up to the 6 MB payload limit; 1 MB for `?invocation=event`). `expect` judges the result (here
+`JSON_EXTRACT(body, '$.id') IS NOT NULL`); in a batch, the result's `batchItemFailures` lists
+the keys that retry, and the others are met. An event invocation is met on its 202 (no
+`expect`): the function must be idempotent.
+
+**Messages to a Pub/Sub topic**, one publish per batch (a subscriber keeps the newest message
+per key):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, vars) VALUES
+ ('orders-topic', 'pubsub', 'gc-pubsub://lwf-test/orders', '{"ordering": true}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms)
+ VALUES ('orders', 'orders-topic', 'batch', 1000,
+  'SELECT c.id AS _key, c.id, c.name, NULL AS _op FROM customers c WHERE c.id IN (:keys)',
+  'POST /v1/projects/{{endpoint.project}}/topics/{{endpoint.topic}}:publish HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"data": {{json (base64 (json doc))}}, "attributes": {"key": {{json key}}, "op": {{json op}}}{{#if @root.target.vars.ordering}}, "orderingKey": {{json key}}{{/if}}}{{#unless @last}}, {{/unless}}{{/each}}]}',
+  100);
+```
+
+A trigger on `customers` marks `{{new.id}}`. One publish carries up to 1000 messages: `data` is
+the document's JSON in base64, `attributes` the `key` and the `op` (a hard-deleted row arrives
+with `"op": "delete"`, the select's `_op` column making keys no select returns deletions), and
+`orderingKey` the key (here, `vars.ordering`), so a subscriber with message ordering on receives
+each key's messages in publish order. For the emulator, `?endpoint=` in the endpoint names its
+address (with no `credentials_ref`, no credentials are sent).
 
 **Search index re-sync in place** (OpenSearch / Elasticsearch): upsert everything, then delete
 what the index has and the database does not.

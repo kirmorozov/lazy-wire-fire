@@ -8,8 +8,9 @@ Change-triggered actions from the MySQL binlog. Row changes in the tables you re
 **keys**. For the changed keys a rule runs its queries concurrently, merges the rows into one JSON
 document per key, renders one Handlebars template and fires the result at a target: an HTTP
 endpoint (any method, a whole raw request), an Amazon SQS queue (one `SendMessageBatch` per
-action), an Amazon Kinesis stream (one `PutRecords` per action), an AMQP broker (one publish per
-action), Redis (one command), or MySQL / PostgreSQL (one SQL statement).
+action), an Amazon Kinesis stream (one `PutRecords` per action), an AWS Lambda function
+(one `Invoke` per action), a Google Cloud Pub/Sub topic (one `publish` per action), an AMQP
+broker (one publish per action), Redis (one command), or MySQL / PostgreSQL (one SQL statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
 knows nothing about any application: everything it does is rows in four tables. It reads the
@@ -76,7 +77,8 @@ backoff, and the error is in `last_error`.
 Values from rows go into templates through the helper of the place they land in (`json`,
 `url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
-export, an SQS queue, a Kinesis stream, an AMQP broker, reset steps, in [docs/reference.md](docs/reference.md#examples).
+export, an SQS queue, a Kinesis stream, a Lambda function, an AMQP broker, a Pub/Sub topic,
+reset steps, in [docs/reference.md](docs/reference.md#examples).
 
 ## Platforms
 
@@ -97,7 +99,7 @@ Example: `LAZYWF_DSN=mysql://lazywf:secret@host.docker.internal:3306/app`.
 
 | guarantee | how |
 |---|---|
-| after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, else `LAZYWF_VISIBILITY_DELAY_MS`) |
+| after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, the commit fence on MySQL / Percona with neither, else `LAZYWF_VISIBILITY_DELAY_MS`; [server setup](docs/server-setup.md#binlog-settings)) |
 | dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `item_42`) live in 64-bit roaring bitmaps, as in lazyview: a million consecutive ids take under 300 KB |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
@@ -123,7 +125,7 @@ Environment variables:
 | `LAZYWF_SERVER_ID` | random | replica server id |
 | `LAZYWF_HEALTH_ADDR` | `127.0.0.1:8081` | `/livez`, `/readyz`, `/status`; `off` disables |
 | `LAZYWF_HEARTBEAT_MS` | `5000` | binlog heartbeat (a silent connection is dropped after 3×) |
-| `LAZYWF_VISIBILITY_DELAY_MS` | `20` | visibility fence when neither GTIDs nor a snapshot position are available |
+| `LAZYWF_VISIBILITY_DELAY_MS` | `20` | the last-resort visibility fence, when GTIDs, a consistent-snapshot position and the commit fence are all unavailable ([server setup](docs/server-setup.md#binlog-settings)) |
 | `LAZYWF_POOL_SIZE` | `16` | query connections (selects run concurrently) |
 | `LAZYWF_SEND_CONCURRENCY` | `16` | concurrent actions of a `fire_per: key` flush |
 | `LAZYWF_STATUS_MS` | `5000` | status rows are written at most this often |
@@ -243,9 +245,10 @@ MySQL 3 (8.0) and 8.4. Lifecycle pages: [MySQL](https://dev.mysql.com/doc/en/mys
 MySQL and Percona publish no pre-release in a registry (MySQL early access ships as downloads
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
 its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
-RDS for MySQL's default parameter group, so it also tests the `LAZYWF_VISIBILITY_DELAY_MS` fence.
-On Oracle MySQL without GTIDs the visibility fence is that delay only: the limitation and its
-workarounds are in [server setup](docs/server-setup.md#binlog-settings).
+RDS for MySQL's default parameter group, so it also tests the commit fence.
+On Oracle MySQL without GTIDs the visibility fence is the commit fence — one write to lazywf's
+own table, exact when commits are in binlog order, with a `LAZYWF_VISIBILITY_DELAY_MS` fallback
+([server setup](docs/server-setup.md#binlog-settings)).
 Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
 2026-12-31.
 
@@ -258,15 +261,18 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 | target | `kind` | endpoint | one action is | per-key answer | stray cleanup | credentials | tested against |
 |---|---|---|---|---|---|---|---|
 | HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]` | one HTTP request | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
-| S3 API | `http.s3` ([targets](docs/reference.md#targets)) | the service URL, optional (derived from `vars` when empty) | one signed S3 request | for the action | allowed | `access_key_ref` / `secret_key_ref` (references only; optional `session_token_ref`), else the AWS default chain | versitygw 1.10 — CI |
+| S3 API | `http.s3` ([targets](docs/reference.md#targets)) | the service URL, optional (derived from `vars` when empty) | one signed S3 request | for the action | allowed | `access_key_ref` / `secret_key_ref` (references only; optional `session_token_ref`), else the [AWS default chain](docs/reference.md#aws-credentials) | versitygw 1.10 — CI |
 | Redis / Valkey, Streams included | `redis` ([targets](docs/reference.md#targets)) | `host:port/db` (or `redis://` / `rediss://`) | one Redis command | for the action | allowed | `vars.password`, optional `vars.username` for ACLs: a literal or a reference | Redis 7.4, Valkey 8.1 — CI |
 | MySQL / MariaDB | `mysql` (also `mariadb`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | MySQL 8.4 — CI |
 | PostgreSQL | `pgsql` (also `postgres`, `postgresql`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | PostgreSQL 17 — CI |
-| Amazon SQS | `sqs` ([SQS targets](docs/reference.md#sqs-targets)) | `aws-sqs://[<region>/]<account-id>/<queue-name>` | one `SendMessageBatch` | per entry, per key | refused at load (append-only; a purging `once` step too) | as `http.s3`; never in the URL | ElasticMQ 1.6 — e2e, opt-in; not in CI yet |
-| Amazon Kinesis Data Streams | `kinesis` ([Kinesis targets](docs/reference.md#kinesis-targets)) | `aws-kinesis://[<region>/]<stream-name>` | one `PutRecords` | per record, per key | refused at load (append-only; a stream-deleting `once` step too) | as `http.s3`; never in the URL | kinesis-mock 0.2 — e2e, opt-in; not in CI yet |
-| AMQP 0-9-1 broker | `amqp` ([AMQP targets](docs/reference.md#amqp-targets)) | `amqp(s)://host[:port][/vhost]` | one confirmed publish | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | RabbitMQ 4.3 — e2e, opt-in; not in CI yet |
+| Amazon SQS | `sqs` ([SQS targets](docs/reference.md#sqs-targets)) | `aws-sqs://[<region>/]<account-id>/<queue-name>` | one `SendMessageBatch` | per entry, per key | refused at load (append-only; a purging `once` step too) | as `http.s3`; never in the URL | ElasticMQ 1.6 — CI (release gate) |
+| Amazon Kinesis Data Streams | `kinesis` ([Kinesis targets](docs/reference.md#kinesis-targets)) | `aws-kinesis://[<region>/]<stream-name>` | one `PutRecords` | per record, per key | refused at load (append-only; a stream-deleting `once` step too) | as `http.s3`; never in the URL | kinesis-mock 0.2 — CI (release gate) |
+| AWS Lambda | `lambda` ([Lambda targets](docs/reference.md#lambda-targets)) | `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (`?invocation=sync\|event`) | one `Invoke` | per item: the result's `batchItemFailures` | refused at load (a function cannot list its invocations) | as `http.s3`; never in the URL | a stand-in Invoke service — CI |
+| AMQP 0-9-1 broker | `amqp` ([AMQP targets](docs/reference.md#amqp-targets)) | `amqp(s)://host[:port][/vhost]` | one confirmed publish | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | RabbitMQ 4.3 — CI (release gate) |
+| Google Cloud Pub/Sub | `pubsub` ([Pub/Sub targets](docs/reference.md#pubsub-targets)) | `gc-pubsub://<project>/<topic>` | one `topics.publish` | for the action | refused at load (append-only; publish-only reset steps) | `vars.credentials_ref` (reference only), else Application Default Credentials; never in the URL | the Pub/Sub emulator — CI (release gate) |
 
-No other kind refuses a stray cleanup or a purge-like reset step.
+The append-only kinds and `lambda` refuse a stray cleanup at load, and `sqs` / `kinesis` /
+`pubsub` refuse purge-like or non-publishing reset steps; no other kind refuses one.
 
 ## Development
 
@@ -277,6 +283,7 @@ make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: M
 make test-matrix               # every other blocking line of "Supported servers", one at a time
 make test-prerelease           # the advisory MariaDB 13.1 RC and 13.2 preview
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
+make test-e2e-queues           # SQS, Kinesis, AMQP and Pub/Sub against their emulators (the sqs, kinesis, amqp and pubsub compose profiles)
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
 ```
@@ -286,9 +293,10 @@ Docker for the test servers.
 
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
 lint, unit tests, the integration suite on the default servers (Varnish included), on every other
-server (one runner each, pre-releases advisory) and with the search engines, and the image for both
+server (one runner each, pre-releases advisory), with the search engines, with the queue
+emulators (SQS, Kinesis, AMQP, Pub/Sub), and the image for both
 platforms. Pushes to `main` publish `edge` once every blocking job passes; `v*` tags a release, which
-also needs the search engines. Dependabot bumps actions, crates, base images and the test servers'
+also needs the search engines and the queue emulators. Dependabot bumps actions, crates, base images and the test servers'
 patch builds weekly.
 
 The binlog reader (`src/binlog.rs`) and the view planner (`src/analyze.rs`, `src/analyzer/`,
