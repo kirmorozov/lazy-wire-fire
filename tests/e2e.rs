@@ -1672,10 +1672,26 @@ async fn search_resync(root: &str, e: Search) {
         }
         r
     };
+    // A passing health check does not mean the cluster takes index calls yet (CI run
+    // 41748509714): wait for yellow first, bounded by the engine's own 60 s.
+    let health = client
+        .send(
+            &call(
+                "GET",
+                "/_cluster/health?wait_for_status=yellow&timeout=60s",
+                "",
+            ),
+            Duration::from_secs(70),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status, 200, "{}: {}", e.name, health.body_snippet());
     let index = format!("lwf_items_{}_{}", e.name, std::process::id());
     let t = Duration::from_secs(10);
+    // The index admin calls and the setup documents get more than the per-call 10 s.
+    let admin = Duration::from_secs(60);
     client
-        .send(&call("DELETE", &format!("/{index}"), ""), t)
+        .send(&call("DELETE", &format!("/{index}"), ""), admin)
         .await
         .unwrap();
     let r = client
@@ -1685,7 +1701,7 @@ async fn search_resync(root: &str, e: Search) {
                 &format!("/{index}"),
                 r#"{"mappings":{"properties":{"title":{"type":"keyword"}}}}"#,
             ),
-            t,
+            admin,
         )
         .await
         .unwrap();
@@ -1699,7 +1715,7 @@ async fn search_resync(root: &str, e: Search) {
                     &format!("/{index}/_doc/{id}?refresh=true"),
                     &format!(r#"{{"title":"{title}"}}"#),
                 ),
-                t,
+                admin,
             )
             .await
             .unwrap();
