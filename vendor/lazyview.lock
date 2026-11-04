@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 1a4c6ea261df1ec5adaab4bca89ef7a6144469b4
+commit c3bae00fe3f9f6ef5bd3ffc6f35be6b8de085e50
 file src/analyze.rs 5953c20f01578a1efa743c9d77fef94f9e8683d41e474f5d7cc4a36ab522b289
 file src/analyzer/ast.rs 395a6b078dbb48e20d10dcfc8b7de6bc7df2e43a6c55c182773aa87713743e5d
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
@@ -22,3 +22,4 @@ file src/binlog.rs ac637c0828edd7110ce36f62e0c089438fce751f03835fe11abfef5f665d9
 file src/catalog.rs 455c20b343c2d3239f2bc115101b5c4c4a6cf9acba055c7105e6f6f612c53ee6
 file src/datum.rs 8395180126aaadb8ec35fd9e00a315a71b59164d7c446554c6f342fcfbf71215
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
+file src/intset.rs b293bb6f8e427d4495cc4255c3f4e798fec59d1866f7a9aa60ee9b9fb46e7aa0
