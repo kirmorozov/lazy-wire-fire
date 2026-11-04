@@ -18,6 +18,7 @@ pub mod fence;
 pub mod gcp;
 pub mod health;
 pub mod http;
+pub mod intset;
 pub mod keyset;
 pub mod lock;
 pub mod model;
