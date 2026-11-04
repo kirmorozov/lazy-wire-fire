@@ -614,17 +614,14 @@ async fn send_batch_items(
         .templates
         .render(template, &ctx)
         .map_err(|e| (e, Fail::Rejected))?;
-    target
-        .send_items(ep, &rendered, keys.len())
-        .await
-        .map_err(|e| {
-            let fail = if crate::target::is_rejected(&e) {
-                Fail::Rejected
-            } else {
-                Fail::Transient
-            };
-            (e, fail)
-        })
+    target.send_items(ep, &rendered, keys).await.map_err(|e| {
+        let fail = if crate::target::is_rejected(&e) {
+            Fail::Rejected
+        } else {
+            Fail::Transient
+        };
+        (e, fail)
+    })
 }
 
 /// Books the answer of one batch request, item by item (`keys[i]` is item `i`). Confirmed items
@@ -729,11 +726,7 @@ fn split_by_bytes(
     docs: &[Doc],
     reset: &Value,
 ) -> Result<Vec<(usize, usize)>> {
-    let Some(max) = rule
-        .def
-        .batch_max_bytes
-        .or(target.def.kind.batch_bytes_limit())
-    else {
+    let Some(max) = rule.def.batch_max_bytes.or(target.batch_bytes_limit()) else {
         return Ok(vec![(0, keys.len())]);
     };
     let ep = target

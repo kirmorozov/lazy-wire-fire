@@ -44,8 +44,10 @@ pub struct Target {
     pub ctx: Value,
     pub endpoints: Vec<Endpoint>,
     pub expect: Expect,
-    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`).
+    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`, `kinesis`, `lambda`).
     aws: Option<AwsSign>,
+    /// The `aws-lambda://` endpoint of a `lambda` target (its function, qualifier, invocation).
+    lambda: Option<aws::LambdaUrl>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
 }
@@ -112,6 +114,20 @@ pub fn kinesis_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
     }
 }
 
+/// The items of a Lambda answer: the keys the function listed in `batchItemFailures` retry
+/// (transient); every other key is met. An identifier that is not a key of the batch is a wrong
+/// answer, so it is an error and nothing is trusted.
+pub fn lambda_items(failed: &[String], keys: &[String]) -> Result<Vec<Item>> {
+    let mut out = vec![Item::Ok; keys.len()];
+    for id in failed {
+        let i = keys.iter().position(|k| k == id).ok_or_else(|| {
+            anyhow!("batchItemFailures lists `{id}`, which is not a key of the batch")
+        })?;
+        out[i] = Item::Transient(format!("key `{id}`: listed in batchItemFailures"));
+    }
+    Ok(out)
+}
+
 /// The AWS credentials of a target's `vars`, when it gives any.
 fn aws_refs(def: &TargetDef) -> Option<aws::Refs> {
     match (var(def, "access_key_ref"), var(def, "secret_key_ref")) {
@@ -157,6 +173,7 @@ impl Target {
         let expect = Expect::new(def.expect.as_deref()).context("`expect`")?;
         let mut endpoints = Vec::new();
         let mut aws_rt = None;
+        let mut lambda_url = None;
         match def.kind {
             Kind::MySql | Kind::PgSql => {
                 use crate::sqlwire::{Credentials, MySqlClient, PgClient, SqlAddr};
@@ -307,6 +324,39 @@ impl Target {
                     provider,
                 });
             }
+            Kind::Lambda => {
+                // from_row: exactly one `aws-lambda://[<region>/]<function>[:<qualifier>]` endpoint.
+                // The request goes to the service root; its path names the function.
+                let url = aws::LambdaUrl::parse(
+                    def.endpoints
+                        .first()
+                        .ok_or_else(|| anyhow!("kind lambda needs its aws-lambda:// endpoint"))?,
+                )?;
+                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
+                let mut base = aws::address("lambda", url.endpoint.as_deref(), &region)?;
+                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
+                                 "region": region, "function": url.function,
+                                 "qualifier": url.qualifier,
+                                 "invocation": if url.invocation == aws::Invocation::Event { "event" } else { "sync" }});
+                base.base = String::new();
+                let host_header = base.host_header();
+                let client = HttpClient::new(base, &def.tls)?;
+                endpoints.push(Endpoint {
+                    ctx,
+                    transport: Transport::Http {
+                        client,
+                        prefix: String::new(),
+                        host_header,
+                    },
+                });
+                let provider = aws::Provider::new(aws_refs(&def), &region);
+                aws_rt = Some(AwsSign {
+                    service: "lambda",
+                    region,
+                    provider,
+                });
+                lambda_url = Some(url);
+            }
             _ => {
                 for e in &def.endpoints {
                     let base = BaseUrl::parse(e)?;
@@ -332,6 +382,7 @@ impl Target {
             endpoints,
             expect,
             aws: aws_rt,
+            lambda: lambda_url,
             pool,
         }))
     }
@@ -339,6 +390,102 @@ impl Target {
     /// Whether this kind's answer to a batch says per item what happened (see `send_items`).
     pub fn reports_items(&self) -> bool {
         self.def.kind.reports_items()
+    }
+
+    /// The largest rendered action this target takes, when it has one: the kind's own limit, or
+    /// the payload limit of the Lambda invocation (6 MB sync, 1 MB event).
+    pub fn batch_bytes_limit(&self) -> Option<usize> {
+        match &self.lambda {
+            Some(u) => Some(u.payload_limit()),
+            None => self.def.kind.batch_bytes_limit(),
+        }
+    }
+
+    /// One Invoke of a `lambda` target with the rendered payload (the template's body), signed
+    /// through the AWS path of `prepare`. `Ok(None)`: nothing rendered. `Ok(Some(failed))`: the
+    /// answer is met, and `failed` lists the identifiers the function left out (`batchItemFailures`;
+    /// always empty for an event). `Err`: refused ([`Rejected`]) or transient, as for `send`: a
+    /// non-2xx status (5xx, 408, 429 and AWS throttling codes are transient), an
+    /// `X-Amz-Function-Error` (refused), or a refused `expect` (sync only; an event is met on 202).
+    async fn lambda_invoke(&self, ep: usize, rendered: &str) -> Result<Option<Vec<String>>> {
+        let (Some(endpoint), Some(url)) = (self.endpoints.get(ep), self.lambda.as_ref()) else {
+            bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+        };
+        let Transport::Http {
+            client,
+            prefix,
+            host_header,
+        } = &endpoint.transport
+        else {
+            bail!("target `{}` is not a lambda target", self.def.name);
+        };
+        if rendered.trim().is_empty() {
+            return Ok(None);
+        }
+        if rendered.len() > url.payload_limit() {
+            return Err(rejected(format!(
+                "the payload is {} bytes, over the {} bytes an Invoke takes",
+                rendered.len(),
+                url.payload_limit()
+            )));
+        }
+        let invocation = match url.invocation {
+            aws::Invocation::Sync => "RequestResponse",
+            aws::Invocation::Event => "Event",
+        };
+        let req = RawRequest {
+            method: "POST".into(),
+            target: url.path(),
+            headers: vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("X-Amz-Invocation-Type".into(), invocation.into()),
+            ],
+            body: rendered.as_bytes().to_vec(),
+        };
+        let req = self.prepare(req, prefix, host_header).await?;
+        let at = format!("{} {}{}", req.method, client.base.url(), req.target);
+        let resp = client
+            .send(&req, self.def.timeout)
+            .await
+            .with_context(|| at.clone())?;
+        if !(200..300).contains(&resp.status) {
+            let msg = format!("{at}: status {}: {}", resp.status, resp.body_snippet());
+            let transient = resp.status >= 500
+                || matches!(resp.status, 408 | 429)
+                || self.aws_throttled(&resp.headers, &resp.body);
+            return Err(if transient {
+                anyhow!(msg)
+            } else {
+                rejected(msg)
+            });
+        }
+        if let Some(err) = aws::function_error(&resp.headers) {
+            return Err(rejected(format!(
+                "{at}: the function raised an error ({err}): {}",
+                resp.body_snippet()
+            )));
+        }
+        match url.invocation {
+            aws::Invocation::Event => {
+                if resp.status != 202 {
+                    bail!("{at}: an event invocation answers 202, not {}", resp.status);
+                }
+                Ok(Some(Vec::new()))
+            }
+            aws::Invocation::Sync => {
+                let verdict = self
+                    .expect
+                    .http(&self.pool, resp.status, &resp.headers, &resp.body)
+                    .await
+                    .with_context(|| at.clone())?;
+                if let Err(e) = verdict {
+                    return Err(rejected(format!("{at}: {e}: {}", resp.body_snippet())));
+                }
+                Ok(Some(
+                    aws::lambda_failed_items(&resp.body).with_context(|| at)?,
+                ))
+            }
+        }
     }
 
     /// A non-2xx answer of an AWS kind whose error code says "not now" (throttling,
@@ -359,6 +506,17 @@ impl Target {
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
+        if self.def.kind == Kind::Lambda {
+            // A lambda answers per item (see `send_items`); one action on its own cannot name
+            // the items it lists, so any listed item is a transient failure here.
+            return match self.lambda_invoke(ep, rendered).await? {
+                None => Ok(Sent::Skipped),
+                Some(failed) if failed.is_empty() => Ok(Sent::Ok),
+                Some(failed) => Err(anyhow!(
+                    "batchItemFailures lists {failed:?}: the action is not confirmed"
+                )),
+            };
+        }
         match &endpoint.transport {
             Transport::Http {
                 client,
@@ -517,10 +675,23 @@ impl Target {
     }
 
     /// Sends one batch request whose answer says per item (`SendMessageBatch`-style: `Successful`
-    /// and `Failed` entries with the `Id` of the item, the index of its key). Returns one
-    /// [`Item`] per item, in order. `Err`: the whole request was refused (rejected) or failed
-    /// (transient), as for [`Target::send`]; the items then have no outcome of their own.
-    pub async fn send_items(&self, ep: usize, rendered: &str, n: usize) -> Result<Vec<Item>> {
+    /// and `Failed` entries with the `Id` of the item, the index of its key; a Lambda's
+    /// `batchItemFailures` naming the key). `keys[i]` is item `i`. Returns one [`Item`] per item,
+    /// in order. `Err`: the whole request was refused (rejected) or failed (transient), as for
+    /// [`Target::send`]; the items then have no outcome of their own.
+    pub async fn send_items(
+        &self,
+        ep: usize,
+        rendered: &str,
+        keys: &[String],
+    ) -> Result<Vec<Item>> {
+        let n = keys.len();
+        if self.def.kind == Kind::Lambda {
+            return match self.lambda_invoke(ep, rendered).await? {
+                None => Ok(vec![Item::Ok; n]),
+                Some(failed) => lambda_items(&failed, keys),
+            };
+        }
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
@@ -698,6 +869,38 @@ impl Target {
             _ => {}
         }
         Ok(req)
+    }
+}
+
+#[cfg(test)]
+mod lambda_items_tests {
+    use super::*;
+
+    fn keys(ks: &[&str]) -> Vec<String> {
+        ks.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn nothing_listed_meets_every_key() {
+        assert_eq!(
+            lambda_items(&[], &keys(&["a", "b"])).unwrap(),
+            vec![Item::Ok, Item::Ok]
+        );
+    }
+
+    #[test]
+    fn only_the_listed_keys_retry() {
+        let items = lambda_items(&["b".into(), "d".into()], &keys(&["a", "b", "c", "d"])).unwrap();
+        assert_eq!(items[0], Item::Ok);
+        assert!(matches!(&items[1], Item::Transient(m) if m.contains("`b`")));
+        assert_eq!(items[2], Item::Ok);
+        assert!(matches!(&items[3], Item::Transient(m) if m.contains("`d`")));
+    }
+
+    #[test]
+    fn an_identifier_that_is_not_a_key_is_a_wrong_answer() {
+        let e = lambda_items(&["zz".into()], &keys(&["a"])).unwrap_err();
+        assert!(e.to_string().contains("`zz`"), "{e}");
     }
 }
 

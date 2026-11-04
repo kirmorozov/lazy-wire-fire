@@ -2423,6 +2423,282 @@ async fn sqs_batch_with_one_bad_entry_retries_only_that_key() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// `lambda` targets, against an in-process Invoke stand-in (`Mock` in tests/common). The stand-in
+// answers the Invoke path with the status, `X-Amz-Function-Error` and body each test scripts, and
+// records every request: its path, its SigV4 `Authorization` and its payload. No emulator: the
+// behaviours under test (per-item retries, function errors, throttles, event mode) are answered
+// by the Invoke API itself, and a function image is not needed. The payload is the template's
+// body; the key's document is in `orders[i].doc`.
+
+const LAMBDA_PAYLOAD: &str = r#"{"orders": [{{#each docs}}{"key": {{json key}}, "doc": {{json doc}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+const LAMBDA_SELECTS: &str =
+    "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)";
+
+fn lambda_creds() -> String {
+    std::env::set_var("LWF_TEST_LAMBDA_AK", "lazywf");
+    std::env::set_var("LWF_TEST_LAMBDA_SK", "lazywfsecret");
+    json!({"access_key_ref": "env:LWF_TEST_LAMBDA_AK",
+           "secret_key_ref": "env:LWF_TEST_LAMBDA_SK"})
+    .to_string()
+}
+
+/// The invocations the stand-in received (its path is the function's Invoke path).
+fn invokes(mock: &Mock) -> Vec<Req> {
+    mock.requests()
+        .into_iter()
+        .filter(|r| {
+            r.path
+                .starts_with("/2015-03-31/functions/orders/invocations")
+        })
+        .collect()
+}
+
+/// The names of the customers an invocation carried.
+fn names_in(r: &Req) -> Vec<String> {
+    let v: Value = serde_json::from_str(&r.body).unwrap();
+    v["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["doc"]["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A customers table with the rule `fn` (fire per `fire_per`) that invokes `endpoint`.
+async fn lambda_rule(db: &Db, endpoint: &str, fire_per: &str) {
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL)")
+        .await;
+    tables(db).await;
+    db.target("fn", "lambda", endpoint, None, &lambda_creds())
+        .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('fn', 'fn', ?, ?, ?, 100)",
+        (fire_per, LAMBDA_SELECTS, LAMBDA_PAYLOAD),
+    )
+    .await;
+    db.trigger("fn", "customers", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// Every key is invoked once with its document, signed for Lambda, on the function's qualifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lambda_invokes_every_key_with_its_document() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    let db = Db::fresh(&root, "lambda_every").await;
+    let endpoint = format!("aws-lambda://us-east-1/orders:live?endpoint={}", mock.url());
+    lambda_rule(&db, &endpoint, "key").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1)")
+        .await;
+    wait_for(Duration::from_secs(30), "three invocations", || async {
+        (invokes(&mock).len() >= 3).then_some(())
+    })
+    .await;
+    sleep_ms(1000).await;
+    let calls = invokes(&mock);
+    assert_eq!(calls.len(), 3, "a key was invoked again");
+    let mut names: Vec<String> = calls.iter().flat_map(names_in).collect();
+    names.sort();
+    assert_eq!(names, ["Ann", "Bob", "Cy"]);
+    let r = &calls[0];
+    assert_eq!(r.method, "POST");
+    assert_eq!(
+        r.path,
+        "/2015-03-31/functions/orders/invocations?Qualifier=live"
+    );
+    assert_eq!(r.header("X-Amz-Invocation-Type"), Some("RequestResponse"));
+    let auth = r.header("Authorization").expect("a signed request");
+    assert!(
+        auth.starts_with("AWS4-HMAC-SHA256 Credential=lazywf/"),
+        "{auth}"
+    );
+    assert!(auth.contains("/us-east-1/lambda/aws4_request"), "{auth}");
+    inst.stop().await;
+}
+
+/// A function error (`X-Amz-Function-Error`) on one key's invocation refuses that key: it is
+/// retried, then dropped after its strikes; the other keys are confirmed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lambda_function_error_is_a_refusal() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    mock.respond(|r| {
+        if r.body.contains("Bob") {
+            (200, r#"{"errorMessage":"boom","errorType":"Error"}"#.into())
+        } else {
+            (200, "{}".into())
+        }
+    });
+    mock.headers(|r| {
+        if r.body.contains("Bob") {
+            vec![("X-Amz-Function-Error".into(), "Unhandled".into())]
+        } else {
+            Vec::new()
+        }
+    });
+    let db = Db::fresh(&root, "lambda_fail").await;
+    let endpoint = format!("aws-lambda://us-east-1/orders?endpoint={}", mock.url());
+    lambda_rule(&db, &endpoint, "key").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1)")
+        .await;
+    wait_for(
+        Duration::from_secs(60),
+        "key 2 dropped after its strikes",
+        || async {
+            db.status("fn")
+                .await
+                .and_then(|s| s.3)
+                .filter(|e| e.contains("key `2`"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    sleep_ms(1000).await;
+    let calls = invokes(&mock);
+    let count = |n: &str| calls.iter().filter(|r| names_in(r) == [n]).count();
+    assert_eq!(count("Ann"), 1, "a confirmed key was invoked again");
+    assert_eq!(count("Cy"), 1, "a confirmed key was invoked again");
+    assert!(count("Bob") >= 2, "a function error was not retried");
+    inst.stop().await;
+}
+
+/// A throttle (429 TooManyRequestsException) is transient: the keys are retried until accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lambda_throttle_is_retried() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let (attempts, accepted) = (attempts.clone(), accepted.clone());
+        mock.respond(move |r| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return (429, r#"{"Type":"User","message":"Rate Exceeded."}"#.into());
+            }
+            accepted.lock().unwrap().extend(names_in(r));
+            (200, "{}".into())
+        });
+    }
+    let db = Db::fresh(&root, "lambda_throttle").await;
+    let endpoint = format!("aws-lambda://us-east-1/orders?endpoint={}", mock.url());
+    lambda_rule(&db, &endpoint, "key").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1)")
+        .await;
+    wait_for(Duration::from_secs(60), "both keys accepted", || async {
+        (accepted.lock().unwrap().len() == 2).then_some(())
+    })
+    .await;
+    sleep_ms(1000).await;
+    let mut names = accepted.lock().unwrap().clone();
+    names.sort();
+    assert_eq!(names, ["Ann", "Bob"], "a key was lost or sent twice");
+    assert!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+        "the throttled keys were not retried"
+    );
+    inst.stop().await;
+}
+
+/// One batch invocation: the function lists one key in `batchItemFailures`. Only that key
+/// retries; the keys the answer does not list are confirmed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lambda_partial_batch_retries_only_the_listed_key() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let failed_once = failed_once.clone();
+        mock.respond(move |r| {
+            if r.body.contains("Bob")
+                && !failed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return (
+                    200,
+                    r#"{"batchItemFailures":[{"itemIdentifier":"2"}]}"#.into(),
+                );
+            }
+            (200, "{}".into())
+        });
+    }
+    let db = Db::fresh(&root, "lambda_partial").await;
+    let endpoint = format!("aws-lambda://us-east-1/orders?endpoint={}", mock.url());
+    lambda_rule(&db, &endpoint, "batch").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1)")
+        .await;
+    wait_for(
+        Duration::from_secs(60),
+        "Bob retried and accepted",
+        || async {
+            (invokes(&mock)
+                .iter()
+                .filter(|r| names_in(r).contains(&"Bob".to_string()))
+                .count()
+                >= 2)
+                .then_some(())
+        },
+    )
+    .await;
+    sleep_ms(1000).await;
+    let calls = invokes(&mock);
+    let with = |n: &str| {
+        calls
+            .iter()
+            .filter(|r| names_in(r).contains(&n.to_string()))
+            .count()
+    };
+    assert_eq!(with("Ann"), 1, "a confirmed key was sent again");
+    assert_eq!(with("Cy"), 1, "a confirmed key was sent again");
+    assert_eq!(with("Bob"), 2, "only the listed key retries");
+    let last = calls
+        .iter()
+        .rfind(|r| names_in(r).contains(&"Bob".to_string()))
+        .unwrap();
+    assert_eq!(names_in(last), ["Bob"], "the retry carried confirmed keys");
+    inst.stop().await;
+}
+
+/// Event mode: one queued invocation per key, answered 202; nothing is sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lambda_event_mode_is_fire_and_forget() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    mock.respond(|_| (202, String::new()));
+    let db = Db::fresh(&root, "lambda_event").await;
+    let endpoint = format!(
+        "aws-lambda://us-east-1/orders?invocation=event&endpoint={}",
+        mock.url()
+    );
+    lambda_rule(&db, &endpoint, "key").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1)")
+        .await;
+    wait_for(Duration::from_secs(30), "two events", || async {
+        (invokes(&mock).len() >= 2).then_some(())
+    })
+    .await;
+    sleep_ms(1000).await;
+    let calls = invokes(&mock);
+    assert_eq!(calls.len(), 2, "an event was sent again");
+    for r in &calls {
+        assert_eq!(r.header("X-Amz-Invocation-Type"), Some("Event"));
+        assert!(!r.path.contains("Qualifier"), "{}", r.path);
+    }
+    let mut names: Vec<String> = calls.iter().flat_map(names_in).collect();
+    names.sort();
+    assert_eq!(names, ["Ann", "Bob"]);
+    assert!(
+        db.status("fn").await.and_then(|s| s.3).is_none(),
+        "an accepted event left an error"
+    );
+    inst.stop().await;
+}
+
 // `kinesis` targets, against kinesis-mock (`LAZYWF_TEST_KINESIS`, e.g. http://127.0.0.1:34562;
 // the `kinesis` compose profile). The tests read the streams back through the same JSON API.
 // A record's `Data` is the document (base64, `base64` in the template); a delete's is
