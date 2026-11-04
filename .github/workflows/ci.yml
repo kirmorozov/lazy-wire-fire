@@ -1,8 +1,9 @@
 name: ci
 
 # Every push, pull request, weekly and on demand:
-#   lint         cargo fmt --check, clippy -D warnings (make lint), Cargo.lock up to date
-#   unit         make test
+#   lint         cargo fmt --check, clippy -D warnings for the default and the roaring feature
+#                (make lint), Cargo.lock up to date
+#   unit         make test: the unit tests for the default and the roaring feature
 #   integration  make servers + make test-e2e-all: MySQL 8.4 and MariaDB 10.11 (the default set)
 #                with Redis, Valkey, PostgreSQL, S3 and Varnish as targets
 #   matrix       make test-matrix, one job per server: every other required line (MySQL 8.0, 9.7,

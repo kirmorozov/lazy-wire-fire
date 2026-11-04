@@ -1,21 +1,29 @@
 //! Sets of keys, compact for the usual shapes: a key that is an integer (`42`) or a prefix and
-//! an integer (`item_42`) lives in a 64-bit roaring bitmap of its prefix, like lazyview's unit
-//! sets; any other key in an ordered set. A million consecutive ids take under 300 KB, not
-//! 60 MB of strings.
+//! an integer (`item_42`) lives in an [`IntSet`] of its prefix (`src/intset.rs`, shared with
+//! lazyview); any other key in an insertion-ordered set.
 //!
-//! Only canonical integers go into bitmaps (no leading zeros, up to `u64::MAX`), so a key reads
-//! back exactly as written. Iteration: prefixes in order, numbers ascending, then the other keys
-//! in insertion order.
+//! Costs of the default backend (a hash set per prefix), release build, measured on the earlier
+//! hash-set version of this type: about 15-19 bytes per number, a million consecutive ids about
+//! 19 MB, 10M about 189 MB. A drain adds the sorted cache of `IntSet` (8 bytes per key) until
+//! it is empty. With `--features roaring` the integer sets are roaring bitmaps instead: a
+//! million consecutive ids under 300 KB and 10M dense ids about 1.3 MB, but sparse ids cost
+//! about 212 bytes per key and drain about 240 times slower at 1M.
+//!
+//! Only canonical integers go into the integer sets (no leading zeros, up to `u64::MAX`), so a
+//! key reads back exactly as written. Iteration: prefixes in order, numbers ascending, then the
+//! other keys in insertion order.
 
 use std::collections::BTreeMap;
 
+use foldhash::fast::RandomState;
 use indexmap::IndexSet;
-use roaring::RoaringTreemap;
+
+use crate::intset::IntSet;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeySet {
-    nums: BTreeMap<String, RoaringTreemap>,
-    other: IndexSet<String>,
+    nums: BTreeMap<String, IntSet>,
+    other: IndexSet<String, RandomState>,
 }
 
 /// `(prefix, number)` when `k` ends in a canonical integer.
@@ -42,7 +50,7 @@ impl KeySet {
             Some((p, n)) => match self.nums.get_mut(p) {
                 Some(b) => b.insert(n),
                 None => {
-                    let mut b = RoaringTreemap::new();
+                    let mut b = IntSet::new();
                     b.insert(n);
                     self.nums.insert(p.to_string(), b);
                     true
@@ -76,7 +84,7 @@ impl KeySet {
     }
 
     pub fn len(&self) -> u64 {
-        self.nums.values().map(RoaringTreemap::len).sum::<u64>() + self.other.len() as u64
+        self.nums.values().map(IntSet::len).sum::<u64>() + self.other.len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
@@ -87,7 +95,7 @@ impl KeySet {
     pub fn extend(&mut self, other: KeySet) {
         for (p, b) in other.nums {
             match self.nums.get_mut(&p) {
-                Some(mine) => *mine |= b,
+                Some(mine) => mine.union_with(b),
                 None => {
                     self.nums.insert(p, b);
                 }
@@ -99,7 +107,11 @@ impl KeySet {
     pub fn iter(&self) -> impl Iterator<Item = String> + '_ {
         self.nums
             .iter()
-            .flat_map(|(p, b)| b.iter().map(move |n| format!("{p}{n}")))
+            .flat_map(|(p, b)| {
+                b.to_sorted_vec()
+                    .into_iter()
+                    .map(move |n| format!("{p}{n}"))
+            })
             .chain(self.other.iter().cloned())
     }
 
@@ -111,14 +123,8 @@ impl KeySet {
             if out.len() >= n {
                 break;
             }
-            let want = n - out.len();
-            let mut last = None;
-            for v in b.iter().take(want) {
+            for v in b.pop_smallest(n - out.len()) {
                 out.push(format!("{p}{v}"));
-                last = Some(v);
-            }
-            if let Some(last) = last {
-                b.remove_range(..=last);
             }
             if b.is_empty() {
                 emptied.push(p.clone());
@@ -223,13 +229,13 @@ mod tests {
     }
 
     #[test]
-    fn compact() {
-        let s: KeySet = (1..=1_000_000u64).map(|i| i.to_string()).collect();
+    fn a_million_dense_ids_drain_in_order() {
+        let mut s: KeySet = (1..=1_000_000u64).map(|i| i.to_string()).collect();
         assert_eq!(s.len(), 1_000_000);
-        assert!(
-            s.nums[""].serialized_size() < 300_000,
-            "{}",
-            s.nums[""].serialized_size()
-        );
+        assert!(s.contains("1") && s.contains("1000000") && !s.contains("1000001"));
+        assert_eq!(s.take(3), vec!["1", "2", "3"]);
+        assert!(s.insert("0"));
+        assert_eq!(s.take(2), vec!["0", "4"]);
+        assert_eq!(s.len(), 999_996);
     }
 }

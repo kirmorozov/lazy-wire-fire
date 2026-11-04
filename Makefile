@@ -5,7 +5,7 @@ IMAGE ?= lazywf:dev
 # Keep in step with the FROM lines of the Dockerfile.
 BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
-.PHONY: build release test lint servers servers-down test-e2e test-e2e-all test-e2e-search \
+.PHONY: build release test test-roaring lint servers servers-down test-e2e test-e2e-all test-e2e-search \
 	test-e2e-queues test-matrix test-prerelease docker-smoke docker-e2e image-digests
 
 build:
@@ -14,14 +14,22 @@ build:
 release:
 	$(CARGO) build --release
 
+# The integer key sets have two backends: the default hash set and roaring bitmaps behind the
+# `roaring` feature. The unit tests and the lint run for both; the integration tests run on the
+# default.
 test:
 	$(CARGO) test --lib
+	$(MAKE) --no-print-directory test-roaring
+
+test-roaring:
+	$(CARGO) test --lib --features roaring
 
 # The lazyview copies (vendor/lazyview.lock) are checked against the lock, and on CI
 # (CI=true) also against lazyview itself at the locked commit.
 lint:
 	$(CARGO) fmt --check
 	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --all-targets --features roaring -- -D warnings
 	scripts/sync-lazyview.sh --check $(if $(CI),--upstream)
 
 servers:

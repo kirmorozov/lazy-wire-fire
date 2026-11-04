@@ -15,8 +15,8 @@ name = "lazywf"
 path = "src/main.rs"
 
 [features]
-# Integer key sets (src/intset.rs) use roaring instead of a hash set. Off by default.
-roaring = []
+# Integer key sets (src/intset.rs) use roaring bitmaps instead of a hash set. Off by default.
+roaring = ["dep:roaring"]
 
 [dependencies]
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "binlog"] }
@@ -40,7 +40,7 @@ google-cloud-auth = { version = "1.18", default-features = false }
 httparse = "1"
 indexmap = "2"
 foldhash = "0.2"
-roaring = "0.12"
+roaring = { version = "0.12", optional = true }
 sqlparser = { version = "0.63", features = ["visitor"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 lapin = { version = "4.12", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
