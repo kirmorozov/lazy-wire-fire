@@ -16,20 +16,43 @@ lines are in the [README](../README.md#supported-servers).
 | `binlog_storage_engine` (MariaDB 12.3+) | unset | at start: refused otherwise |
 | `binlog_row_metadata` | `FULL` recommended | column names then come from the table map, so an `ALTER` of a watched table never resets its rules; otherwise they come from `information_schema`, and a change in its column count does |
 | `gtid_mode`, `enforce_gtid_consistency` (MySQL, Percona) | `ON` recommended | the visibility fence, below |
+| `binlog_order_commits` (MySQL, Percona) | `ON` (the server default) | by the commit fence's probe: with it `OFF`, flushes fall back to `LAZYWF_VISIBILITY_DELAY_MS` (a WARN) |
 | binlog expiry (`binlog_expire_logs_seconds`) | longer than the longest outage to ride out | a restart after a longer one finds its position purged and runs every rule's reset steps |
 
 Before reading, a flush waits until the transaction that marked its keys is visible to other
-sessions:
+sessions. It takes the first of these that the server can answer:
 
-- with GTIDs: `WAIT_FOR_EXECUTED_GTID_SET`, exact;
-- on MariaDB and Percona: the consistent-snapshot binlog position, exact;
+- with GTIDs (MySQL / Percona): `WAIT_FOR_EXECUTED_GTID_SET`, exact;
+- on MariaDB and Percona where it reports one: the consistent-snapshot binlog position, exact;
+- on MySQL / Percona with neither: the [commit fence](#commit-fence), exact when commits are in
+  binlog order;
 - otherwise: `LAZYWF_VISIBILITY_DELAY_MS`.
 
-On Oracle MySQL without GTIDs there is no exact fence: the flush only sleeps
-`LAZYWF_VISIBILITY_DELAY_MS` (default 20 ms) before reading. Under load a flush can read before
-the transaction that marked its keys is visible, and the document then keeps old values until
-its next change. Turn GTIDs on (`gtid_mode=ON`, `enforce_gtid_consistency=ON`) or raise
-`LAZYWF_VISIBILITY_DELAY_MS`.
+### Commit fence
+
+On a server without GTIDs and without a consistent-snapshot position (Oracle MySQL without
+GTIDs), a flush writes one row of lazywf's own table `lazy_wire_fire_fence` (in the DSN's schema;
+the probe creates it when it is missing) on the source connection. With `binlog_order_commits=ON`
+— the server default; on Aurora, the enhanced binlog counts whatever the variable says — the
+server commits transactions in binlog order, so the write returns only after every transaction
+up to the flush's boundary is visible. One write per flush boundary: flushes at the same boundary
+share the write, events never write it, and the counter grows with flushes, not with changes.
+The table's own transactions are lazywf's bookkeeping: they never move a rule's position, and
+routing never treats the table as a source. Nothing else needs to be configured.
+
+The fence needs `INSERT` and `UPDATE` on `lazy_wire_fire_fence`, and `CREATE` on the schema only
+while the table is missing (the probe creates it then; once it exists — for example created by an
+administrator — an account without `CREATE` works). The account in [the next section](#account)
+has all three.
+
+When `binlog_order_commits` is `OFF`, or when the probe or the write fails, a flush waits
+`LAZYWF_VISIBILITY_DELAY_MS` instead; each cause is logged once per process, at WARN:
+
+- commits not in binlog order: `commit fence unavailable: binlog_order_commits is OFF; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead (ON gives an exact fence)`
+- the probe failed (for example no `CREATE` on the schema while the table is missing): `commit fence probe failed: …; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead`
+- the write failed: `commit fence write failed: …; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead`
+
+MariaDB and the GTID path do not change.
 
 lazywf connects as a replica with its own `server_id` (`LAZYWF_SERVER_ID`, random by default).
 
