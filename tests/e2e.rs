@@ -2781,9 +2781,30 @@ impl Kinesis {
         serde_json::from_slice(&resp.body).unwrap()
     }
 
+    /// Creates the stream and waits until it is ACTIVE: kinesis-mock answers
+    /// ResourceInUseException ("the stream is not currently ACTIVE") to puts and reads while
+    /// a new stream is still CREATING.
     async fn create_stream(&self, name: &str) {
         self.call("CreateStream", json!({"StreamName": name, "ShardCount": 1}))
             .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let got = self
+                .call("DescribeStreamSummary", json!({"StreamName": name}))
+                .await;
+            let status = got["StreamDescriptionSummary"]["StreamStatus"]
+                .as_str()
+                .unwrap_or("(no status)")
+                .to_string();
+            if status == "ACTIVE" {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream {name} is still {status} after 30 s"
+            );
+            sleep_ms(200).await;
+        }
     }
 
     /// Every record of the stream, shard by shard, in the order they were put: the partition
