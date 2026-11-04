@@ -21,6 +21,8 @@ pub const TARGET: &str = "lazy_wire_fire_target";
 pub const RULE: &str = "lazy_wire_fire_rule";
 pub const TRIGGER: &str = "lazy_wire_fire_trigger";
 pub const STATUS: &str = "lazy_wire_fire_status";
+/// The commit fence's table (see `fence.rs`), created by `fence::probe` on the first flush.
+pub const FENCE: &str = "lazy_wire_fire_fence";
 
 pub const DDL: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS `lazy_wire_fire_target` (
@@ -100,7 +102,7 @@ pub fn is_config_table(table: &str) -> bool {
 }
 
 pub fn is_own_table(table: &str) -> bool {
-    is_config_table(table) || table == STATUS
+    is_config_table(table) || table == STATUS || table == FENCE
 }
 
 // ---------------------------------------------------------------------------------------------

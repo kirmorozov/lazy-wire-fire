@@ -2,22 +2,31 @@
 //! keys (`keys_sql`), read the documents (all `selects` concurrently), render and send.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use mysql_async::prelude::*;
-use mysql_async::{Params, Pool, Row, Value as My};
+use mysql_async::{Conn, Params, Pool, Row, Value as My};
 use serde_json::{json, Value};
+use tokio::sync::Mutex as TokioMutex;
+use tracing::warn;
 
 use crate::binlog::{Flavor, Position};
 use crate::docs::{self, Doc, Merger, Plan};
+use crate::fence;
 use crate::keyset::KeySet;
 use crate::model::{FirePer, StepKind};
 use crate::rule::{self, Rule};
 use crate::target::{Item, Sent, Target};
+
+/// The commit fence's row id: one row, changed by every commit.
+const FENCE_ID: &str = "lazywf";
+/// Probes remembered at once; past this the memo starts over (pool reconnects make new ids).
+const PROBE_MEMO_MAX: usize = 64;
 
 pub struct Env {
     pub pool: Pool,
@@ -26,6 +35,15 @@ pub struct Env {
     pub send_concurrency: usize,
     /// 0 unknown, 1 the server reports a consistent-snapshot binlog position, 2 it does not.
     snapshot_fence: AtomicU8,
+    /// The commit-fence probe of each server connection, by connection id (see `commit_fence`).
+    probes: StdMutex<HashMap<u32, Probe>>,
+    /// The flush boundary the last commit fence was written for. Held across the write, so
+    /// flushes at one boundary write once.
+    fenced_at: TokioMutex<Option<Position>>,
+    /// The WARN for each cause was logged (once per process).
+    warned_unordered: AtomicBool,
+    warned_probe: AtomicBool,
+    warned_write: AtomicBool,
 }
 
 impl Env {
@@ -41,6 +59,11 @@ impl Env {
             visibility_delay,
             send_concurrency,
             snapshot_fence: AtomicU8::new(0),
+            probes: StdMutex::new(HashMap::new()),
+            fenced_at: TokioMutex::new(None),
+            warned_unordered: AtomicBool::new(false),
+            warned_probe: AtomicBool::new(false),
+            warned_write: AtomicBool::new(false),
         }
     }
 }
@@ -52,11 +75,65 @@ pub struct FenceSpec {
     pub pos: Position,
 }
 
+/// The commit-fence probe of one server connection (`fence::probe`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// `binlog_order_commits` is on: a commit fence is exact.
+    Ordered,
+    /// Commits are not in binlog order: no commit fence.
+    Unordered,
+    /// The probe failed (for example no CREATE privilege on the schema): no commit fence.
+    Failed,
+}
+
+/// The fence for a flush whose exact paths (GTID, consistent snapshot) are unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Path {
+    /// One commit-fence write on the source connection.
+    Commit,
+    /// Sleep `LAZYWF_VISIBILITY_DELAY_MS`.
+    Delay,
+}
+
+/// The decision table of the commit fence: MySQL / Percona (`Flavor::MySql`) with the probe
+/// `Ordered` writes the fence; MariaDB never does (its snapshot position is exact); every other
+/// probe result sleeps the delay.
+pub fn path(flavor: Flavor, probe: Probe) -> Path {
+    match (flavor, probe) {
+        (Flavor::MySql, Probe::Ordered) => Path::Commit,
+        _ => Path::Delay,
+    }
+}
+
+/// Whether a commit fence was already written for boundary `pos` (`last`: the boundary of the
+/// last write). Commits are in binlog order, so one write covers every flush at that boundary.
+fn already_fenced(last: &Option<Position>, pos: &Position) -> bool {
+    last.as_ref() == Some(pos)
+}
+
+fn probe_cached(memo: &HashMap<u32, Probe>, conn: u32) -> Option<Probe> {
+    memo.get(&conn).copied()
+}
+
+/// Remembers the probe of connection `conn`; a full memo starts over (see `PROBE_MEMO_MAX`).
+fn probe_remember(memo: &mut HashMap<u32, Probe>, conn: u32, probe: Probe) {
+    if memo.len() >= PROBE_MEMO_MAX && !memo.contains_key(&conn) {
+        memo.clear();
+    }
+    memo.insert(conn, probe);
+}
+
+/// `true` for the first call with this flag (the WARN of a cause is logged once per process).
+fn warn_once(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
+
 /// Waits until every transaction up to `spec` is visible to readers (binlog events are shipped
 /// before the engine commit completes). MySQL / Percona with GTIDs:
 /// `WAIT_FOR_EXECUTED_GTID_SET`; servers that commit in binlog order and report the binlog
-/// position of a consistent snapshot (MariaDB, Percona): that position; else
-/// `LAZYWF_VISIBILITY_DELAY_MS`.
+/// position of a consistent snapshot (MariaDB, Percona): that position. MySQL / Percona with
+/// neither (no GTID, no snapshot position): the commit fence (`commit_fence`), when commits are
+/// in binlog order. Else `LAZYWF_VISIBILITY_DELAY_MS`.
 pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
     let mut conn = env.pool.get_conn().await.context("fence connection")?;
     if env.flavor == Flavor::MySql {
@@ -111,10 +188,64 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
             }
         }
     }
+    // Neither exact path answered: the commit fence on MySQL / Percona, else the delay.
+    if env.flavor == Flavor::MySql && commit_fence(env, &mut conn, &spec.pos).await {
+        return Ok(());
+    }
     if !env.visibility_delay.is_zero() {
         tokio::time::sleep(env.visibility_delay).await;
     }
     Ok(())
+}
+
+/// Commit fence for boundary `pos` on the source connection `conn`. The probe runs once per
+/// connection (`fence::probe`, which also creates the fence table); the write is one autocommit
+/// row change per boundary, so the binlog carries it and, with `binlog_order_commits`, it
+/// returns only after every transaction up to the boundary is committed. `false`: the fence did
+/// not apply (not ordered, probe or write failed), and the caller falls back to the delay. Each
+/// cause logs one WARN per process.
+async fn commit_fence(env: &Env, conn: &mut Conn, pos: &Position) -> bool {
+    let id = conn.id();
+    let known = probe_cached(&env.probes.lock().expect("probe memo"), id);
+    let probe = match known {
+        Some(p) => p,
+        None => {
+            let p = match fence::probe(conn).await {
+                Ok(true) => Probe::Ordered,
+                Ok(false) => Probe::Unordered,
+                Err(e) => {
+                    if warn_once(&env.warned_probe) {
+                        warn!("commit fence probe failed: {e:#}; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead");
+                    }
+                    Probe::Failed
+                }
+            };
+            probe_remember(&mut env.probes.lock().expect("probe memo"), id, p);
+            p
+        }
+    };
+    if path(env.flavor, probe) != Path::Commit {
+        if probe == Probe::Unordered && warn_once(&env.warned_unordered) {
+            warn!("commit fence unavailable: binlog_order_commits is OFF; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead (ON gives an exact fence)");
+        }
+        return false;
+    }
+    let mut last = env.fenced_at.lock().await;
+    if already_fenced(&last, pos) {
+        return true;
+    }
+    match fence::commit(conn, FENCE_ID).await {
+        Ok(()) => {
+            *last = Some(pos.clone());
+            true
+        }
+        Err(e) => {
+            if warn_once(&env.warned_write) {
+                warn!("commit fence write failed: {e:#}; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead");
+            }
+            false
+        }
+    }
 }
 
 /// A trigger's `keys_sql` with the values of one row image. It carries the statement it was
@@ -978,5 +1109,70 @@ mod tests {
         assert_eq!(padded(3), 4);
         assert_eq!(padded(1000), 1024);
         assert_eq!(padded(1024), 1024);
+    }
+    fn at(file: &str, pos: u64) -> Position {
+        Position {
+            file: file.into(),
+            pos,
+        }
+    }
+
+    #[test]
+    fn commit_fence_only_on_mysql_when_ordered() {
+        // MySQL / Percona (one flavor) with binlog_order_commits ON: the commit fence.
+        assert_eq!(path(Flavor::MySql, Probe::Ordered), Path::Commit);
+        // Not ordered, or the probe failed: the delay.
+        assert_eq!(path(Flavor::MySql, Probe::Unordered), Path::Delay);
+        assert_eq!(path(Flavor::MySql, Probe::Failed), Path::Delay);
+        // MariaDB keeps its snapshot position and its delay; it never writes the fence.
+        assert_eq!(path(Flavor::MariaDb, Probe::Ordered), Path::Delay);
+        assert_eq!(path(Flavor::MariaDb, Probe::Unordered), Path::Delay);
+        assert_eq!(path(Flavor::MariaDb, Probe::Failed), Path::Delay);
+    }
+
+    #[test]
+    fn one_write_per_boundary() {
+        let a = at("binlog.000001", 100);
+        let b = at("binlog.000001", 200);
+        assert!(!already_fenced(&None, &a));
+        assert!(already_fenced(&Some(a.clone()), &a));
+        // A new boundary (a later flush) needs its own write.
+        assert!(!already_fenced(&Some(a), &b));
+        assert!(!already_fenced(&Some(b.clone()), &at("binlog.000002", 200)));
+    }
+
+    #[test]
+    fn probe_is_remembered_per_connection() {
+        let mut memo = HashMap::new();
+        assert_eq!(probe_cached(&memo, 7), None);
+        probe_remember(&mut memo, 7, Probe::Ordered);
+        probe_remember(&mut memo, 8, Probe::Unordered);
+        assert_eq!(probe_cached(&memo, 7), Some(Probe::Ordered));
+        assert_eq!(probe_cached(&memo, 8), Some(Probe::Unordered));
+        // A reconnect is a new connection id: it is probed again.
+        assert_eq!(probe_cached(&memo, 9), None);
+    }
+
+    #[test]
+    fn probe_memo_starts_over_when_full() {
+        let mut memo = HashMap::new();
+        for id in 0..PROBE_MEMO_MAX as u32 {
+            probe_remember(&mut memo, id, Probe::Ordered);
+        }
+        assert_eq!(memo.len(), PROBE_MEMO_MAX);
+        // Re-remembering a known id does not clear the memo.
+        probe_remember(&mut memo, 0, Probe::Ordered);
+        assert_eq!(memo.len(), PROBE_MEMO_MAX);
+        probe_remember(&mut memo, 1000, Probe::Failed);
+        assert_eq!(memo.len(), 1);
+        assert_eq!(probe_cached(&memo, 1000), Some(Probe::Failed));
+    }
+
+    #[test]
+    fn each_cause_warns_once() {
+        let flag = AtomicBool::new(false);
+        assert!(warn_once(&flag));
+        assert!(!warn_once(&flag));
+        assert!(!warn_once(&flag));
     }
 }

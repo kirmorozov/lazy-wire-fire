@@ -3231,3 +3231,143 @@ async fn amqp_restart() {
     );
     inst.stop().await;
 }
+
+/// Commits the commit fence has written for lazywf (0 before the first one; the table is made by
+/// the first flush).
+async fn fence_count(db: &Db) -> u64 {
+    let mut c = db.conn().await;
+    let r: Result<Option<u64>, _> = c
+        .exec_first(
+            "SELECT n FROM lazy_wire_fire_fence WHERE id = ?",
+            ("lazywf",),
+        )
+        .await;
+    c.disconnect().await.ok();
+    r.ok().flatten().unwrap_or(0)
+}
+
+/// Binlog events of `file` from `from`: (position, event type, info).
+async fn binlog_events(db: &Db, file: &str, from: u64) -> Vec<(u64, String, String)> {
+    let mut c = db.conn().await;
+    let rows: Vec<(String, u64, String, u32, u64, String)> = c
+        .query(format!("SHOW BINLOG EVENTS IN '{file}' FROM {from}"))
+        .await
+        .unwrap();
+    c.disconnect().await.ok();
+    rows.into_iter().map(|r| (r.1, r.2, r.5)).collect()
+}
+
+/// A binlog event of a transaction the engine reads as foreign: any table but its own status
+/// and fence tables, or a statement other than the `BEGIN` of an autocommit transaction.
+fn foreign(event: &(u64, String, String)) -> bool {
+    let (_, kind, info) = event;
+    match kind.as_str() {
+        "Table_map" => {
+            !(info.contains("lazy_wire_fire_status") || info.contains("lazy_wire_fire_fence"))
+        }
+        "Query" => !info.starts_with("BEGIN"),
+        _ => false,
+    }
+}
+
+/// MySQL without GTIDs (the commit fence): one write per flush boundary, never per row, and
+/// the fence's own binlog transactions move no rule position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_fence_writes_per_flush_and_moves_no_position() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fence").await;
+    // The commit fence is for MySQL without GTIDs; GTID servers and MariaDB use their own paths.
+    let mut c = db.conn().await;
+    let mode: Option<String> = c
+        .query_first("SELECT @@GLOBAL.gtid_mode")
+        .await
+        .unwrap_or(None);
+    c.disconnect().await.ok();
+    if mode.as_deref() != Some("OFF") {
+        eprintln!(
+            "gtid_mode is not OFF (MySQL without GTIDs only): skipping the commit fence test"
+        );
+        return;
+    }
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("CREATE TABLE other (n INT)").await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('i', 'hook', 'POST /i HTTP/1.1\n\n{{join keys \",\"}}', 50)")
+        .await;
+    db.trigger("i", "items", Some("{{new.id}}"), None).await;
+    let start = binlog_end(&db).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // One change at a time: each flush is a boundary of its own, so each writes the fence once.
+    let n0 = fence_count(&db).await;
+    for i in 1..=5 {
+        db.exec(&format!("INSERT INTO items VALUES ({i}, 0)")).await;
+        wait_for(Duration::from_secs(15), "a flush", || async {
+            (mock.requests().len() >= i).then_some(())
+        })
+        .await;
+        inst.quiet().await;
+    }
+    let n1 = fence_count(&db).await;
+    assert_eq!(n1 - n0, 5, "one fence write per flush");
+
+    // The rule's position may pass a fence write only over a foreign transaction. The suite runs
+    // other tests on this server at the same time, and their transactions are foreign too, so
+    // the check is on the binlog: a position past a fence write with nothing foreign in between
+    // would mean the fence moved it.
+    let (file, p1, _, _) = db.status("i").await.expect("status row");
+    assert_eq!(file, start.0, "the test window stays in one binlog file");
+    let events = binlog_events(&db, &start.0, start.1).await;
+    let fences: Vec<u64> = events
+        .iter()
+        .filter(|e| e.1 == "Table_map" && e.2.contains("lazy_wire_fire_fence"))
+        .map(|e| e.0)
+        .collect();
+    assert!(
+        fences.len() >= 5,
+        "the fence writes are in the binlog: {fences:?}"
+    );
+    if let Some(last) = fences.iter().copied().filter(|&f| f < p1).max() {
+        assert!(
+            events.iter().any(|e| e.0 > last && e.0 < p1 && foreign(e)),
+            "the position {p1} passed the fence write at {last} with no foreign transaction between"
+        );
+    }
+
+    // A foreign change does move it past the fence writes.
+    db.exec("INSERT INTO other VALUES (1)").await;
+    let end = binlog_end(&db).await;
+    wait_for(
+        Duration::from_secs(15),
+        "the position to pass a foreign change",
+        || async {
+            let (f, p, _, _) = db.status("i").await?;
+            (f == end.0 && p >= end.1).then_some(())
+        },
+    )
+    .await;
+
+    // A burst in one transaction is one flush and one write, not one per row.
+    let before = fence_count(&db).await;
+    let rows: Vec<String> = (100..150).map(|i| format!("({i}, 0)")).collect();
+    db.exec(&format!("INSERT INTO items VALUES {}", rows.join(",")))
+        .await;
+    wait_for(Duration::from_secs(15), "the burst", || async {
+        let all: String = mock.requests().iter().map(|r| r.body.clone()).collect();
+        (100..150)
+            .all(|k| all.contains(&k.to_string()))
+            .then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let burst = fence_count(&db).await - before;
+    assert!(
+        (1..50).contains(&burst),
+        "{burst} fence writes for a burst of 50 rows"
+    );
+    inst.stop().await;
+}

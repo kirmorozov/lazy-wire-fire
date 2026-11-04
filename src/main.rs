@@ -117,6 +117,7 @@ async fn run() -> ExitCode {
     init_logging();
     // Before the configuration: its DSN checks already use the binlog reader's messages.
     lazy_wire_fire::binlog::set_product("lazywf", "LAZYWF_");
+    lazy_wire_fire::fence::set_table(lazy_wire_fire::model::FENCE);
     let cfg = match lazy_wire_fire::config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {
