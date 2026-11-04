@@ -568,6 +568,65 @@ fn pg_value(r: &tokio_postgres::Row, i: usize) -> Value {
 mod tests {
     use super::*;
 
+    fn server_error(code: u16) -> mysql_async::Error {
+        mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "test".into(),
+            state: "HY000".into(),
+        })
+    }
+
+    #[test]
+    fn mysql_server_codes_for_not_now() {
+        // Deadlock, lock wait timeout, read-only, lost/gone connection, overload, memory caps.
+        for code in [
+            1040, 1053, 1205, 1213, 1290, 1317, 1927, 1969, 2006, 2013, 3024, 4031,
+        ] {
+            assert!(
+                mysql_transient(&server_error(code)),
+                "{code} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_server_codes_for_refusals() {
+        // Access denied, unknown database/table/column, syntax, duplicate key, foreign key,
+        // out-of-range value: the statement itself is refused.
+        for code in [1045, 1049, 1054, 1062, 1064, 1146, 1452, 1690] {
+            assert!(
+                !mysql_transient(&server_error(code)),
+                "{code} should be a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_connection_level_errors_are_transient() {
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(mysql_transient(&mysql_async::Error::from(reset)));
+        assert!(mysql_transient(&mysql_async::Error::Driver(
+            mysql_async::DriverError::ConnectionClosed
+        )));
+        assert!(!mysql_transient(&mysql_async::Error::Other("other".into())));
+    }
+
+    #[tokio::test]
+    async fn postgres_connection_failure_is_transient() {
+        // A port nothing listens on: the connect fails before any server answers, and the
+        // error carries no SQLSTATE, so it is classed as transient.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let conn = format!("host=127.0.0.1 port={port} connect_timeout=2");
+        let err = match tokio_postgres::connect(&conn, tokio_postgres::NoTls).await {
+            Ok(_) => panic!("nothing listens on the port"),
+            Err(e) => e,
+        };
+        assert!(err.code().is_none());
+        assert!(pg_transient(&err));
+    }
+
     #[test]
     fn quoting() {
         let q = |d, v: Value| quote(d, &v).unwrap();

@@ -210,3 +210,101 @@ pub async fn probe(addr: SocketAddr, path: &str) -> bool {
         Ok(Some(true))
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(h: &Health, path: &str) -> (u16, String, &'static str) {
+        h.respond(path)
+    }
+
+    fn stall(h: &Health) {
+        h.with(|i| {
+            i.beat = Instant::now()
+                .checked_sub(STALL + Duration::from_secs(60))
+                .unwrap()
+        });
+    }
+
+    #[test]
+    fn livez_follows_the_heartbeat() {
+        let h = Health::default();
+        assert_eq!(answer(&h, "/livez"), (200, "ok\n".into(), "text/plain"));
+        assert_eq!(answer(&h, "/healthz").0, 200);
+        stall(&h);
+        let (code, body, _) = answer(&h, "/livez");
+        assert_eq!(code, 503);
+        assert!(body.starts_with("main loop stalled for "), "{body}");
+        assert!(!h.is_ready());
+    }
+
+    #[test]
+    fn readyz_needs_streaming_phase_and_a_connected_binlog() {
+        let h = Health::default();
+        // Starting: not streaming yet, the body names both missing things.
+        let (code, body, _) = answer(&h, "/readyz");
+        assert_eq!(code, 503);
+        assert_eq!(body, "starting, binlog not connected\n");
+
+        h.set_phase("streaming");
+        let (code, body, _) = answer(&h, "/readyz");
+        assert_eq!(code, 503);
+        assert_eq!(body, "streaming, binlog not connected\n");
+        assert!(!h.is_ready());
+
+        h.set_streaming(true);
+        assert_eq!(answer(&h, "/readyz"), (200, "ok\n".into(), "text/plain"));
+        assert!(h.is_ready());
+
+        // A phase other than streaming stays not ready even with the binlog connected.
+        h.set_phase("catching up");
+        let (code, body, _) = answer(&h, "/readyz");
+        assert_eq!(code, 503);
+        assert_eq!(body, "catching up\n");
+        assert!(!h.is_ready());
+    }
+
+    #[test]
+    fn readyz_on_a_stalled_loop_says_stalled() {
+        let h = Health::default();
+        h.set_phase("streaming");
+        h.set_streaming(true);
+        stall(&h);
+        assert_eq!(
+            answer(&h, "/readyz"),
+            (503, "stalled\n".into(), "text/plain")
+        );
+    }
+
+    #[test]
+    fn status_is_json_with_phase_and_streaming() {
+        let h = Health::default();
+        h.set_status(json!({"rules": {"orders": "ok"}}));
+        h.set_phase("streaming");
+        h.set_streaming(true);
+        let (code, body, ctype) = answer(&h, "/status");
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/json");
+        assert!(body.ends_with('\n'));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v,
+            json!({"rules": {"orders": "ok"}, "phase": "streaming", "streaming": true})
+        );
+        // The accessor the rest of the program reads leaves out phase and streaming.
+        assert_eq!(h.status(), json!({"rules": {"orders": "ok"}}));
+    }
+
+    #[test]
+    fn index_and_unknown_paths() {
+        let h = Health::default();
+        let (code, body, _) = answer(&h, "/");
+        assert_eq!(code, 200);
+        assert!(body.contains("/livez") && body.contains("/readyz") && body.contains("/status"));
+        assert_eq!(
+            answer(&h, "/nope"),
+            (404, "not found\n".into(), "text/plain")
+        );
+    }
+}

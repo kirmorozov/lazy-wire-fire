@@ -152,3 +152,44 @@ async fn shutdown_signal() {
         _ = term.recv() => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{anyhow, Context};
+
+    #[test]
+    fn single_error_is_its_message() {
+        assert_eq!(chain(&anyhow!("boom")), "boom");
+    }
+
+    #[test]
+    fn causes_are_joined_outermost_first() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let e = anyhow::Error::new(io).context("connecting to the binlog host");
+        assert_eq!(
+            chain(&e),
+            "connecting to the binlog host: connection refused"
+        );
+
+        let deep = Err::<(), _>(anyhow!("root cause"))
+            .context("loading rule 7")
+            .context("starting")
+            .unwrap_err();
+        assert_eq!(chain(&deep), "starting: loading rule 7: root cause");
+    }
+
+    #[test]
+    fn a_cause_already_in_the_message_above_is_not_repeated() {
+        // The outer message contains the inner one: the inner one is dropped.
+        let e = Err::<(), _>(anyhow!("refused"))
+            .context("connect: refused")
+            .unwrap_err();
+        assert_eq!(chain(&e), "connect: refused");
+        // A different inner message is kept.
+        let e = Err::<(), _>(anyhow!("timed out"))
+            .context("connect: refused")
+            .unwrap_err();
+        assert_eq!(chain(&e), "connect: refused: timed out");
+    }
+}
