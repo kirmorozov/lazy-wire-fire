@@ -22,10 +22,10 @@ object.
 |---|---|
 | `name` | referenced by rules |
 | `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
-SQS queue, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one, the queue
-URL. An action goes to every endpoint |
-| `tls` | empty (TLS for `https://` / `rediss://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` |
+SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `amqp` (an AMQP 0-9-1
+broker with publisher confirms, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>` (the `aws-` URL form, `?endpoint=` and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). An action goes to every endpoint |
+| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
@@ -43,35 +43,79 @@ Identity), EC2 instance metadata. The template renders paths inside the bucket
 (`PUT /products/1.json`); the tool adds `Host`, `x-amz-date`, `x-amz-content-sha256`,
 `Authorization` (and `x-amz-security-token`), and the bucket for path style.
 
-**`sqs`**: the endpoint is the queue URL, and one action is one `SendMessageBatch` request to the
-service root (`POST /`): the template names the action (`X-Amz-Target:
-AmazonSQS.SendMessageBatch`) and the queue in the body (`QueueUrl`, from `{{json endpoint.url}}`).
-`vars.region` is required; `vars.access_key_ref`, `vars.secret_key_ref` (a pair) and optional
+**`sqs`**: the endpoint is the queue, as `aws-sqs://[<region>/]<account-id>/<queue-name>` (the
+`aws-` URL form: below), and one action is one `SendMessageBatch` request to the service root
+(`POST /`): the template names the action (`X-Amz-Target: AmazonSQS.SendMessageBatch`) and the
+queue in the body (`QueueUrl`, from `{{json endpoint.url}}` — the queue URL built from the
+address). `vars.access_key_ref`, `vars.secret_key_ref` (a pair) and optional
 `vars.session_token_ref` must be references, and without them the default AWS chain is used, as
 for `http.s3`; the tool signs the request SigV4 for service `sqs` (adds `Host`, `x-amz-date`,
 `x-amz-content-sha256`, `Authorization`, and `x-amz-security-token` with a session token). One
 entry per key, the answer per entry: [below](#sqs-targets).
 
+**`kinesis`**: the endpoint is the stream, as `aws-kinesis://[<region>/]<stream-name>` (the
+`aws-` URL form: below). One action is one `PutRecords` request to the service root (`POST /`):
+the template names the action (`X-Amz-Target: Kinesis_20131202.PutRecords`) and the stream in
+the body (`StreamName`, from `{{json endpoint.stream}}`). `vars.access_key_ref`,
+`vars.secret_key_ref` (a pair) and optional `vars.session_token_ref` must be references, and
+without them the default AWS chain is used, as for `http.s3`; the tool signs the request SigV4
+for service `kinesis` (adds `Host`, `x-amz-date`, `x-amz-content-sha256`, `Authorization`, and
+`x-amz-security-token` with a session token). One record per key, the answer per record:
+[below](#kinesis-targets).
+
+**`amqp`**: the endpoint is `amqp(s)://host[:port][/vhost]` (default ports 5672 / 5671; the
+vhost is the path, `/` the default vhost), without credentials: `vars.username` and
+`vars.password`, references or literals (as `redis` takes them), resolved on each connect. One
+message per action with a publisher confirm: [below](#amqp-targets).
+
+**The `aws-sqs://` and `aws-kinesis://` URL form** (the `endpoints` of the kinds `sqs` and
+`kinesis`, and of no other kind):
+
+* `sqs`: `aws-sqs://[<region>/]<account-id>/<queue-name>` — the account id is twelve digits, the
+  queue name 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo` (a FIFO queue).
+* `kinesis`: `aws-kinesis://[<region>/]<stream-name>` — the stream name is 1 to 128 letters,
+  digits, `-`, `_` or `.`.
+* The region comes from the URL when the URL gives one; otherwise from the AWS default settings:
+  `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `region` in the shared config file's profile
+  (`AWS_CONFIG_FILE`, default `~/.aws/config`; the profile is `AWS_PROFILE`, default
+  `default`). When none of these gives a region, the target does not load (the error names both
+  ways to set one). `vars.region` is refused by both kinds (`vars.stream_name` and
+  `vars.stream_arn` by `kinesis`); `http.s3` is unchanged and still takes `vars.region`.
+* `?endpoint=http(s)://host:port` (the only query parameter, once, no path) sends the request to
+  that address instead of the regional one — an emulator or a VPC endpoint. The signing still
+  uses the region and the service name; for `sqs`, `endpoint.url` is the queue URL built from
+  that address.
+* Credentials never go in the URL: a `user:password@` in it is a load error, as is a scheme that
+  does not match the kind (`https://` for `sqs` or `kinesis`, `aws-kinesis://` for `sqs`, any
+  `aws-` URL for any other kind); each refusal names the expected form.
+
 **`expect`**: a SQL condition the source database evaluates over the response, as the row `r`
 of a derived table (`SELECT 1 FROM (SELECT … ) AS r WHERE (<expect>)`). The action succeeded
 when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` functions, `CASE`, …
 
-| column | http | redis | mysql / pgsql |
-|---|---|---|---|
-| `status` | status code | NULL | NULL |
-| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL |
-| `body` | the body when it is JSON, else NULL | the reply as JSON | NULL |
-| `text` | the body as text | a string or integer reply as text, else NULL | NULL |
-| `affected_rows` | NULL | NULL | rows the statement changed |
+| column | http | redis | amqp | mysql / pgsql |
+|---|---|---|---|---|
+| `status` | status code | NULL | 200 on an ack, 312 on a return | NULL |
+| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL | NULL |
+| `body` | the body when it is JSON, else NULL | the reply as JSON | the return as JSON | NULL |
+| `text` | the body as text | a string or integer reply as text, else NULL | `ack`, `return` or `nack` | NULL |
+| `affected_rows` | NULL | NULL | NULL | rows the statement changed |
 
-* Empty: http needs a 2xx status, redis any reply but an error, a SQL target a statement that
-  ran. A condition that does not name `status` keeps the 2xx rule; one that does replaces it.
+* Empty: http needs a 2xx status, redis any reply but an error, amqp an ack, a SQL target a
+  statement that ran. A condition that does not name `status` keeps the 2xx rule; one that does
+  replaces it.
 * Redis error replies always fail. An unmet condition on an http 5xx, 408 or 429 is transient
   (retried); on any other answer it is a refusal.
 * For `sqs`, the answer of one `SendMessageBatch` names its entries, so `expect` runs once per
   entry: `status` is the request's HTTP status and `body` is the entry's own JSON (its record in
   `Successful`). An entry whose `expect` is not met is refused on its own.
-* On `http.s3` and `sqs`, an error answer is transient when its code (the
+* For `kinesis`, the answer of one `PutRecords` gives its records in request order, so `expect`
+  runs once per record: `status` is the request's HTTP status and `body` is the record's own
+  JSON. A record whose `expect` is not met is refused on its own.
+* For `amqp`, `expect` is a condition over the broker's confirm ([the rows](#amqp-targets)): an
+  ack with an unmet condition is refused on its own; a returned message (312) is refused and a
+  nack is transient, whatever the condition says.
+* On `http.s3`, `sqs` and `kinesis`, an error answer is transient when its code (the
   `x-amzn-errortype` header, else the body's `__type`) is `ThrottlingException`,
   `RequestThrottled`, `ProvisionedThroughputExceededException`, `ServiceUnavailable` or
   `InternalFailure`, whatever the status (AWS JSON errors come as HTTP 400); every other error
@@ -92,6 +136,8 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | search `_bulk` | `JSON_CONTAINS(body, 'false', '$.errors')` |
 | S3 `PUT` / `DELETE` | `status IN (200, 204)` |
 | SQS `SendMessageBatch` (per entry) | `JSON_EXTRACT(body, '$.MessageId') IS NOT NULL` |
+| Kinesis `PutRecords` (per record) | `JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL` |
+| an AMQP publish (an ack) | `status = 200 AND text = 'ack'` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
 | an API that answers 200 with a state | `JSON_UNQUOTE(JSON_EXTRACT(body, '$.state')) = 'stored'` |
 | a header | `JSON_UNQUOTE(JSON_EXTRACT(headers, '$."x-ack"')) = 'yes'` |
@@ -132,7 +178,7 @@ is per item, not per action.
   retried — only the entries that did not go through wait, and the batches not yet sent wait with
   them. A whole-request refusal (an error code that is not transient) is bisected down to the key
   that fails alone, as with `http`.
-* **FIFO queues.** A queue whose URL ends in `.fifo` is FIFO: the rule's selects must return a
+* **FIFO queues.** A queue whose name ends in `.fifo` is FIFO: the rule's selects must return a
   `version` column (refused at load without it), which the template writes as the entry's
   `MessageDeduplicationId`; the key is the `MessageGroupId` (`{{json key}}`). Use a version that
   changes with each state you want delivered: the queue's deduplication drops an entry whose id it
@@ -151,6 +197,93 @@ is per item, not per action.
   their order (they share its `MessageGroupId`); across keys, and on a standard queue, no order is
   guaranteed.
 
+### Kinesis targets
+
+`kinesis` sends to an Amazon Kinesis stream: one `PutRecords` per action, one record per key, and
+the answer gives the records back in request order — record *i* of the answer is record *i* of
+the request, so the kind's answer is per item, not per action.
+
+* **Batch limits.** With `fire_per = batch`, `batch_max_keys` is required and holds 1 to 500 (the
+  most records a `PutRecords` takes); a rule without it, or with more, does not load.
+  `batch_max_bytes` defaults to 5242880 (5 MiB, the most a request takes, the base64 `Data`
+  counted) and cannot be set higher. With `fire_per = key` each key is its own one-record request,
+  so no batch is sized.
+* **Outcomes.** A record without an `ErrorCode` was stored, and `expect` is evaluated for it: met,
+  its key is confirmed and never sent again; not met, the record is refused on its own. A record
+  whose `ErrorCode` is `ProvisionedThroughputExceededException`, `InternalFailure` or
+  `ServiceUnavailable` is transient:
+  its key waits and is sent again later with its newest document. Any other `ErrorCode` refuses
+  that record on its own (no bisection: the answer names it by position); five such refusals,
+  while other keys went through, drop the key and name it in `last_error`. A record the answer
+  does not name is retried — only the records that did not go through wait, and the requests not
+  yet sent wait with them. A whole-request refusal (an error code that is not transient) is
+  bisected down to the key that fails alone, as with `http`.
+* **Reset steps.** The kind only appends: a put record cannot be recalled, so a stray cleanup has
+  no effect on the stream. A `for_each: stray` step does not load ("a stray cleanup needs a target
+  that can delete keys; kind kinesis only appends"), and neither does a `once` step whose template
+  deletes the stream (`DeleteStream`; recognized by text, so a delete built from variables is not
+  caught). Still allowed: `once` (an announcement record), `for_each: snapshot` (every key is put
+  again as a new record; consumers must tolerate that) and `reset_requested`.
+* **Contract.** The stream receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: a record can arrive twice (a retry after a lost answer; a snapshot
+  reset). With `PartitionKey` set to the key, one key's records land on one shard, in order;
+  across keys, no order is guaranteed. The key must be 1 to 256 bytes. Consumers apply a record
+  as the key's state as of the time it was put, and tolerate repeats.
+
+### AMQP targets
+
+`amqp` sends to an AMQP 0-9-1 broker (RabbitMQ): one message per action — one `mandatory`
+publish, the message persistent — and the broker's publisher confirm is the answer: an ack is
+judged by `expect`, a `basic.return` (the message was not routed anywhere) is refused on its own,
+and a nack or a lost confirm is transient.
+
+* **One message per action.** `fire_per` must be `key`: one action is one message, so there is no
+  batch to size. `fire_per = batch` is refused at rule load ("kind amqp sends one message per
+  action: set `fire_per = key`").
+* **The rendered message.** The first line is `PUBLISH /<exchange>/<routing-key>`, then a
+  `Message-Id: <key>` header (the only header; the key, required), a blank line, and a JSON body
+  (one JSON value, sent as written):
+
+  ```text
+  PUBLISH /orders/order.changed
+  Message-Id: 42
+
+  {"key":42,"op":null,"doc":{"sku":"a","qty":3}}
+  ```
+
+  The exchange is the path segment before the first `/` (`//queue` is the default exchange); the
+  routing key is everything after it (it may hold `/`); both are taken as written. Exchange,
+  routing key and `Message-Id` are at most 255 bytes each (AMQP short strings). A blank render
+  sends nothing.
+* **The confirm.** With `expect` empty, an ack is met; else `expect` runs over the confirm's row
+  (`status` 200 / `text` `ack` on an ack; `status` 312 / `text` `return` / `body`
+  `{"reply_code", "reply_text"}` on a return; `status` NULL / `text` `nack` on a nack), and an
+  ack whose condition is not met is refused on its own. A returned message is refused whatever
+  the condition says (no queue is bound to the routing key); a nack is never judged by `expect`
+  (it is transient).
+* **Outcomes.** An unmet `expect` on an ack, and a `basic.return` (reply 312, `NO_ROUTE`), refuse
+  the key on its own; five such refusals, while
+  other keys went through, drop the key and name it in `last_error`. A nack, a failed publish, a
+  lost connection, and no confirm within `timeout_ms` are transient: the message may or may not
+  have reached the broker, so the key is sent again (at-least-once). A failed publish drops the
+  broker session; the next send opens a new one.
+* **One publish in flight.** Publishes to one endpoint run one at a time (a publish holds the
+  endpoint's session until its confirm arrives; lapin can hand a confirm to the wrong publish
+  when several are in flight on one channel); different endpoints of the target run in parallel.
+* **TLS.** `amqps://` is TLS, `verify-full` by default: the chain against the Mozilla roots and
+  the `tls.ca` files, and the host name. The modes the client cannot express are refused at load,
+  naming the mode: `required` and `verify-ca`, `tls.server_name`, and `disabled` on `amqps://`.
+* **Reset steps.** The kind only appends: a sent message cannot be recalled. A `for_each: stray`
+  step does not load ("a stray cleanup needs a target that can delete keys; kind amqp only
+  appends"). Still allowed: `once` (it publishes one message, an announcement for example) and
+  `for_each: snapshot` (every key is published again, as new messages).
+* **Contract.** The exchange receives the latest state of each key, not a log of every change,
+  and delivery is at-least-once: a message whose confirm was lost (a connection drop, a broker
+  restart, a timeout) is published again, so a consumer accepts duplicates — the message id is
+  the key, and the body carries the key's current state (here `op` and `doc`), so a consumer
+  keeps the newest message per key. Several changes of one key within the debounce window arrive
+  as one message, and a delete is the key's last state. Across keys no order is guaranteed.
+
 ## Rules
 
 `lazy_wire_fire_rule`
@@ -162,8 +295,10 @@ is per item, not per action.
 | `selects` | zero or more queries: SQL separated by `;`, or a JSON array of strings or `{"name", "sql"}`. Each returns `_key` plus [path-named columns](#documents-from-path-named-columns) and uses `:keys` for the changed keys (`WHERE id IN (:keys)`). They run concurrently, each on its own connection |
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
-| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry) |
-| `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)) |
+| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` takes `key` only (one message per action: [AMQP targets](#amqp-targets)) |
+| `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
+is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
+5242880 ([Kinesis targets](#kinesis-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
 | `reset_steps` | JSON array, [below](#reset-steps) |
 | `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded |
@@ -239,7 +374,7 @@ Handlebars, never HTML-escaped. Context:
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`) of the endpoint the action goes to |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`) of the endpoint the action goes to |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -247,6 +382,7 @@ compat mode), so `{{target.vars.prefix}}` works inside `{{#each keys}}`. A field
 element with one of these names is `this.<name>`.
 
 Helpers: `join list sep`, `upper`, `lower`, `regex_escape`, `url_encode`, `json`,
+`base64 s` (the standard base64 alphabet, padded; a Kinesis record's `Data`),
 `replace s regex replacement`, `redis_quote s…` (its arguments concatenated, as one Redis
 argument), `sql_quote v`, `sql_ident name` (in the dialect of the rule's target: PostgreSQL for
 `pgsql`, MySQL otherwise), plus the built-ins `if`, `unless`, `each`, `with`,
@@ -261,6 +397,8 @@ What a template renders:
 * **redis**: one command, split like `redis-cli` arguments (`"…"` with `\n`, `\"`, `\xHH`;
   `'…'`). `redis_quote` makes any string a safe argument. Blank output sends nothing.
 * **mysql / pgsql**: one SQL statement. Blank output sends nothing.
+* **amqp**: one message: `PUBLISH /<exchange>/<routing-key>`, a `Message-Id` header (the key), a
+  blank line, a JSON body. Blank output sends nothing.
 
 ## Reset steps
 
@@ -292,8 +430,10 @@ and resets only when that part of the binlog was purged. An interrupted reset st
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
-* An append-only kind such as `sqs` refuses two of these at load: a `for_each: stray` step, and a
-  `once` step that purges what it has sent — [SQS targets](#sqs-targets).
+* An append-only kind (`sqs`, `kinesis`, `amqp`) refuses a `for_each: stray` step at load (a sent
+  message cannot be recalled), and `sqs` and `kinesis` refuse a `once` step that purges what it
+  has sent (a queue's `PurgeQueue`, a stream's `DeleteStream`) — [SQS targets](#sqs-targets),
+  [Kinesis targets](#kinesis-targets), [AMQP targets](#amqp-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
@@ -351,9 +491,12 @@ What the tool enforces on its own:
   or header with a control character is refused.
 * **A refused key does not stall its rule.** An action the target refuses (4xx, an unmet
   `expect`, a Redis error) is split until the refused keys stand alone; the others go through.
-  A key refused 5 times while others went through is dropped and named in `last_error`. When
-  everything is refused, nothing is dropped (the template or the target is at fault). Transient
-  failures (connection, timeout, 5xx, 429, Redis `LOADING`/`READONLY`/…) only wait.
+  When the target has several endpoints, a refusal is judged only once every endpoint has
+  answered: a transient failure on any endpoint makes the whole action transient, so the refused
+  keys collect no strike. A key refused 5 times while others went through is dropped, named in
+  `last_error`, and logged on the event target `lazywf::undelivered` ([the log event](../README.md#undelivered-keys)).
+  When everything is refused, nothing is dropped (the template or the target is at fault).
+  Transient failures (connection, timeout, 5xx, 429, Redis `LOADING`/`READONLY`/…) only wait.
 * **Bounded parsing**: response bodies, Redis replies and path indexes (`_path`, `a[n]`, at most
   10000) are capped. Partials (`{{> …}}`) are refused.
 * **Secret references are confined**: `env:` cannot name lazywf's own settings (`LAZYWF_*`), and
@@ -446,9 +589,9 @@ latest state):
 
 ```sql
 INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, vars) VALUES ('queue', 'sqs',
- 'https://sqs.eu-west-1.amazonaws.com/123456789012/orders',
- 'JSON_EXTRACT(body, '$.MessageId') IS NOT NULL',
- '{"region": "eu-west-1", "access_key_ref": "env:ORDERS_AK", "secret_key_ref": "env:ORDERS_SK"}');
+ 'aws-sqs://eu-west-1/123456789012/orders',
+ 'JSON_EXTRACT(body, ''$.MessageId'') IS NOT NULL',
+ '{"access_key_ref": "env:ORDERS_AK", "secret_key_ref": "env:ORDERS_SK"}');
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template) VALUES
  ('orders_queue', 'queue', 'batch', 10,
   'SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)',
@@ -461,10 +604,63 @@ Content-Type: application/x-amz-json-1.0
 
 A trigger on `customers` marks `{{new.id}}`. Up to 10 keys go out as one `SendMessageBatch`, and
 the answer's entries are checked one by one: `expect` runs per entry with the entry's own JSON as
-`body` (here it confirms the `MessageId` SQS returns for the message). For a FIFO queue (a `.fifo`
-URL) the select adds a `version` column, one value per state you want delivered (`CONCAT(c.id,
+`body` (here it confirms the `MessageId` SQS returns for the message). For a FIFO queue (a queue
+name ending in `.fifo`, `aws-sqs://eu-west-1/123456789012/orders.fifo`) the select adds a
+`version` column, one value per state you want delivered (`CONCAT(c.id,
 '#', c.rev) AS version` here), and the entry carries `"MessageGroupId": {{json key}}` and
 `"MessageDeduplicationId": {{json doc.version}}`.
+
+**Records to a Kinesis stream**, one per key (a consumer applies each record as the key's latest
+state):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, vars) VALUES ('stream', 'kinesis',
+ 'aws-kinesis://eu-west-1/customer-changes',
+ 'JSON_EXTRACT(body, ''$.SequenceNumber'') IS NOT NULL',
+ '{"access_key_ref": "env:AWS_ACCESS_KEY_ID", "secret_key_ref": "env:AWS_SECRET_ACCESS_KEY"}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms)
+ VALUES ('stream', 'stream', 'batch', 500,
+  'SELECT c.id AS _key, c.id, c.name, IF(c.active, NULL, ''delete'') AS _op
+     FROM customers c WHERE c.id IN (:keys)',
+  'POST / HTTP/1.1
+X-Amz-Target: Kinesis_20131202.PutRecords
+Content-Type: application/x-amz-json-1.1
+
+{"StreamName": {{json endpoint.stream}}, "Records": [{{#each docs}}{"Data": "{{#if (eq op "delete")}}{{base64 ''{"op":"delete"}''}}{{else}}{{base64 (json doc)}}{{/if}}", "PartitionKey": {{json key}}}{{#unless @last}}, {{/unless}}{{/each}}]}',
+  100);
+```
+
+A trigger on `customers` marks `{{new.id}}`. Up to 500 keys go out as one `PutRecords`, and the
+answer's records are checked one by one: `expect` runs per record with the record's own JSON as
+`body` (here it confirms the `SequenceNumber` Kinesis returns for the stored record). `Data` is
+the document in base64 (the `base64` helper); a deleted key's record carries `{"op":"delete"}`,
+and the reader keys on `PartitionKey`. The endpoint names the stream and the region
+(`aws-kinesis://[<region>/]<stream-name>`); without a region in it, one must come from the AWS
+default settings. An emulator or a VPC endpoint is given with `?endpoint=`, e.g.
+`aws-kinesis://eu-west-1/customer-changes?endpoint=http://kinesis-mock:4568`.
+
+**Messages to an AMQP broker**, one publish per key (a consumer keeps the newest message per
+key):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, vars) VALUES ('bus', 'amqp',
+ 'amqp://broker:5672/', '{"username": "lwf", "password": "env:BUS_PASSWORD"}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms)
+ VALUES ('orders', 'bus', 'key',
+  'SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)',
+  '{{#each docs}}PUBLISH /orders/order.changed
+Message-Id: {{key}}
+
+{"key":{{json key}},"op":{{json op}},"doc":{{json doc}}}{{/each}}',
+  100);
+```
+
+A trigger on `orders` marks `{{new.id}}`. Each changed key is one message: exchange `orders`,
+routing key `order.changed`, `Message-Id` the key, and the envelope `{"key","op","doc"}` as the
+JSON body. A deleted row arrives with `"op": "delete"`, an upsert with `null`. The broker's
+confirm decides: `expect` is empty, so an ack confirms the key; a `basic.return` (312, no queue
+is bound to the routing key) refuses the key on its own; a nack is retried with backoff. The
+consumer binds a durable queue to the `orders` exchange with the routing key `order.changed`.
 
 **Search index re-sync in place** (OpenSearch / Elasticsearch): upsert everything, then delete
 what the index has and the database does not.

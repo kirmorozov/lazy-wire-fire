@@ -8,6 +8,7 @@ Change-triggered actions from the MySQL binlog. Row changes in the tables you re
 **keys**. For the changed keys a rule runs its queries concurrently, merges the rows into one JSON
 document per key, renders one Handlebars template and fires the result at a target: an HTTP
 endpoint (any method, a whole raw request), an Amazon SQS queue (one `SendMessageBatch` per
+action), an Amazon Kinesis stream (one `PutRecords` per action), an AMQP broker (one publish per
 action), Redis (one command), or MySQL / PostgreSQL (one SQL statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
@@ -75,7 +76,7 @@ backoff, and the error is in `last_error`.
 Values from rows go into templates through the helper of the place they land in (`json`,
 `url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
-export, an SQS queue, reset steps, in [docs/reference.md](docs/reference.md#examples).
+export, an SQS queue, a Kinesis stream, an AMQP broker, reset steps, in [docs/reference.md](docs/reference.md#examples).
 
 ## Platforms
 
@@ -133,6 +134,28 @@ Environment variables:
 | `RUST_LOG`, `LAZYWF_LOG_FORMAT` | `info`, `text` | log level, `json` |
 
 Rules, triggers and targets: [docs/reference.md](docs/reference.md).
+
+## Undelivered keys
+
+A key is dropped only when the target refuses it for good: it is refused five times while other
+keys of the same actions go through (the strikes live in memory only; when a whole flush is
+refused, the template or the target is at fault, and nothing is dropped). Transient failures
+(connection errors, timeouts, 5xx, 408, 429, AWS throttling codes, a Redis error reply,
+transient SQL errors) never drop a key: it stays pending and the rule retries it with backoff.
+
+A dropped key is named in the rule's `last_error` (`/status`, `lazy_wire_fire_status`). With
+`LAZYWF_LOG_FORMAT=json` it is also one WARN event per key, on the event target
+`lazywf::undelivered`:
+
+```json
+{"timestamp":"2026-11-02T10:15:04.123456Z","level":"WARN","fields":{"message":"undelivered key dropped","rule":"orders_sync","target":"search","key":"42","reason":"400 Bad Request: document is not valid","strikes":5},"target":"lazywf::undelivered"}
+```
+
+Fields: `rule` the rule name; `target` the target's name in the configuration; `key` the key
+(truncated to 200 characters); `reason` the last refusal; `strikes` the number of refusals at
+the drop (5). The `op` (insert, update or delete) is not logged: a flush merges the keys of all
+triggers. To filter for dropped keys in a log pipeline, match the top-level `target`
+`lazywf::undelivered`. The event is WARN, so a `RUST_LOG` of `error` hides it.
 
 ## Operations
 
@@ -226,8 +249,24 @@ workarounds are in [server setup](docs/server-setup.md#binlog-settings).
 Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
 2026-12-31.
 
-Targets tested: OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (security on), Varnish 7.6, Redis 7.4,
-Valkey 8.1, an S3 API (versitygw 1.10), MySQL and PostgreSQL 17 as SQL targets.
+## Supported targets
+
+Where actions go — one row per target kind. The full endpoint forms, limits, resets and delivery
+contracts are in [docs/reference.md](docs/reference.md#targets); the images are pinned in
+[docker-compose.test.yml](docker-compose.test.yml).
+
+| target | `kind` | endpoint | one action is | per-key answer | stray cleanup | credentials | tested against |
+|---|---|---|---|---|---|---|---|
+| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]` | one HTTP request | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
+| S3 API | `http.s3` ([targets](docs/reference.md#targets)) | the service URL, optional (derived from `vars` when empty) | one signed S3 request | for the action | allowed | `access_key_ref` / `secret_key_ref` (references only; optional `session_token_ref`), else the AWS default chain | versitygw 1.10 — CI |
+| Redis / Valkey, Streams included | `redis` ([targets](docs/reference.md#targets)) | `host:port/db` (or `redis://` / `rediss://`) | one Redis command | for the action | allowed | `vars.password`, optional `vars.username` for ACLs: a literal or a reference | Redis 7.4, Valkey 8.1 — CI |
+| MySQL / MariaDB | `mysql` (also `mariadb`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | MySQL 8.4 — CI |
+| PostgreSQL | `pgsql` (also `postgres`, `postgresql`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | PostgreSQL 17 — CI |
+| Amazon SQS | `sqs` ([SQS targets](docs/reference.md#sqs-targets)) | `aws-sqs://[<region>/]<account-id>/<queue-name>` | one `SendMessageBatch` | per entry, per key | refused at load (append-only; a purging `once` step too) | as `http.s3`; never in the URL | ElasticMQ 1.6 — e2e, opt-in; not in CI yet |
+| Amazon Kinesis Data Streams | `kinesis` ([Kinesis targets](docs/reference.md#kinesis-targets)) | `aws-kinesis://[<region>/]<stream-name>` | one `PutRecords` | per record, per key | refused at load (append-only; a stream-deleting `once` step too) | as `http.s3`; never in the URL | kinesis-mock 0.2 — e2e, opt-in; not in CI yet |
+| AMQP 0-9-1 broker | `amqp` ([AMQP targets](docs/reference.md#amqp-targets)) | `amqp(s)://host[:port][/vhost]` | one confirmed publish | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | RabbitMQ 4.3 — e2e, opt-in; not in CI yet |
+
+No other kind refuses a stray cleanup or a purge-like reset step.
 
 ## Development
 
