@@ -120,6 +120,7 @@ Environment variables:
 | `LAZYWF_DSN` | — | `mysql://user:pass@host:3306/schema` (`mariadb://` accepted); the schema holds the tool's tables |
 | `LAZYWF_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_DATABASE` | —, `3306`, `root`, —, — | instead of the DSN (values used verbatim) |
 | `LAZYWF_BINLOG_USER`, `LAZYWF_BINLOG_PASSWORD` (or `LAZYWF_BINLOG_DSN`) | the DSN's | replication account for the binlog stream |
+| `LAZYWF_QUERY_USER`, `LAZYWF_QUERY_PASSWORD` (or `LAZYWF_QUERY_DSN`) | the DSN's | account that runs the SQL the configuration defines; unset: the main account runs it. A SELECT-only account on the source tables the rules read is recommended ([server setup](docs/server-setup.md#query-account)) |
 | `LAZYWF_TLS`, `LAZYWF_TLS_CA` | `disabled`, — | `required`, `verify-ca`, `verify-full`; extra CA file |
 | `LAZYWF_INSTANCE` | `default` | instance name: status rows and the instance lock (one active copy per schema and name; a second one stands by) |
 | `LAZYWF_SERVER_ID` | random | replica server id |
@@ -133,6 +134,7 @@ Environment variables:
 | `LAZYWF_MAX_BACKOFF_MS` | `60000` | longest retry wait |
 | `LAZYWF_STOP_GRACE_MS` | `10000` | on SIGTERM, how long running actions may finish |
 | `LAZYWF_SECRET_DIRS` | `/run/secrets:/var/run/secrets` | where `file:` secret references may point |
+| `LAZYWF_ALLOWED_HOSTS` | — | opt-in: the endpoint hosts a target may connect to (exact names, `*.` suffixes, IP literals or CIDR ranges, each optionally with a port); unset: no restriction ([security](docs/reference.md#security)) |
 | `RUST_LOG`, `LAZYWF_LOG_FORMAT` | `info`, `text` | log level, `json` |
 
 Rules, triggers and targets: [docs/reference.md](docs/reference.md).

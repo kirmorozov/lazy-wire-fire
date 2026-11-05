@@ -208,9 +208,25 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 
 ### SQL targets
 
-`mysql` and `pgsql`: the template renders one SQL statement, run on the target database (a statement followed by another is refused; PostgreSQL runs it through the
-extended protocol, which refuses batches too). Each connect pins the session so quoting is sound:
-MySQL `SET NAMES utf8mb4` with backslash escapes on, PostgreSQL UTF-8 with
+`mysql` and `pgsql`: the template renders one SQL statement, run on the target database. One
+action is one statement, enforced twice: lazywf refuses a top-level `;` followed by more (the
+error names the statement count) and an executable comment (`/*! … */`, `/*!NNNNN … */`,
+`/*M! … */` — the server would run its body as SQL); optimizer hints (`/*+ … */`) stay allowed.
+The server enforces it too: MySQL and MariaDB run the statement as a prepared statement, which
+the server refuses to run as more than one, and PostgreSQL runs it through the extended protocol,
+which refuses batches as well. A server refusal is not transient: it is a refusal in `last_error`
+(MySQL's error 1295 for a kind that cannot be prepared, 1064 for a second statement after the
+`;`).
+
+On MySQL, the kinds that cannot be prepared cannot run through a `mysql` target:
+`CREATE` / `DROP TRIGGER`, `CREATE` / `DROP PROCEDURE`, `BEGIN` / `START TRANSACTION`,
+`SAVEPOINT`, `USE`, `LOCK TABLES` / `UNLOCK TABLES`, `SHOW WARNINGS`, `HANDLER`, `XA START`,
+`LOAD DATA` and `PREPARE` / `EXECUTE` (on MariaDB, only `PREPARE` / `EXECUTE` is refused).
+`COMMIT` and `ROLLBACK` still run, so a statement must not open a transaction on MySQL
+([SQL syntax permitted in prepared statements](https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html#prepared-statements-permitted)).
+
+Each connect pins the session so quoting is sound: MySQL `SET NAMES utf8mb4` with backslash
+escapes on, PostgreSQL UTF-8 with
 `standard_conforming_strings`. Put values in with `sql_quote` (a string literal of the target's
 dialect, `NULL` for null; numbers are quoted too and converted by the server) and names with
 `sql_ident`. Deadlocks, lock waits, timeouts and lost connections are transient; other SQL errors
@@ -677,7 +693,7 @@ rows go through the helper of the place they land in**:
 | a path or query | `/items/{{url_encode key}}.json` | `/items/{{key}}.json`: a key `a?x=` writes another object |
 | a regex (Varnish tags) | `{{regex_escape this}}` | `{{this}}`: a key `.*` purges everything |
 | a Redis argument | `{{redis_quote this}}`, or `ARGV` of a script | splicing keys into a Lua string |
-| SQL | `{{sql_quote key}}`, `{{sql_ident name}}` | `'{{key}}'`: a key `x'); DROP …` runs SQL |
+| SQL | `{{sql_quote key}}`, `{{sql_ident name}}`; an action is one statement, a second is refused ([SQL targets](#sql-targets)) | `'{{key}}'`: a key `x'); DROP …` starts a second statement |
 
 What the tool enforces on its own:
 
@@ -697,16 +713,42 @@ What the tool enforces on its own:
   Transient failures (connection, timeout, 5xx, 429, Redis `LOADING`/`READONLY`/…) only wait.
 * **Bounded parsing**: response bodies, Redis replies and path indexes (`_path`, `a[n]`, at most
   10000) are capped. Partials (`{{> …}}`) are refused.
+* **A SQL target action is one statement.** A rendered statement holding a top-level `;`
+  followed by more, or an executable comment (`/*! … */`, `/*!NNNNN … */`, `/*M! … */`), is
+  refused before it is sent (the error names the statement count or the comment); the server
+  enforces it too — MySQL / MariaDB run the statement as a prepared statement, which refuses
+  more than one, and PostgreSQL's extended protocol refuses batches. Optimizer hints
+  (`/*+ … */`) stay allowed ([SQL targets](#sql-targets)).
 * **Secret references are confined**: `env:` cannot name lazywf's own settings (`LAZYWF_*`), and
   `file:` must resolve (symlinks followed) inside `LAZYWF_SECRET_DIRS` (default
   `/run/secrets:/var/run/secrets`).
 
 What it cannot enforce, so treat the tool's tables as **admin-only**:
 
-* a writer of `lazy_wire_fire_rule` / `_trigger` runs SQL as lazywf's account (give it `SELECT`
-  only where rules need it), and sends the result anywhere a target points;
+* a writer of `lazy_wire_fire_rule` / `_trigger` runs SQL as the account that runs the
+  configuration's queries: lazywf's own account when `LAZYWF_QUERY_*` is unset (give it `SELECT`
+  only where rules need it), or the query account — for which a SELECT-only one on the source
+  tables is recommended ([server setup](server-setup.md#query-account)) — and sends the result
+  anywhere a target points;
 * a writer of `lazy_wire_fire_target` chooses where requests (with the credentials of that target)
-  go, including internal addresses.
+  go, including internal addresses — unless `LAZYWF_ALLOWED_HOSTS` pins the endpoint hosts.
+
+Where the tables cannot be kept admin-only, `LAZYWF_ALLOWED_HOSTS` pins the endpoint hosts a
+target may connect to: a comma-separated list of patterns, each an exact host name
+(case-insensitive), a `*.` suffix (the subdomains of the name, not the name itself), an IP
+literal, or a CIDR range, with an optional `:port` (an IPv6 pattern with a port in brackets,
+`[2001:db8::1]:443`). Unset or blank: no restriction.
+
+Every endpoint's effective host and port — the name lazywf connects to, after a `?endpoint=`
+override, the derived AWS and Google service hosts, and the S3 virtual-hosted bucket host (the
+bucket name in front of the service host) — must match a pattern. Matching is on that name:
+nothing is resolved in DNS, so an IP pattern matches IP-literal endpoints only, and `localhost`
+never matches `127.0.0.1`. An unmatched endpoint is a target load error that names the host and
+the setting; it shows in the rule's `last_error`, and the check runs when a target is loaded —
+at start, and on a config reload whose target row changed (an unchanged target keeps its checked
+load). Not covered: the AWS and Google credential calls (lazywf does not take them from the
+target table) and redirects (the HTTP client does not follow them). At start the log says whether
+the list is set and its pattern count.
 
 ## Examples
 

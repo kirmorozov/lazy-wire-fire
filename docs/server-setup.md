@@ -107,6 +107,42 @@ GRANT SELECT ON app.* TO 'lazywf'@'%';
 The rules' queries then name the source's tables qualified (`FROM app.orders o`), since
 unqualified names resolve in the DSN's schema ([reference](reference.md#rules)).
 
+### Query account
+
+The SQL the configuration defines (rule selects, trigger `keys_sql`, reset-step queries, and the
+`expect` / `keys` / `next` expressions) can run on a separate account instead of the one above:
+
+- `LAZYWF_QUERY_DSN`: a full DSN for that account (the main account's TLS settings apply); it
+  takes precedence over the pair below; or
+- `LAZYWF_QUERY_USER` and `LAZYWF_QUERY_PASSWORD`: the main DSN's host, port and schema with the
+  query credentials.
+
+With neither set, the main account runs everything: the behaviour above, unchanged.
+
+Recommend a SELECT-only account on the source tables the rules read — it can do no more than the
+rules read:
+
+```sql
+CREATE USER 'lwf_query'@'%' IDENTIFIED BY 'change-me';
+GRANT SELECT ON app.orders TO 'lwf_query'@'%';
+GRANT SELECT ON app.customers TO 'lwf_query'@'%';
+```
+
+(one `GRANT` per source table; `SELECT` on the whole source schema is the looser form).
+The source's `SELECT` grants then move to the query account: give the main account only the
+rights on its own schema and the replication grants. What stays on the main account: the tool's
+tables, the status writes, the commit fence and the instance lock. Target connections keep their
+own credentials.
+
+lazywf does not check the first keyword of the configuration's SQL: the `_key` column keeps
+plain DML out of the queries, but a `CALL` or a side-effecting function that returns `_key` rows
+passes the load checks. The account's grants are the real boundary — `SELECT` only, no write
+privilege, and no `EXECUTE` on stored routines that write.
+
+At start the account is probed with `SELECT 1`: a failure stops the start, and the error names
+`LAZYWF_QUERY_*` (never the password). The start line logs `query_account=<user>` (the user name
+only), or `none (the main account runs the queries)` when unset.
+
 ## Amazon RDS and Aurora
 
 lazywf runs on Amazon RDS for MySQL and MariaDB and on Aurora MySQL, on the lines AWS offers that
