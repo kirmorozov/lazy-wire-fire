@@ -22,13 +22,14 @@ pub struct RedisAddr {
 impl RedisAddr {
     /// `host:port/db`, `host:port`, `redis://host:port/db`, `rediss://…` (TLS).
     pub fn parse(s: &str) -> Result<RedisAddr> {
+        let shown = crate::secrets::redact_url(s);
         let s = s.trim();
         let (secure, rest) = if let Some(r) = s.strip_prefix("rediss://") {
             (true, r)
         } else if let Some(r) = s.strip_prefix("redis://") {
             (false, r)
         } else if s.contains("://") {
-            bail!("redis endpoint `{s}`: only redis:// and rediss:// are supported");
+            bail!("redis endpoint `{shown}`: only redis:// and rediss:// are supported");
         } else {
             (false, s)
         };
@@ -38,17 +39,17 @@ impl RedisAddr {
                 a,
                 d.trim_matches('/')
                     .parse()
-                    .map_err(|_| anyhow!("redis endpoint `{s}`: invalid database `{d}`"))?,
+                    .map_err(|_| anyhow!("redis endpoint `{shown}`: invalid database `{d}`"))?,
             ),
             None => (rest, 0),
         };
         if authority.contains('@') {
             bail!(
-                "redis endpoint `{s}`: credentials belong in the target's vars, not in the address"
+                "redis endpoint `{shown}`: credentials belong in the target's vars, not in the address"
             );
         }
-        let (host, port) =
-            split_host_port(authority, 6379).with_context(|| format!("redis endpoint `{s}`"))?;
+        let (host, port) = split_host_port(authority, 6379)
+            .with_context(|| format!("redis endpoint `{shown}`"))?;
         Ok(RedisAddr {
             secure,
             host,

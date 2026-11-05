@@ -84,38 +84,39 @@ pub struct Addr {
 
 impl Addr {
     pub fn parse(s: &str) -> Result<Addr> {
+        let shown = crate::secrets::redact_url(s);
         let s = s.trim();
         let (secure, rest) = if let Some(r) = s.strip_prefix("amqps://") {
             (true, r)
         } else if let Some(r) = s.strip_prefix("amqp://") {
             (false, r)
         } else {
-            bail!("endpoint `{s}`: use amqp://host:port/vhost or amqps://host:port/vhost");
+            bail!("endpoint `{shown}`: use amqp://host:port/vhost or amqps://host:port/vhost");
         };
         if rest.contains('@') {
-            bail!("endpoint `{s}`: credentials belong in vars.username and vars.password, not in the URL");
+            bail!("endpoint `{shown}`: credentials belong in vars.username and vars.password, not in the URL");
         }
         if rest.contains(['?', '#']) {
-            bail!("endpoint `{s}`: no query string or fragment (TLS is the target's `tls`)");
+            bail!("endpoint `{shown}`: no query string or fragment (TLS is the target's `tls`)");
         }
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => (rest, ""),
         };
         if authority.starts_with('[') {
-            bail!("endpoint `{s}`: IPv6 addresses are not supported");
+            bail!("endpoint `{shown}`: IPv6 addresses are not supported");
         }
         let default_port = if secure { 5671 } else { 5672 };
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) => (
                 h,
                 p.parse::<u16>()
-                    .with_context(|| format!("endpoint `{s}`: port `{p}`"))?,
+                    .with_context(|| format!("endpoint `{shown}`: port `{p}`"))?,
             ),
             None => (authority, default_port),
         };
         if host.is_empty() {
-            bail!("endpoint `{s}`: no host");
+            bail!("endpoint `{shown}`: no host");
         }
         let vhost = pct_decode(path.trim_end_matches('/')).context("endpoint vhost")?;
         Ok(Addr {

@@ -226,7 +226,7 @@ impl Kind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct TargetDef {
     pub name: String,
     pub kind: Kind,
@@ -236,6 +236,28 @@ pub struct TargetDef {
     /// SQL condition over the response row (see [`crate::response`]); `None`: the default.
     pub expect: Option<String>,
     pub vars: Map<String, Value>,
+}
+
+/// Endpoints are shown without userinfo, and `vars` by key only: a literal credential
+/// (a header value, a password) must not reach a `{:?}` of the definition.
+impl std::fmt::Debug for TargetDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let endpoints: Vec<String> = self
+            .endpoints
+            .iter()
+            .map(|e| crate::secrets::redact_url(e))
+            .collect();
+        let vars: Vec<&String> = self.vars.keys().collect();
+        f.debug_struct("TargetDef")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("endpoints", &endpoints)
+            .field("tls", &self.tls)
+            .field("timeout", &self.timeout)
+            .field("expect", &self.expect)
+            .field("vars (keys)", &vars)
+            .finish()
+    }
 }
 
 /// A JSON object column (empty when NULL or blank).
@@ -1214,5 +1236,29 @@ mod aws_endpoint_tests {
         assert!(!ok("aws-lambda://orders?invocation=batch", "{}"));
         // the other kinds refuse an aws-lambda:// endpoint
         assert!(TargetDef::from_row(&row("http", Some("aws-lambda://orders"), "{}")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod target_debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_shows_var_keys_and_endpoints_without_userinfo() {
+        let mut vars = Map::new();
+        vars.insert("password".into(), Value::String("VAR-LITERAL-7".into()));
+        let def = TargetDef {
+            name: "t".into(),
+            kind: Kind::HttpBasic,
+            endpoints: vec!["http://u:URL-PW-8@h:1/base".into()],
+            tls: crate::tls::TlsSpec::parse(None).unwrap(),
+            timeout: Duration::from_secs(1),
+            expect: None,
+            vars,
+        };
+        let shown = format!("{def:?}");
+        assert!(!shown.contains("VAR-LITERAL-7"), "{shown}");
+        assert!(!shown.contains("URL-PW-8"), "{shown}");
+        assert!(shown.contains("password"), "{shown}");
     }
 }

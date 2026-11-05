@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Connection for queries, the tool's tables and the instance lock.
     pub dsn: String,
@@ -25,6 +25,30 @@ pub struct Config {
     pub status_every: Duration,
     pub max_backoff: Duration,
     pub stop_grace: Duration,
+}
+
+/// The DSNs are shown without their passwords (`mysql://***@host/...`): a `{:?}` of the
+/// configuration must not reach the log.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("dsn", &crate::secrets::redact_url(&self.dsn))
+            .field("binlog_dsn", &crate::secrets::redact_url(&self.binlog_dsn))
+            .field("schema", &self.schema)
+            .field("instance", &self.instance)
+            .field("server_id", &self.server_id)
+            .field("server_id_fixed", &self.server_id_fixed)
+            .field("health_addr", &self.health_addr)
+            .field("heartbeat", &self.heartbeat)
+            .field("visibility_delay", &self.visibility_delay)
+            .field("pool_size", &self.pool_size)
+            .field("send_concurrency", &self.send_concurrency)
+            .field("config_poll", &self.config_poll)
+            .field("status_every", &self.status_every)
+            .field("max_backoff", &self.max_backoff)
+            .field("stop_grace", &self.stop_grace)
+            .finish()
+    }
 }
 
 impl Config {
@@ -298,5 +322,22 @@ mod tests {
         assert!(cfg(&[]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/")]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/s"), ("LAZYWF_SERVER_ID", "0")]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_shows_the_dsn_without_its_password() {
+        let cfg = Config::from_lookup(|k| match k {
+            "LAZYWF_DSN" => Some("mysql://user:DBPW-debug-1@db.example:3306/app".into()),
+            _ => None,
+        })
+        .unwrap();
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("DBPW-debug-1"), "{shown}");
+        assert!(shown.contains("mysql://***@db.example:3306/app"), "{shown}");
     }
 }

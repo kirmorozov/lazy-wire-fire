@@ -33,11 +33,24 @@ use crate::http::{BaseUrl, RawRequest};
 use crate::secrets;
 
 /// The target's references (`access_key_ref`, `secret_key_ref`, `session_token_ref`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Refs {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for Refs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Refs")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"** redacted **")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "** redacted **"),
+            )
+            .finish()
+    }
 }
 
 impl Refs {
@@ -356,18 +369,20 @@ pub fn scheme_of(url: &str) -> Option<&str> {
 /// `aws-sqs://…` for kind sqs and `aws-kinesis://…` for kind kinesis (`service` is both the
 /// kind name and the scheme suffix). Any other URL is refused, with the reason.
 fn scheme_error(url: &str, service: &str) -> anyhow::Error {
+    let shown = crate::secrets::redact_url(url);
     let want = format!("aws-{service}://");
     if url.starts_with("https://") || url.starts_with("http://") {
         anyhow!("kind {service} takes `{want}` endpoints, not a plain http(s) URL")
     } else if let Some(other) = scheme_of(url).filter(|s| s.starts_with("aws-")) {
         anyhow!("kind {service} takes `{want}` endpoints, not `{other}://`")
     } else {
-        anyhow!("kind {service} takes `{want}` endpoints, not `{url}`")
+        anyhow!("kind {service} takes `{want}` endpoints, not `{shown}`")
     }
 }
 
 /// The path segments of an `aws-<service>://` URL, and its `?endpoint=` override (validated).
 fn split_aws_url(url: &str, service: &str) -> Result<(Vec<String>, Option<String>)> {
+    let shown = crate::secrets::redact_url(url);
     let rest = url
         .strip_prefix(&format!("aws-{service}://"))
         .ok_or_else(|| scheme_error(url, service))?;
@@ -376,25 +391,25 @@ fn split_aws_url(url: &str, service: &str) -> Result<(Vec<String>, Option<String
         None => (rest, None),
     };
     if path.contains('@') {
-        bail!("`{url}`: credentials belong in the target's vars (secret references), never in the URL");
+        bail!("`{shown}`: credentials belong in the target's vars (secret references), never in the URL");
     }
     if path.is_empty() || path.split('/').any(str::is_empty) {
-        bail!("`{url}`: the path has an empty segment");
+        bail!("`{shown}`: the path has an empty segment");
     }
     let mut endpoint = None;
     for part in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
         let Some(value) = part.strip_prefix("endpoint=") else {
             let name = part.split('=').next().unwrap_or(part);
-            bail!("`{url}`: unknown query parameter `{name}` (the only one is `endpoint`)");
+            bail!("`{shown}`: unknown query parameter `{name}` (the only one is `endpoint`)");
         };
         if endpoint.is_some() {
-            bail!("`{url}`: `endpoint` is given twice");
+            bail!("`{shown}`: `endpoint` is given twice");
         }
         let value = percent_decode(value);
         let base = BaseUrl::parse(&value)
-            .with_context(|| format!("`{url}`: `endpoint` must be http(s)://host:port"))?;
+            .with_context(|| format!("`{shown}`: `endpoint` must be http(s)://host:port"))?;
         if !base.base.is_empty() {
-            bail!("`{url}`: `endpoint` must be http(s)://host:port, without a path");
+            bail!("`{shown}`: `endpoint` must be http(s)://host:port, without a path");
         }
         endpoint = Some(value);
     }
@@ -431,21 +446,22 @@ pub struct SqsUrl {
 impl SqsUrl {
     /// `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`.
     pub fn parse(url: &str) -> Result<SqsUrl> {
+        let shown = crate::secrets::redact_url(url);
         let (segs, endpoint) = split_aws_url(url, "sqs")?;
         let (region, account, queue) = match segs.as_slice() {
             [a, q] => (None, a, q),
             [r, a, q] => (Some(r), a, q),
             _ => bail!(
-                "`{url}`: kind sqs takes `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`"
+                "`{shown}`: kind sqs takes `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`"
             ),
         };
         if let Some(r) = region {
             if !valid_region(r) {
-                bail!("`{url}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
             }
         }
         if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
-            bail!("`{url}`: the account id is twelve digits");
+            bail!("`{shown}`: the account id is twelve digits");
         }
         let stem = queue.strip_suffix(".fifo").unwrap_or(queue);
         let name_ok = !stem.is_empty()
@@ -454,7 +470,7 @@ impl SqsUrl {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
         if !name_ok {
-            bail!("`{url}`: the queue name is 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo`");
+            bail!("`{shown}`: the queue name is 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo`");
         }
         Ok(SqsUrl {
             region: region.cloned(),
@@ -482,17 +498,18 @@ pub struct KinesisUrl {
 impl KinesisUrl {
     /// `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`.
     pub fn parse(url: &str) -> Result<KinesisUrl> {
+        let shown = crate::secrets::redact_url(url);
         let (segs, endpoint) = split_aws_url(url, "kinesis")?;
         let (region, stream) = match segs.as_slice() {
             [s] => (None, s),
             [r, s] => (Some(r), s),
             _ => bail!(
-                "`{url}`: kind kinesis takes `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`"
+                "`{shown}`: kind kinesis takes `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`"
             ),
         };
         if let Some(r) = region {
             if !valid_region(r) {
-                bail!("`{url}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
             }
         }
         let ok = (1..=128).contains(&stream.len())
@@ -500,7 +517,7 @@ impl KinesisUrl {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
         if !ok {
-            bail!("`{url}`: a stream name is 1 to 128 letters, digits, `-`, `_` or `.`");
+            bail!("`{shown}`: a stream name is 1 to 128 letters, digits, `-`, `_` or `.`");
         }
         Ok(KinesisUrl {
             region: region.cloned(),
@@ -548,6 +565,7 @@ impl LambdaUrl {
     /// `aws-lambda://<function>[:<qualifier>]` or `aws-lambda://<region>/<function>[:<qualifier>]`,
     /// with `?invocation=sync|event` and `?endpoint=`.
     pub fn parse(url: &str) -> Result<LambdaUrl> {
+        let shown = crate::secrets::redact_url(url);
         // `invocation` is this kind's own parameter; `split_aws_url` takes `endpoint` only, so the
         // rest of the query is passed on to it.
         let (base, query) = match url.split_once('?') {
@@ -560,12 +578,14 @@ impl LambdaUrl {
             match part.strip_prefix("invocation=") {
                 Some(v) => {
                     if invocation.is_some() {
-                        bail!("`{url}`: `invocation` is given twice");
+                        bail!("`{shown}`: `invocation` is given twice");
                     }
                     invocation = Some(match v {
                         "sync" => Invocation::Sync,
                         "event" => Invocation::Event,
-                        other => bail!("`{url}`: `invocation` is `sync` or `event`, not `{other}`"),
+                        other => {
+                            bail!("`{shown}`: `invocation` is `sync` or `event`, not `{other}`")
+                        }
                     });
                 }
                 None => rest.push(part),
@@ -581,12 +601,12 @@ impl LambdaUrl {
             [f] => (None, f.as_str()),
             [r, f] => (Some(r.as_str()), f.as_str()),
             _ => bail!(
-                "`{url}`: kind lambda takes `aws-lambda://<function-name>[:<qualifier>]` or `aws-lambda://<region>/<function-name>[:<qualifier>]`"
+                "`{shown}`: kind lambda takes `aws-lambda://<function-name>[:<qualifier>]` or `aws-lambda://<region>/<function-name>[:<qualifier>]`"
             ),
         };
         if let Some(r) = region {
             if !valid_region(r) {
-                bail!("`{url}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
             }
         }
         let (function, qualifier) = match last.split_once(':') {
@@ -599,7 +619,7 @@ impl LambdaUrl {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
         if !name_ok {
-            bail!("`{url}`: a function name is 1 to 64 letters, digits, `-`, `_` or `.`, optionally followed by `:<qualifier>`");
+            bail!("`{shown}`: a function name is 1 to 64 letters, digits, `-`, `_` or `.`, optionally followed by `:<qualifier>`");
         }
         // A qualifier: `$LATEST`, `$LATEST.PUBLISHED`, a version number or an alias (Invoke, Qualifier).
         if let Some(q) = qualifier {
@@ -609,7 +629,7 @@ impl LambdaUrl {
                     && q.bytes()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')));
             if !q_ok {
-                bail!("`{url}`: the qualifier is `$LATEST`, a version or an alias (letters, digits, `-`, `_`)");
+                bail!("`{shown}`: the qualifier is `$LATEST`, a version or an alias (letters, digits, `-`, `_`)");
             }
         }
         Ok(LambdaUrl {
@@ -1556,5 +1576,23 @@ mod url_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_masks_the_secret_key_and_the_session_token() {
+        let refs = Refs {
+            access_key: "env:AK-NAME".into(),
+            secret_key: "SK-LITERAL-5".into(),
+            session_token: Some("ST-LITERAL-6".into()),
+        };
+        let shown = format!("{refs:?}");
+        assert!(!shown.contains("SK-LITERAL-5"), "{shown}");
+        assert!(!shown.contains("ST-LITERAL-6"), "{shown}");
+        assert!(shown.contains("env:AK-NAME"), "{shown}");
     }
 }

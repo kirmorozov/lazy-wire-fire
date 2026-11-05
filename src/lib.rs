@@ -22,6 +22,7 @@ pub mod http;
 pub mod intset;
 pub mod keyset;
 pub mod lock;
+pub mod logging;
 pub mod model;
 pub mod path;
 pub mod pubsub;

@@ -107,3 +107,31 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 }
+
+/// `s` for a message: a URL's userinfo (`scheme://user:password@host`) is masked as `***`.
+/// Endpoint strings are echoed in refusals, and a refused credential must not reach the log.
+pub fn redact_url(s: &str) -> String {
+    let (head, rest) = match s.find("://") {
+        Some(i) => (&s[..i + 3], &s[i + 3..]),
+        None => ("", s),
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{head}***@{}", &rest[at + 1..]),
+        None => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_url;
+
+    #[test]
+    fn userinfo_is_masked_everywhere_else_kept() {
+        assert_eq!(redact_url("http://u:pw@h:1/x"), "http://***@h:1/x");
+        assert_eq!(redact_url("redis://:pw@h:6379/5"), "redis://***@h:6379/5");
+        assert_eq!(redact_url("u:pw@h:3306/db"), "***@h:3306/db");
+        assert_eq!(redact_url("http://h:1/a@b"), "http://h:1/a@b");
+        assert_eq!(redact_url("host:3306/db"), "host:3306/db");
+    }
+}

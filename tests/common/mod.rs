@@ -200,10 +200,11 @@ pub fn logs() {
     ONCE.call_once(|| {
         let filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
             .unwrap_or_else(|_| "info".into());
-        tracing_subscriber::fmt()
+        // `try_init`: a test binary that installs its own subscriber first keeps it.
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_test_writer()
-            .init();
+            .try_init();
     });
 }
 
