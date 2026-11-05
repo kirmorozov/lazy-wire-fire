@@ -531,20 +531,44 @@ pub async fn run(
         .query_first("SELECT @@lower_case_table_names")
         .await
         .unwrap_or(None);
-    let pool = Pool::new(
-        OptsBuilder::from_opts(opts.clone()).pool_opts(
-            PoolOpts::default()
-                .with_constraints(PoolConstraints::new(0, cfg.pool_size).expect("0 <= max")),
-        ),
-    );
+    let pool_opts = || {
+        PoolOpts::default()
+            .with_constraints(PoolConstraints::new(0, cfg.pool_size).expect("0 <= max"))
+    };
+    let pool = Pool::new(OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts()));
+    // The SQL that the configuration defines runs on the query account when one is set;
+    // otherwise on the main pool (the same pool, so nothing changes).
+    let query_account = cfg.query_account;
+    let query = if query_account {
+        let query_opts = binlog::replica_opts(&cfg.query_dsn)?;
+        let query = Pool::new(OptsBuilder::from_opts(query_opts).pool_opts(pool_opts()));
+        let mut probe = query
+            .get_conn()
+            .await
+            .map_err(|e| anyhow!("LAZYWF_QUERY_* account cannot connect to the server: {e}"))?;
+        probe
+            .query_drop("SELECT 1")
+            .await
+            .context("LAZYWF_QUERY_* account: SELECT 1")?;
+        drop(probe);
+        query
+    } else {
+        pool.clone()
+    };
     let env = Arc::new(Env::new(
         pool.clone(),
+        query.clone(),
         info.flavor,
         cfg.visibility_delay,
         cfg.send_concurrency,
     ));
     let saved = status::load(&mut control, &cfg.instance).await?;
-    info!(server = %info.version, schema = %cfg.schema, instance = %cfg.instance, "lazywf {} starting", env!("CARGO_PKG_VERSION"));
+    let query_user = if cfg.query_account {
+        query_opts_user(&cfg.query_dsn)
+    } else {
+        "none (the main account runs the queries)".to_string()
+    };
+    info!(server = %info.version, schema = %cfg.schema, instance = %cfg.instance, query_account = %query_user, "lazywf {} starting", env!("CARGO_PKG_VERSION"));
     let (tx, rx) = mpsc::unbounded_channel();
     let mut e = Engine {
         lock: lock_name,
@@ -604,7 +628,18 @@ pub async fn run(
     let start = e.choose_start().await?;
     let r = e.stream(start, rx, &mut shutdown).await;
     pool.disconnect().await.ok();
+    if query_account {
+        query.disconnect().await.ok();
+    }
     r
+}
+
+/// The user name of a DSN, for logs (never the password).
+fn query_opts_user(dsn: &str) -> String {
+    binlog::replica_opts(dsn)
+        .ok()
+        .and_then(|o| o.user().map(str::to_string))
+        .unwrap_or_default()
 }
 
 impl Engine {
@@ -938,7 +973,7 @@ impl Engine {
                 .map_err(|e| format!("{e:#}"))
                 .and_then(|def| match self.targets.get(&def.name) {
                     Some(old) if old.def == def => Ok(old.clone()),
-                    _ => Target::new(def, self.env.pool.clone()).map_err(|e| format!("{e:#}")),
+                    _ => Target::new(def, self.env.query.clone()).map_err(|e| format!("{e:#}")),
                 });
             if let Err(e) = &r {
                 warn!(target = %t.name, "invalid target: {e}");
@@ -971,7 +1006,13 @@ impl Engine {
                 }
             }
             sources.extend(defs.iter().map(|d| d.schema.clone()));
-            let mut rule = rule::compile(&mut self.control, def, defs, &targets).await;
+            // The configuration's SQL is prepared (and checked) on the query account.
+            let mut rule = if self.cfg.query_account {
+                let mut qc = self.env.query.get_conn().await?;
+                rule::compile(&mut qc, def, defs, &targets).await
+            } else {
+                rule::compile(&mut self.control, def, defs, &targets).await
+            };
             if let Some(e) = parse_err {
                 rule.error = Some(match rule.error.take() {
                     Some(o) => format!("{e}; {o}"),

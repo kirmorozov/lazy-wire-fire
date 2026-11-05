@@ -29,7 +29,11 @@ const FENCE_ID: &str = "lazywf";
 const PROBE_MEMO_MAX: usize = 64;
 
 pub struct Env {
+    /// lazywf's own reads and writes (fence, status, config, the instance lock): the main account.
     pub pool: Pool,
+    /// The SQL that the configuration defines (selects, `keys_sql`, snapshot keys, reset-step
+    /// expressions and `expect` conditions): the query account; the same pool when unset.
+    pub query: Pool,
     pub flavor: Flavor,
     pub visibility_delay: Duration,
     pub send_concurrency: usize,
@@ -49,12 +53,14 @@ pub struct Env {
 impl Env {
     pub fn new(
         pool: Pool,
+        query: Pool,
         flavor: Flavor,
         visibility_delay: Duration,
         send_concurrency: usize,
     ) -> Env {
         Env {
             pool,
+            query,
             flavor,
             visibility_delay,
             send_concurrency,
@@ -320,7 +326,7 @@ pub async fn resolve_keys(env: &Env, queries: &[KeyQuery]) -> Result<Vec<String>
     let futs: Vec<_> = queries
         .iter()
         .map(|q| async move {
-            let mut conn = env.pool.get_conn().await?;
+            let mut conn = env.query.get_conn().await?;
             let params: Vec<My> = q.params.iter().map(to_param).collect();
             let rows: Vec<Row> = conn
                 .exec(&*q.sql, Params::Positional(params))
@@ -367,7 +373,7 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
                 async move {
                     // Each `:keys` becomes `n` parameters.
                     let (sql, slots) = crate::sql::expand(&s.sql, |_| n);
-                    let mut conn = env.pool.get_conn().await?;
+                    let mut conn = env.query.get_conn().await?;
                     let stmt = conn
                         .prep(sql.as_str())
                         .await
@@ -945,7 +951,7 @@ pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<KeySet> {
         .snapshot_keys_sql
         .as_deref()
         .ok_or_else(|| anyhow!("the rule has no snapshot_keys_sql"))?;
-    let mut conn = env.pool.get_conn().await?;
+    let mut conn = env.query.get_conn().await?;
     let rows: Vec<Row> = conn.exec(q, ()).await.context("snapshot_keys_sql")?;
     Ok(keys_of(rows).into_iter().collect())
 }
@@ -984,7 +990,7 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeyS
                 .await
                 .with_context(|| format!("listing page {page}"))?;
             let mut got = read
-                .eval(&env.pool, &resp)
+                .eval(&env.query, &resp)
                 .await
                 .with_context(|| format!("listing page {page}: `keys` / `next`"))?
                 .into_iter();
