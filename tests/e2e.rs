@@ -377,6 +377,128 @@ async fn least_privilege_account() {
     db.exec(&format!("DROP USER {user}")).await;
 }
 
+/// The SQL that the configuration defines runs on the query account (`LAZYWF_QUERY_*`), a
+/// SELECT-only account with grants on the two source tables alone: a rule's selects and a
+/// trigger's `keys_sql` work under it; a select that reads past its grants is refused by the
+/// server, and the rule's status names it; lazywf's own tables stay on the main account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_account_runs_the_configured_sql() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "queryacct").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    db.exec("CREATE TABLE secret (id INT PRIMARY KEY)").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status VARCHAR(20))")
+        .await;
+    let user = "'lwf_query'@'%'";
+    db.exec(&format!("DROP USER IF EXISTS {user}")).await;
+    db.exec(&format!("CREATE USER {user} IDENTIFIED BY 'query-pw'"))
+        .await;
+    for table in ["orders", "customers"] {
+        db.exec(&format!(
+            "GRANT SELECT ON `{}`.`{table}` TO {user}",
+            db.schema
+        ))
+        .await;
+    }
+    let inst = Instance::ready(config(
+        &db,
+        &[
+            ("LAZYWF_QUERY_USER", "lwf_query"),
+            ("LAZYWF_QUERY_PASSWORD", "query-pw"),
+        ],
+    ))
+    .await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let template = "POST /o HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.status}};{{/each}}";
+    let good = json!([{"name": "by_id", "sql": "SELECT id AS _key, status FROM orders WHERE id IN (:keys)"}]);
+    let refused = json!([{"name": "by_id_locked", "sql": "SELECT id AS _key, status FROM orders WHERE id IN (:keys) AND id IN (SELECT id FROM secret)"}]);
+    for (name, selects) in [("good", good), ("locked", refused)] {
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms) VALUES (?, 'hook', ?, ?, 100)",
+            (name, selects.to_string(), template),
+        )
+        .await;
+    }
+    db.trigger("good", "orders", Some("{{new.id}}"), None).await;
+    db.trigger(
+        "good",
+        "customers",
+        None,
+        Some("SELECT id AS _key FROM orders WHERE customer_id = :new.id"),
+    )
+    .await;
+    db.trigger("locked", "orders", Some("{{new.id}}"), None)
+        .await;
+    // The rules are picked up from their own row events.
+    sleep_ms(1500).await;
+    db.exec("INSERT INTO orders VALUES (7, 1, 'paid')").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(15), "the select action", || async {
+        mock.requests()
+            .iter()
+            .any(|r| r.body == "7=paid;")
+            .then_some(())
+    })
+    .await;
+    // The customer row's keys_sql finds the order: the same action again.
+    mock.clear();
+    db.exec("INSERT INTO customers VALUES (1, 'ann')").await;
+    db.tick().await;
+    wait_for(Duration::from_secs(15), "the keys_sql action", || async {
+        mock.requests()
+            .iter()
+            .any(|r| r.body == "7=paid;")
+            .then_some(())
+    })
+    .await;
+    // The select reads a table the account has no grant on: the server refuses it, and the
+    // status names the select. (A locking read, FOR UPDATE, is refused by MySQL only: MariaDB
+    // needs just SELECT for it.)
+    wait_for(
+        Duration::from_secs(20),
+        "the refusal in the status",
+        || async {
+            let (_, _, _, err) = db.status("locked").await?;
+            err.filter(|e| e.contains("by_id_locked") && e.contains("denied"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    wait_for(Duration::from_secs(10), "the saved position", || async {
+        let (f, p, _, _) = db.status("good").await?;
+        ((f, p) >= after).then_some(())
+    })
+    .await;
+    inst.stop().await;
+    db.exec(&format!("DROP USER {user}")).await;
+}
+
+/// A query account that cannot connect stops the start, and the error names the setting, never
+/// the password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_account_that_cannot_connect_stops_the_start() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "queryrefuse").await;
+    let cfg = config(
+        &db,
+        &[
+            ("LAZYWF_QUERY_USER", "lwf_nobody"),
+            ("LAZYWF_QUERY_PASSWORD", "NOPE-query-7"),
+        ],
+    );
+    let (_tx, rx) = watch::channel(false);
+    let health = Arc::new(lazy_wire_fire::health::Health::default());
+    let err = lazy_wire_fire::engine::run(cfg, health, rx)
+        .await
+        .expect_err("the start must fail");
+    let shown = format!("{err:#}");
+    assert!(shown.contains("LAZYWF_QUERY_"), "{shown}");
+    assert!(!shown.contains("NOPE-query-7"), "{shown}");
+}
+
 /// `expect` is SQL over the response row: a condition on the body and a header holds the key
 /// (and the rule's position) until the target's answer meets it; a condition naming `status`
 /// replaces the 2xx default.

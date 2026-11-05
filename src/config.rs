@@ -11,6 +11,12 @@ pub struct Config {
     pub dsn: String,
     /// Connection for the binlog stream (replication account); defaults to `dsn`.
     pub binlog_dsn: String,
+    /// Connection for the SQL that the configuration defines (rule selects, trigger
+    /// `keys_sql`, reset-step queries, `expect` and `keys` / `next` expressions): a SELECT-only
+    /// account is recommended. Equal to `dsn` when `query_account` is false.
+    pub query_dsn: String,
+    /// `LAZYWF_QUERY_DSN` or `LAZYWF_QUERY_USER` is set: the query statements use `query_dsn`.
+    pub query_account: bool,
     /// Schema holding the tool's tables (the DSN's database).
     pub schema: String,
     pub instance: String,
@@ -34,6 +40,8 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("dsn", &crate::secrets::redact_url(&self.dsn))
             .field("binlog_dsn", &crate::secrets::redact_url(&self.binlog_dsn))
+            .field("query_dsn", &crate::secrets::redact_url(&self.query_dsn))
+            .field("query_account", &self.query_account)
             .field("schema", &self.schema)
             .field("instance", &self.instance)
             .field("server_id", &self.server_id)
@@ -70,6 +78,19 @@ impl Config {
                     with_credentials(&dsn, &user, get("LAZYWF_BINLOG_PASSWORD").as_deref())?
                 }
                 None => dsn.clone(),
+            },
+        };
+        let (query_dsn, query_account) = match get("LAZYWF_QUERY_DSN").filter(|v| !v.is_empty()) {
+            Some(d) => (
+                finish_dsn(&d, tls_mode(&get, "LAZYWF")?.as_deref(), "LAZYWF")?,
+                true,
+            ),
+            None => match get("LAZYWF_QUERY_USER").filter(|v| !v.is_empty()) {
+                Some(user) => (
+                    with_credentials(&dsn, &user, get("LAZYWF_QUERY_PASSWORD").as_deref())?,
+                    true,
+                ),
+                None => (dsn.clone(), false),
             },
         };
         let schema = schema_of(&dsn)?;
@@ -113,6 +134,8 @@ impl Config {
         Ok(Config {
             dsn,
             binlog_dsn,
+            query_dsn,
+            query_account,
             schema,
             instance,
             server_id,
@@ -295,6 +318,8 @@ mod tests {
         .unwrap();
         assert_eq!(c.dsn, "mysql://app:p%40ss%3Aw%2Frd@db:3306/shop");
         assert_eq!(c.binlog_dsn, c.dsn);
+        assert_eq!(c.query_dsn, c.dsn);
+        assert!(!c.query_account);
         assert_eq!(c.schema, "shop");
         assert_eq!(c.instance, "default");
         assert_eq!(c.health_addr, Some(([127, 0, 0, 1], 8081).into()));
@@ -319,6 +344,8 @@ mod tests {
             (c.server_id, c.server_id_fixed, c.health_addr),
             (77, true, None)
         );
+        assert_eq!(c.query_dsn, c.dsn);
+        assert!(!c.query_account);
         assert!(cfg(&[]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/")]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/s"), ("LAZYWF_SERVER_ID", "0")]).is_err());
@@ -339,5 +366,90 @@ mod debug_tests {
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("DBPW-debug-1"), "{shown}");
         assert!(shown.contains("mysql://***@db.example:3306/app"), "{shown}");
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
+        let m: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Config::from_lookup(|k| m.get(k).cloned())
+    }
+
+    #[test]
+    fn query_account_user_and_password_on_the_main_dsn() {
+        let c = cfg(&[
+            ("LAZYWF_DSN", "mysql://app:pw@db:3306/shop"),
+            ("LAZYWF_QUERY_USER", "lwf_query"),
+            ("LAZYWF_QUERY_PASSWORD", "q p"),
+        ])
+        .unwrap();
+        assert!(c.query_account);
+        assert_eq!(c.query_dsn, "mysql://lwf_query:q%20p@db:3306/shop");
+        assert_eq!(c.dsn, "mysql://app:pw@db:3306/shop");
+        assert_eq!(c.binlog_dsn, c.dsn);
+        assert_eq!(c.schema, "shop");
+    }
+
+    #[test]
+    fn query_account_user_without_password_keeps_the_host() {
+        let c = cfg(&[
+            ("LAZYWF_HOST", "db2"),
+            ("LAZYWF_PORT", "3307"),
+            ("LAZYWF_USER", "app"),
+            ("LAZYWF_PASSWORD", "pw"),
+            ("LAZYWF_DATABASE", "shop"),
+            ("LAZYWF_QUERY_USER", "lwf_query"),
+        ])
+        .unwrap();
+        assert_eq!(c.query_dsn, "mysql://lwf_query@db2:3307/shop");
+    }
+
+    #[test]
+    fn query_dsn_takes_precedence_over_query_user() {
+        let c = cfg(&[
+            ("LAZYWF_DSN", "mysql://app:pw@db:3306/shop"),
+            ("LAZYWF_QUERY_DSN", "mariadb://ro:rp@other:3308/shop"),
+            ("LAZYWF_QUERY_USER", "ignored"),
+            ("LAZYWF_QUERY_PASSWORD", "ignored"),
+            ("LAZYWF_TLS", "required"),
+        ])
+        .unwrap();
+        assert!(c.query_account);
+        assert_eq!(
+            c.query_dsn,
+            "mysql://ro:rp@other:3308/shop?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+    }
+
+    #[test]
+    fn empty_query_settings_mean_no_query_account() {
+        let c = cfg(&[
+            ("LAZYWF_DSN", "mysql://app:pw@db:3306/shop"),
+            ("LAZYWF_QUERY_DSN", ""),
+            ("LAZYWF_QUERY_USER", ""),
+        ])
+        .unwrap();
+        assert!(!c.query_account);
+        assert_eq!(c.query_dsn, c.dsn);
+    }
+
+    #[test]
+    fn debug_shows_the_query_dsn_without_its_password() {
+        let c = cfg(&[
+            ("LAZYWF_DSN", "mysql://app:pw@db:3306/shop"),
+            ("LAZYWF_QUERY_USER", "lwf_query"),
+            ("LAZYWF_QUERY_PASSWORD", "QPW-debug-7"),
+        ])
+        .unwrap();
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("QPW-debug-7"), "{shown}");
+        assert!(shown.contains("mysql://***@db:3306/shop"), "{shown}");
+        assert!(shown.contains("query_account: true"), "{shown}");
     }
 }
