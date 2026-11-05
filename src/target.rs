@@ -8,6 +8,7 @@ use base64::Engine as _;
 use mysql_async::Pool;
 use serde_json::{json, Value};
 
+use crate::allow::HostList;
 use crate::aws;
 use crate::http::{BaseUrl, Client as HttpClient, RawRequest};
 use crate::model::{Kind, TargetDef};
@@ -170,8 +171,26 @@ fn var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Every endpoint's host (the `ctx` host: the name or IP literal lazywf connects to) and port
+/// must match the allow-list. The first one that does not names the host and the setting.
+fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
+    for ep in endpoints {
+        let host = ep.ctx["host"].as_str().unwrap_or_default();
+        let port = ep.ctx["port"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(0);
+        if !list.allows(host, port) {
+            bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
+        }
+    }
+    Ok(())
+}
+
 impl Target {
-    pub fn new(def: TargetDef, pool: Pool) -> Result<Arc<Target>> {
+    /// Loads a target. With an allow-list (`LAZYWF_ALLOWED_HOSTS`), every endpoint's effective
+    /// host and port must match it, or the target is refused.
+    pub fn new(def: TargetDef, pool: Pool, allowed: Option<&HostList>) -> Result<Arc<Target>> {
         let expect = Expect::new(def.expect.as_deref()).context("`expect`")?;
         let mut endpoints = Vec::new();
         let mut aws_rt = None;
@@ -384,6 +403,9 @@ impl Target {
                     });
                 }
             }
+        }
+        if let Some(list) = allowed {
+            check_allowed(list, &endpoints)?;
         }
         let ctx = json!({"name": def.name, "vars": def.template_vars()});
         Ok(Arc::new(Target {
@@ -999,5 +1021,188 @@ mod kinesis_verdict_tests {
             .decode(data)
             .unwrap();
         assert_eq!(decoded, doc);
+    }
+}
+
+#[cfg(test)]
+mod allow_tests {
+    use super::*;
+    use crate::model::{RawTarget, TargetDef};
+
+    /// Loads a target of `kind` with one endpoint, under the allow-list `allowed`.
+    fn load(kind: &str, endpoint: &str, vars: &str, allowed: &str) -> Result<Arc<Target>> {
+        let def = TargetDef::from_row(&RawTarget {
+            name: "t".into(),
+            kind: Some(kind.into()),
+            endpoints: Some(endpoint.into()),
+            vars: Some(vars.into()),
+            ..Default::default()
+        })?;
+        let list = HostList::parse(allowed)?;
+        let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+        Target::new(def, pool, list.as_ref())
+    }
+
+    /// Each kind's effective host (the one lazywf connects to) is the one the list is matched
+    /// against: the listed host loads, another host is refused and the error names it.
+    #[test]
+    fn each_kind_checks_its_effective_host() {
+        let cases = [
+            (
+                "http",
+                "https://api.example.test:8443/hook",
+                "{}",
+                "api.example.test",
+            ),
+            (
+                "http.s3",
+                "",
+                r#"{"bucket":"orders","region":"eu-west-1"}"#,
+                "orders.s3.eu-west-1.amazonaws.com",
+            ),
+            (
+                "http.s3",
+                "",
+                r#"{"bucket":"orders","region":"eu-west-1","path_style":true}"#,
+                "s3.eu-west-1.amazonaws.com",
+            ),
+            (
+                "sqs",
+                "aws-sqs://eu-west-1/123456789012/orders",
+                "{}",
+                "sqs.eu-west-1.amazonaws.com",
+            ),
+            (
+                "sqs",
+                "aws-sqs://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34561",
+                "{}",
+                "127.0.0.1",
+            ),
+            (
+                "kinesis",
+                "aws-kinesis://eu-west-1/orders",
+                "{}",
+                "kinesis.eu-west-1.amazonaws.com",
+            ),
+            (
+                "lambda",
+                "aws-lambda://eu-west-1/orders",
+                "{}",
+                "lambda.eu-west-1.amazonaws.com",
+            ),
+            (
+                "pubsub",
+                "gc-pubsub://lwf-test/orders?endpoint=http://127.0.0.1:34563",
+                "{}",
+                "127.0.0.1",
+            ),
+            (
+                "pubsub",
+                "gc-pubsub://lwf-test/orders",
+                "{}",
+                "pubsub.googleapis.com",
+            ),
+            (
+                "redis",
+                "redis://cache.example.test:6380/0",
+                "{}",
+                "cache.example.test",
+            ),
+            (
+                "mysql",
+                "mysql://db.example.test:3306/app",
+                r#"{"username":"u","password":"p"}"#,
+                "db.example.test",
+            ),
+            (
+                "pgsql",
+                "postgres://pg.example.test:5432/app",
+                r#"{"username":"u","password":"p"}"#,
+                "pg.example.test",
+            ),
+            (
+                "amqp",
+                "amqp://mq.example.test:5672/",
+                r#"{"username":"u","password":"p"}"#,
+                "mq.example.test",
+            ),
+        ];
+        for (kind, endpoint, vars, host) in cases {
+            let listed = load(kind, endpoint, vars, host);
+            assert!(
+                listed.is_ok(),
+                "{kind} {endpoint}: {:?}",
+                listed.err().map(|e| format!("{e:#}"))
+            );
+            let refused = load(kind, endpoint, vars, "unrelated.example.test").err();
+            let msg = format!(
+                "{:#}",
+                refused.unwrap_or_else(|| panic!("{kind} {endpoint}: not refused"))
+            );
+            assert!(
+                msg.contains(host) && msg.contains("LAZYWF_ALLOWED_HOSTS"),
+                "{kind}: {msg}"
+            );
+        }
+        // Unset: no check, whatever the host.
+        assert!(load("http", "https://api.example.test/hook", "{}", "").is_ok());
+    }
+
+    #[test]
+    fn the_port_of_an_endpoint_is_matched_too() {
+        assert!(load(
+            "http",
+            "https://api.example.test:8443/hook",
+            "{}",
+            "api.example.test:443"
+        )
+        .is_err());
+        assert!(load(
+            "http",
+            "https://api.example.test:8443/hook",
+            "{}",
+            "api.example.test:8443"
+        )
+        .is_ok());
+        assert!(load(
+            "redis",
+            "redis://cache.example.test:6380/0",
+            "{}",
+            "*.example.test:6379"
+        )
+        .is_err());
+    }
+
+    /// Wildcards and CIDR ranges are matched on the effective host of each kind as well.
+    #[test]
+    fn wildcards_and_ranges_match_the_derived_hosts() {
+        assert!(load(
+            "http.s3",
+            "",
+            r#"{"bucket":"orders","region":"eu-west-1"}"#,
+            "*.s3.eu-west-1.amazonaws.com"
+        )
+        .is_ok());
+        assert!(load(
+            "http.s3",
+            "",
+            r#"{"bucket":"orders","region":"eu-west-1"}"#,
+            "s3.eu-west-1.amazonaws.com"
+        )
+        .is_err());
+        assert!(load(
+            "pubsub",
+            "gc-pubsub://lwf-test/orders",
+            "{}",
+            "*.googleapis.com"
+        )
+        .is_ok());
+        assert!(load(
+            "sqs",
+            "aws-sqs://eu-west-1/123456789012/orders?endpoint=http://10.4.0.7:9324",
+            "{}",
+            "10.4.0.0/16"
+        )
+        .is_ok());
     }
 }

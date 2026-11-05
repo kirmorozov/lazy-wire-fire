@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::allow::HostList;
+
 #[derive(Clone)]
 pub struct Config {
     /// Connection for queries, the tool's tables and the instance lock.
@@ -31,6 +33,8 @@ pub struct Config {
     pub status_every: Duration,
     pub max_backoff: Duration,
     pub stop_grace: Duration,
+    /// `LAZYWF_ALLOWED_HOSTS`: the endpoint hosts a target may connect to; `None` when unset.
+    pub allowed_hosts: Option<HostList>,
 }
 
 /// The DSNs are shown without their passwords (`mysql://***@host/...`): a `{:?}` of the
@@ -55,6 +59,10 @@ impl std::fmt::Debug for Config {
             .field("status_every", &self.status_every)
             .field("max_backoff", &self.max_backoff)
             .field("stop_grace", &self.stop_grace)
+            .field(
+                "allowed_hosts",
+                &self.allowed_hosts.as_ref().map(HostList::len),
+            )
             .finish()
     }
 }
@@ -149,6 +157,8 @@ impl Config {
             status_every: ms("LAZYWF_STATUS_MS", 5_000)?.max(Duration::from_millis(100)),
             max_backoff: ms("LAZYWF_MAX_BACKOFF_MS", 60_000)?.max(Duration::from_millis(100)),
             stop_grace: ms("LAZYWF_STOP_GRACE_MS", 10_000)?,
+            allowed_hosts: HostList::parse(&get("LAZYWF_ALLOWED_HOSTS").unwrap_or_default())
+                .context("LAZYWF_ALLOWED_HOSTS")?,
         })
     }
 }
@@ -349,6 +359,29 @@ mod tests {
         assert!(cfg(&[]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/")]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/s"), ("LAZYWF_SERVER_ID", "0")]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod allow_tests {
+    use super::*;
+
+    #[test]
+    fn allowed_hosts_is_opt_in() {
+        let set = |v: &'static str| {
+            Config::from_lookup(|k| match k {
+                "LAZYWF_DSN" => Some("mysql://u:p@db.test:3306/app".into()),
+                "LAZYWF_ALLOWED_HOSTS" => Some(v.into()),
+                _ => None,
+            })
+        };
+        assert!(set("").unwrap().allowed_hosts.is_none());
+        assert!(set("  ").unwrap().allowed_hosts.is_none());
+        let cfg = set("api.test, *.cdn.test, 10.0.0.0/8:443").unwrap();
+        assert_eq!(cfg.allowed_hosts.as_ref().map(|l| l.len()), Some(3));
+        assert!(format!("{cfg:?}").contains("allowed_hosts: Some(3)"));
+        let err = format!("{:#}", set("bad host name").unwrap_err());
+        assert!(err.contains("LAZYWF_ALLOWED_HOSTS"), "{err}");
     }
 }
 

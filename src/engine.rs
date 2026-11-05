@@ -569,6 +569,13 @@ pub async fn run(
         "none (the main account runs the queries)".to_string()
     };
     info!(server = %info.version, schema = %cfg.schema, instance = %cfg.instance, query_account = %query_user, "lazywf {} starting", env!("CARGO_PKG_VERSION"));
+    match &cfg.allowed_hosts {
+        Some(list) => info!(
+            patterns = list.len(),
+            "LAZYWF_ALLOWED_HOSTS is set: target endpoints must match it"
+        ),
+        None => info!("LAZYWF_ALLOWED_HOSTS is not set: target endpoints may use any host"),
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     let mut e = Engine {
         lock: lock_name,
@@ -973,7 +980,8 @@ impl Engine {
                 .map_err(|e| format!("{e:#}"))
                 .and_then(|def| match self.targets.get(&def.name) {
                     Some(old) if old.def == def => Ok(old.clone()),
-                    _ => Target::new(def, self.env.query.clone()).map_err(|e| format!("{e:#}")),
+                    _ => Target::new(def, self.env.query.clone(), self.cfg.allowed_hosts.as_ref())
+                        .map_err(|e| format!("{e:#}")),
                 });
             if let Err(e) = &r {
                 warn!(target = %t.name, "invalid target: {e}");
