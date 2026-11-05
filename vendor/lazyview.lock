@@ -1,8 +1,9 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 6d827b2f2b9375c5782928f503d38ba611d0589d
-file src/analyze.rs 047b21e803b90f9305b3b26cf8ecc73e6db9e92a86e027ae711b5013ed0a3b7a
+commit 9462728e834ed9b883f44c54152ee684d32244c5
+file src/access.rs 063a30a111e6c3b09a05647919c9e76896e6b3fdfba94a4e8e46ff719c7694b8
+file src/analyze.rs 2781f031182cfc27f39d7ad61c1b472c694667aa2366c32c55c8e63deef45409
 file src/analyzer/ast.rs 395a6b078dbb48e20d10dcfc8b7de6bc7df2e43a6c55c182773aa87713743e5d
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
 file src/analyzer/internal.rs 9b226a82771b875808fbee30c7ef3738ffa90965316182db23781d18c0401bfd
@@ -15,10 +16,10 @@ file src/analyzer/normalize.rs 525a3dfae67fa837b4fa8f26105a30e350936d08a9fee5a5c
 file src/analyzer/rename.rs 2764a9d4f197c02d03d43882631e0011dc3444de9ce55afc4d20fbe292f2458e
 file src/analyzer/scope.rs 57c05dc25bd438c8d4f766cddd3113d5bdf850f7bb657eb053fbb83f9df14682
 file src/analyzer/source.rs 462ee360b10581cfae8a5bdb8b12ec803714f8f687e1988cafd7fac6be294d13
-file src/analyzer/tests.rs 86a61e6dc768049a365922c03bd7b03fa0664384ce39f6dd7f3a1705f54a872d
+file src/analyzer/tests.rs f53d0ce10e5254529aa7130eb5d13d82305ec84b8df640f7ae47581f348d4f85
 file src/analyzer/tests_rename.rs 1f06ec0cc0b40bad380f5fa5cbc8bef1413093067988ff24d4266626c4726176
 file src/analyzer/union.rs 9acd5df87a46c597178cd7b8b167041e797f92684d746d48ac60a8b6ee2c79ab
-file src/binlog.rs ac637c0828edd7110ce36f62e0c089438fce751f03835fe11abfef5f665d9194
+file src/binlog.rs 43c96f7c1286abaa6a965e82a09ada281fb9974596934a6719492497c2a4a0e1
 file src/catalog.rs 455c20b343c2d3239f2bc115101b5c4c4a6cf9acba055c7105e6f6f612c53ee6
 file src/datum.rs c6088b9dc4b92e0bc7b76105c207b179debb28cdd54301e081d014cd56771def
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
