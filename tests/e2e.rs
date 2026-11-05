@@ -4578,3 +4578,53 @@ async fn pubsub_ordering_survives_a_transient_failure_in_order() {
     );
     inst.stop().await;
 }
+
+/// `LAZYWF_ALLOWED_HOSTS`: a target whose endpoint host is not listed is refused at load, and
+/// its rule's `last_error` names the host and the setting; a listed host delivers. The names
+/// are matched as written (`localhost` is not `127.0.0.1`, and nothing is resolved).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allowed_hosts_refuse_unlisted_endpoints() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "allowlist").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let listed = mock.url();
+    let unlisted = listed.replace("127.0.0.1", "localhost");
+    db.target("listed", "http", &listed, None, "{}").await;
+    db.target("unlisted", "http", &unlisted, None, "{}").await;
+    for (rule, target) in [("ok", "listed"), ("no", "unlisted")] {
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, 'POST /hook HTTP/1.1\n\n{{join keys \",\"}}', 100)",
+            (rule, target),
+        )
+        .await;
+        db.trigger(rule, "orders", Some("{{new.id}}"), None).await;
+    }
+    let inst = Instance::ready(config(&db, &[("LAZYWF_ALLOWED_HOSTS", "127.0.0.1")])).await;
+    db.exec("INSERT INTO orders VALUES (7, 1, 'new', 1)").await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(10),
+        "the listed target delivers",
+        || async { mock.requests().iter().any(|r| r.body == "7").then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the unlisted rule's error",
+        || async {
+            let (_, _, _, err) = db.status("no").await?;
+            err.filter(|e| e.contains("localhost")).map(|_| ())
+        },
+    )
+    .await;
+    let (_, _, _, err) = db.status("no").await.unwrap();
+    assert!(
+        err.as_deref()
+            .is_some_and(|e| e.contains("LAZYWF_ALLOWED_HOSTS")),
+        "{err:?}"
+    );
+    // Only the listed target was called, and only with the listed rule's key.
+    assert!(mock.requests().iter().all(|r| r.body == "7"));
+    inst.stop().await;
+}

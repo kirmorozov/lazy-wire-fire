@@ -5,6 +5,7 @@
 
 pub mod access;
 pub mod action;
+pub mod allow;
 pub mod amqp;
 pub mod analyze;
 pub mod analyzer;
