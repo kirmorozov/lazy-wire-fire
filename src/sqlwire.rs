@@ -1,8 +1,11 @@
 //! `mysql` and `pgsql` targets: the template renders one SQL statement, run on the target
 //! database over its own protocol.
 //!
-//! * One statement per action: a top-level `;` followed by more is refused (PostgreSQL runs it
-//!   through the extended protocol, which refuses batches as well).
+//! * One statement per action, enforced twice. The rendered text holding a top-level `;` followed
+//!   by more is refused, and it may not hold an executable comment (`/*! … */`, which the server
+//!   would run as SQL). MySQL and MariaDB then run the statement as a prepared statement, which
+//!   the server refuses to run as more than one; PostgreSQL uses the extended protocol, which
+//!   refuses batches as well. The server, not the lexer, is the authority.
 //! * The session is pinned on every connect, so quoting is sound: MySQL `SET NAMES utf8mb4` with
 //!   backslash escapes on (`NO_BACKSLASH_ESCAPES` removed, verified); PostgreSQL UTF-8 with
 //!   `standard_conforming_strings` on (verified).
@@ -71,6 +74,9 @@ pub fn ident(d: Dialect, name: &str) -> Result<String> {
 /// The rendered statement, trimmed (`None` when blank). A statement followed by another one
 /// is refused; one trailing `;` is fine.
 pub fn single_statement(rendered: &str) -> Result<Option<String>> {
+    if crate::sql::has_executable_comment(rendered) {
+        bail!("executable comments are not allowed in a SQL target statement");
+    }
     let parts = crate::sql::split_statements(rendered);
     match parts.len() {
         0 => Ok(None),
@@ -295,21 +301,22 @@ impl MySqlClient {
         }
     }
 
-    /// Runs the statement; returns the affected rows.
+    /// Runs the statement as a prepared statement; returns the affected rows. The server runs
+    /// one statement per prepare, whatever the text holds.
     pub async fn exec(&self, sql: String, timeout: Duration) -> Result<u64> {
         self.with_conn(timeout, |c| {
             Box::pin(async move {
-                c.query_drop(sql).await?;
+                c.exec_drop(sql, ()).await?;
                 Ok(c.affected_rows())
             })
         })
         .await
     }
 
-    /// Runs a query; returns its rows as objects.
+    /// Runs a query as a prepared statement; returns its rows as objects.
     pub async fn rows(&self, sql: String, timeout: Duration) -> Result<Value> {
         let rows: Vec<mysql_async::Row> = self
-            .with_conn(timeout, |c| Box::pin(async move { c.query(sql).await }))
+            .with_conn(timeout, |c| Box::pin(async move { c.exec(sql, ()).await }))
             .await?;
         Ok(Value::Array(
             rows.into_iter()
@@ -317,6 +324,15 @@ impl MySqlClient {
                     let cols = r.columns();
                     let mut m = Map::new();
                     for (i, v) in r.unwrap().into_iter().enumerate() {
+                        // Prepared results carry FLOAT as the binary f32 (1.100000023841858);
+                        // the text protocol gave its shortest decimal text (1.1), which is
+                        // kept so the rows read as they did before.
+                        let v = match v {
+                            mysql_async::Value::Float(f) => {
+                                mysql_async::Value::Bytes(format!("{f}").into_bytes())
+                            }
+                            v => v,
+                        };
                         m.insert(
                             cols[i].name_str().into_owned(),
                             crate::docs::to_json(v, cols.get(i)),

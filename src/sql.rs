@@ -25,6 +25,8 @@ struct Lexed {
     tok: Tok,
     start: usize,
     end: usize,
+    /// Lexed from inside an executable comment (`/*! … */`, `/*M! … */`): the server runs it.
+    exec: bool,
 }
 
 /// Length of a quoted section starting at `b[i]` (the opening quote), backslash escapes and
@@ -81,6 +83,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Other,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             b'"' | b'`' => {
@@ -89,6 +92,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Quoted(unquote(&sql[start..i])),
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             b'#' => {
@@ -110,6 +114,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     for mut l in lex(&rest[skip..]) {
                         l.start += off;
                         l.end += off;
+                        l.exec = true;
                         out.push(l);
                     }
                 }
@@ -148,6 +153,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Param(name),
                     start,
                     end: j,
+                    exec: false,
                 });
                 i = j;
             }
@@ -157,6 +163,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Dot,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             b',' => {
@@ -165,6 +172,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Comma,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             b';' => {
@@ -173,6 +181,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Semi,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             b'(' => {
@@ -181,6 +190,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::LParen,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             b')' => {
@@ -189,6 +199,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::RParen,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             c if is_ident(c) => {
@@ -199,6 +210,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Word(sql[start..i].to_string()),
                     start,
                     end: i,
+                    exec: false,
                 });
             }
             _ => {
@@ -208,6 +220,7 @@ fn lex(sql: &str) -> Vec<Lexed> {
                     tok: Tok::Other,
                     start,
                     end: i,
+                    exec: false,
                 });
             }
         }
@@ -318,6 +331,13 @@ pub fn expression(sql: &str) -> Result<Expression, String> {
         return Err("unbalanced `(`".into());
     }
     Ok(e)
+}
+
+/// Whether `sql` holds an executable comment (`/*! … */`, `/*!NNNNN … */`, `/*M! … */`) whose
+/// body is SQL the server runs. Literals and ordinary comments do not count; optimizer hints
+/// (`/*+ … */`) are not executable comments.
+pub fn has_executable_comment(sql: &str) -> bool {
+    lex(sql).iter().any(|l| l.exec)
 }
 
 /// Splits `text` into statements at `;` outside literals and comments. Empty statements are
@@ -751,6 +771,30 @@ mod tests {
             vec![(n("app", "t"), n("app", "u"))]
         );
         assert!(renames("ALTER TABLE t RENAME TO u", "app").is_empty());
+    }
+
+    #[test]
+    fn executable_comments_are_marked() {
+        // The probe's shape: the body ends at the `*/` inside the literal, so the server runs
+        // `INSERT` as a second statement. The lexer must see the body as executable.
+        let probe = "/*!SELECT '*/' */; INSERT INTO t VALUES (21)";
+        assert!(has_executable_comment(probe));
+        assert!(has_executable_comment("/*!50000 SELECT 1 */"));
+        assert!(has_executable_comment("/*M!100000 SELECT 1 */"));
+        assert!(has_executable_comment("SELECT 1 /*!; DROP TABLE t */"));
+        assert!(has_executable_comment("/*!40000 TRUNCATE t */"));
+        // Hints and ordinary comments are not executable.
+        assert!(!has_executable_comment("SELECT /*+ NO_INDEX(t) */ 1"));
+        assert!(!has_executable_comment("SELECT 1 /* plain ; comment */"));
+        assert!(!has_executable_comment("SELECT 1 -- /*! not one"));
+        // Inside literals and quoted identifiers the text is data.
+        assert!(!has_executable_comment("SELECT '/*! x */' AS a"));
+        assert!(!has_executable_comment("SELECT \"/*!\" AS `a /*! b`"));
+        assert!(!has_executable_comment(
+            "INSERT INTO t VALUES ('a\\'/*!x*/')"
+        ));
+        // An executable comment is not a statement break for the splitter either way.
+        assert_eq!(split_statements("SELECT '/*!' AS a; SELECT 2").len(), 2);
     }
 
     #[test]

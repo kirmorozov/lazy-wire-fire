@@ -2238,6 +2238,188 @@ async fn sql_targets() {
     inst.stop().await;
 }
 
+/// Values that look like SQL to a careless splice: an executable comment, a `;`, a backslash.
+const ONE_STMT_NAMES: [&str; 3] = ["keep /*!; x */ \\ end", "it's \\' ; /*!", "plain"];
+
+/// A MySQL SQL target runs one statement per action, and the server enforces it as well. The
+/// lexer refuses the probe's shape (an executable comment, which MySQL runs as a second statement)
+/// and two statements: those keys insert nothing. Sent straight to the server, the same texts are
+/// refused too (prepared statements), and `sql_quote`d values come out as they went in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_target_one_statement() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "sqlone").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(100))")
+        .await;
+    tables(&db).await;
+    let sink = Db::fresh(&root, "sqlone_sink").await;
+    sink.exec("CREATE TABLE probe (id INT PRIMARY KEY)").await;
+    sink.exec("CREATE TABLE copy (id INT PRIMARY KEY, name VARCHAR(100))")
+        .await;
+    sink.exec("CREATE TABLE fl (f FLOAT)").await;
+    sink.exec("INSERT INTO fl VALUES (1.1)").await;
+    let opts = mysql_async::Opts::from_url(&root).unwrap();
+    let user = opts.user().unwrap_or("root").to_string();
+    let pass = opts.pass().unwrap_or("").to_string();
+    std::env::set_var("LWF_TEST_ONE_PW", &pass);
+    let my_host = format!(
+        "{}:{}/{}",
+        opts.ip_or_hostname(),
+        opts.tcp_port(),
+        sink.schema
+    );
+    db.target(
+        "mysink",
+        "mysql",
+        &my_host,
+        None,
+        &json!({"username": user, "password": "env:LWF_TEST_ONE_PW"}).to_string(),
+    )
+    .await;
+    // Rule, template: one per case. Each rule fires per key, on every customer.
+    let rules = [
+        // The probe's shape: the lexer reads one statement; MySQL would run the INSERT too.
+        (
+            "probe",
+            "/*!SELECT '*/' */; INSERT INTO probe VALUES (21)",
+        ),
+        // Two plain statements: refused by the count.
+        (
+            "twice",
+            "INSERT INTO probe VALUES (22); INSERT INTO probe VALUES (23)",
+        ),
+        // Copies the hostile names with sql_quote, one statement per key.
+        (
+            "copy",
+            "{{#each docs}}INSERT INTO copy (id, name) VALUES ({{sql_quote key}}, {{sql_quote doc.name}}){{/each}}",
+        ),
+    ];
+    for (name, template) in rules {
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES (?, 'mysink', 'key', \
+             'SELECT id AS _key, name, NULL AS _op FROM customers WHERE id IN (:keys)', ?, 100)",
+            (name, template),
+        )
+        .await;
+        db.trigger(name, "customers", Some("{{new.id}}"), None)
+            .await;
+    }
+    let inst = Instance::ready(config(&db, &[])).await;
+    for (i, n) in ONE_STMT_NAMES.iter().enumerate() {
+        db.exec_params("INSERT INTO customers VALUES (?, ?)", (i as i64 + 1, *n))
+            .await;
+    }
+    let want: Vec<(i64, String)> = ONE_STMT_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as i64 + 1, n.to_string()))
+        .collect();
+    wait_for(
+        Duration::from_secs(30),
+        "the copy of the hostile names",
+        || async {
+            let got: Vec<(i64, String)> = sink.query("SELECT id, name FROM copy ORDER BY id").await;
+            (got == want).then_some(())
+        },
+    )
+    .await;
+    let err = wait_for(Duration::from_secs(30), "the probe refused", || async {
+        let (_, _, _, err) = db.status("probe").await?;
+        err.filter(|e| e.contains("executable comments are not allowed"))
+    })
+    .await;
+    assert!(err.contains("executable comments"), "{err}");
+    let err = wait_for(
+        Duration::from_secs(30),
+        "the two statements refused",
+        || async {
+            let (_, _, _, err) = db.status("twice").await?;
+            err.filter(|e| e.contains("holds 2 statements"))
+        },
+    )
+    .await;
+    assert!(err.contains("holds 2 statements"), "{err}");
+    let probe: Vec<i64> = sink.query("SELECT id FROM probe ORDER BY id").await;
+    assert!(probe.is_empty(), "refused actions inserted {probe:?}");
+    inst.stop().await;
+
+    // The server, without the lexer: the same texts are refused by the server itself.
+    let addr = lazy_wire_fire::sqlwire::SqlAddr {
+        host: opts.ip_or_hostname().to_string(),
+        port: opts.tcp_port(),
+        db: sink.schema.clone(),
+    };
+    let client = lazy_wire_fire::sqlwire::MySqlClient::new(
+        addr,
+        &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+        lazy_wire_fire::sqlwire::Credentials {
+            user: Some(user),
+            password: Some(pass),
+        },
+    );
+    let t = Duration::from_secs(10);
+    for sql in [
+        "/*!SELECT '*/' */; INSERT INTO probe VALUES (41)",
+        "INSERT INTO probe VALUES (42); INSERT INTO probe VALUES (43)",
+    ] {
+        client
+            .exec(sql.to_string(), t)
+            .await
+            .expect_err("the server runs one statement per prepare");
+    }
+    client
+        .rows("SELECT 1 AS a; SELECT 2 AS b".to_string(), t)
+        .await
+        .expect_err("the server runs one statement per prepare");
+    let probe: Vec<i64> = sink.query("SELECT id FROM probe ORDER BY id").await;
+    assert!(
+        probe.is_empty(),
+        "the server let a second statement run: {probe:?}"
+    );
+    // A single statement still runs, and the rows come back as before (FLOAT as its text).
+    assert_eq!(
+        client
+            .exec("INSERT INTO probe VALUES (44)".to_string(), t)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        client
+            .rows("SELECT f FROM fl".to_string(), t)
+            .await
+            .unwrap(),
+        json!([{"f": 1.1}])
+    );
+    // PostgreSQL, if up: the extended protocol runs one statement per call as well.
+    match tokio_postgres::connect(
+        "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink",
+        tokio_postgres::NoTls,
+    )
+    .await
+    {
+        Ok((pg, conn)) => {
+            tokio::spawn(conn);
+            pg.batch_execute("DROP TABLE IF EXISTS one_probe; CREATE TABLE one_probe (id int)")
+                .await
+                .unwrap();
+            pg.execute(
+                "INSERT INTO one_probe VALUES (1); INSERT INTO one_probe VALUES (2)",
+                &[],
+            )
+            .await
+            .expect_err("PostgreSQL runs one statement per call");
+            let n: i64 = pg
+                .query_one("SELECT count(*) FROM one_probe", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(n, 0, "PostgreSQL ran the second statement");
+        }
+        Err(_) => eprintln!("no PostgreSQL on 127.0.0.1:34432: skipping its check"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // `sqs` targets, against ElasticMQ (`LAZYWF_TEST_SQS`, e.g. http://127.0.0.1:34561; the
 // `sqs` compose profile). The tests read the queues back through the same SQS JSON API.
