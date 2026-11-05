@@ -100,7 +100,7 @@ Example: `LAZYWF_DSN=mysql://lazywf:secret@host.docker.internal:3306/app`.
 | guarantee | how |
 |---|---|
 | after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, the commit fence on MySQL / Percona with neither, else `LAZYWF_VISIBILITY_DELAY_MS`; [server setup](docs/server-setup.md#binlog-settings)) |
-| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `item_42`) live in 64-bit roaring bitmaps, as in lazyview: a million consecutive ids take under 300 KB |
+| dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `item_42`) keep their prefix's integers in a hash set by default (about 19 bytes per key at a million dense ids); with `--features roaring` they are 64-bit roaring bitmaps (a million consecutive ids under 300 KB, but sparse ids cost more) — [Development](#development) |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
 | at least once | a rule's position in `lazy_wire_fire_status` only passes changes whose actions met `expect` on every endpoint. After a restart the stream resumes from the lowest position; rules ahead skip what they confirmed |
@@ -287,6 +287,13 @@ make test-e2e-queues           # SQS, Kinesis, AMQP and Pub/Sub against their em
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
 ```
+
+The integer key sets have two backends: a hash set by default, and 64-bit roaring bitmaps
+behind the `roaring` Cargo feature (`cargo build --release --features roaring`). `make test`
+and `make lint` cover both; `make test-roaring` the roaring one alone. The roaring backend
+pays on very large dense resets and snapshots (a million consecutive ids take under 300 KB,
+against about 19 MB in the hash set) but costs more for sparse ids (about 212 bytes per
+key); the default is what the integration suite and the published image use.
 
 On macOS the test servers (`make servers`) need Docker. On Windows, develop inside WSL 2, with
 Docker for the test servers.
