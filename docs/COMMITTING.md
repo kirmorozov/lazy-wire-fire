@@ -26,15 +26,19 @@ House rules for commits, branches and pull requests on this repository.
 
 ## Hand-offs from workers
 
-- A worker hands over a branch that is ready to merge: one commit on it,
-  rebased onto the tip of `main`, and its own checks green. The git keeper
-  pushes it as is, opens the pull request and squash-merges it when CI is
-  green.
-- The keeper never edits code and never resolves a conflict. It rebases the
-  branch onto `main` only while the rebase is clean; when it stops on a
-  conflict the keeper runs `git rebase --abort`, marks the branch "needs
-  refresh" and stops. Refreshing the branch onto the new `main` — including
-  any porting of its code — is the worker's job.
+- The author of a change works on its own branch, cut from the tip of
+  `main`: one commit per change, with a message per this file. The author
+  pushes the branch, opens a draft pull request, runs its CI until green,
+  and only then marks it ready to merge (`gh pr ready`). The keeper never
+  writes a commit for the author's change.
+- The git keeper squash-merges the pull requests that are ready, green and
+  mergeable, in a merge pass over the open pull requests. Squash merging
+  does not need the branch to be up to date, so nobody rebases for the
+  merge.
+- A pull request that conflicts with `main` goes back to its author:
+  "needs refresh." The author rebases onto the new `main`, force-pushes its
+  own branch, and gets its CI green again. The keeper never rebases another
+  author's branch and never resolves a conflict.
 
 ## Checks before a commit
 
