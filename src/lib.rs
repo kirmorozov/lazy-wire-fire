@@ -3,6 +3,7 @@
 //! SQL target. Rules, triggers and targets are rows in the tool's tables.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod access;
 pub mod action;
 pub mod amqp;
 pub mod analyze;
