@@ -10,7 +10,7 @@
 //! * **Positions:** a rule's position is the start of its oldest unconfirmed mark (or where the
 //!   stream is). The stream resumes from the lowest one; rules ahead skip what they confirmed.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ use crate::action::{self, Env, FenceSpec, Fired, KeyQuery};
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position, RowsKind};
 use crate::config::Config;
 use crate::fence;
+use crate::filters::{self, Role};
 use crate::health::Health;
 use crate::lock;
 use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
@@ -384,6 +385,10 @@ pub struct Engine {
     star_written: Option<(Position, Instant)>,
     render_warnings: u64,
     invalid_keys: u64,
+    /// Schemas already checked against the server's binlog filters (see `check_binlog_filters`).
+    filter_checked: HashSet<String>,
+    /// The checked schemas the filters drop (shown on `/status`).
+    binlog_filtered: BTreeSet<String>,
 }
 
 fn server_code(e: &anyhow::Error) -> Option<u16> {
@@ -591,6 +596,8 @@ pub async fn run(
         star_written: None,
         render_warnings: 0,
         invalid_keys: 0,
+        filter_checked: HashSet::new(),
+        binlog_filtered: BTreeSet::new(),
         cfg,
     };
     e.reload_config(true).await?;
@@ -945,6 +952,7 @@ impl Engine {
         let triggers = model::triggers_by_rule(&raw);
         let mut compiled: BTreeMap<String, Arc<Rule>> = BTreeMap::new();
         let mut disabled = HashSet::new();
+        let mut sources = BTreeSet::new();
         for r in &raw.rules {
             if !r.enabled {
                 disabled.insert(r.name.clone());
@@ -962,6 +970,7 @@ impl Engine {
                     Err(e) => terr.push(format!("trigger {}: {e:#}", t.id)),
                 }
             }
+            sources.extend(defs.iter().map(|d| d.schema.clone()));
             let mut rule = rule::compile(&mut self.control, def, defs, &targets).await;
             if let Some(e) = parse_err {
                 rule.error = Some(match rule.error.take() {
@@ -1020,11 +1029,68 @@ impl Engine {
                 self.add_rule(&name, rule, initial);
             }
         }
+        self.check_binlog_filters(&sources).await;
         self.rebuild_routes();
         if !initial {
             debug!("configuration reloaded: {} rules", self.rules.len());
         }
         Ok(true)
+    }
+
+    /// Checks, once per schema, whether the server's binlog filters drop it: lazywf's own schema
+    /// and each source schema of an enabled trigger (see [`filters`]). Advisory: a schema whose
+    /// filters cannot be read is logged at debug and checked again on the next reload.
+    async fn check_binlog_filters(&mut self, sources: &BTreeSet<String>) {
+        let own: Option<String> = self
+            .control
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        let todo = filters::to_check(own.as_deref(), sources, &self.filter_checked);
+        if todo.is_empty() {
+            return;
+        }
+        let (own_todo, src_todo): (Vec<_>, Vec<_>) =
+            todo.into_iter().partition(|(_, r)| *r == Role::Own);
+        if !own_todo.is_empty() {
+            match binlog::binlog_filters(&mut self.control).await {
+                Ok(f) => self.record_filters(f, own_todo),
+                Err(e) => debug!("reading the binlog filters of the status schema: {e:#}"),
+            }
+        }
+        if !src_todo.is_empty() {
+            let read = match tokio::time::timeout(
+                Duration::from_secs(10),
+                Conn::new(self.binlog_opts.clone()),
+            )
+            .await
+            {
+                Ok(Ok(mut c)) => {
+                    let r = binlog::binlog_filters(&mut c).await;
+                    c.disconnect().await.ok();
+                    r
+                }
+                Ok(Err(e)) => Err(anyhow::Error::new(e)),
+                Err(_) => Err(anyhow!("connecting timed out")),
+            };
+            match read {
+                Ok(f) => self.record_filters(f, src_todo),
+                Err(e) => debug!("reading the binlog filters of the source server: {e:#}"),
+            }
+        }
+    }
+
+    /// Records the checked schemas and warns about those the filters drop.
+    fn record_filters(&mut self, (do_db, ignore_db): (String, String), todo: Vec<(String, Role)>) {
+        for (schema, role) in todo {
+            if let Some(filter) = filters::filter_of(&do_db, &ignore_db, &schema) {
+                warn!(schema = %schema, "{}", filters::warning(role, &schema, filter));
+                self.binlog_filtered.insert(schema.clone());
+            }
+            self.filter_checked.insert(schema);
+        }
     }
 
     fn add_rule(&mut self, name: &str, rule: Arc<Rule>, initial: bool) {
@@ -2447,6 +2513,7 @@ impl Engine {
             "position": resume.to_string(),
             "stream_lag_ms": self.stream_lag_ms(),
             "rules": summary,
+            "binlog_filtered_schemas": self.binlog_filtered.iter().collect::<Vec<_>>(),
         }));
         if rows.is_empty() {
             return Ok(());

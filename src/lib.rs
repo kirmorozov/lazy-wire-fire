@@ -16,6 +16,7 @@ pub mod datum;
 pub mod docs;
 pub mod engine;
 pub mod fence;
+pub mod filters;
 pub mod gcp;
 pub mod health;
 pub mod http;
