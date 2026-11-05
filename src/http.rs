@@ -13,13 +13,41 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::tls::{Connector, Stream, TlsSpec};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawRequest {
     pub method: String,
     /// Path and query, as written (`/a/b?x=1`).
     pub target: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Header values whose names say credential (`Authorization`, `X-Amz-Security-Token`,
+/// `X-Api-Key`, ...) are masked, and the body shows its length only: a request is data a
+/// target receives, and a `{:?}` of it must not carry a credential.
+impl std::fmt::Debug for RawRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(n, v)| {
+                let l = n.to_ascii_lowercase();
+                let secret = ["auth", "token", "secret", "key", "password", "cookie"]
+                    .iter()
+                    .any(|w| l.contains(w));
+                (
+                    n.as_str(),
+                    if secret { "** redacted **" } else { v.as_str() },
+                )
+            })
+            .collect();
+        f.debug_struct("RawRequest")
+            .field("method", &self.method)
+            .field("target", &self.target)
+            .field("headers", &headers)
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .finish()
+    }
 }
 
 impl RawRequest {
@@ -179,13 +207,14 @@ pub struct BaseUrl {
 
 impl BaseUrl {
     pub fn parse(s: &str) -> Result<BaseUrl> {
+        let shown = crate::secrets::redact_url(s);
         let s = s.trim();
         let (secure, rest) = if let Some(r) = s.strip_prefix("https://") {
             (true, r)
         } else if let Some(r) = s.strip_prefix("http://") {
             (false, r)
         } else if s.contains("://") {
-            bail!("endpoint `{s}`: only http:// and https:// are supported");
+            bail!("endpoint `{shown}`: only http:// and https:// are supported");
         } else {
             (false, s)
         };
@@ -194,10 +223,10 @@ impl BaseUrl {
             None => (rest, ""),
         };
         if authority.contains('@') {
-            bail!("endpoint `{s}`: credentials belong in the target's vars, not in the URL");
+            bail!("endpoint `{shown}`: credentials belong in the target's vars, not in the URL");
         }
         let (host, port) = split_host_port(authority, if secure { 443 } else { 80 })
-            .with_context(|| format!("endpoint `{s}`"))?;
+            .with_context(|| format!("endpoint `{shown}`"))?;
         Ok(BaseUrl {
             secure,
             host,
@@ -632,5 +661,31 @@ mod tests {
         assert_eq!(BaseUrl::parse("https://h").unwrap().url(), "https://h");
         assert!(BaseUrl::parse("ftp://h").is_err());
         assert!(BaseUrl::parse("http://u:p@h").is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_masks_credential_headers_and_the_body() {
+        let r = RawRequest {
+            method: "POST".into(),
+            target: "/x".into(),
+            headers: vec![
+                ("Authorization".into(), "Basic HDR-AUTH-1".into()),
+                ("X-Amz-Security-Token".into(), "HDR-TOKEN-2".into()),
+                ("X-Api-Key".into(), "HDR-KEY-3".into()),
+                ("Host".into(), "visible.example".into()),
+            ],
+            body: b"BODY-SECRET-4".to_vec(),
+        };
+        let shown = format!("{r:?}");
+        for hidden in ["HDR-AUTH-1", "HDR-TOKEN-2", "HDR-KEY-3", "BODY-SECRET-4"] {
+            assert!(!shown.contains(hidden), "{shown}");
+        }
+        assert!(shown.contains("visible.example"), "{shown}");
+        assert!(shown.contains("13 bytes"), "{shown}");
     }
 }

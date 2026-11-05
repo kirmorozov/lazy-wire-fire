@@ -89,6 +89,7 @@ pub struct SqlAddr {
 impl SqlAddr {
     /// `host:port/db`, or with a scheme (`mysql://`, `postgres://`, `postgresql://`, `pgsql://`).
     pub fn parse(s: &str, d: Dialect) -> Result<SqlAddr> {
+        let shown = crate::secrets::redact_url(s);
         let s = s.trim();
         let rest = match s.split_once("://") {
             Some((scheme, r)) => {
@@ -97,7 +98,7 @@ impl SqlAddr {
                     Dialect::Postgres => matches!(scheme, "postgres" | "postgresql" | "pgsql"),
                 };
                 if !ok {
-                    bail!("endpoint `{s}`: unexpected scheme `{scheme}`");
+                    bail!("endpoint `{shown}`: unexpected scheme `{scheme}`");
                 }
                 r
             }
@@ -105,14 +106,16 @@ impl SqlAddr {
         };
         let (authority, db) = rest.split_once('/').unwrap_or((rest, ""));
         if authority.contains('@') {
-            bail!("endpoint `{s}`: credentials belong in the target's vars, not in the address");
+            bail!(
+                "endpoint `{shown}`: credentials belong in the target's vars, not in the address"
+            );
         }
         let default = if d == Dialect::MySql { 3306 } else { 5432 };
         let (host, port) =
-            split_host_port(authority, default).with_context(|| format!("endpoint `{s}`"))?;
+            split_host_port(authority, default).with_context(|| format!("endpoint `{shown}`"))?;
         let db = db.trim_matches('/').to_string();
         if db.is_empty() {
-            bail!("endpoint `{s}` names no database (`host:port/db`)");
+            bail!("endpoint `{shown}` names no database (`host:port/db`)");
         }
         Ok(SqlAddr { host, port, db })
     }

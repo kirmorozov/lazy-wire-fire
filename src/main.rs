@@ -5,7 +5,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use tokio::sync::watch;
-use tracing_subscriber::EnvFilter;
 
 const HELP: &str = "lazywf (lazy_wire_fire): change-triggered actions from the MySQL binlog
 
@@ -41,7 +40,8 @@ fn chain(e: &anyhow::Error) -> String {
 }
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let filter = lazy_wire_fire::logging::filter(rust_log.as_deref());
     let json = std::env::var("LAZYWF_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if json {
