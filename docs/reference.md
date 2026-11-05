@@ -490,6 +490,47 @@ the old image and with the new one. `keys_sql` runs at flush time, once per dist
 parameters, after the changes are visible. It reads the current state: for a delete, rows already
 gone are not found (have a trigger on that table too).
 
+### Foreign key cascades
+
+Whether lazywf sees the changes a foreign key's `ON DELETE CASCADE` (or `ON UPDATE CASCADE`,
+`SET NULL`) makes in a child table depends on whether the server writes them to the binary
+log:
+
+- MySQL 8.0 / 8.4: not logged — "the cascading deletes are handled internally by the InnoDB
+  storage engine, which means that none of the changes are logged" (§17.19 "InnoDB and MySQL
+  Replication",
+  [8.0](https://dev.mysql.com/doc/refman/8.0/en/innodb-and-mysql-replication.html),
+  [8.4](https://dev.mysql.com/doc/refman/8.4/en/innodb-and-mysql-replication.html)).
+- Percona Server 8.4: not verified.
+- MariaDB: not logged — "cascading deletes or updates based on foreign key relations are an
+  internal mechanism, and are not written to the binary log"
+  ([Replication and Foreign Keys](https://mariadb.com/docs/server/ha-and-performance/standard-replication/replication-and-foreign-keys));
+  [MDEV-38243](https://jira.mariadb.org/browse/MDEV-38243) adds an opt-in session variable
+  `rpl_use_binlog_events_for_fk_cascade`, default `OFF`.
+- MySQL 9.6 and later: logged by default — as of 9.6 the SQL layer handles InnoDB foreign keys
+  by default (`innodb_native_foreign_keys` default `FALSE`), and "SQL-layer cascades generate
+  row events for affected child tables"
+  ([9.7 §15.1.25.5](https://dev.mysql.com/doc/refman/9.7/en/create-table-foreign-keys.html));
+  with `innodb_native_foreign_keys=ON` the cascades stay in InnoDB and "do not generate
+  separate row events"
+  ([26.10 §19.5.1.37](https://dev.mysql.com/doc/refman/26.10/en/replication-features-foreign-keys.html)).
+
+Where the child changes are not logged, only the parent's change reaches lazywf:
+
+- a document keyed by the parent (one per parent row, the children included by the rule's
+  select) stays correct: the parent's change marks its key, and the select reads the current
+  state, where the children are already gone;
+- a document keyed by the child (one per child row) goes stale: the child table's trigger
+  never sees the cascaded change, and `keys_sql` on the parent cannot list the children
+  either — it runs at flush time, after the changes are visible, when they are already gone
+  (the last paragraph above).
+
+Workarounds: a rule triggered on the parent's deletes whose template removes the children by
+parent id in the target (OpenSearch / Elasticsearch: `_delete_by_query` on the parent field;
+a SQL target: `DELETE … WHERE parent_id = …`); a reset step with stray cleanup
+([Reset steps](#reset-steps)); or deleting the children explicitly in the application, so
+each delete is binlogged.
+
 ## Documents from path-named columns
 
 The rows of all selects for a batch are merged by `_key`:
@@ -620,6 +661,7 @@ and resets only when that part of the binlog was purged. An interrupted reset st
 | `select_ms` | the time of the rule's selects in its last flush |
 | `events` | the row changes that matched one of the rule's triggers since start (a row matching two triggers counts twice) |
 | `actions_ok`, `actions_failed` | the actions sent since start: one action may carry a batch of keys, so they are not key counts |
+| `binlog_filtered_schemas` | instance only, not per rule: the checked schemas the server's binlog filters drop (sorted); [Binlog filters](server-setup.md#binlog-filters) |
 
 The counters are in memory only: they start at 0 at each start and are not written to
 `lazy_wire_fire_status`, which keeps only what a restart needs.

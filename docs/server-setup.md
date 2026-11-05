@@ -61,6 +61,25 @@ may. With binary logging on, a `CREATE TRIGGER` by an account without `SUPER` is
 error 1419) unless `log_bin_trust_function_creators=1` — that is the database administrator's
 decision, and lazywf does not need it.
 
+### Binlog filters
+
+`binlog-do-db` and `binlog-ignore-db` must not drop lazywf's own schema (the DSN's schema,
+where the status and commit-fence writes go) or the schema of an enabled trigger: with row
+logging a change to a dropped schema is not binlogged at all.
+
+lazywf checks the filters at start and when the trigger set changes, once per schema (a
+schema whose filters cannot be read is checked again on the next reload). The check is
+advisory: it never refuses to start. A dropped schema is logged at WARN:
+
+- a source schema: `the server's binlog filter drops source schema \`<schema>\` (…): changes in it are not binlogged, so its triggers never fire; remove the filter or include the schema`
+- the own schema: `the server's binlog filter drops lazywf's own schema \`<schema>\` (…): the status and commit-fence writes are not binlogged, so the fence cannot prove visibility; remove the filter or include the schema`
+
+The (…) is `Binlog_Do_DB does not list it` (the schema is not in `binlog-do-db`) or
+`Binlog_Ignore_DB lists it` (it is in `binlog-ignore-db`); when both drop the schema the
+first is reported. The fix: remove the filter, or include the schema in `binlog-do-db`. The
+checked schemas the filters drop are on `/status` as `binlog_filtered_schemas`
+([reference](reference.md#status)).
+
 ## Account
 
 Run once as an admin. `app` is the schema of the DSN, which holds lazywf's tables. Add a
