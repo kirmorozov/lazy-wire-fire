@@ -11,7 +11,8 @@ name: ci
 #                (continue-on-error, never blocking), the MariaDB 13.1 RC and 13.2 preview
 #   search       make test-e2e-search: OpenSearch 2.19, Elasticsearch 7.17 and 8.17
 #   queues       make test-e2e-queues: the sqs, kinesis, amqp and pubsub targets against ElasticMQ,
-#                kinesis-mock, RabbitMQ and Google's Pub/Sub emulator
+#                kinesis-mock, RabbitMQ and Google's Pub/Sub emulator; the log-secrets binary with
+#                the same emulators up (its S3 and Redis flows use the default target servers)
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, then make docker-e2e on amd64
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
@@ -326,9 +327,9 @@ jobs:
           persist-credentials: false
       - name: reserve the test ports
         run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=34070-34881
-      - name: start MySQL 8.4, pull the emulators (in the background)
+      - name: start MySQL 8.4, S3 and Redis, pull the emulators (in the background)
         run: |
-          docker compose up -d --quiet-pull mysql84
+          docker compose up -d --quiet-pull mysql84 s3 redis
           nohup docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub pull --quiet elasticmq kinesis-mock rabbitmq pubsub-emulator > pull.log 2>&1 &
       - name: rust ${{ env.RUST_TOOLCHAIN }}
         run: |
@@ -339,9 +340,9 @@ jobs:
           shared-key: e2e
           save-if: false
       - name: build the integration tests
-        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --no-run
-      - name: wait for MySQL 8.4
-        run: docker compose up -d --wait --wait-timeout 300 mysql84
+        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --test log_secrets --no-run
+      - name: wait for MySQL 8.4 and Redis
+        run: docker compose up -d --wait --wait-timeout 300 mysql84 redis
       - name: server versions
         run: scripts/ci-summary.sh versions mysql84 | tee versions.md
       - name: make test-e2e-queues

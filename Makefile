@@ -70,7 +70,9 @@ test-e2e-search:
 # The queue kinds against their emulators (sqs: ElasticMQ, kinesis: kinesis-mock, amqp:
 # RabbitMQ, pubsub: Google's emulator; compose profiles of the same names). The four are small
 # enough to run together on the host; the tests are run per kind with their env vars, and the
-# services are stopped even when a test fails.
+# services are stopped even when a test fails. The log_secrets binary runs against the emulators
+# too (the same four vars; its lambda flow needs none of them); its other flows need the
+# default `make servers` set (MySQL, S3 and Redis among it).
 QUEUE_PROFILES := --profile sqs --profile kinesis --profile amqp --profile pubsub
 QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator
 test-e2e-queues:
@@ -80,6 +82,9 @@ test-e2e-queues:
 	  $(E2E_DB) LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 $(CARGO) test --test e2e kinesis_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_AMQP=127.0.0.1:34560 $(CARGO) test --test e2e amqp_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 $(CARGO) test --test e2e pubsub_ || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_SQS=http://127.0.0.1:34561 LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 \
+	    LAZYWF_TEST_AMQP=127.0.0.1:34560 LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 \
+	    $(CARGO) test --test log_secrets -- --test-threads=$(E2E_THREADS) || rc=1; \
 	fi; \
 	$(COMPOSE) $(QUEUE_PROFILES) stop $(QUEUE_SERVICES); exit $$rc
 
