@@ -111,6 +111,14 @@ services:
       ELASTIC_PASSWORD: elasticpw
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
       xpack.ml.enabled: "false"
+      # A CI runner's disk is routinely >90% used (build caches, engine images). With 8.x's default
+      # watermarks, a node with <10% of the disk free refuses to allocate new primaries, so the test's
+      # index leaves the cluster RED and its writes hang until the client timeout (CI runs
+      # 41748509714 / 42042716686). The test holds a few MB, so absolute thresholds that still hold
+      # on a nearly-full runner:
+      cluster.routing.allocation.disk.watermark.low: "2g"
+      cluster.routing.allocation.disk.watermark.high: "1g"
+      cluster.routing.allocation.disk.watermark.flood_stage: "500m"
     ports: ["127.0.0.1:34202:9200"]
     healthcheck: { test: ["CMD-SHELL", "curl -sfk -u elastic:elasticpw https://localhost:9200/_cluster/health || exit 1"], interval: 3s, retries: 80 }
 

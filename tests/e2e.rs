@@ -1816,12 +1816,14 @@ async fn search_resync(root: &str, e: Search) {
         .send(&call("DELETE", &format!("/{index}"), ""), admin)
         .await
         .unwrap();
+    // number_of_replicas 0: the single-node cluster can never host the replica, so it would sit
+    // unassigned for the whole test (the cluster's yellow status is already waited for above).
     let r = client
         .send(
             &call(
                 "PUT",
                 &format!("/{index}"),
-                r#"{"mappings":{"properties":{"title":{"type":"keyword"}}}}"#,
+                r#"{"settings":{"number_of_replicas":0},"mappings":{"properties":{"title":{"type":"keyword"}}}}"#,
             ),
             admin,
         )
