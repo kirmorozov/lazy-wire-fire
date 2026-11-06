@@ -147,8 +147,10 @@ pub async fn tables(db: &Db) {
 
 pub struct Instance {
     stop: watch::Sender<bool>,
-    task: JoinHandle<anyhow::Result<()>>,
+    task: JoinHandle<()>,
     pub health: Arc<Health>,
+    /// The engine's own answer, once the task has finished.
+    done: Arc<Mutex<Option<anyhow::Result<()>>>>,
 }
 
 /// A replica server id for a test engine, in 4,000,000,000..=4,294,967,294: the range the
@@ -214,11 +216,17 @@ impl Instance {
         let (tx, rx) = watch::channel(false);
         let health = Arc::new(Health::default());
         let h = health.clone();
-        let task = tokio::spawn(async move { lazy_wire_fire::engine::run(cfg, h, rx).await });
+        let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let d = done.clone();
+        let task = tokio::spawn(async move {
+            let r = lazy_wire_fire::engine::run(cfg, h, rx).await;
+            *d.lock().unwrap() = Some(r);
+        });
         Instance {
             stop: tx,
             task,
             health,
+            done,
         }
     }
 
@@ -227,8 +235,12 @@ impl Instance {
         let i = Instance::start(cfg);
         let deadline = Instant::now() + Duration::from_secs(20);
         while !i.health.is_ready() {
-            if i.task.is_finished() || Instant::now() > deadline {
-                panic!("the engine did not get ready");
+            if i.task.is_finished() {
+                let r = i.done.lock().unwrap().take();
+                panic!("the engine did not get ready: {r:?}");
+            }
+            if Instant::now() > deadline {
+                panic!("the engine did not get ready in 20 s (it is still running)");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -257,8 +269,13 @@ impl Instance {
     pub async fn stop(self) {
         let _ = self.stop.send(true);
         match tokio::time::timeout(Duration::from_secs(20), self.task).await {
-            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(())) => {}
             other => panic!("engine did not stop cleanly: {other:?}"),
+        }
+        let engine = self.done.lock().unwrap().take();
+        match engine {
+            Some(Ok(())) => {}
+            other => panic!("engine did not stop cleanly: the engine answered {other:?}"),
         }
     }
 
