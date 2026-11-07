@@ -9,6 +9,7 @@
 #   docker compose -f docker-compose.test.yml --profile search up -d --wait    # + OpenSearch, Elasticsearch 8 / 7
 #   docker compose -f docker-compose.test.yml --profile varnish up -d --wait   # + Varnish (host network)
 #   docker compose -f docker-compose.test.yml --profile amqp up -d --wait      # + RabbitMQ (the amqp target tests)
+#   docker compose -f docker-compose.test.yml --profile smtp up -d --wait      # + Mailpit (the smtp target tests)
 #   make servers-down        # every profile, volumes included
 #
 # MySQL and Percona run with GTIDs on except MySQL 8.0 (off, as in RDS for MySQL's default
@@ -81,6 +82,19 @@ services:
     environment: { RABBITMQ_DEFAULT_USER: lwftest, RABBITMQ_DEFAULT_PASS: lwftest }
     ports: ["127.0.0.1:34560:5672"]
     healthcheck: { test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"], interval: 3s, retries: 60 }
+
+  # Mailpit for the `smtp` target tests (SMTP on 1025, its HTTP API on 8025). Not started by
+  # `make servers`: `docker compose -f docker-compose.test.yml --profile smtp up -d --wait mailpit`.
+  # AUTH takes any credentials (the log_secrets flow); anonymous sends still work. The recipient
+  # allow-list (a 550 on the rest) is what the refusal test addresses against.
+  mailpit:
+    image: axllent/mailpit:v1.33.0@sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231
+    profiles: ["smtp"]
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_SMTP_ALLOWED_RECIPIENTS: "^lwf-smtp-.*@lwf-smtp\\.test$"
+    ports: ["127.0.0.1:34565:1025", "127.0.0.1:34566:8025"]
 
   # Google's Pub/Sub emulator for the `pubsub` target tests (Google Cloud SDK `emulators` image,
   # pinned by digest; ~1.1 GB). Not started by `make servers`: `docker compose -f

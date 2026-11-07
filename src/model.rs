@@ -123,6 +123,8 @@ pub enum Kind {
     Lambda,
     /// RabbitMQ: one publish with a confirm per action (see `amqp.rs`).
     Amqp,
+    /// SMTP: one mail per action (see `smtp.rs`).
+    Smtp,
     /// Google Cloud Pub/Sub `topics.publish` (one request per action, a whole-action answer).
     PubSub,
     Redis,
@@ -142,18 +144,22 @@ impl Kind {
             "kinesis" => Kind::Kinesis,
             "lambda" => Kind::Lambda,
             "amqp" => Kind::Amqp,
+            "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, pubsub, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, smtp, pubsub, redis, mysql or pgsql)"
             ),
         })
     }
 
     pub fn is_http(self) -> bool {
-        !matches!(self, Kind::Amqp | Kind::Redis | Kind::MySql | Kind::PgSql)
+        !matches!(
+            self,
+            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql
+        )
     }
 
     /// The name of the kind, as written in `kind`.
@@ -168,6 +174,7 @@ impl Kind {
             Kind::Kinesis => "kinesis",
             Kind::Lambda => "lambda",
             Kind::Amqp => "amqp",
+            Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
@@ -184,7 +191,10 @@ impl Kind {
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
     /// stray cleanup and purge-like reset actions are refused at rule load (decision D9 / D7).
     pub fn append_only(self) -> bool {
-        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Amqp | Kind::PubSub)
+        matches!(
+            self,
+            Kind::Sqs | Kind::Kinesis | Kind::Amqp | Kind::Smtp | Kind::PubSub
+        )
     }
 
     /// The largest request body the service takes, when the kind has a fixed one.
@@ -221,7 +231,7 @@ impl Kind {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
             Kind::PubSub => &["credentials_ref"],
-            Kind::Amqp | Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
+            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
         }
     }
 }
@@ -404,6 +414,7 @@ impl TargetDef {
                 aws_refs(&vars)?;
             }
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }

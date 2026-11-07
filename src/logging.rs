@@ -6,11 +6,12 @@ use tracing_subscriber::EnvFilter;
 /// Dependency targets whose `trace` / `debug` events carry secret material: aws-sigv4 logs the
 /// signing request (with `x-amz-security-token`) and the string to sign, aws-config logs the
 /// `credential_process` command line, lapin's `internal_rpc` trace formats every command with
-/// the connection's `status` (which holds the AMQP username). A later directive in `RUST_LOG`
-/// cannot raise them; `lapin` and `amq_protocol_tcp` are held at `debug` rather than `info`:
-/// their debug events carry no credentials, and capping `amq_protocol_tcp` at `info` would
-/// silence its connection diagnostics (a refused connection), leaving the engine with only its
-/// own "no confirm within …" to say.
+/// the connection's `status` (which holds the AMQP username), and lettre's debug events echo
+/// every SMTP command (`Wrote: AUTH PLAIN …`, the credentials in base64) and every reply. A
+/// later directive in `RUST_LOG` cannot raise them; `lapin` and `amq_protocol_tcp` are held at
+/// `debug` rather than `info`: their debug events carry no credentials, and capping
+/// `amq_protocol_tcp` at `info` would silence its connection diagnostics (a refused
+/// connection), leaving the engine with only its own "no confirm within …" to say.
 pub const CAPPED: &[&str] = &[
     "aws_sigv4=info",
     "aws_config=info",
@@ -20,6 +21,7 @@ pub const CAPPED: &[&str] = &[
     "aws_smithy_http_client=info",
     "lapin=debug",
     "amq_protocol_tcp=debug",
+    "lettre=info",
 ];
 
 /// The filter for a `RUST_LOG` value (`None`: unset, which means `info`). An unparsable value

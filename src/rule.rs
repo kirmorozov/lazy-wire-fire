@@ -203,6 +203,9 @@ pub fn kind_errors(
     if kind == Kind::Amqp {
         out.extend(crate::amqp::rule_errors(def.fire_per));
     }
+    if kind == Kind::Smtp {
+        out.extend(crate::smtp::rule_errors(def.fire_per));
+    }
     if matches!(kind, Kind::Sqs | Kind::Kinesis) {
         // Purge-like `once` actions: a queue purge (`PurgeQueue`) or a stream delete
         // (`DeleteStream`, which drops every record). Recognized by text, as the only names of

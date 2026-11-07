@@ -44,6 +44,11 @@ roaring = { version = "0.12", optional = true }
 sqlparser = { version = "0.63", features = ["visitor"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 lapin = { version = "4.12", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
+# SMTP (src/smtp.rs). Default features off: they pull native-tls (OpenSSL); the rustls backend
+# is ring only, as the rest of the TLS here. `tracing` on: its debug events echo the SMTP
+# commands (the AUTH line carries the credentials), so the CAPPED filter of `logging.rs`
+# holds the target at `info`.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "hostname", "tracing"] }
 # AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
 # aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }

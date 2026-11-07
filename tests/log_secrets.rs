@@ -17,7 +17,7 @@ use std::time::Duration;
 use common::*;
 use lazy_wire_fire::http::{BaseUrl, Client, RawRequest};
 use lazy_wire_fire::tls::TlsSpec;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// Fake secrets: each is unique, so finding one in the output is a leak, not a coincidence.
 const BASIC_PW: &str = "LWFSECRET-basic-pw-3c1";
@@ -39,6 +39,10 @@ const AWS_SESSION: &str = "LWFSECRET-queue-session-8a2b";
 /// The AMQP account the flow creates on the test broker (dropped at its end).
 const AMQP_USER: &str = "lwf_ls_amqp";
 const AMQP_PW: &str = "LWFSECRET-amqp-pw-5e9c";
+/// The SMTP account of the smtp flow: Mailpit's `any` AUTH accepts it (its `Username` in the
+/// API says the flow really authenticated).
+const SMTP_USER: &str = "lwf_ls_smtp";
+const SMTP_PW: &str = "LWFSECRET-smtp-pw-7c2e";
 /// The password of the separate binlog account (`lwf_ls_binlog`), created for the flow.
 const BINLOG_PW: &str = "LWFSECRET-binlog-pw-1d4f";
 /// The fake Google service-account key behind the pubsub flow's `credentials_ref`. The private
@@ -83,7 +87,7 @@ fn install() -> &'static Capture {
         let filter = lazy_wire_fire::logging::filter(Some(
             "trace,aws_sigv4=trace,aws_config=trace,aws_credential_types=trace,\
              aws_smithy_runtime=trace,aws_smithy_runtime_api=trace,aws_smithy_http_client=trace,\
-             lapin=trace,amq_protocol_tcp=trace",
+             lapin=trace,amq_protocol_tcp=trace,lettre=trace",
         ));
         let sub = tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -1166,6 +1170,125 @@ Content-Type: application/json
     let out = captured();
     assert!(out.contains("starting"), "no engine log in the capture");
     let leaks = leaks(&out, &[("service-account key", SA_KEY_FRAG)]);
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// Mailpit's HTTP API (its port is the SMTP port plus one): the mailbox, emptied for the flow.
+async fn mailpit(host: &str, port: u16, method: &str, path: &str) -> Value {
+    let client = lazy_wire_fire::http::Client::new(
+        lazy_wire_fire::http::BaseUrl::parse(&format!("http://{host}:{port}")).unwrap(),
+        &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+    )
+    .unwrap();
+    let mut req = lazy_wire_fire::http::RawRequest {
+        method: method.into(),
+        target: path.into(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    req.set_header("Host", format!("{host}:{port}"));
+    let resp = client
+        .send(&req, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("{method} {path}: {e:#}"));
+    assert!(
+        (200..300).contains(&resp.status),
+        "{method} {path}: {} {}",
+        resp.status,
+        resp.body_snippet()
+    );
+    serde_json::from_slice(&resp.body).unwrap_or(Value::Null)
+}
+
+/// The `smtp` target against Mailpit (`LAZYWF_TEST_SMTP`): the target's credentials are by
+/// reference (the password a fake secret), the AUTH goes over the wire, and the mails read back
+/// through Mailpit's API carry the authenticated username (the flow really ran).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_smtp() {
+    let root = need_db!();
+    let Ok(s) = std::env::var("LAZYWF_TEST_SMTP") else {
+        return eprintln!(
+            "LAZYWF_TEST_SMTP not set: skipping the smtp flow (make test-e2e-queues)"
+        );
+    };
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>().ok() {
+            Some(p) => (h, p),
+            None => panic!("LAZYWF_TEST_SMTP is `{s}`, not host:port"),
+        },
+        None => panic!("LAZYWF_TEST_SMTP is `{s}`, not host:port"),
+    };
+    install();
+    let api = port + 1;
+    let db = Db::fresh(&root, "logsmtp").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    std::env::set_var("LWF_LOGSMTP_USER", SMTP_USER);
+    std::env::set_var("LWF_LOGSMTP_PW", SMTP_PW);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, vars) VALUES ('mail', 'smtp', ?, 'off', ?)",
+        (
+            format!("smtp://{s}"),
+            json!({"username": "env:LWF_LOGSMTP_USER", "password": "env:LWF_LOGSMTP_PW"})
+                .to_string(),
+        ),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'mail', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            "{{#each docs}}From: lazywf@lwf-smtp.test\nTo: lwf-smtp-{{key}}@lwf-smtp.test\n\
+             Subject: Order {{key}}\nContent-Type: text/plain; charset=utf-8\n\n\
+             {\"key\":{{json key}},\"op\":{{json op}},\"doc\":{{json doc}}}{{/each}}",
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    wait_for(
+        Duration::from_secs(30),
+        "two authenticated mails",
+        || async {
+            let v = mailpit(host, api, "GET", "/api/v1/messages?limit=100").await;
+            let m = v
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let n = m
+                .iter()
+                .filter(|m| m.get("Username").and_then(Value::as_str) == Some(SMTP_USER))
+                .count();
+            (n >= 2).then_some(())
+        },
+    )
+    .await;
+    inst.quiet().await;
+    inst.stop().await;
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    // PLAIN puts both credentials in one base64 blob: that exact wire form is what an
+    // un-capped debug log of the AUTH command would carry.
+    use base64::Engine as _;
+    let plain =
+        base64::engine::general_purpose::STANDARD.encode(format!("\u{0}{SMTP_USER}\u{0}{SMTP_PW}"));
+    let leaks = leaks(
+        &out,
+        &[
+            ("SMTP username", SMTP_USER),
+            ("SMTP password", SMTP_PW),
+            ("SMTP PLAIN auth response", &plain),
+        ],
+    );
     if !leaks.is_empty() {
         dump(&out);
     }
