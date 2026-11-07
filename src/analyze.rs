@@ -324,6 +324,14 @@ pub fn definition_hash(def: &str) -> String {
 /// Parses `CREATE [OR REPLACE] [ALGORITHM=..] [DEFINER=..] [SQL SECURITY ..] VIEW name [(cols)] AS
 /// SELECT ... [WITH [CASCADED|LOCAL] CHECK OPTION]`.
 pub fn parse_definition(def: &str) -> Result<ParsedDef> {
+    // MySQL and MariaDB execute the content of `/*! ... */`, `/*!NNNNN ... */` and `/*M! ... */`: sqlparser expands
+    // the first two unconditionally (whatever the version gate says) and ignores the third, so what lazyview plans
+    // could differ from what the server runs. Refuse them anywhere in the text (also inside a string literal: no
+    // quote-aware scan that could disagree with the server's escape rules).
+    if def.contains("/*!") || def.to_ascii_uppercase().contains("/*M!") {
+        bail!("the definition contains an executable comment (`/*!` or `/*M!`): the server would run its content; write the SQL without it");
+    }
+
     let dialect = MySqlDialect {};
     let tokens = tokenize(def)?;
     // Indexes of the non-whitespace tokens.
@@ -981,6 +989,16 @@ impl MapPlan {
     }
 }
 
+/// An equality between two alias columns, valid on every view row when `only_with` is `None`
+/// (a WHERE conjunct or an inner-join ON) and, when `Some(j)`, only on the rows where the
+/// alias `j` participates (its own LEFT-join ON). The hop paths of `crate::access` walk them.
+#[derive(Debug, Clone)]
+pub struct Edge {
+    pub a: (usize, usize),
+    pub b: (usize, usize),
+    pub only_with: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ViewPlan {
     pub schema: String,
@@ -1031,6 +1049,10 @@ pub struct ViewPlan {
     pub partial: PartialUnits,
     /// Hidden presence columns of pinned cascade children (after the lineage columns).
     pub presence: Vec<Presence>,
+    /// The equality edges between alias columns ([`Edge`]).
+    pub edges: Vec<Edge>,
+    /// Per reduced unit expression: the alias columns it reads.
+    pub unit_refs: Vec<Vec<(usize, usize)>>,
 }
 
 impl ViewPlan {
@@ -2428,6 +2450,8 @@ pub fn plan_block(
         unit_unique: false,
         lineage: Vec::new(),
         output_names: output_names.clone(),
+        edges: Vec::new(),
+        unit_refs: Vec::new(),
     };
     let full = |reason: &str| {
         let columns = read_columns(&def.query, &all_tables, tables);
@@ -2963,6 +2987,24 @@ pub fn plan_block(
     } else {
         unit_refs
     };
+    // The plan's equality edges (the WHERE / inner ON, plus each LEFT-joined alias's own ON)
+    // and the column refs of the reduced units: the hop paths of `crate::access` walk them.
+    let edges: Vec<Edge> = base_edges
+        .iter()
+        .map(|&(a, b)| Edge {
+            a,
+            b,
+            only_with: None,
+        })
+        .chain(own_edges.iter().enumerate().flat_map(|(ja, es)| {
+            es.iter().map(move |&(a, b)| Edge {
+                a,
+                b,
+                only_with: Some(ja),
+            })
+        }))
+        .collect();
+    let unit_refs_cols: Vec<Vec<ColRef>> = unit_refs.iter().map(|e| col_refs(e, &scope)).collect();
     // Units and WHERE are evaluated on literal row images in lookups; that is only sound when the
     // NULL-extended rows of LEFT JOINs cannot change them.
     let null_side: Vec<usize> = joins
@@ -3404,6 +3446,8 @@ pub fn plan_block(
         cascades,
         aliases: alias_plans,
         output_names,
+        edges,
+        unit_refs: unit_refs_cols,
     })
 }
 
@@ -7199,5 +7243,27 @@ mod tests {
             v.full_select,
             "SELECT DISTINCT  COUNT( * ) , 'a' 'b' FROM orders"
         );
+    }
+
+    #[test]
+    fn executable_comments_are_refused() {
+        let err = |sql: &str| format!("{:#}", parse_definition(sql).unwrap_err());
+        for sql in [
+            "CREATE VIEW v AS SELECT id /*! , 1 */ FROM items",
+            "CREATE VIEW v AS SELECT id FROM items /*!50100 WHERE 1 */",
+            "CREATE VIEW v AS SELECT id FROM items /*M! WHERE 1 */",
+            "CREATE VIEW v AS SELECT id FROM items /*m!100500 WHERE 1 */",
+            "CREATE VIEW v AS SELECT id FROM items WHERE note = '/*!x*/'",
+        ] {
+            let e = err(sql);
+            assert!(e.contains("executable comment"), "{sql}: {e}");
+        }
+        for sql in [
+            "CREATE VIEW v AS SELECT id /* a note */ FROM items",
+            "CREATE VIEW v AS SELECT id FROM items -- a note",
+            "CREATE VIEW v AS SELECT /*+ MAX_EXECUTION_TIME(1000) */ id FROM items",
+        ] {
+            assert!(parse_definition(sql).is_ok(), "{sql}");
+        }
     }
 }

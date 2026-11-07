@@ -1,9 +1,9 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 9462728e834ed9b883f44c54152ee684d32244c5
-file src/access.rs 063a30a111e6c3b09a05647919c9e76896e6b3fdfba94a4e8e46ff719c7694b8
-file src/analyze.rs 2781f031182cfc27f39d7ad61c1b472c694667aa2366c32c55c8e63deef45409
+commit 1a9eb51aa9afc39f525f82a897caddd10e7670ad
+file src/access.rs ecbc68321a5ebbf9e3b882ad480c3edea60471b0d58abcb8b0aea7f0c29d98e7
+file src/analyze.rs 90a13671f7f603ffabb454805f87c6af672c2e58a07663166704e0b5c64e19ac
 file src/analyzer/ast.rs 395a6b078dbb48e20d10dcfc8b7de6bc7df2e43a6c55c182773aa87713743e5d
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
 file src/analyzer/internal.rs 9b226a82771b875808fbee30c7ef3738ffa90965316182db23781d18c0401bfd
@@ -20,7 +20,7 @@ file src/analyzer/tests.rs f53d0ce10e5254529aa7130eb5d13d82305ec84b8df640f7ae475
 file src/analyzer/tests_rename.rs 1f06ec0cc0b40bad380f5fa5cbc8bef1413093067988ff24d4266626c4726176
 file src/analyzer/union.rs 9acd5df87a46c597178cd7b8b167041e797f92684d746d48ac60a8b6ee2c79ab
 file src/binlog.rs 43c96f7c1286abaa6a965e82a09ada281fb9974596934a6719492497c2a4a0e1
-file src/catalog.rs 455c20b343c2d3239f2bc115101b5c4c4a6cf9acba055c7105e6f6f612c53ee6
+file src/catalog.rs 0ac6d4a103fe9f32dbe145097866a8f870c5a2557628bf2bfb65b4deab57bda0
 file src/datum.rs c6088b9dc4b92e0bc7b76105c207b179debb28cdd54301e081d014cd56771def
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
-file src/intset.rs b293bb6f8e427d4495cc4255c3f4e798fec59d1866f7a9aa60ee9b9fb46e7aa0
+file src/intset.rs 264c0704ef3b640e343952fa9a0114a38d5f22d609b67ad2893335e44ef99ad8
