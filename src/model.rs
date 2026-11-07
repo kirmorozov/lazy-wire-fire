@@ -24,6 +24,11 @@ pub const STATUS: &str = "lazy_wire_fire_status";
 /// The commit fence's table (see `fence.rs`), created by `fence::probe` on the first flush.
 pub const FENCE: &str = "lazy_wire_fire_fence";
 
+/// The tables the vendored view planner refuses as view sources (`analyze::set_reserved` at
+/// startup): the exact names above and their shared prefix.
+pub const RESERVED_TABLES: &[&str] = &[TARGET, RULE, TRIGGER, STATUS, FENCE];
+pub const RESERVED_PREFIX: &str = "lazy_wire_fire_";
+
 pub const DDL: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS `lazy_wire_fire_target` (
   `name` VARCHAR(191) NOT NULL,

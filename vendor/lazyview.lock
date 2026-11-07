@@ -1,9 +1,9 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 1a9eb51aa9afc39f525f82a897caddd10e7670ad
+commit 95054b795e9828d1f173e9150a51190b644c874f
 file src/access.rs ecbc68321a5ebbf9e3b882ad480c3edea60471b0d58abcb8b0aea7f0c29d98e7
-file src/analyze.rs 90a13671f7f603ffabb454805f87c6af672c2e58a07663166704e0b5c64e19ac
+file src/analyze.rs 4da2475b684cb8eaeed96a62f07ebd8ed6cc5ed5d38d45339b7494cca68ab4f3
 file src/analyzer/ast.rs 395a6b078dbb48e20d10dcfc8b7de6bc7df2e43a6c55c182773aa87713743e5d
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
 file src/analyzer/internal.rs 9b226a82771b875808fbee30c7ef3738ffa90965316182db23781d18c0401bfd
