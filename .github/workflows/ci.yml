@@ -1,6 +1,6 @@
 name: ci
 
-# Every push, pull request, weekly and on demand:
+# Every push, pull request, weekly and on demand (lazyview-drift runs weekly and on demand only):
 #   lint         cargo fmt --check, clippy -D warnings for the default and the roaring feature
 #                (make lint), Cargo.lock up to date
 #   unit         make test: the unit tests for the default and the roaring feature
@@ -16,6 +16,10 @@ name: ci
 #                default target servers)
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, then make docker-e2e on amd64
+#   lazyview-drift  scripts/sync-lazyview.sh --drift, advisory and always green: a ::warning
+#                annotation and a step summary when lazyview's main changed a locked file, grew
+#                its copy set, or dropped one (lint's lock check runs on every event; this one
+#                watches main)
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
 #
 # Images go to ghcr.io/kirmorozov/lazy-wire-fire (publish-image.yml) only for pushes:
@@ -373,6 +377,62 @@ jobs:
       - name: stop the servers
         if: always()
         run: make servers-down
+
+  lazyview-drift:
+    # Advisory: reminds to re-sync when lazyview's main moves past the lock. Weekly (the schedule
+    # event) and on demand (workflow_dispatch) only: it cannot gate a release, and a push or a
+    # pull request cannot have changed which commit main points at.
+    name: lazyview drift (advisory)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: scripts/sync-lazyview.sh --drift
+        run: scripts/sync-lazyview.sh --drift 2>&1 | tee drift.txt
+      - name: annotate the drifted files
+        if: always()
+        run: |
+          while IFS= read -r line; do
+            echo "::warning title=lazyview drift::$line"
+          done < <(grep -E ': (differs from|new in|not in lazyview) ' drift.txt || true)
+      - name: summary
+        if: always()
+        run: |
+          main=$(sed -n 's/^lazyview main: \([0-9a-f]*\).*/\1/p' drift.txt)
+          locked=$(sed -n 's/^lazyview main: .*lock holds \([0-9a-f]*\).*/\1/p' drift.txt)
+          {
+            echo "### Lazyview drift (advisory)"
+            echo
+            if [[ -n $main && -n $locked ]]; then
+              echo "The lock pins lazyview at \`$locked\`; its main is at \`$main\`."
+              echo
+            fi
+            if grep -qE ': (differs from|new in|not in lazyview) ' drift.txt; then
+              echo "| file | locked commit | lazyview main |"
+              echo "|---|---|---|"
+              awk '
+                {
+                  f = $1; sub(/:$/, "", f)
+                  l = ""; m = ""
+                  if ($2 == "differs") { m = $6; l = $8 }
+                  else if ($2 == "new") { m = $8 }
+                  else if ($2 == "not") { l = $8 }
+                  else next
+                  sub(/\)$/, "", l); sub(/\)$/, "", m)
+                  if (l == "") l = "not in the lock"
+                  if (m == "") m = "gone from lazyview"
+                  print "| `" f "` | " l " | " m " |"
+                }
+              ' drift.txt
+              echo
+              echo "Advisory only: re-sync the copies with \`scripts/sync-lazyview.sh\`; nothing here gates a release."
+            else
+              echo "No drift: every locked file matches lazyview main."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   image:
     name: image (build, smoke, end to end)
