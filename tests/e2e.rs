@@ -1737,6 +1737,153 @@ async fn targets_add_their_authentication() {
     inst.stop().await;
 }
 
+/// Signing of the http kinds: the Standard Webhooks scheme and the GitHub-style header. The
+/// Mock is the receiver: it verifies the signature of each request and refuses the wrong
+/// secret with a 401, so the mis-signed rule is held back as any other refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhooks_signed_and_verified_by_the_receiver() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "sign").await;
+    shop(&db).await;
+    // The spec's published test secret (its reference libraries pin the same one in their
+    // tests): the Mock verifies against its key. The wrong one decodes to another key.
+    use base64::Engine as _;
+    const STD_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    const WRONG_SECRET: &str = "whsec_9m8ZK5oW1xQeVbTcDrYfGhJkLnMoPqRsUvWxYz012345";
+    let key = base64::engine::general_purpose::STANDARD
+        .decode("MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw")
+        .unwrap();
+    const HMAC_KEY: &str = "0123456789012345678901234567890123456789012345678901234567890123";
+    std::env::set_var("LWF_E2E_SIGN_STD", STD_SECRET);
+    std::env::set_var("LWF_E2E_SIGN_HMAC", HMAC_KEY);
+    std::env::set_var("LWF_E2E_SIGN_WRONG", WRONG_SECRET);
+    let mock = Mock::start().await;
+    mock.respond(move |req| {
+        let key = base64::engine::general_purpose::STANDARD
+            .decode("MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw")
+            .unwrap();
+        let ok = match req.path.as_str() {
+            "/std" | "/wrong" => req.standard_ok(&key),
+            "/hmac" => req.hmac_ok(HMAC_KEY.as_bytes(), "x-signature-256", "sha256="),
+            _ => false,
+        };
+        if ok {
+            (200, "{}".into())
+        } else {
+            (401, "invalid signature".into())
+        }
+    });
+    db.target(
+        "sign-std",
+        "http",
+        &mock.url(),
+        None,
+        r#"{"sign": "standard", "sign_secret_ref": "env:LWF_E2E_SIGN_STD"}"#,
+    )
+    .await;
+    db.target(
+        "sign-hmac",
+        "http",
+        &mock.url(),
+        None,
+        r#"{"sign": "hmac", "sign_secret_ref": "env:LWF_E2E_SIGN_HMAC"}"#,
+    )
+    .await;
+    db.target(
+        "sign-wrong",
+        "http",
+        &mock.url(),
+        None,
+        r#"{"sign": "standard", "sign_secret_ref": "env:LWF_E2E_SIGN_WRONG"}"#,
+    )
+    .await;
+    for (rule, target, path) in [
+        ("sign-std", "sign-std", "/std"),
+        ("sign-hmac", "sign-hmac", "/hmac"),
+        ("sign-wrong", "sign-wrong", "/wrong"),
+    ] {
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, ?, 50)",
+            (rule, target, &format!("POST {path} HTTP/1.1\n\n{{{{join keys \",\"}}}}")),
+        )
+        .await;
+        db.trigger(rule, "orders", Some("{{new.id}}"), None).await;
+    }
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(10), "the signed requests", || async {
+        let r = mock.requests();
+        (r.iter()
+            .any(|r| r.path == "/std" && r.header("webhook-signature").is_some())
+            && r.iter()
+                .any(|r| r.path == "/hmac" && r.header("x-signature-256").is_some()))
+        .then_some(())
+    })
+    .await;
+    // The Mock accepted them: it answers 200 only when the signature verifies.
+    let reqs = mock.requests();
+    let std = reqs.iter().find(|r| r.path == "/std").unwrap();
+    assert_eq!(
+        std.header("webhook-signature"),
+        std.standard_signature(&key).as_deref()
+    );
+    assert!(std
+        .header("webhook-timestamp")
+        .unwrap()
+        .parse::<u64>()
+        .is_ok());
+    // The second insert: the ids stay unique per request.
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    wait_for(
+        Duration::from_secs(10),
+        "the second standard request",
+        || async {
+            let got = mock
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/std")
+                .map(|r| r.header("webhook-id").unwrap().to_string())
+                .collect::<Vec<_>>();
+            (got.len() >= 2 && got[0] != got[1]).then_some(())
+        },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the two signed rules past the inserts",
+        || async {
+            // A status row appears only once the rule has something to record: a missing row
+            // waits for the next poll, as for the other rules' positions.
+            let (b1, p1, _, e1) = db.status("sign-std").await?;
+            let (b2, p2, _, e2) = db.status("sign-hmac").await?;
+            (((b1, p1) > after && e1.is_none()) && ((b2, p2) > after && e2.is_none())).then_some(())
+        },
+    )
+    .await;
+    // The wrong secret: the Mock refused it, and lazywf's rule sees the refusal.
+    wait_for(
+        Duration::from_secs(10),
+        "the mis-signed request",
+        || async {
+            mock.requests()
+                .iter()
+                .any(|r| r.path == "/wrong")
+                .then_some(())
+        },
+    )
+    .await;
+    sleep_ms(1000).await;
+    let (bf, bp, _, err) = db.status("sign-wrong").await.unwrap();
+    assert!(
+        (bf, bp) < after,
+        "the mis-signed rule moved past its failing action"
+    );
+    assert!(err.as_deref().is_some_and(|e| e.contains("401")), "{err:?}");
+    inst.stop().await;
+}
+
 /// One search engine of the OpenSearch / Elasticsearch family.
 struct Search {
     name: &'static str,

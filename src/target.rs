@@ -51,6 +51,8 @@ pub struct Target {
     pub expect: Expect,
     /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`, `kinesis`, `lambda`).
     aws: Option<AwsSign>,
+    /// Webhook signing for the http kinds (`src/sign.rs`); the secret is resolved on every use.
+    sign: Option<crate::sign::Spec>,
     /// The `aws-lambda://` endpoint of a `lambda` target (its function, qualifier, invocation).
     lambda: Option<aws::LambdaUrl>,
     /// The source database, which evaluates `expect`.
@@ -418,6 +420,7 @@ impl Target {
         if let Some(list) = allowed {
             check_allowed(list, &endpoints)?;
         }
+        let sign = crate::sign::spec(&def.vars)?;
         let ctx = json!({"name": def.name, "vars": def.template_vars()});
         Ok(Arc::new(Target {
             def,
@@ -425,6 +428,7 @@ impl Target {
             endpoints,
             expect,
             aws: aws_rt,
+            sign,
             lambda: lambda_url,
             pool,
         }))
@@ -921,6 +925,10 @@ impl Target {
                 req.set_header(&name, get("value")?);
             }
             _ => {}
+        }
+        // The signature goes over the exact body the request will send.
+        if let Some(s) = &self.sign {
+            crate::sign::apply(&mut req, &self.def.name, s, crate::time::unix_now())?;
         }
         Ok(req)
     }

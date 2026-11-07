@@ -33,6 +33,7 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 handlebars = "6"
 regex = "1"
 sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
 base64 = "0.23"
 # Google credentials for the pubsub kind. Default features off: they pull aws-lc and cmake.
