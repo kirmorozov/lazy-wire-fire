@@ -1,6 +1,7 @@
 //! lazy_wire_fire (lazywf): row changes in registered tables mark keys; for the changed keys a
-//! rule's queries run, one template renders an action, and it is fired at an HTTP, Redis or
-//! SQL target. Rules, triggers and targets are rows in the tool's tables.
+//! rule's queries run, one template renders an action, and it is fired at an HTTP, S3, queue,
+//! stream, mail, Redis or SQL target. Rules, triggers and targets are rows in the tool's
+//! tables.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod access;

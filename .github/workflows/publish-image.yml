@@ -33,7 +33,7 @@ jobs:
       IMAGE: ghcr.io/kirmorozov/lazy-wire-fire
       PLATFORMS: linux/amd64,linux/arm64
       SOURCE: https://github.com/kirmorozov/lazy-wire-fire
-      DESCRIPTION: "Change-triggered actions from the MySQL binlog: HTTP, Redis and SQL targets"
+      DESCRIPTION: "Change-triggered actions from the MySQL binlog: HTTP, S3, queues, streams, mail, Redis and SQL targets"
       # OCI annotations on the per-platform manifests and on the index
       # (GHCR shows the index description for multi-arch packages).
       DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
