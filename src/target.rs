@@ -35,6 +35,8 @@ enum Transport {
     Redis(RedisClient),
     /// One RabbitMQ endpoint (see `amqp.rs`).
     Amqp(Box<crate::amqp::Client>),
+    /// One SMTP endpoint (see `smtp.rs`).
+    Smtp(Box<crate::smtp::Client>),
     MySql(crate::sqlwire::MySqlClient),
     Pg(crate::sqlwire::PgClient),
     /// Google Cloud Pub/Sub (`src/pubsub.rs`): one publish per action.
@@ -220,6 +222,15 @@ impl Target {
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Amqp(Box::new(client)),
+                    });
+                }
+            }
+            Kind::Smtp => {
+                for e in &def.endpoints {
+                    let (ctx, client) = crate::smtp::Client::new(&def, e)?;
+                    endpoints.push(Endpoint {
+                        ctx,
+                        transport: Transport::Smtp(Box::new(client)),
                     });
                 }
             }
@@ -596,6 +607,9 @@ impl Target {
             Transport::Amqp(client) => {
                 crate::amqp::send(client, rendered, &self.expect, &self.pool).await
             }
+            Transport::Smtp(client) => {
+                crate::smtp::send(client, rendered, &self.expect, &self.pool).await
+            }
             Transport::Redis(client) => {
                 let args = redis::tokenize(rendered)
                     .map_err(|e| rejected(format!("the rendered command: {e:#}")))?;
@@ -686,6 +700,7 @@ impl Target {
                 Ok(Row::http(uses, resp.status, &resp.headers, &resp.body))
             }
             Transport::Amqp(_) => bail!("kind amqp appends: it cannot list keys"),
+            Transport::Smtp(_) => bail!("kind smtp appends: it cannot list keys"),
             Transport::Redis(client) => {
                 let args = redis::tokenize(rendered)?;
                 if args.is_empty() {
@@ -1125,6 +1140,18 @@ mod allow_tests {
                 "amqp://mq.example.test:5672/",
                 r#"{"username":"u","password":"p"}"#,
                 "mq.example.test",
+            ),
+            (
+                "smtp",
+                "smtp://mail.example.test:587",
+                "{}",
+                "mail.example.test",
+            ),
+            (
+                "smtp",
+                "smtps://mail.example.test:465",
+                "{}",
+                "mail.example.test",
             ),
         ];
         for (kind, endpoint, vars, host) in cases {

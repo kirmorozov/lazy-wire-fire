@@ -3851,6 +3851,273 @@ async fn amqp_restart() {
     inst.stop().await;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The smtp kind against Mailpit (`LAZYWF_TEST_SMTP=127.0.0.1:34565`, compose profile `smtp`;
+// Mailpit's HTTP API is on the next port, 34566). The server is configured to refuse every
+// recipient but `lwf-smtp-*@lwf-smtp.test` (a 550), which the refusal test uses.
+
+/// The server's `host:port`, when the suite has one.
+fn smtp_endpoint() -> Option<(String, u16)> {
+    let s = std::env::var("LAZYWF_TEST_SMTP").ok()?;
+    let (host, port) = s.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// The messages Mailpit holds, read through its HTTP API.
+struct Mailpit {
+    host: String,
+    port: u16,
+    client: lazy_wire_fire::http::Client,
+}
+
+impl Mailpit {
+    /// The SMTP endpoint and the API (Mailpit's HTTP port is the SMTP port plus one).
+    fn new(host: &str, smtp_port: u16) -> Mailpit {
+        let port = smtp_port + 1;
+        let api = lazy_wire_fire::http::BaseUrl::parse(&format!("http://{host}:{port}")).unwrap();
+        Mailpit {
+            host: host.to_string(),
+            port,
+            client: lazy_wire_fire::http::Client::new(
+                api,
+                &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("smtp://{}:{}", self.host, self.port - 1)
+    }
+
+    async fn call(&self, method: &str, path: &str) -> Value {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: method.into(),
+            target: path.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        req.set_header("Host", format!("{}:{}", self.host, self.port));
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|e| panic!("{method} {path}: {e:#}"));
+        assert!(
+            (200..300).contains(&resp.status),
+            "{method} {path}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+        serde_json::from_slice(&resp.body).unwrap_or(Value::Null)
+    }
+
+    /// The summaries of the mails held now (newest first).
+    async fn messages(&self) -> Vec<Value> {
+        self.call("GET", "/api/v1/messages?limit=100")
+            .await
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// One full message (the headers and the body as Mailpit parsed them).
+    async fn get(&self, id: &str) -> Value {
+        self.call("GET", &format!("/api/v1/message/{id}")).await
+    }
+}
+
+/// Whether a mail summary is one of the test's own (its addresses carry the test's suffix).
+fn own(suffix: &str, m: &Value) -> bool {
+    m.get("To")
+        .and_then(Value::as_array)
+        .and_then(|t| t.first())
+        .and_then(|t| t.get("Address"))
+        .and_then(Value::as_str)
+        .is_some_and(|a| a.contains(suffix))
+}
+
+/// The envelope template: one mail per key (the key's address as the recipient, a Cc of its
+/// own), with the JSON envelope `{key, op, doc}` as the body. The suffix marks the test's mails
+/// (the tests share the Mailpit).
+fn smtp_envelope(suffix: &str) -> String {
+    r#"{{#each docs}}From: lazywf@lwf-smtp.test
+To: lwf-smtp-{{key}}"#
+        .to_string()
+        + suffix
+        + r#"@lwf-smtp.test
+Cc: lwf-smtp-cc-{{key}}"#
+        + suffix
+        + r#"@lwf-smtp.test
+Subject: Order {{key}}
+Content-Type: text/plain; charset=utf-8
+
+{"key":{{json key}},"op":{{json op}},"doc":{{json doc}}}{{/each}}"#
+}
+
+/// The `smtp` kind as a mail producer: one mail per changed key; the Mailpit API shows the
+/// sender, the recipients (To and Cc), the subject and the body exactly; a delete sends its mail
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn smtp_target() {
+    let root = need_db!();
+    let Some((host, port)) = smtp_endpoint() else {
+        return eprintln!("LAZYWF_TEST_SMTP not set: skipping");
+    };
+    let mp = Mailpit::new(&host, port);
+    let suffix = format!("-tg{}", std::process::id());
+    let db = Db::fresh(&root, "smtp_target").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    // Mailpit runs plain on the test port: no STARTTLS (the target's `tls` says so).
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, vars) VALUES ('mail', 'smtp', ?, 'off', ?)",
+        (mp.endpoint(), "{}"),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'mail', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            smtp_envelope(&suffix),
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    let got = wait_for(Duration::from_secs(30), "two mails", || async {
+        let m = mp.messages().await;
+        let mine: Vec<Value> = m.into_iter().filter(|m| own(&suffix, m)).collect();
+        (mine.len() >= 2).then_some(mine)
+    })
+    .await;
+    assert_eq!(got.len(), 2, "one mail per key: {got:?}");
+    for (id, sku, qty) in [("1", "A-1", 3), ("2", "B-2", 1)] {
+        let m = got
+            .iter()
+            .find(|m| m["To"][0]["Address"] == format!("lwf-smtp-{id}{suffix}@lwf-smtp.test"))
+            .unwrap_or_else(|| panic!("the mail to lwf-smtp-{id}{suffix}@lwf-smtp.test: {got:?}"))
+            .clone();
+        assert_eq!(m["From"]["Address"], "lazywf@lwf-smtp.test", "{m:?}");
+        assert_eq!(m["Subject"], format!("Order {id}"), "{m:?}");
+        assert_eq!(
+            m["Cc"][0]["Address"],
+            format!("lwf-smtp-cc-{id}{suffix}@lwf-smtp.test"),
+            "{m:?}"
+        );
+        let full = mp.get(m["ID"].as_str().unwrap()).await;
+        // Mailpit stores the body with its final line ending: the rendered body plus a CRLF.
+        assert_eq!(
+            full["Text"].as_str().unwrap(),
+            &format!(
+                "{{\"key\":\"{id}\",\"op\":\"upsert\",\"doc\":{{\"sku\":\"{sku}\",\"qty\":{qty}}}}}\r\n"
+            ),
+            "{full:?}"
+        );
+    }
+
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    wait_for(Duration::from_secs(30), "the delete mail", || async {
+        let m = mp
+            .messages()
+            .await
+            .into_iter()
+            .filter(|m| own(&suffix, m))
+            .find(|m| m["To"][0]["Address"] == format!("lwf-smtp-2{suffix}@lwf-smtp.test"))?;
+        let full = mp.get(m["ID"].as_str().unwrap()).await;
+        (full_body(&full).as_deref() == Some(r#"{"key":"2","op":"delete","doc":{}}"#)).then_some(())
+    })
+    .await;
+    inst.stop().await;
+}
+
+/// The body of a full Mailpit message (its stored final CRLF dropped).
+fn full_body(m: &Value) -> Option<String> {
+    m.get("Text")
+        .and_then(Value::as_str)
+        .map(|t| t.trim_end_matches("\r\n").to_string())
+}
+
+/// A recipient Mailpit is configured to refuse comes back as a 550. It is refused, struck and
+/// dropped after its strikes, because the other key went through; the refused mail never arrives
+/// and `last_error` says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn smtp_refusal() {
+    let root = need_db!();
+    let Some((host, port)) = smtp_endpoint() else {
+        return eprintln!("LAZYWF_TEST_SMTP not set: skipping");
+    };
+    let mp = Mailpit::new(&host, port);
+    let suffix = format!("-rf{}", std::process::id());
+    let db = Db::fresh(&root, "smtp_refusal").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    // Orders with the sku NOROUTE are addressed to a recipient the server refuses (a 550).
+    let to = "lwf-smtp-{{key}}".to_string() + &suffix + "@lwf-smtp.test";
+    let replaced = r#"{{#if (eq doc.sku "NOROUTE")}}refused@lwf-smtp.test{{else}}"#.to_string()
+        + &to
+        + "{{/if}}";
+    let template = smtp_envelope(&suffix).replace(&to, &replaced);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, vars) VALUES ('mail', 'smtp', ?, 'off', ?)",
+        (mp.endpoint(), "{}"),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'mail', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            template,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'NOROUTE', 1)")
+        .await;
+    let err = wait_for(
+        Duration::from_secs(60),
+        "the refused key dropped",
+        || async {
+            let (f, p, _, err) = db.status("orders").await?;
+            let err = err?;
+            (err.contains("`2` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(
+        err.contains("550") && err.contains("mailbox unavailable"),
+        "{err}"
+    );
+
+    let got = mp
+        .messages()
+        .await
+        .into_iter()
+        .filter(|m| own(&suffix, m))
+        .collect::<Vec<_>>();
+    assert_eq!(got.len(), 1, "only the good key's mail arrives: {got:?}");
+    assert_eq!(
+        got[0]["To"][0]["Address"],
+        format!("lwf-smtp-1{suffix}@lwf-smtp.test")
+    );
+    assert_eq!(
+        full_body(&mp.get(got[0]["ID"].as_str().unwrap()).await).as_deref(),
+        Some(r#"{"key":"1","op":"upsert","doc":{"sku":"A-1","qty":3}}"#)
+    );
+    inst.stop().await;
+}
+
 /// Commits the commit fence has written for lazywf (0 before the first one; the table is made by
 /// the first flush).
 async fn fence_count(db: &Db) -> u64 {
