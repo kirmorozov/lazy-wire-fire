@@ -347,6 +347,42 @@ impl Req {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
     }
+
+    /// The body parsed as YAML (the `yaml` helper's round-trip check).
+    pub fn yaml(&self) -> serde_json::Value {
+        let v: yaml_serde::Value = yaml_serde::from_str(&self.body)
+            .unwrap_or_else(|e| panic!("the body is not YAML ({e}):\n{}", self.body));
+        yaml_to_json(&v)
+    }
+}
+
+/// A `yaml_serde::Value` as the JSON value it holds (numbers through their text form, so
+/// `12.5` compares as `12.5`).
+fn yaml_to_json(v: &yaml_serde::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        yaml_serde::Value::Null => J::Null,
+        yaml_serde::Value::Bool(b) => J::Bool(*b),
+        yaml_serde::Value::Number(n) => {
+            serde_json::from_str(&n.to_string()).unwrap_or_else(|e| panic!("number: {e}"))
+        }
+        yaml_serde::Value::String(s) => J::String(s.clone()),
+        yaml_serde::Value::Sequence(a) => J::Array(a.iter().map(yaml_to_json).collect()),
+        yaml_serde::Value::Mapping(m) => {
+            let mut o = serde_json::Map::new();
+            for (k, val) in m.iter() {
+                o.insert(
+                    match yaml_to_json(k) {
+                        J::String(s) => s,
+                        other => other.to_string(),
+                    },
+                    yaml_to_json(val),
+                );
+            }
+            J::Object(o)
+        }
+        yaml_serde::Value::Tagged(_) => panic!("a tagged value in a test body"),
+    }
 }
 
 type Handler = Box<dyn Fn(&Req) -> (u16, String) + Send>;

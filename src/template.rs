@@ -5,19 +5,22 @@
 //! `lookup`, `eq`, `ne`, `gt`, `lt`, `and`, `or`, `not`, `len`):
 //!
 //! * `join list sep` (default `,`), `upper s`, `lower s`;
-//! * `regex_escape s`, `url_encode s` (RFC 3986 unreserved kept), `json v` (compact JSON);
+//! * `regex_escape s`, `url_encode s` (RFC 3986 unreserved kept), `json v` (compact JSON),
+//!   `yaml v` (a YAML document, block style, keys in the value's order; the one helper whose
+//!   output the escape function does not touch, see [`Yaml`]);
 //! * `base64 s` (standard alphabet, padded; a Kinesis record's `Data`);
 //! * `replace s regex replacement` (all matches, `$1` groups), `redis_quote s…` (its arguments,
 //!   concatenated, as one double-quoted redis-cli argument).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use handlebars::{
-    Context, Handlebars, Helper, HelperDef, RenderContext, RenderError, RenderErrorReason,
-    ScopedJson,
+    Context, Handlebars, Helper, HelperDef, HelperResult, Output, RenderContext, RenderError,
+    RenderErrorReason, ScopedJson,
 };
+use regex::Regex;
 use serde_json::Value;
 
 /// Text form of a value as templates print it: strings raw, `null` empty, others as JSON.
@@ -46,6 +49,7 @@ fn leak(name: &str) -> &'static str {
         "regex_escape" => "regex_escape",
         "url_encode" => "url_encode",
         "json" => "json",
+        "yaml" => "yaml",
         "replace" => "replace",
         _ => "redis_quote",
     }
@@ -105,6 +109,51 @@ fn h_json(h: &Helper<'_>) -> Result<Value, RenderError> {
     Ok(Value::String(v.to_string()))
 }
 
+fn h_yaml(h: &Helper<'_>) -> Result<Value, RenderError> {
+    let v = h.param(0).map(|p| p.value().clone()).unwrap_or(Value::Null);
+    Ok(Value::String(yaml_doc(&v)))
+}
+
+/// `yaml v`: the value as a YAML document (see [`yaml_doc`]).
+///
+/// A document is multi-line, so this helper writes it straight to the output rather than
+/// returning a value: Handlebars escapes only what the default [`HelperDef::call`] writes, so
+/// overriding it is how a helper marks its output as already safe. `{{{yaml v}}}` renders
+/// identically. Being exempt is sound only because [`yaml_doc`] keeps every control character
+/// inside an escaped double-quoted scalar: the raw line breaks of the output are YAML's own
+/// structure, never data, so no value starts a new key, list item, header or request line.
+///
+/// `call_inner` stays for a subexpression (`{{upper (yaml doc)}}`), where the caller's own
+/// stash decides about escaping.
+struct Yaml;
+
+impl HelperDef for Yaml {
+    fn call_inner<'reg: 'rc, 'rc>(
+        &self,
+        h: &Helper<'rc>,
+        _: &'reg Handlebars<'reg>,
+        _: &'rc Context,
+        _: &mut RenderContext<'reg, 'rc>,
+    ) -> Result<ScopedJson<'rc>, RenderError> {
+        h_yaml(h).map(ScopedJson::Derived)
+    }
+
+    fn call<'reg: 'rc, 'rc>(
+        &self,
+        h: &Helper<'rc>,
+        _: &'reg Handlebars<'reg>,
+        _: &'rc Context,
+        rc: &mut RenderContext<'reg, 'rc>,
+        out: &mut dyn Output,
+    ) -> HelperResult {
+        // What the default `call` does around its write, minus the escape: an empty output is
+        // what drops a line, and this registry sets `prevent_indent`, so nothing indents.
+        rc.set_content_produced(true);
+        out.write(&text(&h_yaml(h)?))?;
+        Ok(())
+    }
+}
+
 fn h_base64(h: &Helper<'_>) -> Result<Value, RenderError> {
     use base64::Engine as _;
     let s = text(param(h, 0, "base64")?);
@@ -132,6 +181,239 @@ pub fn url_encode(s: &str) -> String {
     }
     out
 }
+
+/// A YAML document body for `v`: block style, two-space indents, keys in `v`'s order, and no
+/// `---` header (nothing that could read as one comes out unquoted).
+///
+/// A string comes out a plain scalar only when it cannot be read as anything else: a control
+/// character (a line break included, and the ones YAML 1.1 reads as a line break), a number, a
+/// boolean, a null, a date/timestamp, the merge key or a YAML indicator (`: `, ` #`, a leading
+/// `-`, `?`, `#`, `&`, `*`, `!`, `|`, `>`, `%`, `@`, backtick, `{`, `[`, `'`, `"`, `…`) sends
+/// it through double quotes with backslash escapes. So the only raw line breaks the document
+/// holds are its own, no value can start a new key, list item or document, and the receiver
+/// reads back exactly the document's values, with their types (a string `123` or `true` stays
+/// a string; `null` stays a null).
+fn yaml_doc(v: &Value) -> String {
+    let mut out = String::new();
+    yaml_node(&mut out, v, 0);
+    out
+}
+
+/// A value: a block (a mapping or sequence with entries) one line per entry at column `col`,
+/// a scalar on its own. The cursor sits at the line's start when this is called.
+fn yaml_node(out: &mut String, v: &Value, col: usize) {
+    match v {
+        Value::Object(m) if m.is_empty() => out.push_str("{}"),
+        Value::Array(a) if a.is_empty() => out.push_str("[]"),
+        Value::Object(m) => {
+            for (i, (k, val)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&" ".repeat(col));
+                yaml_entry(out, k, val, col);
+            }
+        }
+        Value::Array(a) => {
+            for (i, item) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&" ".repeat(col));
+                yaml_item(out, item, col);
+            }
+        }
+        _ => yaml_scalar(out, v),
+    }
+}
+
+/// A `key: value` entry, the key at the cursor; a block value on the lines that follow, at
+/// `col + 2`.
+fn yaml_entry(out: &mut String, k: &str, v: &Value, col: usize) {
+    yaml_string(out, k);
+    match v {
+        Value::Object(m) if !m.is_empty() => {
+            out.push_str(":\n");
+            yaml_node(out, v, col + 2);
+        }
+        Value::Array(a) if !a.is_empty() => {
+            out.push_str(":\n");
+            yaml_node(out, v, col + 2);
+        }
+        _ => {
+            out.push_str(": ");
+            yaml_scalar(out, v);
+        }
+    }
+}
+
+/// A `- value` item, the dash at the cursor; an item that is itself a block continues at
+/// `col + 2`.
+fn yaml_item(out: &mut String, v: &Value, col: usize) {
+    match v {
+        Value::Object(m) if !m.is_empty() => {
+            // `… - a: 1`: the entry's keys ride the dash's line, at column `col + 2`.
+            out.push_str("- ");
+            let (k, val) = m.iter().next().unwrap();
+            yaml_entry(out, k, val, col + 2);
+            for (k, val) in m.iter().skip(1) {
+                out.push('\n');
+                out.push_str(&" ".repeat(col + 2));
+                yaml_entry(out, k, val, col + 2);
+            }
+        }
+        Value::Array(a) if !a.is_empty() => {
+            // A sequence item: the dash stands alone, the items indent under it.
+            out.push_str("-\n");
+            yaml_node(out, v, col + 2);
+        }
+        _ => {
+            out.push_str("- ");
+            yaml_scalar(out, v);
+        }
+    }
+}
+
+/// A value on one line: null, booleans and numbers, strings quoted when they are not
+/// plain-safe, empty collections in flow style.
+fn yaml_scalar(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&yaml_number(n)),
+        Value::String(s) => yaml_string(out, s),
+        Value::Object(_) => out.push_str("{}"),
+        Value::Array(_) => out.push_str("[]"),
+    }
+}
+
+/// A JSON number the way a YAML reader resolves it as a number: an integer verbatim, a float
+/// with the dot and the exponent sign that a 1.1 / 1.2 core reader wants. serde_json prints
+/// `1e20`, and a reader that needs `1.0e+20` to see a float reads that back as a string.
+fn yaml_number(n: &serde_json::Number) -> String {
+    let s = n.to_string();
+    if !n.is_f64() {
+        return s;
+    }
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (s.as_str(), None),
+    };
+    let mantissa = if mantissa.contains('.') {
+        mantissa.to_string()
+    } else {
+        format!("{mantissa}.0")
+    };
+    match exp {
+        None => mantissa,
+        Some(e) => {
+            let signless = !e.starts_with(['+', '-']);
+            format!("{mantissa}e{}{e}", if signless { "+" } else { "" })
+        }
+    }
+}
+
+/// A string: plain when [`yaml_plain_safe`], otherwise double-quoted with escapes, so it
+/// holds no control character raw.
+fn yaml_string(out: &mut String, s: &str) {
+    if yaml_plain_safe(s) {
+        out.push_str(s);
+        return;
+    }
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // The control characters, and the ones YAML 1.1 reads as a line break or as a
+            // byte-order mark: raw, they would break the line or the document.
+            c if c.is_control() || YAML_BREAKS.contains(&c) => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// What YAML 1.1 (PyYAML and libyaml both) reads as a line break inside a scalar, and the
+/// byte-order mark, which 1.1 allows only at the start of a stream. `char::is_control` covers
+/// C0 and C1, but none of these.
+const YAML_BREAKS: [char; 3] = ['\u{2028}', '\u{2029}', '\u{feff}'];
+
+/// Plain-safe: what a YAML reader (1.1 or 1.2, any resolver's quirks included) could not
+/// resolve into a number, a boolean, a null, a date, a marker or a different node.
+fn yaml_plain_safe(s: &str) -> bool {
+    let b = s.as_bytes();
+    if s.is_empty()
+        || s.chars()
+            .any(|c| c.is_control() || YAML_BREAKS.contains(&c))
+        || b[0] == b' '
+        || b[b.len() - 1] == b' '
+    {
+        return false;
+    }
+    // An indicator at the start (or anywhere, for the flow ones) reads as a node of its own.
+    const INDICATORS: &[u8] = b"-?:,[]{}#&*!|>'\"%@`=";
+    if INDICATORS.contains(&b[0])
+        || b.iter()
+            .any(|c| matches!(c, b',' | b'[' | b']' | b'{' | b'}'))
+    {
+        return false;
+    }
+    if s.ends_with(':') || s.contains(": ") || s.contains(":\t") {
+        return false;
+    }
+    if s.contains(" #") || s.contains("\t#") || s == "..." {
+        return false;
+    }
+    let low = s.to_ascii_lowercase();
+    if matches!(
+        low.as_str(),
+        "true"
+            | "false"
+            | "yes"
+            | "no"
+            | "on"
+            | "off"
+            | "y"
+            | "n"
+            | "null"
+            | "~"
+            | "<<"
+            | ".inf"
+            | "+.inf"
+            | "-.inf"
+            | ".nan"
+            | "+.nan"
+            | "-.nan"
+    ) {
+        return false;
+    }
+    !YAML_NUMBER.is_match(s) && !YAML_DATE.is_match(s)
+}
+
+/// What a YAML 1.1 reader resolves as a number: decimal with 1.1's underscores (including a
+/// trailing one), a fraction after the dot (even a bare dot), an exponent, octal (`0777`,
+/// `0o777`), hex / binary, and sexagesimal (`1:2:3`).
+static YAML_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[+-]?(0x[0-9A-Fa-f_]+|0b[0-9_]+|0o[0-7_]+|0[0-7_]+|[0-9][0-9_]*(\.[0-9_]*)?|\.[0-9][0-9_]*|[0-9_]+(:[0-9_]+)+)([eE][+-]?[0-9]+(_[0-9]+)*)?$",
+    )
+    .unwrap()
+});
+
+/// What a YAML 1.1 reader resolves as a date or timestamp (the time may follow `T`, `t` or a
+/// space and may stop at the hour or the minute, the way PyYAML's resolver reads it).
+static YAML_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[+-]?[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}([Tt ][0-9]{1,2}(:[0-9]{2}){1,2}(\.[0-9]+)?( ?(Z|[+-][0-9]{1,2}(:?[0-9]{2})?))?)?$",
+    )
+    .unwrap()
+});
 
 /// A double-quoted redis-cli argument holding `s` exactly.
 pub fn redis_quote(s: &str) -> String {
@@ -352,7 +634,10 @@ fn rewrite_tag(inner: &str, roots: &[&str], params: &[String]) -> String {
 
 /// The escape function: no HTML escaping, but control characters in an interpolated value
 /// (`{{x}}`) become spaces, so data never starts a new header, request, NDJSON line or
-/// command line. `{{{x}}}` opts out; `json`, `redis_quote` and `url_encode` never emit them.
+/// command line. `{{{x}}}` opts out; `json`, `redis_quote` and `url_encode` never emit
+/// control characters, and `yaml` keeps them inside escaped double-quoted scalars — which is
+/// what lets a YAML document, whose own line breaks are structure, be exempt from it
+/// (see [`Yaml`]).
 pub fn neutralize(s: &str) -> String {
     if s.chars().any(char::is_control) {
         s.chars()
@@ -429,6 +714,7 @@ impl Templates {
         for (name, f) in simple {
             hb.register_helper(name, Box::new(Simple(f)));
         }
+        hb.register_helper("yaml", Box::new(Yaml));
         hb.register_helper("replace", Box::<Replace>::default());
         hb.register_helper(
             "sql_quote",
@@ -656,6 +942,257 @@ mod tests {
             .decode(enc)
             .unwrap();
         assert_eq!(String::from_utf8(dec).unwrap(), "{\"k\":\"v/+=\"}");
+    }
+
+    #[test]
+    fn yaml_helper() {
+        let y = |v: Value| render("{{{yaml doc}}}", json!({"doc": v}));
+
+        // The document's key order, scalars verbatim.
+        assert_eq!(
+            y(json!({"b": 1, "a": "two", "c": true, "d": null})),
+            "b: 1\na: two\nc: true\nd: null"
+        );
+        assert_eq!(
+            y(json!({"i": 7, "f": 1.5, "neg": -3})),
+            "i: 7\nf: 1.5\nneg: -3"
+        );
+        // A key is quoted by the same rule as a value: unquoted, `n:` is a 1.1 boolean, so the
+        // receiver would lose the string the document's key is.
+        assert_eq!(
+            y(json!({"y": 1, "n": 2, "null": 3})),
+            "\"y\": 1\n\"n\": 2\n\"null\": 3"
+        );
+        // A float serde_json prints without a dot takes the dot and the exponent sign a YAML
+        // reader needs to see a float: `1e20` alone reads back as a string.
+        assert_eq!(
+            y(json!({"a": 1e20, "b": 1.5e30, "c": 1e-7, "d": 1.0, "e": -0.5, "f": 3})),
+            "a: 1.0e+20\nb: 1.5e+30\nc: 1.0e-7\nd: 1.0\ne: -0.5\nf: 3"
+        );
+        // Top-level values of every shape.
+        assert_eq!(y(json!([1, 2])), "- 1\n- 2");
+        assert_eq!(y(json!({})), "{}");
+        assert_eq!(y(json!([])), "[]");
+        assert_eq!(y(json!(null)), "null");
+        assert_eq!(y(json!("hi")), "hi");
+        assert_eq!(y(json!("")), "\"\"");
+        // Nesting, two spaces a level.
+        assert_eq!(
+            y(json!({"outer": {"inner": 1}, "list": [1, "two", true]})),
+            "outer:\n  inner: 1\nlist:\n  - 1\n  - two\n  - true"
+        );
+        // A sequence item that is a mapping: the first entry rides the dash's line.
+        assert_eq!(
+            y(json!({"rows": [{"id": 1, "name": "a"}, {"id": 2}]})),
+            "rows:\n  - id: 1\n    name: a\n  - id: 2"
+        );
+        // A sequence item that is a sequence: the dash stands alone.
+        assert_eq!(
+            y(json!({"a": [[1, 2], [3]]})),
+            "a:\n  -\n    - 1\n    - 2\n  -\n    - 3"
+        );
+        // A sequence item that is a mapping holding a block of its own: the entries ride the
+        // dash and its block indents past them.
+        assert_eq!(
+            y(json!({"rows": [{"a": {"b": 1}, "c": [2]}]})),
+            "rows:\n  - a:\n      b: 1\n    c:\n      - 2"
+        );
+        // Empty collections inside a document.
+        assert_eq!(y(json!({"o": {}, "a": []})), "o: {}\na: []");
+        // A string a YAML reader would resolve as something else stays a string:
+        // numbers (whole, decimal, exponent, underscores, sexagesimal, hex),
+        // booleans (1.1's included), null, .inf / .nan and dates.
+        assert_eq!(
+            y(json!({"a": "123", "b": "1.5", "c": "1.5e3", "d": "0x1F", "e": "1:2", "f": "true", "g": "yes", "h": "On", "i": "null", "j": "~", "k": ".inf", "l": "2026-11-07", "m": "2026-11-07 10:00:00"})),
+            "a: \"123\"\nb: \"1.5\"\nc: \"1.5e3\"\nd: \"0x1F\"\ne: \"1:2\"\nf: \"true\"\ng: \"yes\"\nh: \"On\"\ni: \"null\"\nj: \"~\"\nk: \".inf\"\nl: \"2026-11-07\"\nm: \"2026-11-07 10:00:00\""
+        );
+        // Indicators and the comment / colon contexts are quoted; the rest stay plain.
+        assert_eq!(
+            y(
+                json!({"a": "-lead", "b": "?q", "c": "x #y", "d": "a: b", "e": "...", "f": "it's", "g": "a b"})
+            ),
+            "a: \"-lead\"\nb: \"?q\"\nc: \"x #y\"\nd: \"a: b\"\ne: \"...\"\nf: it's\ng: a b"
+        );
+        // Control characters are escaped: a value holds no raw line break.
+        assert_eq!(
+            y(json!({"a": "l1\nl2", "b": "a\tb", "c": "x\u{0}y"})),
+            "a: \"l1\\nl2\"\nb: \"a\\tb\"\nc: \"x\\u0000y\""
+        );
+        // The C1 controls and the characters YAML 1.1 reads as a line break or a byte-order
+        // mark are escaped too: is_control does not cover the last three.
+        assert_eq!(
+            y(json!({"a": "x\u{85}y", "b": "x\u{9f}y", "c": "x\u{2028}y", "d": "x\u{2029}y", "e": "x\u{feff}y"})),
+            "a: \"x\\u0085y\"\nb: \"x\\u009Fy\"\nc: \"x\\u2028y\"\nd: \"x\\u2029y\"\ne: \"x\\uFEFFy\""
+        );
+        // 1.1's one-letter booleans, the merge key, an underscored number and a timestamp that
+        // stops at the minute are quoted as well.
+        assert_eq!(
+            y(
+                json!({"a": "y", "b": "N", "c": "<<", "d": "1_000", "e": "2026-11-07 10:00", "f": "1e5"})
+            ),
+            "a: \"y\"\nb: \"N\"\nc: \"<<\"\nd: \"1_000\"\ne: \"2026-11-07 10:00\"\nf: \"1e5\""
+        );
+        // Unicode stays as is, quoted or not.
+        assert_eq!(
+            y(json!({"a": "日本", "b": "x\nü"})),
+            "a: 日本\nb: \"x\\nü\""
+        );
+        // Keys take the same treatment.
+        assert_eq!(
+            y(json!({": x": 1, "123": 2, "": 3})),
+            r#"": x": 1
+"123": 2
+"": 3"#
+        );
+        // Both stashes give the document: the helper writes it to the output itself, so the
+        // escape function never sees it (and a value with a line break stays quoted, so the
+        // exemption cannot smuggle one in).
+        let ctx = json!({"doc": {"a": 1, "b": "x\ny"}});
+        assert_eq!(render("{{yaml doc}}", ctx.clone()), "a: 1\nb: \"x\\ny\"");
+        assert_eq!(render("{{{yaml doc}}}", ctx.clone()), "a: 1\nb: \"x\\ny\"");
+        // Every other helper keeps its escaping: the exemption is this helper's alone. `json`
+        // escapes a line break itself; `join` and a bare value still go through the escape.
+        assert_eq!(
+            render("{{json doc}}", json!({"doc": ["a\nb"]})),
+            "[\"a\\nb\"]"
+        );
+        assert_eq!(render("{{join list}}", json!({"list": ["a\nb"]})), "a b");
+        assert_eq!(render("{{this}}", json!("x\ny")), "x y");
+    }
+
+    /// What a YAML reader makes of the helper's output: exactly the document, with its types.
+    /// The strings are the ones item by item kept out of plain scalars, plus the shapes the
+    /// emitter writes around them.
+    #[test]
+    fn yaml_helper_round_trips_through_a_parser() {
+        let cases = vec![
+            json!(null),
+            json!(true),
+            json!(7),
+            json!(-3),
+            json!(1.5),
+            // Floats serde_json prints without a dot, with and without an exponent: the
+            // reader must still resolve them as numbers.
+            json!(1e20),
+            json!(1.5e30),
+            json!(1e-7),
+            json!(1.0),
+            json!(-0.0),
+            json!(1e308),
+            json!("hi"),
+            json!(""),
+            json!([]),
+            json!({}),
+            json!({"a": [1, {"b": [true, null, "x"]}], "c": {"d": {}}, "e": [[1], []]}),
+            // A list item that is a mapping with a block of its own: the entries ride the
+            // dash's line and the block indents past them.
+            json!({"rows": [{"a": {"b": 1}, "c": [2, {"d": 3}], "e": "x: y"}, {"f": null}]}),
+            // The keys as well: unquoted, `n:`, `123:` or `<<:` are a boolean, a number and a
+            // merge key to a reader, not the strings the document's keys are.
+            Value::Object(
+                [
+                    ("y", 1),
+                    ("n", 2),
+                    ("123", 3),
+                    ("true", 4),
+                    ("null", 5),
+                    ("~", 6),
+                    ("2026-11-07", 7),
+                    ("<<", 8),
+                    ("a: b", 9),
+                    ("- x", 10),
+                    ("", 11),
+                    (" lead", 12),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), json!(v)))
+                .collect(),
+            ),
+            Value::Object(
+                [
+                    ("int", "123"),
+                    ("dec", "1.5"),
+                    ("exp", "1e5"),
+                    ("hex", "0x1F"),
+                    ("oct", "0777"),
+                    ("oct2", "0o17"),
+                    ("bin", "0b101"),
+                    ("sex", "1:2:3"),
+                    ("und", "1_000"),
+                    ("dot", ".5"),
+                    ("neg", "-3"),
+                    ("bool1", "true"),
+                    ("bool2", "yes"),
+                    ("bool3", "y"),
+                    ("bool4", "n"),
+                    ("bool5", "On"),
+                    ("nil", "null"),
+                    ("tilde", "~"),
+                    ("inf", ".inf"),
+                    ("nan", "-.nan"),
+                    ("date", "2026-11-07"),
+                    ("ts", "2026-11-07 10:00"),
+                    ("ts2", "2026-11-07T10:00:00.5-05:00"),
+                    ("merge", "<<"),
+                    ("dots", "..."),
+                    ("dash", "- x"),
+                    ("quest", "? q"),
+                    ("cmt", "a #b"),
+                    ("colon", "a: b"),
+                    ("colon_end", "end:"),
+                    ("amp", "&anchor"),
+                    ("star", "*alias"),
+                    ("tag", "!!str"),
+                    ("pipe", "|"),
+                    ("fold", ">"),
+                    ("pct", "%YAML"),
+                    ("at", "@a"),
+                    ("tick", "`x"),
+                    ("brace", "{a}"),
+                    ("brack", "[a]"),
+                    ("comma", "a,b"),
+                    ("sq", "'x"),
+                    ("dq", "\"x"),
+                    ("lead", " lead"),
+                    ("trail", "trail "),
+                    ("tab", "a\tb"),
+                    ("nl", "l1\nl2"),
+                    ("cr", "a\rb"),
+                    ("nul", "a\0b"),
+                    ("del", "a\u{7f}b"),
+                    ("c1", "a\u{85}b"),
+                    ("c1b", "a\u{9f}b"),
+                    ("ls", "a\u{2028}b"),
+                    ("ps", "a\u{2029}b"),
+                    ("bom", "a\u{feff}b"),
+                    ("jp", "日本語"),
+                    ("emoji", "🎉"),
+                    ("acute", "e\u{301}"),
+                    ("inject", "x\nInjected: yes\n\nGET / HTTP/1.1"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), Value::String(v.into())))
+                .collect(),
+            ),
+        ];
+        for v in cases {
+            for src in ["{{yaml doc}}", "{{{yaml doc}}}"] {
+                let doc = render(src, json!({"doc": v.clone()}));
+                // The document's own line breaks are the only control characters in it.
+                assert!(
+                    !doc.chars().any(|c| c != '\n' && c.is_control()),
+                    "a raw control character in {src}:\n{doc:?}"
+                );
+                assert_eq!(yaml_parse(&doc), v, "read back from {src}:\n{doc}");
+            }
+        }
+    }
+
+    /// The document as a YAML reader sees it, as JSON.
+    fn yaml_parse(doc: &str) -> Value {
+        let v: yaml_serde::Value = yaml_serde::from_str(doc)
+            .unwrap_or_else(|e| panic!("the document is not YAML ({e}):\n{doc}"));
+        serde_json::to_value(v).unwrap_or_else(|e| panic!("{e}"))
     }
 
     #[test]

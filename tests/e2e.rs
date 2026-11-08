@@ -1191,6 +1191,54 @@ async fn s3_target() {
     inst.stop().await;
 }
 
+/// An http target whose template sends the document as a YAML body (`{{yaml doc}}`, with the
+/// `Content-Type` set by the template): the receiver parses the body back to the document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn yaml_body_over_http() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "yaml").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, sku VARCHAR(20), qty INT, price DECIMAL(10,1), active INT, note VARCHAR(200), gone DATE)")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("yamlhook", "http", &mock.url(), None, "{}").await;
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('y', 'yamlhook', 'key', \
+         'SELECT id AS _key, sku, qty, price, active, note, gone FROM items WHERE id IN (:keys)', \
+         '{{#each docs}}POST /items/{{key}} HTTP/1.1\nContent-Type: application/yaml\n\n{{yaml doc}}{{/each}}', 100)",
+    )
+    .await;
+    db.trigger("y", "items", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // A string a YAML reader would resolve as a date, one with a colon, and one whose line
+    // breaks, `---` and `key: value` would start a new key, a new document or a new header of
+    // the request if the helper let them through raw.
+    db.exec("INSERT INTO items VALUES (1, 'sku: 1', 3, 12.5, 1, 'line1\\n---\\ninjected: yes\\nGET /evil HTTP/1.1', '2026-11-07')")
+        .await;
+    wait_for(Duration::from_secs(15), "the yaml body", || async {
+        (!mock.requests().is_empty()).then_some(())
+    })
+    .await;
+    let r = &mock.requests()[0];
+    assert_eq!((r.method.as_str(), r.path.as_str()), ("POST", "/items/1"));
+    assert_eq!(r.header("content-type"), Some("application/yaml"));
+    assert_eq!(r.header("injected"), None);
+    assert_eq!(
+        r.yaml(),
+        json!({
+            "sku": "sku: 1",
+            "qty": 3,
+            "price": 12.5,
+            "active": 1,
+            "note": "line1\n---\ninjected: yes\nGET /evil HTTP/1.1",
+            "gone": "2026-11-07"
+        })
+    );
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xa_fires_only_after_commit() {
     let root = need_db!();
