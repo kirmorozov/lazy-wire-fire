@@ -1,6 +1,6 @@
 name: ci
 
-# Every push, pull request, weekly and on demand (lazyview-drift runs weekly and on demand only):
+# Every push, pull request, weekly and on demand:
 #   lint         cargo fmt --check, clippy -D warnings for the default and the roaring feature
 #                (make lint), Cargo.lock up to date
 #   unit         make test: the unit tests for the default and the roaring feature
@@ -16,10 +16,14 @@ name: ci
 #                default target servers)
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, then make docker-e2e on amd64
-#   lazyview-drift  scripts/sync-lazyview.sh --drift, advisory and always green: a ::warning
-#                annotation and a step summary when lazyview's main changed a locked file, grew
-#                its copy set, or dropped one (lint's lock check runs on every event; this one
-#                watches main)
+# Two jobs run on narrower triggers:
+#   lazyview-drift  weekly and on demand only: scripts/sync-lazyview.sh --drift, advisory and
+#                always green — a ::warning annotation and a step summary when lazyview's main
+#                changed a locked file, grew its copy set, or dropped one (lint's lock check runs
+#                on every event; this one watches main)
+#   coverage        pull requests and pushes to main only: make coverage — the unit tests and the
+#                e2e suite under cargo-llvm-cov 0.9.1 (pinned), informational (continue-on-error,
+#                it gates nothing); the lcov file and the HTML report stay 14 days as artifacts
 # Commands live in the Makefile; this file only provides servers, toolchain and caches.
 #
 # Images go to ghcr.io/kirmorozov/lazy-wire-fire (publish-image.yml) only for pushes:
@@ -433,6 +437,82 @@ jobs:
               echo "No drift: every locked file matches lazyview main."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    # Informational: it reports, it does not gate (continue-on-error), a merge, edge or a release.
+    # Pull requests and pushes to main only: a tag run publishes the release and its commit already
+    # got its coverage on main. The servers are the integration job's set; the instrumented build
+    # drops debug info (CARGO_PROFILE_*_DEBUG=0 in make coverage) to fit the runner.
+    name: coverage (informational)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      COMPOSE_PROFILES: varnish
+      LAZYWF_TEST_VARNISH: http://127.0.0.1:34681
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Test ports (docker-compose.test.yml, varnish, docker-e2e health) stay out of the ephemeral range.
+      - name: reserve the test ports
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=34070-34881
+      - name: start the servers (in the background)
+        run: docker compose up -d --quiet-pull
+      - name: rust ${{ env.RUST_TOOLCHAIN }} + llvm-tools-preview
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component llvm-tools-preview
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Shared with the integration and matrix jobs; the instrumented build lands in
+          # target/llvm-cov-target and is cached with the rest of target/.
+          shared-key: e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo-llvm-cov 0.9.1 (the published prebuilt binary, checksum verified)
+        run: |
+          mkdir -p tmp/cov
+          curl -fsSL -o tmp/cov/cargo-llvm-cov.tar.gz \
+            https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
+          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  tmp/cov/cargo-llvm-cov.tar.gz" | sha256sum --check
+          tar -xzf tmp/cov/cargo-llvm-cov.tar.gz -C tmp/cov
+      - name: make servers
+        run: make servers
+      - name: make coverage
+        timeout-minutes: 70
+        run: PATH="$PWD/tmp/cov:$PATH" make coverage 2>&1 | tee coverage.log
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Test coverage (informational)"
+            echo
+            echo "cargo-llvm-cov 0.9.1: the unit tests plus the e2e suite (MySQL 8.4 + the default targets), merged into one report."
+            echo
+            if [[ -s tmp/coverage/summary.md ]]; then
+              cat tmp/coverage/summary.md
+            else
+              echo "No coverage report: the job stopped before the report target — see the log."
+            fi
+            echo
+            echo "The lcov file and the HTML report are in the \`coverage\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: coverage report (lcov + HTML, kept 14 days)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: |
+            tmp/coverage/cov.lcov
+            tmp/coverage/html/
+            tmp/coverage/cov.json
+            tmp/coverage/summary.md
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: make servers-down
 
   image:
     name: image (build, smoke, end to end)
