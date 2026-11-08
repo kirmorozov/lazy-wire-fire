@@ -50,6 +50,15 @@ lapin = { version = "4.12", default-features = false, features = ["tokio", "rust
 # commands (the AUTH line carries the credentials), so the CAPPED filter of `logging.rs`
 # holds the target at `info`.
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "hostname", "tracing"] }
+# Kafka produce for the kafka kind (src/kafka.rs). Pure Rust: no librdkafka, no cmake; the TLS
+# and the ring crypto are the crate's; the compression codecs the features select (the zstd and
+# lz4 ones are the C ones, built with cc / zig as with every other C dependency here).
+rskafka = { version = "0.6", default-features = false, features = [
+    "compression-gzip",
+    "compression-lz4",
+    "compression-zstd",
+    "transport-tls",
+] }
 # AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
 # aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }

@@ -3,10 +3,11 @@
 //! the capped dependency targets, writing to a buffer. Representative flows run with fake
 //! secrets (target credentials, an S3 session token, a SQL and a Redis password, a credential
 //! inside an endpoint, a separate binlog account, the webhook signing secrets, and, for the
-//! queue targets: AWS access / secret / session references, an AMQP account and a
-//! service-account key by reference), and the captured output must contain none of them, nor
-//! the DSN password (when it is long enough to tell apart from ordinary text).
-//! `make servers test-e2e`; the sqs, kinesis, amqp and pubsub flows are
+//! queue targets: AWS access / secret / session references, an AMQP account, a service-account
+//! key by reference and a SCRAM account of the Kafka broker), and the captured output must
+//! contain none of them, nor the DSN password (when it is long enough to tell apart from
+//! ordinary text).
+//! `make servers test-e2e`; the sqs, kinesis, amqp, pubsub, smtp and kafka flows are
 //! `make test-e2e-queues` (their emulators; skipped when absent).
 
 mod common;
@@ -55,6 +56,9 @@ const SIGN_HMAC_KEY: &str = "LWFSECRET-hmac-key-1c8d";
 /// key is a test-only RSA key; `SA_KEY_FRAG` is its prefix, what a leak would have to carry.
 const SA_KEY: &str = r#"{"type":"service_account","project_id":"lwf-test","private_key_id":"lwflogsakey0000000","client_email":"logsecrets@lwf-test.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDPPV+OBRe/GnMo\nF1WQp05LO5uKzh2Gim1icaodqhFWjvQmAHYtA/3g51UrooQY37H7Y0dSynVZ5BoR\n+ZyB9BjumHByNmvwBKgcvkQbz/JX/hR4wcHTz9PPyOIyr1WIQxU9eTK/+Bzur4Vq\n7AEEdCIruYeJMqXoUxL26jdZMdvKMFVYEwvN2cI43JsSz+fWDC2zy13au6rwgfi7\nqxJZeOAczfNlZXa6WFUGGkzUgSq7X9UNKmZhG/Dl3DiNh4YjiG9+ES/XlC8thE9w\nPTM8ZzjgXAq26V1tuZnT86SYv5PVKy37yIMEW+IHQFpTLn1OJUxyjQxdwFHEJzOH\nsEtbjUyjAgMBAAECggEAHtx9X9lbTW6jant7FwULMEHqqlOCaxgvLONPWYaLeW/l\nZMlZz99Rzc21Tb+wW0Hor857fxU+P4or5bRdva57jgBucluvXDldTZZ57whbBwaD\nxu3XrvK6kK1SHgklPBr9TT/AsnzA1jyWKjOF/UNMGWXSDLjZowzH/LQpVOOLXwLp\n8zEQ2P1Qcy7cx4AcH7Z0/r82M25eEFRZoL01pcd94VXj/dlEWSygAdY5O4TaDKzm\nDV+W+Pcm/8qksD/mhK6AD8BOHikqngXM0HxTGwoOQsVGycZqIqkG0BuoCGyYlj36\nENlYlyPsE4FQaabfrXTXdqcPAf0NRL7DyHofh/VmBQKBgQDvh+R+va7QDSNUWesa\nmg8Z9kxNiLcpaY9o8lW9bNbFS/o0SMAZ9DwO+WdoyHQXiaPW2qIwYesABU+ScJOX\nae3mBoAZV6F+VQWMAeN1T1AV0Gas3/+I1IhfapXVDEc8+zoAqvtv+kJhxQ1Ietqd\nXRNh3vfUUMwLZ+EXMrjx8vuZNQKBgQDdfRu6t2yunQGwANxq7P4EFpIl55WJVrlu\nlscSWcoM1tcLBIhzaaJfxRvWsHAHcTAp1qDpS9+xGSo7Mu6WZ1EmWOFRgcoyOXJS\nNhGQuIhaxKK2K6jzZ5KIP4QT7jCSRLnp5M+bdA8OMhVg59ylm9UTcb6YCooV6tnN\ngHj4AtxhdwKBgQDEOzYMRuVB+KFq50deQbwBbu/PzSMQwDQGrBFl4BaLB9Vwo/EM\n0jOpqNT42M+SwOYCjJa2wGE/YRpxQ90F/HgzLDwhhtL8pjanHpzzbAiV9mdHVTMJ\nK+SVFsKtCSQLZ117Upgugn2Dj2V0bYFPzgKk+X9a5t5isbWLxbgSLxfDyQKBgQCy\nJTZwb6fSqiX5Ujf3KLcGwsC6DBKSbFapREzJzb5dpU9BZVv6uDQJo5hIjZEN61Q5\n0o+KFaTN5Ne61bRg9Kiol0RjMmlXDC2PQj3OkR3bI91beLJjVCLfw3aQMTyP6Qc/\nwPHarvaNDGt1jghCi5xOD2alE5UNG+AjEfo6QNLQ8QKBgQCPN4iYKAiN2qcw0dGz\nnhr5P/9l+LZwteHa/NFp8qieT3nPXdoONK+dmUMS6RrokR6xmviJmR0T1eDB1gRw\n40OxmoCmMkdvVLTFMoGrNcu/TT597U/5669/FTxVI1Jdy2tD2L+mL6ZJRFuikbYC\nkseTs63uBwj90peHtRtMWZAs/Q==\n-----END PRIVATE KEY-----\n"}"#;
 const SA_KEY_FRAG: &str = "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDPPV";
+/// The SCRAM account the kafka flow creates on the test broker (dropped at its end).
+const KAFKA_USER: &str = "lwf_ls_kafka";
+const KAFKA_PW: &str = "LWFSECRET-kafka-pw-9d3e";
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -93,7 +97,7 @@ fn install() -> &'static Capture {
         let filter = lazy_wire_fire::logging::filter(Some(
             "trace,aws_sigv4=trace,aws_config=trace,aws_credential_types=trace,\
              aws_smithy_runtime=trace,aws_smithy_runtime_api=trace,aws_smithy_http_client=trace,\
-             lapin=trace,amq_protocol_tcp=trace,lettre=trace",
+             lapin=trace,amq_protocol_tcp=trace,lettre=trace,rskafka=trace,rsasl=trace",
         ));
         let sub = tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -1323,6 +1327,415 @@ async fn no_secret_in_the_logs_smtp() {
             ("SMTP password", SMTP_PW),
             ("SMTP PLAIN auth response", &plain),
         ],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// The Redpanda admin API of the test broker (`LAZYWF_TEST_KAFKA_ADMIN`): the flow's account
+/// and the cluster settings it turns on for the flow, restored at its end.
+struct KafkaAdmin {
+    host: String,
+    client: Client,
+}
+
+impl KafkaAdmin {
+    fn new(root: &str) -> KafkaAdmin {
+        KafkaAdmin {
+            host: root.trim_start_matches("http://").to_string(),
+            client: Client::new(
+                BaseUrl::parse(root).unwrap(),
+                &TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    /// One call; the answer's JSON (an empty answer is `Value::Null`). `body` null: no body
+    /// (the GETs).
+    async fn call(&self, method: &str, path: &str, body: Value) -> Value {
+        let mut req = RawRequest {
+            method: method.into(),
+            target: path.into(),
+            headers: Vec::new(),
+            body: if body.is_null() {
+                Vec::new()
+            } else {
+                body.to_string().into_bytes()
+            },
+        };
+        req.set_header("Host", self.host.clone());
+        if !body.is_null() {
+            req.set_header("Content-Type", "application/json".into());
+        }
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            (200..300).contains(&resp.status),
+            "{method} {path}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+        if resp.body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&resp.body).unwrap()
+        }
+    }
+
+    /// The flow's SCRAM account.
+    async fn create_user(&self, user: &str, password: &str) {
+        self.call(
+            "POST",
+            "/v1/security/users",
+            json!({"username": user, "password": password, "algorithm": "SCRAM-SHA-256"}),
+        )
+        .await;
+    }
+
+    /// Deletes the account (404: it is already gone, a rerun after a failed one).
+    async fn delete_user(&self, user: &str) {
+        let mut req = RawRequest {
+            method: "DELETE".into(),
+            target: format!("/v1/security/users/{user}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        req.set_header("Host", self.host.clone());
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            resp.status == 200 || resp.status == 404,
+            "delete the user {user}: {}",
+            resp.status
+        );
+    }
+
+    /// The current value of one cluster key (the admin's native JSON).
+    async fn cluster_value(&self, key: &str) -> Value {
+        self.call("GET", &format!("/v1/cluster_config?key={key}"), Value::Null)
+            .await[key]
+            .clone()
+    }
+
+    /// Sets one cluster key to `value` (the admin's string form of it).
+    async fn cluster_set(&self, key: &str, value: &str) {
+        self.cluster_set_json(key, json!(value)).await;
+    }
+
+    /// Sets one cluster key to a native JSON `value` (array-typed keys as `superusers` need
+    /// the array itself, not its string form).
+    async fn cluster_set_json(&self, key: &str, value: Value) {
+        self.call(
+            "PUT",
+            "/v1/cluster_config",
+            json!({"remove": [], "upsert": {key: value}}),
+        )
+        .await;
+    }
+
+    /// Drops one cluster key (back to the broker's default; restores what a GET left as null).
+    async fn cluster_drop(&self, key: &str) {
+        self.call(
+            "PUT",
+            "/v1/cluster_config",
+            json!({"remove": [key], "upsert": {}}),
+        )
+        .await;
+    }
+
+    /// Restores one key from the `cluster_value` read at the flow's start.
+    async fn cluster_restore(&self, key: &str, was: &Value) {
+        match was {
+            Value::Null => self.cluster_drop(key).await,
+            v => self.cluster_set_json(key, v.clone()).await,
+        }
+    }
+}
+
+/// Puts the test broker back the way the kafka flow found it when that flow ends, *including*
+/// when it ends by panicking. This matters beyond the flow: `enable_sasl` left on makes every
+/// unauthenticated Kafka call fail (`rpk`, and the other kafka flows' topic creation), so one
+/// dead flow would break the ones after it on the shared broker. On the normal path the flow
+/// restores and drops the topic itself and marks this done, so `Drop` does nothing.
+struct BrokerRestore {
+    /// The admin API's address, for the settings and the account.
+    root: String,
+    /// The bootstrap address, for dropping the flow's own topic.
+    broker: String,
+    topic: String,
+    user: &'static str,
+    sasl_was: Value,
+    supers_was: Value,
+    done: bool,
+}
+
+impl BrokerRestore {
+    /// The flow's own restore, awaited at its end; afterwards `Drop` has nothing left to do.
+    async fn restore(&mut self) {
+        let admin = KafkaAdmin::new(&self.root);
+        admin.cluster_restore("enable_sasl", &self.sasl_was).await;
+        admin.cluster_restore("superusers", &self.supers_was).await;
+        admin.delete_user(self.user).await;
+        self.delete_topic().await;
+        self.done = true;
+    }
+
+    async fn delete_topic(&self) {
+        match rskafka::client::ClientBuilder::new(vec![self.broker.clone()])
+            .client_id("lazywf-logs")
+            .backoff_config(rskafka::BackoffConfig {
+                deadline: Some(Duration::from_secs(5)),
+                ..Default::default()
+            })
+            .build()
+            .await
+        {
+            Ok(c) => {
+                if let Ok(cc) = c.controller_client() {
+                    cc.delete_topic(&self.topic, 5_000).await.ok();
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "the kafka broker at {}: no client to drop the topic: {e:#}",
+                    self.broker
+                )
+            }
+        }
+    }
+}
+
+impl Drop for BrokerRestore {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        eprintln!(
+            "the kafka log flow ended without restoring the broker, doing it now \
+             (`enable_sasl` left on would break every later kafka flow)"
+        );
+        let (root, broker, topic, user) = (
+            self.root.clone(),
+            self.broker.clone(),
+            self.topic.clone(),
+            self.user,
+        );
+        let (sasl, supers) = (self.sasl_was.clone(), self.supers_was.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        // On a thread of its own with a runtime of its own: `Drop` cannot await, and the test's
+        // runtime is the one being unwound. A panic here while unwinding would abort the binary,
+        // so it is contained; a restore that does not finish in time is left to the next run.
+        std::thread::spawn(move || {
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async move {
+                    let admin = KafkaAdmin::new(&root);
+                    admin.cluster_restore("enable_sasl", &sasl).await;
+                    admin.cluster_restore("superusers", &supers).await;
+                    admin.delete_user(user).await;
+                    let cleanup = BrokerRestore {
+                        root,
+                        broker,
+                        topic,
+                        user,
+                        sasl_was: sasl,
+                        supers_was: supers,
+                        done: true,
+                    };
+                    cleanup.delete_topic().await;
+                });
+            }));
+            let _ = tx.send(done.is_ok());
+        });
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+    }
+}
+
+/// The `kafka` target against the test broker (`LAZYWF_TEST_KAFKA`, admin API
+/// `LAZYWF_TEST_KAFKA_ADMIN`): the account is the flow's own (SCRAM-SHA-256; its password is
+/// a fake secret, a reference, never a literal), and the records are read back through the
+/// broker as that account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_kafka() {
+    let root = need_db!();
+    let Some(broker) = std::env::var("LAZYWF_TEST_KAFKA")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        return eprintln!(
+            "LAZYWF_TEST_KAFKA not set: skipping the kafka flow (make test-e2e-queues)"
+        );
+    };
+    let Some(admin_root) = std::env::var("LAZYWF_TEST_KAFKA_ADMIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        return eprintln!("LAZYWF_TEST_KAFKA_ADMIN not set: skipping the kafka flow");
+    };
+    install();
+    let admin = KafkaAdmin::new(&admin_root);
+
+    // The broker's settings as the flow finds them (put back by the flow, or by the guard if the
+    // flow panics). The flow's own account is taken out of the recorded `superusers`: a rerun
+    // after a dead run must not put the dead run's account back.
+    let mut sasl_was = admin.cluster_value("enable_sasl").await;
+    let mut supers_was = admin.cluster_value("superusers").await;
+    if let Some(list) = supers_was.as_array_mut() {
+        list.retain(|u| u.as_str() != Some(KAFKA_USER));
+    }
+    if sasl_was.as_bool() == Some(true) {
+        // A previous run died with it on. On this shared broker `off` is the only state the
+        // other kafka flows can use (their `rpk` and topic calls are anonymous), so it is what
+        // gets restored either way -- and it goes off now, before the anonymous calls below.
+        eprintln!("`enable_sasl` was already on from a dead run: healing it");
+        admin.cluster_set("enable_sasl", "false").await;
+        sasl_was = Value::Bool(false);
+    }
+    let topic = format!("lwf-logkafka-{}", std::process::id());
+    let mut broker_state = BrokerRestore {
+        root: admin_root.clone(),
+        broker: broker.clone(),
+        topic: topic.clone(),
+        user: KAFKA_USER,
+        sasl_was: sasl_was.clone(),
+        supers_was: supers_was.clone(),
+        done: false,
+    };
+
+    // The topic, made by the test's own anonymous client (the broker has no SASL yet).
+    {
+        let anon = rskafka::client::ClientBuilder::new(vec![broker.clone()])
+            .client_id("lazywf-logs")
+            .backoff_config(rskafka::BackoffConfig {
+                deadline: Some(Duration::from_secs(10)),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap_or_else(|e| panic!("the kafka broker at {broker}: {e:#}"));
+        anon.controller_client()
+            .unwrap()
+            .create_topic(&topic, 1, 1, 10_000)
+            .await
+            .unwrap_or_else(|e| panic!("creating the topic `{topic}`: {e:#}"));
+    }
+
+    // The flow's account, and the settings that use it: a rerun after a failed one drops the
+    // old user first (its absence is not an error).
+    admin.delete_user(KAFKA_USER).await;
+    admin.create_user(KAFKA_USER, KAFKA_PW).await;
+    admin
+        .cluster_set_json("superusers", json!([KAFKA_USER]))
+        .await;
+    admin.cluster_set("enable_sasl", "true").await;
+
+    let db = Db::fresh(&root, "logkafka").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    std::env::set_var("LWF_LOGKAFKA_USER", KAFKA_USER);
+    std::env::set_var("LWF_LOGKAFKA_PW", KAFKA_PW);
+    db.target(
+        "events",
+        "kafka",
+        &format!("kafka://{broker}/{topic}"),
+        Some("JSON_EXTRACT(body, '$.offset') IS NOT NULL"),
+        &json!({"sasl": "scram-sha-256",
+                "username": "env:LWF_LOGKAFKA_USER",
+                "password": "env:LWF_LOGKAFKA_PW"})
+        .to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'events', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty FROM orders WHERE id IN (:keys)",
+            r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"records": [{{#each docs}}{"value": {{json doc}}, "headers": {"op": {{json op}}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+
+    // The records, read back as the flow's account (a SCRAM handshake on the test's own
+    // client).
+    let reader = rskafka::client::ClientBuilder::new(vec![broker.clone()])
+        .client_id("lazywf-logs")
+        .backoff_config(rskafka::BackoffConfig {
+            deadline: Some(Duration::from_secs(10)),
+            ..Default::default()
+        })
+        .sasl_config(rskafka::client::SaslConfig::ScramSha256(
+            rskafka::client::Credentials::new(KAFKA_USER.to_string(), KAFKA_PW.to_string()),
+        ))
+        .build()
+        .await
+        .unwrap_or_else(|e| panic!("the kafka broker at {broker}: {e:#}"));
+    use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
+    let pc = reader
+        .partition_client(&topic, 0, UnknownTopicHandling::Retry)
+        .await
+        .unwrap_or_else(|e| panic!("the leader of `{topic}/0`: {e:#}"));
+    let mut offset = pc
+        .get_offset(OffsetAt::Earliest)
+        .await
+        .unwrap_or_else(|e| panic!("the earliest offset of `{topic}/0`: {e:#}"));
+    let mut keys = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (recs, hw) = pc
+            .fetch_records(offset, 0..1_048_576, 500)
+            .await
+            .unwrap_or_else(|e| panic!("the records of `{topic}/0`: {e:#}"));
+        for r in &recs {
+            keys.push(String::from_utf8(r.record.key.clone().unwrap()).unwrap());
+        }
+        offset = if recs.is_empty() {
+            hw
+        } else {
+            recs.last().unwrap().offset + 1
+        };
+        if keys.len() >= 2 || std::time::Instant::now() > deadline {
+            break;
+        }
+        sleep_ms(100).await;
+    }
+    keys.sort();
+    assert_eq!(keys, vec!["1", "2"], "one record per key: {keys:?}");
+    inst.quiet().await;
+    inst.stop().await;
+
+    // The broker's back the way the flow found it: its old settings, no user, no topic. The
+    // guard notes it, so a later panic in this flow (the leak assertions) cannot leave the
+    // broker mid-change.
+    broker_state.restore().await;
+
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    let leaks = leaks(
+        &out,
+        &[("kafka username", KAFKA_USER), ("kafka password", KAFKA_PW)],
     );
     if !leaks.is_empty() {
         dump(&out);

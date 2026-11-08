@@ -122,6 +122,18 @@ impl Row {
         }
     }
 
+    /// The result of one kafka produce as `body`: `{"topic": …, "partition": …, "offset": …}`
+    /// (the record's offset: the partition's base offset plus its place in the batch).
+    pub fn kafka(uses: Uses, topic: &str, partition: i32, offset: i64) -> Row {
+        Row {
+            body: uses.body.then(|| {
+                serde_json::json!({"topic": topic, "partition": partition, "offset": offset})
+                    .to_string()
+            }),
+            ..Row::default()
+        }
+    }
+
     /// A JSON answer as `body` (the rows of a SQL listing).
     pub fn json(uses: Uses, v: &Value) -> Row {
         Row {

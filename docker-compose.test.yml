@@ -10,6 +10,7 @@
 #   docker compose -f docker-compose.test.yml --profile varnish up -d --wait   # + Varnish (host network)
 #   docker compose -f docker-compose.test.yml --profile amqp up -d --wait      # + RabbitMQ (the amqp target tests)
 #   docker compose -f docker-compose.test.yml --profile smtp up -d --wait      # + Mailpit (the smtp target tests)
+#   docker compose -f docker-compose.test.yml --profile kafka up -d --wait     # + Redpanda (the kafka target tests, host network)
 #   make servers-down        # every profile, volumes included
 #
 # MySQL and Percona run with GTIDs on except MySQL 8.0 (off, as in RDS for MySQL's default
@@ -104,6 +105,28 @@ services:
     profiles: ["pubsub"]
     command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=lwf-test"]
     ports: ["127.0.0.1:34563:8085"]
+
+  # The Kafka-protocol broker for the `kafka` target tests (Redpanda, a single node, pinned by
+  # manifest digest; one core, ~174 MiB, ready in ~10 s). Not started by `make servers`:
+  # `docker compose -f docker-compose.test.yml --profile kafka up -d --wait kafka`. Host network
+  # (the varnish precedent): its advertised address is 127.0.0.1, which both the host's clients
+  # and its own rpk reach; the baked-in configuration binds 0.0.0.0:9092/9644/33145, which a
+  # shared host must not keep. Kafka on 34564, the admin API on 34567, the RPC on 34568: 34565
+  # and 34566 are Mailpit's (the `smtp` service), and `make test-e2e-queues` runs both.
+  kafka:
+    image: redpandadata/redpanda:v26.1.20@sha256:8c94f3135dcb94736744aea8fae1ca46c46c7d26ad219cb2e2c10defbe884872
+    profiles: ["kafka"]
+    network_mode: host
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |-
+        rpk redpanda config set redpanda.kafka_api "[{\"address\":\"127.0.0.1\",\"port\":34564}]" && \
+        rpk redpanda config set redpanda.advertised_kafka_api "[{\"address\":\"127.0.0.1\",\"port\":34564}]" && \
+        rpk redpanda config set redpanda.admin "[{\"address\":\"127.0.0.1\",\"port\":34567}]" && \
+        rpk redpanda config set redpanda.rpc_server "{\"address\":\"127.0.0.1\",\"port\":34568}" && \
+        rpk redpanda config set redpanda.advertised_rpc_api "{\"address\":\"127.0.0.1\",\"port\":34568}" && \
+        exec redpanda --redpanda-cfg /etc/redpanda/redpanda.yaml --smp 1 --memory 1G --overprovisioned --unsafe-bypass-fsync=true
+    healthcheck: { test: ["CMD-SHELL", "curl -sf http://127.0.0.1:34567/v1/status/ready || exit 1"], interval: 2s, retries: 60 }
 
   opensearch:
     image: opensearchproject/opensearch:2.19.7
