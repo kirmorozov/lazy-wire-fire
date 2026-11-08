@@ -21,12 +21,12 @@ object.
 | column | meaning |
 |---|---|
 | `name` | referenced by rules |
-| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
+| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`) (these four can sign their requests: [Webhook signing](#webhook-signing)), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
 SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
 Lambda function, below), `amqp` (an AMQP 0-9-1
-broker with publisher confirms, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). An action goes to every endpoint |
-| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets)) |
+broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). An action goes to every endpoint |
+| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
@@ -79,6 +79,11 @@ the emulator, below). Credentials: `vars.credentials_ref`, a reference to a serv
 vhost is the path, `/` the default vhost), without credentials: `vars.username` and
 `vars.password`, references or literals (as `redis` takes them), resolved on each connect. One
 message per action with a publisher confirm: [below](#amqp-targets).
+
+**`smtp`**: the endpoint is `smtp(s)://host[:port]` (default ports 587 / 465), without
+credentials: `vars.username` and `vars.password`, references or literals (as `redis` and `amqp`
+take them), resolved on each connect, or no credentials at all for an anonymous session. One
+mail per action, the server's reply the answer: [below](#smtp-targets).
 
 **The `aws-sqs://`, `aws-kinesis://` and `aws-lambda://` URL form** (the `endpoints` of the kinds
 `sqs`, `kinesis` and `lambda`, and of no other kind):
@@ -146,18 +151,18 @@ region is always the target's.
 of a derived table (`SELECT 1 FROM (SELECT … ) AS r WHERE (<expect>)`). The action succeeded
 when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` functions, `CASE`, …
 
-| column | http | redis | amqp | lambda | pubsub | mysql / pgsql |
-|---|---|---|---|---|---|---|
-| `status` | status code | NULL | 200 on an ack, 312 on a return | 200 on a sync answer, 202 on an event | status code | NULL |
-| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL | JSON object | JSON object | NULL |
-| `body` | the body when it is JSON, else NULL | the reply as JSON | the return as JSON | the function's result, when it is JSON | the publish answer, when it is JSON | NULL |
-| `text` | the body as text | a string or integer reply as text, else NULL | `ack`, `return` or `nack` | the result as text | the answer as text | NULL |
-| `affected_rows` | NULL | NULL | NULL | NULL | NULL | rows the statement changed |
+| column | http | redis | amqp | smtp | lambda | pubsub | mysql / pgsql |
+|---|---|---|---|---|---|---|---|
+| `status` | status code | NULL | 200 on an ack, 312 on a return | the reply code | 200 on a sync answer, 202 on an event | status code | NULL |
+| `headers` | JSON object, names in lower case (repeated headers joined with `, `) | NULL | NULL | NULL | JSON object | JSON object | NULL |
+| `body` | the body when it is JSON, else NULL | the reply as JSON | the return as JSON | NULL | the function's result, when it is JSON | the publish answer, when it is JSON | NULL |
+| `text` | the body as text | a string or integer reply as text, else NULL | `ack`, `return` or `nack` | the reply as text | the result as text | the answer as text | NULL |
+| `affected_rows` | NULL | NULL | NULL | NULL | NULL | NULL | rows the statement changed |
 
-* Empty: http needs a 2xx status, redis any reply but an error, amqp an ack, lambda a 200
-  without a function error (an event is met on its 202), pubsub a 2xx whose `messageIds` reach
-  every message, a SQL target a statement that ran. A condition that does not name `status`
-  keeps the 2xx rule; one that does replaces it.
+* Empty: http needs a 2xx status, redis any reply but an error, amqp an ack, smtp an accepted
+  (2xx) reply, lambda a 200 without a function error (an event is met on its 202), pubsub a 2xx
+  whose `messageIds` reach every message, a SQL target a statement that ran. A condition that
+  does not name `status` keeps the 2xx rule; one that does replaces it.
 * Redis error replies always fail. An unmet condition on an http 5xx, 408 or 429 is transient
   (retried); on any other answer it is a refusal.
 * For `sqs`, the answer of one `SendMessageBatch` names its entries, so `expect` runs once per
@@ -169,6 +174,10 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 * For `amqp`, `expect` is a condition over the broker's confirm ([the rows](#amqp-targets)): an
   ack with an unmet condition is refused on its own; a returned message (312) is refused and a
   nack is transient, whatever the condition says.
+* For `smtp`, `expect` is a condition over the server's reply ([the rows](#smtp-targets)): the
+  reply code as `status`, the reply as `text`. Only an accepted message (a 2xx after the data)
+  is judged, and an unmet condition refuses it on its own; a 4xx is transient and a 5xx is
+  refused whatever the condition says.
 * For `lambda`, a synchronous invocation's `expect` runs over the result (`body` the result,
   `status` 200); a function error (`X-Amz-Function-Error`) refuses the invocation whatever the
   condition says, and an event invocation is met on its 202 with no `expect`
@@ -198,6 +207,7 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | SQS `SendMessageBatch` (per entry) | `JSON_EXTRACT(body, '$.MessageId') IS NOT NULL` |
 | Kinesis `PutRecords` (per record) | `JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL` |
 | an AMQP publish (an ack) | `status = 200 AND text = 'ack'` |
+| an SMTP mail (the server accepted it) | `status = 250` |
 | a Lambda invoke (the result names the stored id) | `JSON_EXTRACT(body, '$.id') IS NOT NULL` |
 | a Pub/Sub publish (at least one message id) | `JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
@@ -205,6 +215,43 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | a header | `JSON_UNQUOTE(JSON_EXTRACT(headers, '$."x-ack"')) = 'yes'` |
 | redis `SET` | `text = 'OK'` |
 | SQL targets | `affected_rows > 0` |
+
+### Webhook signing
+
+The four plain http kinds (`http`, `http.basic`, `http.bearer`, `http.header`) can sign the
+requests they send, so the receiver can tell they came from lazywf and that nothing in them
+changed. Signing is settings in the target's `vars`, applied after the template is rendered and
+after the kind's authentication headers, over the exact body the request sends — the bytes the
+receiver reads (a stray-cleanup listing of these kinds is signed too):
+
+| `vars` | meaning |
+|---|---|
+| `vars.sign` | `standard` or `hmac`: the scheme, below. The setting that turns signing on; a signing setting without it is a load error naming the setting |
+| `vars.sign_secret_ref` | the signing secret: a reference only (`env:NAME` or `file:/path`), never a literal, resolved on every request like the other credentials |
+| `vars.sign_header` | `hmac` only: the header that carries the signature, `X-Signature-256` by default |
+| `vars.sign_encoding` | `hmac` only: `hex` (the default) or `base64`, the form of the digest |
+| `vars.sign_prefix` | `hmac` only: the text before the digest, `sha256=` by default |
+
+* **`standard`** — [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md),
+  its symmetric scheme: the tool adds `Webhook-Id` (unique per request: the target's name and a
+  counter), `Webhook-Timestamp` (Unix seconds) and `Webhook-Signature: v1,<base64>`, the base64
+  HMAC-SHA256 of `<id>.<timestamp>.<body>`. The secret is the spec's `whsec_` form and the key is
+  its base64 part; a secret without the prefix, that is not base64, or whose key is empty fails
+  when the request is signed, naming the setting (the secret is a reference, so its content is
+  known only then).
+* **`hmac`** — one header (`vars.sign_header`) with `vars.sign_prefix` and the HMAC-SHA256 of the
+  body in `vars.sign_encoding`, keyed by the secret's own bytes: with the defaults the
+  GitHub-style `X-Signature-256: sha256=<hex>`.
+* Everything else is checked at load and names the setting: an unknown scheme, a missing or
+  literal `sign_secret_ref`, a signing setting without `vars.sign`, a header name that is not a
+  header name, an encoding that is neither `hex` nor `base64`, a `sign_prefix` that is not a
+  string, and the three `hmac`-only settings on `standard` (that scheme fixes its headers).
+* A signing setting on any other kind — `http.s3`, `sqs`, `kinesis`, `lambda`, `pubsub`, `amqp`,
+  `smtp`, `redis`, `mysql`, `pgsql` — is a load error too: `http.s3` signs SigV4 and the queue
+  kinds their own protocols, so the setting would point at nothing.
+* The secret is a credential of the kind: it stays out of the template context (`target.vars`
+  holds the scheme and the header form, not the secret) and out of the logs
+  ([security](#security)).
 
 ### SQL targets
 
@@ -397,6 +444,73 @@ and a nack or a lost confirm is transient.
   keeps the newest message per key. Several changes of one key within the debounce window arrive
   as one message, and a delete is the key's last state. Across keys no order is guaranteed.
 
+### SMTP targets
+
+`smtp` sends to an SMTP server: one mail per action, written and addressed by the template, over
+one connection per endpoint that stays open while the server accepts. The server's reply is the
+answer: an accepted message is judged by `expect`, a 4xx is transient, a 5xx is refused on its
+own.
+
+* **One message per action.** `fire_per` must be `key`: one action is one mail, so there is no
+  batch to size. `fire_per = batch` is refused at rule load ("kind smtp sends one message per
+  action: set `fire_per = key`").
+* **The rendered message.** The header lines, a blank line, the body:
+
+  ```text
+  From: sender@example.com
+  To: a@example.com, b@example.com
+  Cc: c@example.com
+  Subject: order 42 changed
+  Content-Type: text/plain; charset=utf-8
+
+  {"key":42,"op":null,"doc":{"sku":"a","qty":3}}
+  ```
+
+  The headers are `From`, `To`, `Cc`, `Subject`, `Reply-To` and `Content-Type`, each exactly
+  once: an unknown or repeated header, a folded (continuation) line, or a control character in a
+  header line is refused, as http refuses it in a request line — data cannot start an SMTP
+  conversation. Addresses are one line each, `user@domain`, comma-separated; `Content-Type` is
+  `text/plain` or `text/html`, its optional `charset` parameter must be `utf-8`. The message
+  goes on the wire as it was rendered (its line endings turned into CRLF): nothing of it is
+  rebuilt, so the server sees what the template wrote. A blank render sends nothing.
+* **The envelope.** The sender is `From` and the recipients are `To` plus `Cc`, at most
+  `vars.recipients` of them (a number, 1 or more; 50 by default). A `Bcc` has no envelope to go
+  into, so the header is refused.
+* **The reply.** `expect` sees one row: the reply code as `status`, the reply as `text`
+  ([above](#targets)). With `expect` empty, a 2xx after the message is met. A 4xx (421 and 451
+  among them: throttling, greylisting) is transient: the key waits and is sent again with
+  backoff. A 5xx refuses the key on its own (strikes; five of them while other keys go through
+  drop the key and name it in `last_error`). A connection, TLS or STARTTLS failure is transient
+  too: the mail may or may not have reached the server, so it is sent again (at-least-once).
+* **One connection per endpoint.** A send holds the endpoint's connection until its reply is
+  read; the connection is kept while the server accepts and dropped on every other answer (a
+  4xx, a 5xx, a broken or a timed-out session), so a refused mail costs one reconnect and
+  accepted mails reuse the session. The whole send is bounded by the target's `timeout_ms`;
+  different endpoints of the target run in parallel.
+* **Credentials.** The session authenticates with `vars.username` and `vars.password`, which go
+  together or not at all and are resolved on every connect. Each is a literal or a reference to
+  where the value really lives — `env:NAME` for an environment variable, `file:/path` for a file
+  under `LAZYWF_SECRET_DIRS` — and a reference is what to use when others can read the target
+  table ([above](#targets)). The auth itself is PLAIN, then LOGIN, whichever the server offers
+  first; without credentials the mail goes anonymously, when the server takes it. They never go
+  in the endpoint: a `user:password@` in the URL is a load error, as are a path, a query, a
+  fragment and an IPv6 literal.
+* **TLS.** `smtp://` connects plain and upgrades with STARTTLS, which is mandatory unless `tls`
+  says `disabled` (port 587 by default); `smtps://` is implicit TLS from the connection (465).
+  Both default to `verify-full`: the chain against the Mozilla roots and the `tls.ca` files, and
+  the host name. `verify-ca` checks the chain only, `required` encrypts without checking the
+  certificate, and `disabled` skips TLS — on `smtp://` only: `smtps://` with `disabled` is a
+  load error. `tls.server_name` is refused: the endpoint's host name is the one checked.
+* **Reset steps.** The kind only appends: a sent mail cannot be recalled. A `for_each: stray`
+  step does not load ("a stray cleanup needs a target that can delete keys; kind smtp only
+  appends"). Still allowed: `once` (it sends one mail, an announcement for example) and
+  `for_each: snapshot` (every key is mailed again, as new messages).
+* **Contract.** The mailbox receives the latest state of each key, not a log of every change,
+  and delivery is at-least-once: a mail whose reply was lost (a connection drop, a timeout) is
+  sent again, so a reader keeps the newest mail per key. Several changes of one key within the
+  debounce window arrive as one mail, and a delete is the key's last state. Across keys no order
+  is guaranteed.
+
 ### Pub/Sub targets
 
 `pubsub` sends to a Google Cloud Pub/Sub topic: one `topics.publish` request per action, rendered
@@ -457,7 +571,7 @@ not by key, so one publish is either met, refused or transient for all of its me
 | `selects` | zero or more queries: SQL separated by `;`, or a JSON array of strings or `{"name", "sql"}`. Each returns `_key` plus [path-named columns](#documents-from-path-named-columns) and uses `:keys` for the changed keys (`WHERE id IN (:keys)`). They run concurrently, each on its own connection |
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
-| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` takes `key` only (one message per action: [AMQP targets](#amqp-targets)) |
+| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)) |
 | `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
 is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
 5242880 ([Kinesis targets](#kinesis-targets)). `pubsub`: `batch_max_keys` is required with
@@ -605,6 +719,9 @@ What a template renders:
 * **mysql / pgsql**: one SQL statement. Blank output sends nothing.
 * **amqp**: one message: `PUBLISH /<exchange>/<routing-key>`, a `Message-Id` header (the key), a
   blank line, a JSON body. Blank output sends nothing.
+* **smtp**: one mail: the header lines (`From`, `To`, `Cc`, `Subject`, `Reply-To`,
+  `Content-Type`), a blank line, the body; the envelope comes from `From`, `To` and `Cc`
+  ([SMTP targets](#smtp-targets)). Blank output sends nothing.
 * **lambda**: the Invoke payload only (one JSON value); the tool writes and signs the request.
   Blank output sends nothing.
 * **pubsub**: the raw request as for `http`, but only the topic's `:publish` path is sent
@@ -640,7 +757,7 @@ and resets only when that part of the binlog was purged. An interrupted reset st
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
-* An append-only kind (`sqs`, `kinesis`, `amqp`, `pubsub`) refuses a `for_each: stray` step at
+* An append-only kind (`sqs`, `kinesis`, `amqp`, `smtp`, `pubsub`) refuses a `for_each: stray` step at
   load (a sent message cannot be recalled), `lambda` refuses one too (a function cannot list
   what it was invoked with), `sqs` and `kinesis` refuse a `once` step that purges what it has
   sent (a queue's `PurgeQueue`, a stream's `DeleteStream`), and `pubsub` a step that does
@@ -702,7 +819,9 @@ What the tool enforces on its own:
   rendered line by line, so a newline in a value cannot mark extra keys.
 * **Interpolated values hold no control characters**: `{{x}}` turns them into spaces, so data
   never starts a new header, request, NDJSON line or command (`{{{x}}}` opts out). A request line
-  or header with a control character is refused.
+  or header with a control character is refused; a rendered mail refuses, besides that, an
+  unknown or repeated header, a folded line, and more recipients than `vars.recipients`
+  ([SMTP targets](#smtp-targets)).
 * **A refused key does not stall its rule.** An action the target refuses (4xx, an unmet
   `expect`, a Redis error) is split until the refused keys stand alone; the others go through.
   When the target has several endpoints, a refusal is judged only once every endpoint has
@@ -722,6 +841,10 @@ What the tool enforces on its own:
 * **Secret references are confined**: `env:` cannot name lazywf's own settings (`LAZYWF_*`), and
   `file:` must resolve (symlinks followed) inside `LAZYWF_SECRET_DIRS` (default
   `/run/secrets:/var/run/secrets`).
+* **The webhook signing secret is a reference.** `vars.sign_secret_ref` is confined like any
+  other secret reference and a literal is a load error; it is a credential of the kind, so it
+  stays out of the template context and is read only where the signature is computed: it never
+  reaches a template or a log ([Webhook signing](#webhook-signing)).
 
 What it cannot enforce, so treat the tool's tables as **admin-only**:
 
