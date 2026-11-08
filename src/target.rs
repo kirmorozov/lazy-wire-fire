@@ -51,7 +51,7 @@ pub struct Target {
     pub ctx: Value,
     pub endpoints: Vec<Endpoint>,
     pub expect: Expect,
-    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`, `kinesis`, `lambda`).
+    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`, `kinesis`, `lambda`, `eventbridge`).
     aws: Option<AwsSign>,
     /// Webhook signing for the http kinds (`src/sign.rs`); the secret is resolved on every use.
     sign: Option<crate::sign::Spec>,
@@ -124,6 +124,74 @@ pub fn kinesis_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
             }
         }
     }
+}
+
+/// What one `Entries[i]` of a `PutEvents` answer says, before `expect` (see
+/// [`eventbridge_verdict`]). EventBridge answers by position: the i-th entry of the answer is
+/// the i-th entry of the request.
+pub fn eventbridge_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
+    let Some(e) = entry else {
+        return RecordVerdict::Missing;
+    };
+    // An `EventId` says the event was stored (PutEvents, PutEventsResponseEntry.EventId).
+    if e.get("EventId")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return RecordVerdict::Stored(serde_json::to_vec(e).unwrap_or_default());
+    }
+    let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match e
+        .get("ErrorCode")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+    {
+        // The AWS "not now" codes (aws::transient_code: throttling, the service is unwell) keep
+        // the key waiting, as for a whole-request 503; any other code is the service's clear
+        // refusal of this one entry (PutEvents, PutEventsResultEntry.ErrorCode).
+        Some(code) if crate::aws::transient_code(code) => {
+            RecordVerdict::Transient(format!("entry {i}: {code}: {}", text("ErrorMessage")))
+        }
+        Some(code) => {
+            RecordVerdict::Rejected(format!("entry {i}: {code}: {}", text("ErrorMessage")))
+        }
+        // Neither an `EventId` nor an `ErrorCode`: nothing is known about this entry.
+        None => RecordVerdict::Missing,
+    }
+}
+
+/// The rendered body of a `PutEvents` action: `{"Entries": [...]}` with exactly one entry per
+/// key (`Entries[i]` is answered by position), each holding the members AWS requires on every
+/// entry as non-empty strings (PutEvents, PutEventsRequestEntry: `Source`, `DetailType`,
+/// `Detail`). Checked before the request goes out: a template that renders a broken batch
+/// fails once with one clear error, not as `n` per-entry refusals on every retry.
+fn eventbridge_entries_ok(body: &[u8], n: usize) -> Result<(), String> {
+    let request: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("the body is not JSON: {e}")),
+    };
+    let Some(entries) = request.get("Entries").and_then(Value::as_array) else {
+        return Err("the body has no `Entries` array".to_string());
+    };
+    if entries.len() != n {
+        return Err(format!(
+            "`Entries` holds {} entries for {n} keys",
+            entries.len()
+        ));
+    }
+    for (i, e) in entries.iter().enumerate() {
+        for field in ["Source", "DetailType", "Detail"] {
+            if e.get(field)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!(
+                    "entry {i}: `{field}` is not a non-empty string (PutEvents requires it on every entry)"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The items of a Lambda answer: the keys the function listed in `batchItemFailures` retry
@@ -420,6 +488,35 @@ impl Target {
                     provider,
                 });
                 lambda_url = Some(url);
+            }
+            Kind::EventBridge => {
+                // from_row: exactly one `aws-eventbridge://[<region>/]<event-bus>` endpoint. The
+                // request goes to the service root; the bus is named in the entries
+                // (`endpoint.bus`).
+                let url = aws::EventBridgeUrl::parse(def.endpoints.first().ok_or_else(|| {
+                    anyhow!("kind eventbridge needs its aws-eventbridge:// endpoint")
+                })?)?;
+                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
+                let mut base = aws::address("events", url.endpoint.as_deref(), &region)?;
+                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
+                                 "region": region, "bus": url.bus});
+                base.base = String::new();
+                let host_header = base.host_header();
+                let client = HttpClient::new(base, &def.tls)?;
+                endpoints.push(Endpoint {
+                    ctx,
+                    transport: Transport::Http {
+                        client,
+                        prefix: String::new(),
+                        host_header,
+                    },
+                });
+                let provider = aws::Provider::new(aws_refs(&def), &region);
+                aws_rt = Some(AwsSign {
+                    service: "events",
+                    region,
+                    provider,
+                });
             }
             Kind::Kafka => {
                 // from_row: exactly one endpoint, `kafka(s)://<broker>[:port][,…]/<topic>` —
@@ -822,6 +919,13 @@ impl Target {
             Ok(None) => return Ok(vec![Item::Ok; n]),
             Err(e) => return Err(rejected(format!("the rendered request: {e:#}"))),
         };
+        if self.def.kind == Kind::EventBridge {
+            // The batch is answered by position: check the rendered entries before the request
+            // goes out (see [`eventbridge_entries_ok`]).
+            if let Err(why) = eventbridge_entries_ok(&req.body, n) {
+                return Err(rejected(format!("the rendered request: {why}")));
+            }
+        }
         let req = self.prepare(req, prefix, host_header).await?;
         let resp = client
             .send(&req, self.def.timeout)
@@ -875,6 +979,33 @@ impl Target {
                     RecordVerdict::Transient(m) => Item::Transient(m),
                     RecordVerdict::Rejected(m) => Item::Rejected(m),
                     RecordVerdict::Missing => Item::Transient(format!("record {i}: no answer")),
+                };
+                out.push(item);
+            }
+            return Ok(out);
+        }
+        if self.def.kind == Kind::EventBridge {
+            // `Entries[i]` answers item i. `expect` per entry, as for the records above.
+            let entries = answer
+                .get("Entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let item = match eventbridge_verdict(entries.get(i), i) {
+                    RecordVerdict::Stored(bytes) => match self
+                        .expect
+                        .http(&self.pool, resp.status, &resp.headers, &bytes)
+                        .await
+                        .with_context(|| format!("entry {i} of {}", client.base.url()))?
+                    {
+                        Ok(()) => Item::Ok,
+                        Err(why) => Item::Rejected(format!("entry {i}: {why}")),
+                    },
+                    RecordVerdict::Transient(m) => Item::Transient(m),
+                    RecordVerdict::Rejected(m) => Item::Rejected(m),
+                    RecordVerdict::Missing => Item::Transient(format!("entry {i}: no answer")),
                 };
                 out.push(item);
             }
@@ -1104,6 +1235,115 @@ mod kinesis_verdict_tests {
 }
 
 #[cfg(test)]
+mod eventbridge_verdict_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn an_entry_with_an_event_id_is_stored_and_checked_by_expect() {
+        let e = json!({"EventId": "919a0147-83c9-4f53-a66c-c6a0aabbccdd"});
+        match eventbridge_verdict(Some(&e), 0) {
+            RecordVerdict::Stored(bytes) => {
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), e)
+            }
+            other => panic!("{other:?}"),
+        }
+        // an empty or null id is no id
+        let e = json!({"EventId": "", "ErrorCode": "ValidationException"});
+        assert!(matches!(
+            eventbridge_verdict(Some(&e), 1),
+            RecordVerdict::Rejected(_)
+        ));
+        let e = json!({"EventId": null});
+        assert_eq!(eventbridge_verdict(Some(&e), 2), RecordVerdict::Missing);
+    }
+
+    #[test]
+    fn throttling_and_unwell_service_codes_are_transient() {
+        for code in [
+            "ThrottlingException",
+            "InternalFailure",
+            "ServiceUnavailable",
+        ] {
+            let e = json!({"ErrorCode": code, "ErrorMessage": "try later"});
+            assert_eq!(
+                eventbridge_verdict(Some(&e), 3),
+                RecordVerdict::Transient(format!("entry 3: {code}: try later"))
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_code_is_a_refusal_of_that_entry() {
+        // what moto and AWS answer for a bad entry (PutEvents result codes)
+        for code in [
+            "InvalidArgument",
+            "MalformedDetail",
+            "AccessDeniedException",
+        ] {
+            let e = json!({"ErrorCode": code, "ErrorMessage": "the reason"});
+            assert_eq!(
+                eventbridge_verdict(Some(&e), 1),
+                RecordVerdict::Rejected(format!("entry 1: {code}: the reason"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_answerless_entry_waits() {
+        assert_eq!(eventbridge_verdict(None, 5), RecordVerdict::Missing);
+        assert_eq!(
+            eventbridge_verdict(Some(&json!({})), 0),
+            RecordVerdict::Missing
+        );
+    }
+
+    fn entries(n: usize) -> String {
+        let one = r#"{"Source":"lazywf","DetailType":"t","Detail":"{}"}"#;
+        format!("{{\"Entries\": [{}]}}", vec![one; n].join(", "))
+    }
+
+    #[test]
+    fn a_batch_of_complete_entries_passes() {
+        assert!(eventbridge_entries_ok(entries(3).as_bytes(), 3).is_ok());
+    }
+
+    #[test]
+    fn the_body_must_be_entries_json() {
+        assert!(eventbridge_entries_ok(b"not json", 1).is_err());
+        assert!(eventbridge_entries_ok(br#"{"Records":[]}"#, 0).is_err());
+        assert!(eventbridge_entries_ok(br#"{"Entries":{}}"#, 0).is_err());
+    }
+
+    #[test]
+    fn the_entry_count_must_match_the_keys() {
+        // one entry short or long: the positional answer could not be trusted
+        assert!(eventbridge_entries_ok(entries(2).as_bytes(), 3).is_err());
+        assert!(eventbridge_entries_ok(entries(4).as_bytes(), 3).is_err());
+        assert!(eventbridge_entries_ok(br#"{"Entries": []}"#, 0).is_ok());
+    }
+
+    #[test]
+    fn every_entry_needs_the_three_required_members() {
+        let cases = [
+            r#"{"Entries":[{"DetailType":"t","Detail":"{}"}]}"#, // no Source
+            r#"{"Entries":[{"Source":"s","Detail":"{}"}]}"#,     // no DetailType
+            r#"{"Entries":[{"Source":"s","DetailType":"t"}]}"#,  // no Detail
+            r#"{"Entries":[{"Source":"","DetailType":"t","Detail":"{}"}]}"#, // empty
+            r#"{"Entries":[{"Source":"s","DetailType":"t","Detail":null}]}"#, // not a string
+            r#"{"Entries":[{"Source":"s","DetailType":"t","Detail":{"k":1}}]}"#, // the JSON, not its text
+            r#"{"Entries":["a"]}"#, // not even an object
+        ];
+        for body in cases {
+            assert!(
+                eventbridge_entries_ok(body.as_bytes(), 1).is_err(),
+                "accepted `{body}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod allow_tests {
     use super::*;
     use crate::model::{RawTarget, TargetDef};
@@ -1168,6 +1408,18 @@ mod allow_tests {
                 "aws-lambda://eu-west-1/orders",
                 "{}",
                 "lambda.eu-west-1.amazonaws.com",
+            ),
+            (
+                "eventbridge",
+                "aws-eventbridge://eu-west-1/orders",
+                "{}",
+                "events.eu-west-1.amazonaws.com",
+            ),
+            (
+                "eventbridge",
+                "aws-eventbridge://eu-west-1/orders?endpoint=http://127.0.0.1:34569",
+                "{}",
+                "127.0.0.1",
             ),
             (
                 "pubsub",

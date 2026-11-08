@@ -43,7 +43,7 @@ servers:
 servers-down:
 	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease \
 	  --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
-	  --profile kafka down -v
+	  --profile kafka --profile eventbridge down -v
 
 # The integration servers and test threads; override them to run against other servers.
 E2E_DSN ?= mysql://root:root@127.0.0.1:34184
@@ -74,14 +74,16 @@ test-e2e-search:
 	$(COMPOSE) --profile search stop es8
 
 # The queue kinds against their emulators (sqs: ElasticMQ, kinesis: kinesis-mock, amqp:
-# RabbitMQ, pubsub: Google's emulator, smtp: Mailpit, kafka: a Redpanda single node; compose
-# profiles of the same names). The six are small enough to run together on the host; the tests
-# are run per kind with their env vars, and the services are stopped even when a test fails.
-# The kafka tests run one at a time (the restart one stops the shared broker). The log_secrets
-# binary runs against the emulators too (the same six vars; its lambda flow needs none of
-# them); its other flows need the default `make servers` set (MySQL, S3 and Redis among it).
-QUEUE_PROFILES := --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp --profile kafka
-QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka
+# RabbitMQ, pubsub: Google's emulator, smtp: Mailpit, kafka: a Redpanda single node, eventbridge:
+# moto; compose profiles of the same names). The seven are small enough to run together on the
+# host; the tests are run per kind with their env vars, and the services are stopped even when a
+# test fails. The kafka tests run one at a time (the restart one stops the shared broker). The
+# log_secrets binary runs against the emulators too (the same seven vars; its lambda flow needs
+# none of them); its other flows need the default `make servers` set (MySQL, S3 and Redis among
+# it).
+QUEUE_PROFILES := --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
+  --profile kafka --profile eventbridge
+QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka moto
 test-e2e-queues:
 	$(COMPOSE) $(QUEUE_PROFILES) up -d --wait $(QUEUE_SERVICES); rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
@@ -91,9 +93,10 @@ test-e2e-queues:
 	  $(E2E_DB) LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 $(CARGO) test --test e2e pubsub_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_SMTP=127.0.0.1:34565 $(CARGO) test --test e2e smtp_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_KAFKA=127.0.0.1:34564 $(CARGO) test --test e2e kafka_ -- --test-threads=1 || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_EVENTBRIDGE=http://127.0.0.1:34569 $(CARGO) test --test e2e eventbridge_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_SQS=http://127.0.0.1:34561 LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 \
 	    LAZYWF_TEST_AMQP=127.0.0.1:34560 LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 \
-	    LAZYWF_TEST_SMTP=127.0.0.1:34565 \
+	    LAZYWF_TEST_SMTP=127.0.0.1:34565 LAZYWF_TEST_EVENTBRIDGE=http://127.0.0.1:34569 \
 	    LAZYWF_TEST_KAFKA=127.0.0.1:34564 LAZYWF_TEST_KAFKA_ADMIN=http://127.0.0.1:34567 \
 	    $(CARGO) test --test log_secrets -- --test-threads=$(E2E_THREADS) || rc=1; \
 	fi; \

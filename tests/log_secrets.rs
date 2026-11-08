@@ -1742,3 +1742,200 @@ Content-Type: application/json
     }
     assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
 }
+
+/// moto: the EventBridge JSON API and the SQS JSON API of the read-back queue. moto dispatches
+/// by the service of the credential scope and does not check the signature.
+struct Moto {
+    root: String,
+    client: lazy_wire_fire::http::Client,
+}
+
+impl Moto {
+    /// Waits for the server: compose has no healthcheck for it (the other emulators' precedent).
+    async fn new(root: &str) -> Moto {
+        let moto = Moto {
+            root: root.to_string(),
+            client: lazy_wire_fire::http::Client::new(
+                lazy_wire_fire::http::BaseUrl::parse(root).unwrap(),
+                &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        };
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        req.set_header("Host", root.trim_start_matches("http://").to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(moto.client.send(&req, Duration::from_secs(2)).await, Ok(r) if r.status < 500)
+            {
+                return moto;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "moto at {root} did not come up within 30 s"
+            );
+            sleep_ms(200).await;
+        }
+    }
+
+    async fn call(&self, target: &str, service: &str, body: serde_json::Value) {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header("Content-Type", "application/x-amz-json-1.1".into());
+        req.set_header("X-Amz-Target", target.into());
+        req.set_header(
+            "Authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=lazywf/20260101/us-east-1/{service}/aws4_request, \
+                 SignedHeaders=content-type;host;x-amz-target, Signature=00"
+            ),
+        );
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            resp.status == 200,
+            "{target}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+    }
+
+    /// Creates the bus and a queue, and the rule on the bus that delivers every event of it
+    /// to the queue (an SQS target, as AWS would); the queue URL. moto answers as the
+    /// account 123456789012.
+    async fn pipe(&self, bus: &str, queue: &str) -> String {
+        self.call("AWSEvents.CreateEventBus", "events", json!({"Name": bus}))
+            .await;
+        self.call("AmazonSQS.CreateQueue", "sqs", json!({"QueueName": queue}))
+            .await;
+        self.call(
+            "AWSEvents.PutRule",
+            "events",
+            json!({"Name": format!("{bus}-rule"), "EventBusName": bus, "EventPattern": "{}"}),
+        )
+        .await;
+        self.call(
+            "AWSEvents.PutTargets",
+            "events",
+            json!({"EventBusName": bus, "Rule": format!("{bus}-rule"),
+                   "Targets": [{"Id": "sqs",
+                                "Arn": format!("arn:aws:sqs:us-east-1:123456789012:{queue}")}]}),
+        )
+        .await;
+        format!("{}/123456789012/{queue}", self.root)
+    }
+
+    async fn count(&self, url: &str) -> u64 {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: json!({"QueueUrl": url, "AttributeNames": ["ApproximateNumberOfMessages"]})
+                .to_string()
+                .into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header("Content-Type", "application/x-amz-json-1.0".into());
+        req.set_header("X-Amz-Target", "AmazonSQS.GetQueueAttributes".into());
+        req.set_header(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=lazywf/20260101/us-east-1/sqs/aws4_request, \
+             SignedHeaders=content-type;host;x-amz-target, Signature=00"
+                .into(),
+        );
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(resp.status == 200, "GetQueueAttributes: {}", resp.status);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        v["Attributes"]["ApproximateNumberOfMessages"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// The `eventbridge` target against moto (`LAZYWF_TEST_EVENTBRIDGE`): every put is signed with
+/// the fake reference credentials, and the bus is read back through a rule with an SQS target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_eventbridge() {
+    let root = need_db!();
+    let Ok(moto_root) = std::env::var("LAZYWF_TEST_EVENTBRIDGE") else {
+        return eprintln!(
+            "LAZYWF_TEST_EVENTBRIDGE not set: skipping the eventbridge flow (make test-e2e-queues)"
+        );
+    };
+    install();
+    let moto = Moto::new(&moto_root).await;
+    let bus = format!("lwf_logseb_{}", std::process::id());
+    let url = moto.pipe(&bus, &bus).await;
+    let db = Db::fresh(&root, "logeb").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+    std::env::set_var("LWF_LOGB_AK", AWS_AK);
+    std::env::set_var("LWF_LOGB_SK", AWS_SK);
+    std::env::set_var("LWF_LOGB_ST", AWS_SESSION);
+    db.target(
+        "bus",
+        "eventbridge",
+        &format!("aws-eventbridge://us-east-1/{bus}?endpoint={moto_root}"),
+        None,
+        &json!({"access_key_ref": "env:LWF_LOGB_AK",
+                "secret_key_ref": "env:LWF_LOGB_SK",
+                "session_token_ref": "env:LWF_LOGB_ST"})
+        .to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('bus', 'bus', 'batch', 10, ?, ?, 100)",
+        (
+            "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+            r#"POST / HTTP/1.1
+X-Amz-Target: AWSEvents.PutEvents
+Content-Type: application/x-amz-json-1.1
+
+{"Entries": [{{#each docs}}{"Source": "lazywf", "DetailType": {{json key}}, "Detail": {{json (json doc)}}, "EventBusName": {{json endpoint.bus}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#,
+        ),
+    )
+    .await;
+    db.trigger("bus", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann'), (2, 'Bob')")
+        .await;
+    wait_for(Duration::from_secs(30), "two events", || async {
+        (moto.count(&url).await >= 2).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    inst.stop().await;
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    let leaks = leaks(
+        &out,
+        &[
+            ("bus secret key", AWS_SK),
+            ("bus session token", AWS_SESSION),
+        ],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}

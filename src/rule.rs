@@ -155,6 +155,8 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>,
 /// - `sqs`: a batch holds at most 10 keys (`batch_max_keys`, required) and 256 KiB.
 /// - A FIFO queue (the endpoint names a `.fifo` queue) needs a `version` column: it is the
 ///   `MessageDeduplicationId` (decision D5).
+/// - `eventbridge`: a batch holds at most 10 keys (`batch_max_keys`, required: 10 entries per
+///   PutEvents) and 1 MB.
 /// - `kafka`: a batch holds at most the target's limit (the broker's `message.max.bytes`,
 ///   raised by its `vars.message_max_bytes`).
 pub fn kind_errors(
@@ -209,31 +211,28 @@ pub fn kind_errors(
     if kind == Kind::Smtp {
         out.extend(crate::smtp::rule_errors(def.fire_per));
     }
-    if matches!(kind, Kind::Sqs | Kind::Kinesis) {
-        // Purge-like `once` actions: a queue purge (`PurgeQueue`) or a stream delete
-        // (`DeleteStream`, which drops every record). Recognized by text, as the only names of
+    if matches!(kind, Kind::Sqs | Kind::Kinesis | Kind::EventBridge) {
+        // Purge-like `once` actions: a queue purge (`PurgeQueue`), a stream delete
+        // (`DeleteStream`, which drops every record) or an event bus delete (`DeleteEventBus`,
+        // which takes the bus and every rule on it). Recognized by text, as the only names of
         // such actions the templates can show us.
-        let purge_words: &[&str] = if kind == Kind::Sqs {
-            &["purgequeue"]
-        } else {
-            &["deletestream"]
+        let (word, action) = match kind {
+            Kind::Sqs => ("purgequeue", "PurgeQueue"),
+            Kind::EventBridge => ("deleteeventbus", "DeleteEventBus"),
+            _ => ("deletestream", "DeleteStream"),
         };
         for s in &def.reset_steps {
             let purge = s.kind == StepKind::Once
                 && s.template.as_deref().is_some_and(|t| {
                     let t = t.to_ascii_lowercase();
-                    purge_words.iter().any(|w| t.contains(w))
+                    t.contains(word)
                 });
             if purge {
                 out.push(format!(
                     "reset step `{}`: purging is refused (kind {}: {} would drop the records)",
                     s.name,
                     kind.name(),
-                    if kind == Kind::Sqs {
-                        "PurgeQueue"
-                    } else {
-                        "DeleteStream"
-                    }
+                    action
                 ));
             }
         }
@@ -286,6 +285,32 @@ pub fn kind_errors(
         if fifo && !columns.iter().any(|c| c == "version") {
             out.push(
                 "a FIFO queue (a queue name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
+                    .into(),
+            );
+        }
+    }
+    if kind == Kind::EventBridge {
+        // One action is one PutEvents (aws::EVENTBRIDGE_MAX_ENTRIES / _MAX_BYTES); the engine
+        // splits by bytes, never by count, so the count is a load-time requirement as for sqs.
+        if def.fire_per == FirePer::Batch {
+            match def.batch_max_keys {
+                None => out.push(
+                    "kind eventbridge needs `batch_max_keys` (1 to 10: entries per PutEvents)"
+                        .into(),
+                ),
+                Some(n) if n > crate::aws::EVENTBRIDGE_MAX_ENTRIES => out.push(format!(
+                    "`batch_max_keys` {n} is over {}, the most entries a PutEvents takes",
+                    crate::aws::EVENTBRIDGE_MAX_ENTRIES
+                )),
+                Some(_) => {}
+            }
+        }
+        if def
+            .batch_max_bytes
+            .is_some_and(|n| n > crate::aws::EVENTBRIDGE_MAX_BYTES)
+        {
+            out.push(
+                "`batch_max_bytes` is over 1048576 (1 MB), the most a PutEvents request takes"
                     .into(),
             );
         }
@@ -708,6 +733,55 @@ mod kind_tests {
         d.batch_max_bytes = Some(2_000_000);
         let raised = r#"{"message_max_bytes": 2097152}"#;
         assert!(kind_errors(&d, &target("kafka", KAFKA, raised), &[]).is_empty());
+    }
+
+    const BUS: &str = "aws-eventbridge://eu-west-1/orders";
+
+    #[test]
+    fn eventbridge_batches_hold_at_most_ten_entries_and_1_mib() {
+        let eb = || target("eventbridge", BUS, "{}");
+        let mut d = def();
+        d.batch_max_keys = None;
+        assert_eq!(kind_errors(&d, &eb(), &[]).len(), 1);
+        d.batch_max_keys = Some(11);
+        let e = kind_errors(&d, &eb(), &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("a PutEvents takes"), "{e:?}");
+        d.batch_max_keys = Some(10);
+        assert!(kind_errors(&d, &eb(), &[]).is_empty());
+        d.batch_max_bytes = Some(1_048_577);
+        assert_eq!(kind_errors(&d, &eb(), &[]).len(), 1);
+        d.batch_max_bytes = Some(1_048_576);
+        assert!(kind_errors(&d, &eb(), &[]).is_empty());
+        // One key per action has no batch to size.
+        d.fire_per = FirePer::Key;
+        d.batch_max_keys = None;
+        d.batch_max_bytes = None;
+        assert!(kind_errors(&d, &eb(), &[]).is_empty());
+    }
+
+    #[test]
+    fn eventbridge_refuses_stray_and_bus_delete_resets() {
+        let eb = || target("eventbridge", BUS, "{}");
+        let mut d = def();
+        d.reset_steps = vec![step(stray(), None)];
+        let e = kind_errors(&d, &eb(), &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("only appends"));
+
+        d.reset_steps = vec![step(
+            StepKind::Once,
+            Some("POST / HTTP/1.1\nX-Amz-Target: AWSEvents.DeleteEventBus\n\n{}"),
+        )];
+        let e = kind_errors(&d, &eb(), &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("DeleteEventBus"), "{e:?}");
+        // PutEvents is the kind's everyday action, not a purge.
+        d.reset_steps = vec![step(
+            StepKind::Once,
+            Some("POST / HTTP/1.1\nX-Amz-Target: AWSEvents.PutEvents\n\n{}"),
+        )];
+        assert!(kind_errors(&d, &eb(), &[]).is_empty());
     }
 }
 
