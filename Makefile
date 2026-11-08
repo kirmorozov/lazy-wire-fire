@@ -17,12 +17,16 @@ release:
 # The integer key sets have two backends: the default hash set and roaring bitmaps behind the
 # `roaring` feature. The unit tests and the lint run for both; the integration tests run on the
 # default.
+# The reserved-tables test is a unit test in its own process: set_reserved takes effect once per
+# process, and the planner's own unit tests take that call in the lib test binary.
 test:
 	$(CARGO) test --lib
+	$(CARGO) test --test reserved
 	$(MAKE) --no-print-directory test-roaring
 
 test-roaring:
 	$(CARGO) test --lib --features roaring
+	$(CARGO) test --test reserved --features roaring
 
 # The lazyview copies (vendor/lazyview.lock) are checked against the lock, and on CI
 # (CI=true) also against lazyview itself at the locked commit.

@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::action::{self, Env, FenceSpec, Fired, KeyQuery};
+use crate::analyze;
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position, RowsKind};
 use crate::config::Config;
 use crate::fence;
@@ -513,6 +514,7 @@ pub async fn run(
     // The reader names lazyview in its messages unless told otherwise (main does it earlier).
     binlog::set_product("lazywf", "LAZYWF_");
     fence::set_table(model::FENCE);
+    analyze::set_reserved(model::RESERVED_TABLES, &[model::RESERVED_PREFIX]);
     let opts = binlog::replica_opts(&cfg.dsn)?;
     let binlog_opts = binlog::replica_opts(&cfg.binlog_dsn)?;
     let Some(mut control) = connect_wait(&opts, &health, &mut shutdown).await? else {
