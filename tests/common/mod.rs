@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use hmac::{Hmac, KeyInit, Mac};
 use lazy_wire_fire::config::Config;
 use lazy_wire_fire::health::Health;
 use mysql_async::prelude::*;
@@ -298,6 +300,43 @@ impl Req {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(n))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The Standard Webhooks v1 signature a receiver computes over this request with `key`
+    /// (the raw HMAC key, the base64 of a `whsec_` secret's remainder): `v1,` + the base64 of
+    /// the HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<body>`.
+    pub fn standard_signature(&self, key: &[u8]) -> Option<String> {
+        use sha2::Sha256;
+        let id = self.header("webhook-id")?;
+        let ts = self.header("webhook-timestamp")?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+        mac.update(id.as_bytes());
+        mac.update(b".");
+        mac.update(ts.as_bytes());
+        mac.update(b".");
+        mac.update(self.body.as_bytes());
+        Some(format!(
+            "v1,{}",
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+        ))
+    }
+
+    /// Whether this request carries the standard signature of `key` (one of its space-separated
+    /// `v1,` entries is what the receiver recomputes).
+    pub fn standard_ok(&self, key: &[u8]) -> bool {
+        let want = self.standard_signature(key);
+        self.header("webhook-signature")
+            .is_some_and(|h| h.split_whitespace().any(|e| Some(e) == want.as_deref()))
+    }
+
+    /// Whether this request's header `h` is `prefix` + the hex HMAC-SHA256 of its body with
+    /// `key` (the GitHub-style default of the hmac signing).
+    pub fn hmac_ok(&self, key: &[u8], h: &str, prefix: &str) -> bool {
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(self.body.as_bytes());
+        let want = format!("{}{}", prefix, hex::encode(mac.finalize().into_bytes()));
+        self.header(h) == Some(want.as_str())
     }
 
     /// NDJSON body lines as JSON.

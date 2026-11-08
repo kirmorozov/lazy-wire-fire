@@ -2,11 +2,12 @@
 //! filter (`lazy_wire_fire::logging::filter`) at `trace`, with `RUST_LOG` set to try to re-enable
 //! the capped dependency targets, writing to a buffer. Representative flows run with fake
 //! secrets (target credentials, an S3 session token, a SQL and a Redis password, a credential
-//! inside an endpoint, a separate binlog account, and, for the queue targets: AWS access /
-//! secret / session references, an AMQP account and a service-account key by reference), and
-//! the captured output must contain none of them, nor the DSN password (when it is long enough
-//! to tell apart from ordinary text). `make servers test-e2e`; the sqs, kinesis, amqp and
-//! pubsub flows are `make test-e2e-queues` (their emulators; skipped when absent).
+//! inside an endpoint, a separate binlog account, the webhook signing secrets, and, for the
+//! queue targets: AWS access / secret / session references, an AMQP account and a
+//! service-account key by reference), and the captured output must contain none of them, nor
+//! the DSN password (when it is long enough to tell apart from ordinary text).
+//! `make servers test-e2e`; the sqs, kinesis, amqp and pubsub flows are
+//! `make test-e2e-queues` (their emulators; skipped when absent).
 
 mod common;
 
@@ -45,6 +46,11 @@ const SMTP_USER: &str = "lwf_ls_smtp";
 const SMTP_PW: &str = "LWFSECRET-smtp-pw-7c2e";
 /// The password of the separate binlog account (`lwf_ls_binlog`), created for the flow.
 const BINLOG_PW: &str = "LWFSECRET-binlog-pw-1d4f";
+/// The signing secrets of the signed-webhook flow: `SIGN_STD_KEY` is the raw key of the
+/// standard scheme (its secret is `whsec_` + its base64), `SIGN_HMAC_KEY` the secret of the
+/// hmac scheme. Both are fake, so finding either in the output is a leak, not a coincidence.
+const SIGN_STD_KEY: &str = "LWFSECRET-whsec-key-5f3b";
+const SIGN_HMAC_KEY: &str = "LWFSECRET-hmac-key-1c8d";
 /// The fake Google service-account key behind the pubsub flow's `credentials_ref`. The private
 /// key is a test-only RSA key; `SA_KEY_FRAG` is its prefix, what a leak would have to carry.
 const SA_KEY: &str = r#"{"type":"service_account","project_id":"lwf-test","private_key_id":"lwflogsakey0000000","client_email":"logsecrets@lwf-test.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDPPV+OBRe/GnMo\nF1WQp05LO5uKzh2Gim1icaodqhFWjvQmAHYtA/3g51UrooQY37H7Y0dSynVZ5BoR\n+ZyB9BjumHByNmvwBKgcvkQbz/JX/hR4wcHTz9PPyOIyr1WIQxU9eTK/+Bzur4Vq\n7AEEdCIruYeJMqXoUxL26jdZMdvKMFVYEwvN2cI43JsSz+fWDC2zy13au6rwgfi7\nqxJZeOAczfNlZXa6WFUGGkzUgSq7X9UNKmZhG/Dl3DiNh4YjiG9+ES/XlC8thE9w\nPTM8ZzjgXAq26V1tuZnT86SYv5PVKy37yIMEW+IHQFpTLn1OJUxyjQxdwFHEJzOH\nsEtbjUyjAgMBAAECggEAHtx9X9lbTW6jant7FwULMEHqqlOCaxgvLONPWYaLeW/l\nZMlZz99Rzc21Tb+wW0Hor857fxU+P4or5bRdva57jgBucluvXDldTZZ57whbBwaD\nxu3XrvK6kK1SHgklPBr9TT/AsnzA1jyWKjOF/UNMGWXSDLjZowzH/LQpVOOLXwLp\n8zEQ2P1Qcy7cx4AcH7Z0/r82M25eEFRZoL01pcd94VXj/dlEWSygAdY5O4TaDKzm\nDV+W+Pcm/8qksD/mhK6AD8BOHikqngXM0HxTGwoOQsVGycZqIqkG0BuoCGyYlj36\nENlYlyPsE4FQaabfrXTXdqcPAf0NRL7DyHofh/VmBQKBgQDvh+R+va7QDSNUWesa\nmg8Z9kxNiLcpaY9o8lW9bNbFS/o0SMAZ9DwO+WdoyHQXiaPW2qIwYesABU+ScJOX\nae3mBoAZV6F+VQWMAeN1T1AV0Gas3/+I1IhfapXVDEc8+zoAqvtv+kJhxQ1Ietqd\nXRNh3vfUUMwLZ+EXMrjx8vuZNQKBgQDdfRu6t2yunQGwANxq7P4EFpIl55WJVrlu\nlscSWcoM1tcLBIhzaaJfxRvWsHAHcTAp1qDpS9+xGSo7Mu6WZ1EmWOFRgcoyOXJS\nNhGQuIhaxKK2K6jzZ5KIP4QT7jCSRLnp5M+bdA8OMhVg59ylm9UTcb6YCooV6tnN\ngHj4AtxhdwKBgQDEOzYMRuVB+KFq50deQbwBbu/PzSMQwDQGrBFl4BaLB9Vwo/EM\n0jOpqNT42M+SwOYCjJa2wGE/YRpxQ90F/HgzLDwhhtL8pjanHpzzbAiV9mdHVTMJ\nK+SVFsKtCSQLZ117Upgugn2Dj2V0bYFPzgKk+X9a5t5isbWLxbgSLxfDyQKBgQCy\nJTZwb6fSqiX5Ujf3KLcGwsC6DBKSbFapREzJzb5dpU9BZVv6uDQJo5hIjZEN61Q5\n0o+KFaTN5Ne61bRg9Kiol0RjMmlXDC2PQj3OkR3bI91beLJjVCLfw3aQMTyP6Qc/\nwPHarvaNDGt1jghCi5xOD2alE5UNG+AjEfo6QNLQ8QKBgQCPN4iYKAiN2qcw0dGz\nnhr5P/9l+LZwteHa/NFp8qieT3nPXdoONK+dmUMS6RrokR6xmviJmR0T1eDB1gRw\n40OxmoCmMkdvVLTFMoGrNcu/TT597U/5669/FTxVI1Jdy2tD2L+mL6ZJRFuikbYC\nkseTs63uBwj90peHtRtMWZAs/Q==\n-----END PRIVATE KEY-----\n"}"#;
@@ -318,11 +324,37 @@ async fn no_secret_in_the_logs_at_any_level() {
         r#"{"token": "env:LWF_LOGSECRETS_TOKEN"}"#,
     )
     .await;
+    // The signing secrets: by reference only (the standard one is `whsec_` + base64 of its key).
+    use base64::Engine as _;
+    let sign_std_secret = format!(
+        "whsec_{}",
+        base64::engine::general_purpose::STANDARD.encode(SIGN_STD_KEY.as_bytes())
+    );
+    std::env::set_var("LWF_LOGSECRETS_SIGN_STD", &sign_std_secret);
+    std::env::set_var("LWF_LOGSECRETS_SIGN_HMAC", SIGN_HMAC_KEY);
+    db.target(
+        "signstd",
+        "http",
+        &url,
+        None,
+        r#"{"sign": "standard", "sign_secret_ref": "env:LWF_LOGSECRETS_SIGN_STD"}"#,
+    )
+    .await;
+    db.target(
+        "signhmac",
+        "http",
+        &url,
+        None,
+        r#"{"sign": "hmac", "sign_secret_ref": "env:LWF_LOGSECRETS_SIGN_HMAC"}"#,
+    )
+    .await;
 
     let rules: &[(&str, &str, &str, &str)] = &[
         ("basic", "basic", "", "POST /{{rule}} HTTP/1.1\n\nok"),
         ("bearer", "bearer", "", "POST /{{rule}} HTTP/1.1\n\nok"),
         ("header", "header", "", "POST /{{rule}} HTTP/1.1\n\nok"),
+        ("signstd", "signstd", "", "POST /{{rule}} HTTP/1.1\n\nok"),
+        ("signhmac", "signhmac", "", "POST /{{rule}} HTTP/1.1\n\nok"),
         (
             "export",
             "store",
@@ -372,7 +404,7 @@ async fn no_secret_in_the_logs_at_any_level() {
         .await;
     let deadline = std::time::Instant::now() + Duration::from_secs(25);
     loop {
-        let http_ok = mock.requests().len() >= 3;
+        let http_ok = mock.requests().len() >= 5;
         let sink_ok = sink.query::<(i64,)>("SELECT id FROM copy").await.len() >= 2;
         if (http_ok && sink_ok) || std::time::Instant::now() > deadline {
             if !(http_ok && sink_ok) {
@@ -411,6 +443,9 @@ async fn no_secret_in_the_logs_at_any_level() {
         ("Redis password", REDIS_PW.into()),
         ("URL password", URL_PW.into()),
         ("binlog password", BINLOG_PW.into()),
+        ("standard signing secret", sign_std_secret),
+        ("standard signing key", SIGN_STD_KEY.into()),
+        ("hmac signing secret", SIGN_HMAC_KEY.into()),
     ];
     if dsn_pw.len() >= 4 {
         secrets.push(("DSN password", dsn_pw.clone()));

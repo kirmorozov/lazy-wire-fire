@@ -2175,6 +2175,7 @@ dependencies = [
  "google-cloud-auth",
  "handlebars",
  "hex",
+ "hmac 0.13.0",
  "httparse",
  "indexmap 2.14.2",
  "lapin",

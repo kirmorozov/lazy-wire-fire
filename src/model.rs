@@ -228,10 +228,10 @@ impl Kind {
     /// `vars` entries that hold credentials and never reach templates.
     pub fn secret_vars(self) -> &'static [&'static str] {
         match self {
-            Kind::Http => &[],
-            Kind::HttpBasic => &["password"],
-            Kind::HttpBearer => &["token"],
-            Kind::HttpHeader => &["value"],
+            Kind::Http => &["sign_secret_ref"],
+            Kind::HttpBasic => &["password", "sign_secret_ref"],
+            Kind::HttpBearer => &["token", "sign_secret_ref"],
+            Kind::HttpHeader => &["value", "sign_secret_ref"],
             Kind::HttpS3 | Kind::Sqs | Kind::Kinesis | Kind::Lambda => {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
@@ -422,6 +422,19 @@ impl TargetDef {
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
+        }
+        // Webhook signing is an option of the plain http kinds; on the others the settings
+        // would go unused (http.s3 signs SigV4, the queue kinds their own way).
+        if matches!(
+            kind,
+            Kind::Http | Kind::HttpBasic | Kind::HttpBearer | Kind::HttpHeader
+        ) {
+            crate::sign::check(&vars)?;
+        } else if let Some(k) = crate::sign::first_var(&vars) {
+            bail!(
+                "`vars.{k}` is not used by kind {} (signing is an option of http, http.basic, http.bearer and http.header)",
+                kind.name()
+            );
         }
         if !matches!(kind, Kind::Sqs | Kind::Kinesis | Kind::Lambda) {
             if let Some(e) = endpoints
@@ -1031,6 +1044,44 @@ mod tests {
         .unwrap();
         assert_eq!(redis.endpoints.len(), 2);
         assert_eq!(redis.template_vars(), serde_json::json!({"prefix":"69d_"}));
+    }
+
+    #[test]
+    fn signing_vars_load_and_hide() {
+        let row = |kind: &str, endpoint: &str, vars: &str| RawTarget {
+            name: "hook".into(),
+            kind: Some(kind.into()),
+            endpoints: Some(endpoint.into()),
+            vars: Some(vars.into()),
+            ..Default::default()
+        };
+        let http = |vars: &str| row("http", "http://a.example", vars);
+        let t = TargetDef::from_row(&http(
+            r#"{"sign": "standard", "sign_secret_ref": "env:HOOK_SECRET", "note": "visible"}"#,
+        ))
+        .unwrap();
+        // The secret reference never reaches templates; the scheme and the rest do.
+        assert_eq!(
+            t.template_vars(),
+            serde_json::json!({"sign": "standard", "note": "visible"})
+        );
+        let e = |vars: &str| TargetDef::from_row(&http(vars)).unwrap_err().to_string();
+        // The load checks name the setting.
+        assert!(e(r#"{"sign": "ed25519", "sign_secret_ref": "env:A"}"#).contains("`vars.sign`"));
+        assert!(e(r#"{"sign": "standard"}"#).contains("`vars.sign_secret_ref`"));
+        assert!(e(r#"{"sign": "standard", "sign_secret_ref": "a-literal"}"#)
+            .contains("never a literal"));
+        // The settings are refused by the kinds that sign their own way or not at all.
+        let sqs_err = TargetDef::from_row(&row(
+            "sqs",
+            "aws-sqs://eu-west-1/123456789012/orders",
+            r#"{"sign": "hmac", "sign_secret_ref": "env:A"}"#,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(sqs_err.contains("`vars.sign`"), "{sqs_err}");
+        // A plain http target without the settings stays fine.
+        assert!(TargetDef::from_row(&http("{}")).is_ok());
     }
 
     #[test]
