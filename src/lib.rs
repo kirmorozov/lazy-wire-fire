@@ -14,6 +14,7 @@ pub mod binlog;
 pub mod catalog;
 pub mod config;
 pub mod datum;
+pub mod dedup;
 pub mod docs;
 pub mod engine;
 pub mod fence;
