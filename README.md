@@ -76,7 +76,7 @@ actions instead (auto-creation off), the rule's position holds, the keys are ret
 backoff, and the error is in `last_error`.
 
 Values from rows go into templates through the helper of the place they land in (`json`,
-`url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
+`yaml`, `url_encode`, `regex_escape`, `redis_quote`), and the tool's tables are admin-only: see
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
 export, an SQS queue, a Kinesis stream, a Lambda function, an AMQP broker, a Pub/Sub topic,
 reset steps, in [docs/reference.md](docs/reference.md#examples).

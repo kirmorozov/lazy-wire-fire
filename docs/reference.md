@@ -700,14 +700,34 @@ Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as wi
 compat mode), so `{{target.vars.prefix}}` works inside `{{#each keys}}`. A field of the current
 element with one of these names is `this.<name>`.
 
-Helpers: `join list sep`, `upper`, `lower`, `regex_escape`, `url_encode`, `json`,
-`base64 s` (the standard base64 alphabet, padded: a Kinesis record's `Data`, a Pub/Sub
-message's `data`),
-`replace s regex replacement`, `redis_quote s…` (its arguments concatenated, as one Redis
-argument), `sql_quote v`, `sql_ident name` (in the dialect of the rule's target: PostgreSQL for
-`pgsql`, MySQL otherwise), plus the built-ins `if`, `unless`, `each`, `with`,
-`lookup`, `eq`, `ne`, `gt`, `lt`, `and`, `or`, `not`, `len`. String literals in templates take
-JSON escapes: write `"\\d"` for the regex `\d`.
+Helpers: `join list sep`, `upper`, `lower`, `regex_escape`, `url_encode`, `json`, `yaml v` (the
+value as a YAML document: block style, two-space indents, the value's own key order, no `---`
+header), `base64 s` (the standard base64 alphabet, padded: a Kinesis record's `Data`, a
+Pub/Sub message's `data`), `replace s regex replacement`, `redis_quote s…` (its arguments
+concatenated, as one Redis argument), `sql_quote v`, `sql_ident name` (in the dialect of the
+rule's target: PostgreSQL for `pgsql`, MySQL otherwise), plus the built-ins `if`, `unless`,
+`each`, `with`, `lookup`, `eq`, `ne`, `gt`, `lt`, `and`, `or`, `not`, `len`. String literals in
+templates take JSON escapes: write `"\\d"` for the regex `\d`.
+
+**`{{yaml v}}`** writes its argument as a YAML document, for a body: an empty object or list is
+`{}` or `[]`, an object's entries are one per line and a nested block indents two spaces, a
+list's items take a `- ` at the item's column. It is the one helper whose output the escape
+function does not touch, and `{{yaml doc}}` and `{{{yaml doc}}}` render the same document: a
+document is multi-line by nature, and the helper keeps every control character of the data
+inside an escaped double-quoted scalar, so the only raw line breaks in its output are YAML's own
+structure. The read-back is guaranteed: a string that a YAML 1.1 or 1.2 reader could resolve as
+a number, a boolean (`y`, `no`, `on` among them), a null or a date (`2026-11-07`,
+`2026-11-07 10:00`) goes out double-quoted, so the receiver gets the document's values with their
+types (a `DATE` column reaches the template as a string and comes back a string, not a date), a
+float carries the dot and the exponent sign a 1.1 reader needs (`1.0e+20`, not the `1e20` JSON
+prints), and a key whose written form — quotes and `\n` escapes counted, not the raw key —
+passes 1024 characters goes on its own line in the explicit `? key` / `: value` form: a reader
+refuses the `:` right after a key that long, quoted or not, so such a key cannot share its line
+with its value. Use it in a body only: elsewhere a line break is not data, so in a request line,
+a header, a mail header or a one-line command the document's lines would arrive as extra headers,
+extra arguments or a refusal — put `{{json doc}}` or a single value in those places. The template
+writes the body's `Content-Type` itself (`application/yaml`), as it does for a JSON body: the tool
+adds no content type to an http request.
 
 What a template renders:
 
@@ -807,6 +827,7 @@ rows go through the helper of the place they land in**:
 | where | write | not |
 |---|---|---|
 | a JSON string or value | `"_id":{{json key}}`, `{{json doc}}` | `"_id":"{{key}}"`: a key `1"}}…` adds `_bulk` actions |
+| a YAML value | `{{yaml doc}}` | `key: {{value}}`: a value `1` reads back a number, a value `k: 2` leaves the line unparseable |
 | a path or query | `/items/{{url_encode key}}.json` | `/items/{{key}}.json`: a key `a?x=` writes another object |
 | a regex (Varnish tags) | `{{regex_escape this}}` | `{{this}}`: a key `.*` purges everything |
 | a Redis argument | `{{redis_quote this}}`, or `ARGV` of a script | splicing keys into a Lua string |
@@ -818,10 +839,12 @@ What the tool enforces on its own:
   the snapshot or a stray listing) is ignored and reported in `last_error`; a key template is
   rendered line by line, so a newline in a value cannot mark extra keys.
 * **Interpolated values hold no control characters**: `{{x}}` turns them into spaces, so data
-  never starts a new header, request, NDJSON line or command (`{{{x}}}` opts out). A request line
-  or header with a control character is refused; a rendered mail refuses, besides that, an
-  unknown or repeated header, a folded line, and more recipients than `vars.recipients`
-  ([SMTP targets](#smtp-targets)).
+  never starts a new header, request, NDJSON line or command (`{{{x}}}` opts out, and
+  `{{yaml doc}}` is exempt the same way: its line breaks are the document's own structure and
+  every control character of the data sits inside an escaped double-quoted scalar, so use it in a
+  body only — [Templates](#templates)). A request line or header with a control character is
+  refused; a rendered mail refuses, besides that, an unknown or repeated header, a folded line,
+  and more recipients than `vars.recipients` ([SMTP targets](#smtp-targets)).
 * **A refused key does not stall its rule.** An action the target refuses (4xx, an unmet
   `expect`, a Redis error) is split until the refused keys stand alone; the others go through.
   When the target has several endpoints, a refusal is judged only once every endpoint has
@@ -946,6 +969,35 @@ Content-Type: application/json
 
 The `_op` column is what turns a deleted customer into a `DELETE`: a key that no select returns,
 while a select has `_op`, is deleted.
+
+**A YAML body over http**, the same customers as a document a receiver parses (plain tables, one
+request per key):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints) VALUES ('collector', 'http', 'http://collector:9090');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES
+ ('customers_yaml', 'collector', 'key',
+  'SELECT id AS _key, name, note, qty FROM customers WHERE id IN (:keys)',
+  '{{#each docs}}POST /customers/{{url_encode key}} HTTP/1.1
+Content-Type: application/yaml
+
+{{yaml doc}}{{/each}}', 100);
+```
+
+Customer `42` with `name = 'Ana'`, a `note` of two lines and `qty = 3` sends this body, its keys
+in the select's column order:
+
+```text
+name: Ana
+note: "left at the door\nring the bell"
+qty: 3
+```
+
+`note` is one column holding a line break: it goes out double-quoted with `\n`, so the
+receiver's parser hands back the same two lines, `qty` comes back the number the column is, and
+a `name` of `2026-11-07` would go out quoted too and stay a string rather than becoming a date.
+The template writes the `Content-Type` line itself — the tool adds `Content-Length`, `Host` and
+`User-Agent` and no content type of its own — and a `{{yaml doc}}` needs no triple stash.
 
 **Messages to an SQS queue**, one entry per key (a consumer applies each message as the key's
 latest state):
