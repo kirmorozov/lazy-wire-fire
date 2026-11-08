@@ -1,8 +1,8 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 95054b795e9828d1f173e9150a51190b644c874f
-file src/access.rs ecbc68321a5ebbf9e3b882ad480c3edea60471b0d58abcb8b0aea7f0c29d98e7
+commit 2a8f36fab2053942d1941ea2a25eb4fdd35621dd
+file src/access.rs a262def510c36b69457b764ef241b18ccc561f3bfd1ad8d3c144e08652d869b5
 file src/analyze.rs 4da2475b684cb8eaeed96a62f07ebd8ed6cc5ed5d38d45339b7494cca68ab4f3
 file src/analyzer/ast.rs 395a6b078dbb48e20d10dcfc8b7de6bc7df2e43a6c55c182773aa87713743e5d
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
@@ -22,5 +22,8 @@ file src/analyzer/union.rs 9acd5df87a46c597178cd7b8b167041e797f92684d746d48ac60a
 file src/binlog.rs 43c96f7c1286abaa6a965e82a09ada281fb9974596934a6719492497c2a4a0e1
 file src/catalog.rs 0ac6d4a103fe9f32dbe145097866a8f870c5a2557628bf2bfb65b4deab57bda0
 file src/datum.rs c6088b9dc4b92e0bc7b76105c207b179debb28cdd54301e081d014cd56771def
+file src/dedup/buffer.rs f8ec48531d9a9f919419678451ca71edf32fa6ef18a11361c39b688fc53b5f93
+file src/dedup/key.rs 8d63a28958658662c7eb559a340cd30c9f3ed91765492adf8884a148e95a3839
+file src/dedup/mod.rs 5c088c946f40231e1a4d15e37e69dc0bd1f2c0f082939959766d15dbead85a31
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
 file src/intset.rs 264c0704ef3b640e343952fa9a0114a38d5f22d609b67ad2893335e44ef99ad8
