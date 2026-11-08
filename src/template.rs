@@ -186,13 +186,15 @@ pub fn url_encode(s: &str) -> String {
 /// `---` header (nothing that could read as one comes out unquoted).
 ///
 /// A string comes out a plain scalar only when it cannot be read as anything else: a control
-/// character (a line break included, and the ones YAML 1.1 reads as a line break), a number, a
-/// boolean, a null, a date/timestamp, the merge key or a YAML indicator (`: `, ` #`, a leading
-/// `-`, `?`, `#`, `&`, `*`, `!`, `|`, `>`, `%`, `@`, backtick, `{`, `[`, `'`, `"`, `…`) sends
-/// it through double quotes with backslash escapes. So the only raw line breaks the document
-/// holds are its own, no value can start a new key, list item or document, and the receiver
-/// reads back exactly the document's values, with their types (a string `123` or `true` stays
-/// a string; `null` stays a null).
+/// character (a line break included, and the ones YAML 1.1 reads as a line break), a number
+/// (a sexagesimal like `1:20.5` included, which 1.1 resolves as a float), a boolean, a null, a
+/// date/timestamp, the merge key, a YAML indicator (`: `, ` #`, a leading `-`, `?`, `#`, `&`,
+/// `*`, `!`, `|`, `>`, `%`, `@`, backtick, `{`, `[`, `'`, `"`) or the start of a document-end
+/// marker (`...`) sends it through double quotes with backslash escapes. So the only raw line
+/// breaks the document holds are its own, no value can start a new key, list item or document,
+/// and the receiver reads back exactly the document's values, with their types (a string `123`
+/// or `true` stays a string; `null` stays a null). A key past 1.1's 1024-character simple-key
+/// length goes on its own line in the `? key` / `: value` form ([`yaml_entry`]).
 fn yaml_doc(v: &Value) -> String {
     let mut out = String::new();
     yaml_node(&mut out, v, 0);
@@ -230,7 +232,23 @@ fn yaml_node(out: &mut String, v: &Value, col: usize) {
 /// A `key: value` entry, the key at the cursor; a block value on the lines that follow, at
 /// `col + 2`.
 fn yaml_entry(out: &mut String, k: &str, v: &Value, col: usize) {
-    yaml_string(out, k);
+    // The key as it will stand on the line: plain, or double-quoted with escapes.
+    let mut key = String::new();
+    yaml_string(&mut key, k);
+    // A key that shares its line with its value has to fit YAML 1.1's 1024-character limit
+    // *as written*: the quotes and the `\n` escapes are what the reader scans, not the raw
+    // key, so a key under the limit can still come out past it. Past it libyaml refuses the
+    // `:` that follows ("mapping values are not allowed here"), in PyYAML and here alike, so
+    // such a key takes the explicit form instead: `? <key>` and `: <value>`, one per line,
+    // both at the entry's column.
+    if key.chars().count() > YAML_MAX_PLAIN_KEY {
+        out.push_str("? ");
+        out.push_str(&key);
+        out.push('\n');
+        out.push_str(&" ".repeat(col));
+    } else {
+        out.push_str(&key);
+    }
     match v {
         Value::Object(m) if !m.is_empty() => {
             out.push_str(":\n");
@@ -344,6 +362,12 @@ fn yaml_string(out: &mut String, s: &str) {
 /// C0 and C1, but none of these.
 const YAML_BREAKS: [char; 3] = ['\u{2028}', '\u{2029}', '\u{feff}'];
 
+/// How long a key that shares its line with its value may be, counting what the reader scans
+/// — the quotes and escape sequences of the written key, not its raw characters. Past it a 1.1
+/// reader refuses the `:` that follows, so [`yaml_entry`] writes such a key in the explicit
+/// `? key` form instead. A value has no such limit.
+const YAML_MAX_PLAIN_KEY: usize = 1024;
+
 /// Plain-safe: what a YAML reader (1.1 or 1.2, any resolver's quirks included) could not
 /// resolve into a number, a boolean, a null, a date, a marker or a different node.
 fn yaml_plain_safe(s: &str) -> bool {
@@ -367,7 +391,7 @@ fn yaml_plain_safe(s: &str) -> bool {
     if s.ends_with(':') || s.contains(": ") || s.contains(":\t") {
         return false;
     }
-    if s.contains(" #") || s.contains("\t#") || s == "..." {
+    if s.contains(" #") || s.contains("\t#") || s.starts_with("...") {
         return false;
     }
     let low = s.to_ascii_lowercase();
@@ -398,10 +422,11 @@ fn yaml_plain_safe(s: &str) -> bool {
 
 /// What a YAML 1.1 reader resolves as a number: decimal with 1.1's underscores (including a
 /// trailing one), a fraction after the dot (even a bare dot), an exponent, octal (`0777`,
-/// `0o777`), hex / binary, and sexagesimal (`1:2:3`).
+/// `0o777`), hex / binary, and sexagesimal (`1:2:3`, and `1:20.5`, which 1.1's float resolver
+/// reads as 80.5 — the fraction belongs to the sexagesimal form too).
 static YAML_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^[+-]?(0x[0-9A-Fa-f_]+|0b[0-9_]+|0o[0-7_]+|0[0-7_]+|[0-9][0-9_]*(\.[0-9_]*)?|\.[0-9][0-9_]*|[0-9_]+(:[0-9_]+)+)([eE][+-]?[0-9]+(_[0-9]+)*)?$",
+        r"^[+-]?(0x[0-9A-Fa-f_]+|0b[0-9_]+|0o[0-7_]+|0[0-7_]+|[0-9][0-9_]*(\.[0-9_]*)?|\.[0-9][0-9_]*|[0-9_]+(:[0-9_]+)+(\.[0-9_]*)?)([eE][+-]?[0-9]+(_[0-9]+)*)?$",
     )
     .unwrap()
 });
@@ -969,6 +994,43 @@ mod tests {
             y(json!({"a": 1e20, "b": 1.5e30, "c": 1e-7, "d": 1.0, "e": -0.5, "f": 3})),
             "a: 1.0e+20\nb: 1.5e+30\nc: 1.0e-7\nd: 1.0\ne: -0.5\nf: 3"
         );
+        // 1.1's float resolver reads a sexagesimal with a fraction as a number, and a line
+        // that starts with `...` ends the document: both take quotes.
+        assert_eq!(
+            y(json!({"a": "1:20.5", "b": "190:20:30.15", "c": "... x", "d": "..."})),
+            "a: \"1:20.5\"\nb: \"190:20:30.15\"\nc: \"... x\"\nd: \"...\""
+        );
+        // A key past the 1.1 simple-key length is refused unquoted *and* quoted, so it takes
+        // the explicit form; a value of the same length needs nothing of the sort.
+        let long = "k".repeat(1100);
+        let mut keyed = serde_json::Map::new();
+        keyed.insert(long.clone(), json!(1));
+        assert_eq!(y(Value::Object(keyed)), format!("? {long}\n: 1"));
+        assert_eq!(y(json!({"k": long})), format!("k: {}", "k".repeat(1100)));
+        // …inside a block and as a list item's key too, where both lines keep the entry's
+        // column.
+        assert_eq!(
+            y(json!({"m": {long.as_str(): 1}, "rows": [{ long.as_str(): 2 }]})),
+            format!("m:\n  ? {long}\n  : 1\nrows:\n  - ? {long}\n    : 2")
+        );
+        // The limit counts the key *as written* — the quotes and the `\n` escapes are what the
+        // reader scans, not the raw key. So 1022 characters of key that needs quoting (its
+        // leading `-`) still rides its line at 1024 written, and one raw character more, and a
+        // key of exactly 1024 whose 24 line breaks take two characters each, do not.
+        let fits = format!("-{}", "k".repeat(1021));
+        let over = format!("-{}", "k".repeat(1022));
+        assert_eq!(y(json!({ fits.as_str(): 1 })), format!("\"{fits}\": 1"));
+        assert_eq!(y(json!({ over.as_str(): 1 })), format!("? \"{over}\"\n: 1"));
+        let breaks = format!("{}{}{}", "m".repeat(500), "\n".repeat(24), "n".repeat(500));
+        assert_eq!(
+            y(json!({ breaks.as_str(): 1 })),
+            format!(
+                "? \"{}{}{}\"\n: 1",
+                "m".repeat(500),
+                "\\n".repeat(24),
+                "n".repeat(500)
+            )
+        );
         // Top-level values of every shape.
         assert_eq!(y(json!([1, 2])), "- 1\n- 2");
         assert_eq!(y(json!({})), "{}");
@@ -1065,6 +1127,7 @@ mod tests {
     /// emitter writes around them.
     #[test]
     fn yaml_helper_round_trips_through_a_parser() {
+        let long_key = "k".repeat(1100);
         let cases = vec![
             json!(null),
             json!(true),
@@ -1108,6 +1171,34 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), json!(v)))
                 .collect(),
             ),
+            // A key past 1.1's simple-key length: a reader refuses the `:` that follows it,
+            // plain or quoted, so such a key cannot share its line with its value.
+            Value::Object(
+                [
+                    (long_key.clone(), 1),
+                    (long_key.clone() + " x", 2),
+                    ("k".repeat(1024), 3),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k, json!(v)))
+                .collect(),
+            ),
+            // …and the same key inside a block and as a list item's key.
+            json!({"m": {long_key.as_str(): {"deep": 1}}, "rows": [{ long_key.as_str(): [1, "x"] }]}),
+            // Keys at the boundary of the 1024-character limit *as written*: the two `-` keys
+            // are 1022 and 1023 raw and take quotes for their leading `-`, so it is the two
+            // quote characters that decide which side of the limit they land on; the third is
+            // 1024 raw but 1050 written, its 24 line breaks escaping to two characters each.
+            {
+                let mut keyed = serde_json::Map::new();
+                keyed.insert(format!("-{}", "k".repeat(1021)), json!(1));
+                keyed.insert(format!("-{}", "k".repeat(1022)), json!(2));
+                keyed.insert(
+                    format!("{}{}{}", "m".repeat(500), "\n".repeat(24), "n".repeat(500)),
+                    json!(3),
+                );
+                Value::Object(keyed)
+            },
             Value::Object(
                 [
                     ("int", "123"),
@@ -1118,6 +1209,9 @@ mod tests {
                     ("oct2", "0o17"),
                     ("bin", "0b101"),
                     ("sex", "1:2:3"),
+                    // 1.1's float resolver reads a sexagesimal with a fraction as a number.
+                    ("sex_f", "1:20.5"),
+                    ("sex_f2", "190:20:30.15"),
                     ("und", "1_000"),
                     ("dot", ".5"),
                     ("neg", "-3"),
@@ -1135,6 +1229,10 @@ mod tests {
                     ("ts2", "2026-11-07T10:00:00.5-05:00"),
                     ("merge", "<<"),
                     ("dots", "..."),
+                    // A document-end marker at the start of a line, and a plain key past the
+                    // 1.1 implicit-key length, both refused by a reader unquoted.
+                    ("dots_x", "... x"),
+                    ("long_key", long_key.as_str()),
                     ("dash", "- x"),
                     ("quest", "? q"),
                     ("cmt", "a #b"),
