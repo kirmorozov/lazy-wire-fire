@@ -54,8 +54,12 @@ House rules for commits, branches and pull requests on this repository.
 ## Vendored lazyview files
 
 The files listed in `vendor/lazyview.lock` are byte-for-byte copies of
-[lazyview](https://github.com/kirmorozov/lazyview) — `src/binlog.rs` (the
-binlog reader) and the view planner. Never edit the copies in this repo:
+[lazyview](https://github.com/kirmorozov/lazyview) — the binlog reader
+(`src/binlog.rs`), the commit fence (`src/fence.rs`), the integer key set
+(`src/intset.rs`) and the view planner (`src/analyze.rs`, `src/analyzer/`,
+`src/access.rs`, `src/catalog.rs`, `src/datum.rs`); the dedup core
+(`src/dedup/`) is in the copy set but not wired into the engine yet.
+Never edit the copies in this repo:
 
 - a fix lands in lazyview first;
 - then the copies are synced with `scripts/sync-lazyview.sh <commit>`, which
