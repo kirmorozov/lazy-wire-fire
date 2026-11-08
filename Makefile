@@ -6,7 +6,8 @@ IMAGE ?= lazywf:dev
 BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
 .PHONY: build release test test-roaring lint servers servers-down test-e2e test-e2e-all test-e2e-search \
-	test-e2e-queues test-matrix test-prerelease docker-smoke docker-e2e image-digests
+	test-e2e-queues test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
+	docker-smoke docker-e2e image-digests
 
 build:
 	$(CARGO) build
@@ -109,6 +110,41 @@ test-matrix:
 PRERELEASE := mariadb131-rc:34131 mariadb132-pre:34132
 test-prerelease:
 	@$(MAKE) --no-print-directory test-matrix MATRIX="$(PRERELEASE)"
+
+# Test coverage, informational (not a gate): the unit tests and the e2e suite (against $(E2E_DSN),
+# so `make servers` up) under one instrumented build with cargo-llvm-cov, pinned to 0.9.1. The two
+# --no-report runs accumulate their profile data; coverage-report turns it into one lcov file,
+# one HTML report (tmp/coverage/) and the summary table (scripts/coverage-summary.py).
+# CI installs the published 0.9.1 prebuilt binary (checksum verified); locally:
+# cargo install cargo-llvm-cov --version 0.9.1. CARGO_PROFILE_*_DEBUG=0: an instrumented build
+# with debug info does not fit a shared host; the coverage data is unaffected.
+COV_ENV := CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+# Two jobs for the instrumented build: it peaks in memory where the default 4 does not fit a
+# shared host (or a 16 GiB runner) with debug info; CARGO_PROFILE_*_DEBUG=0 is what lets it fit.
+coverage-unit coverage-e2e coverage-report: CARGO := CARGO_BUILD_JOBS=2 cargo
+
+coverage-unit:
+	$(COV_ENV) $(CARGO) llvm-cov --no-report --lib --bins
+
+coverage-e2e:
+	$(E2E_DB) $(COV_ENV) $(CARGO) llvm-cov --no-report --test e2e -- --test-threads=$(E2E_THREADS)
+
+coverage-report:
+	@mkdir -p tmp/coverage
+	$(COV_ENV) $(CARGO) llvm-cov report --lcov --output-path tmp/coverage/cov.lcov
+	# (report --html writes into <dir>/html)
+	$(COV_ENV) $(CARGO) llvm-cov report --html --output-dir tmp/coverage
+	$(COV_ENV) $(CARGO) llvm-cov report --json --output-path tmp/coverage/cov.json
+	@python3 scripts/coverage-summary.py tmp/coverage/cov.json vendor/lazyview.lock \
+	  | tee tmp/coverage/summary.md
+
+coverage:
+	@v=$$(cargo llvm-cov --version 2>/dev/null | awk '{print $$2}'); \
+	if [[ -z $$v ]]; then \
+	  echo "cargo-llvm-cov not found: cargo install cargo-llvm-cov --version 0.9.1 (CI uses the 0.9.1 prebuilt)" >&2; exit 1; \
+	fi; \
+	if [[ $$v != 0.9.1 ]]; then echo "note: cargo-llvm-cov $$v found, CI pins the 0.9.1 prebuilt" >&2; fi
+	$(MAKE) --no-print-directory coverage-unit coverage-e2e coverage-report
 
 # A loaded image, checked without a shell inside it: version, exit 2 without configuration,
 # user, entrypoint, health check, no shell. CI runs it on both platforms of every build.
