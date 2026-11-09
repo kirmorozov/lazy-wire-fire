@@ -1,5 +1,7 @@
-# Builds and tests share the host with other projects: keep cargo to 4 jobs.
-CARGO := CARGO_BUILD_JOBS=4 cargo
+# Builds and tests share the host with other projects: keep cargo to 4 jobs, unless
+# CARGO_BUILD_JOBS in the environment asks for fewer (or more).
+CARGO_BUILD_JOBS ?= 4
+CARGO := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) cargo
 COMPOSE := docker compose -f docker-compose.test.yml
 IMAGE ?= lazywf:dev
 # Keep in step with the FROM lines of the Dockerfile.
@@ -130,7 +132,9 @@ test-prerelease:
 COV_ENV := CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 # Two jobs for the instrumented build: it peaks in memory where the default 4 does not fit a
 # shared host (or a 16 GiB runner) with debug info; CARGO_PROFILE_*_DEBUG=0 is what lets it fit.
-coverage-unit coverage-e2e coverage-report: CARGO := CARGO_BUILD_JOBS=2 cargo
+# An explicit CARGO_BUILD_JOBS still wins over the 2, from the environment or the command line.
+COVERAGE_JOBS := $(if $(filter environment command line,$(origin CARGO_BUILD_JOBS)),$(CARGO_BUILD_JOBS),2)
+coverage-unit coverage-e2e coverage-report: CARGO := CARGO_BUILD_JOBS=$(COVERAGE_JOBS) cargo
 
 coverage-unit:
 	$(COV_ENV) $(CARGO) llvm-cov --no-report --lib --bins
