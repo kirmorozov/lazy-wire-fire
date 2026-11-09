@@ -339,7 +339,7 @@ jobs:
       - name: start MySQL 8.4, S3 and Redis, pull the emulators (in the background)
         run: |
           docker compose up -d --quiet-pull mysql84 s3 redis
-          nohup docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp --profile kafka --profile eventbridge pull --quiet elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka moto > pull.log 2>&1 &
+          nohup docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp --profile kafka --profile eventbridge --profile sns pull --quiet elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka moto > pull.log 2>&1 &
       - name: rust ${{ env.RUST_TOOLCHAIN }}
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
@@ -360,14 +360,14 @@ jobs:
       - name: summary
         if: always()
         run: |
-          scripts/ci-summary.sh report "Queues: ElasticMQ (SQS), kinesis-mock, RabbitMQ (AMQP), Pub/Sub emulator, Mailpit (SMTP), Redpanda (kafka), moto (EventBridge)" e2e.log versions.md \
+          scripts/ci-summary.sh report "Queues: ElasticMQ (SQS), kinesis-mock, RabbitMQ (AMQP), Pub/Sub emulator, Mailpit (SMTP), Redpanda (kafka), moto (EventBridge, SNS)" e2e.log versions.md \
             >> "$GITHUB_STEP_SUMMARY"
       - name: collect server logs
         if: failure()
         run: |
           mkdir -p server-logs
           cp pull.log server-logs/ 2>/dev/null || true
-          docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp --profile kafka --profile eventbridge logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
+          docker compose --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp --profile kafka --profile eventbridge --profile sns logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

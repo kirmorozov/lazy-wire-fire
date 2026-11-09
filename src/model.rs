@@ -128,6 +128,8 @@ pub enum Kind {
     Lambda,
     /// Amazon EventBridge `PutEvents` (one request per action, an answer per entry).
     EventBridge,
+    /// Amazon SNS `PublishBatch` (one request per action, an answer per entry; see `sns.rs`).
+    Sns,
     /// RabbitMQ: one publish with a confirm per action (see `amqp.rs`).
     Amqp,
     /// SMTP: one mail per action (see `smtp.rs`).
@@ -154,6 +156,7 @@ impl Kind {
             "kinesis" => Kind::Kinesis,
             "lambda" => Kind::Lambda,
             "eventbridge" => Kind::EventBridge,
+            "sns" => Kind::Sns,
             "amqp" => Kind::Amqp,
             "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
@@ -162,7 +165,7 @@ impl Kind {
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
             ),
         })
     }
@@ -186,6 +189,7 @@ impl Kind {
             Kind::Kinesis => "kinesis",
             Kind::Lambda => "lambda",
             Kind::EventBridge => "eventbridge",
+            Kind::Sns => "sns",
             Kind::Amqp => "amqp",
             Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
@@ -201,7 +205,7 @@ impl Kind {
     pub fn reports_items(self) -> bool {
         matches!(
             self,
-            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka | Kind::EventBridge
+            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka | Kind::EventBridge | Kind::Sns
         )
     }
 
@@ -213,6 +217,7 @@ impl Kind {
             Kind::Sqs
                 | Kind::Kinesis
                 | Kind::EventBridge
+                | Kind::Sns
                 | Kind::Amqp
                 | Kind::Smtp
                 | Kind::PubSub
@@ -232,6 +237,10 @@ impl Kind {
             // PutEvents: 1 MB is the limit for the sum of the entries; the rendered request
             // carries the JSON around them, so it is the text that is measured (aws::EVENTBRIDGE_MAX_BYTES).
             Kind::EventBridge => Some(crate::aws::EVENTBRIDGE_MAX_BYTES),
+            // PublishBatch: 256 KiB is the default for one message and for the sum of the
+            // batch; `vars.maximum_message_size` raises it to the topic's
+            // `MaximumMessageSize` (see `Target::batch_bytes_limit`).
+            Kind::Sns => Some(crate::aws::SNS_MAX_BYTES),
             // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
             // (see `Target::batch_bytes_limit`).
             Kind::Kafka => Some(crate::kafka::MESSAGE_MAX_BYTES),
@@ -256,9 +265,12 @@ impl Kind {
             Kind::HttpBasic => &["password", "sign_secret_ref"],
             Kind::HttpBearer => &["token", "sign_secret_ref"],
             Kind::HttpHeader => &["value", "sign_secret_ref"],
-            Kind::HttpS3 | Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::EventBridge => {
-                &["access_key_ref", "secret_key_ref", "session_token_ref"]
-            }
+            Kind::HttpS3
+            | Kind::Sqs
+            | Kind::Kinesis
+            | Kind::Lambda
+            | Kind::EventBridge
+            | Kind::Sns => &["access_key_ref", "secret_key_ref", "session_token_ref"],
             Kind::PubSub => &["credentials_ref"],
             Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka => {
                 &["password"]
@@ -458,6 +470,21 @@ impl TargetDef {
                 refuse_vars(&vars, &["region", "event_bus_name", "event_bus_arn"], kind, "the region and the event bus go in the endpoint: aws-eventbridge://[<region>/]<event-bus-name-or-arn>")?;
                 aws_refs(&vars)?;
             }
+            Kind::Sns => {
+                // `aws-sns://[<region>/]<account-id>/<topic-name>`: account, topic and region are
+                // in the URL; the ARN is built from them (as SqsUrl builds the queue URL).
+                match endpoints.as_slice() {
+                    [url] => {
+                        aws::SnsUrl::parse(url)?;
+                    }
+                    _ => bail!(
+                        "kind sns takes exactly one endpoint: aws-sns://[<region>/]<account-id>/<topic-name>"
+                    ),
+                }
+                refuse_vars(&vars, &["region", "account_id", "topic_name", "topic_arn"], kind, "the region, the account and the topic go in the endpoint: aws-sns://[<region>/]<account-id>/<topic-name>")?;
+                crate::sns::check_vars(&vars)?;
+                aws_refs(&vars)?;
+            }
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
@@ -479,14 +506,14 @@ impl TargetDef {
         }
         if !matches!(
             kind,
-            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::EventBridge
+            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::EventBridge | Kind::Sns
         ) {
             if let Some(e) = endpoints
                 .iter()
                 .find(|e| crate::aws::scheme_of(e).is_some_and(|s| s.starts_with("aws-")))
             {
                 bail!(
-                    "`{e}` is an endpoint of kind sqs, kinesis, lambda or eventbridge, not of kind {}",
+                    "`{e}` is an endpoint of kind sqs, kinesis, lambda, eventbridge or sns, not of kind {}",
                     kind.name()
                 );
             }
@@ -1371,6 +1398,101 @@ mod aws_endpoint_tests {
         assert!(TargetDef::from_row(&row("http", Some("aws-eventbridge://orders"), "{}")).is_err());
     }
 
+    const TOPIC: &str = "aws-sns://eu-west-1/123456789012/orders";
+
+    #[test]
+    fn sns_accepts_the_url_forms_with_references() {
+        let t = TargetDef::from_row(&row("sns", Some(TOPIC), &format!("{{{CREDS}}}"))).unwrap();
+        assert_eq!(t.kind, Kind::Sns);
+        assert_eq!(t.endpoints, vec![TOPIC.to_string()]);
+        assert_eq!(t.template_vars(), serde_json::json!({}));
+        let ok = |url: &str| TargetDef::from_row(&row("sns", Some(url), "{}")).is_ok();
+        assert!(ok("aws-sns://123456789012/orders"));
+        assert!(ok(
+            "aws-sns://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34569"
+        ));
+        // a FIFO topic by its name, and the name's `_` and `-`
+        assert!(ok("aws-sns://eu-west-1/123456789012/orders.fifo"));
+        assert!(ok("aws-sns://eu-west-1/123456789012/orders_events-1"));
+        // the topic's MaximumMessageSize, stated for the batch's byte limit: an ordinary var, so
+        // a template can read it too
+        let t = TargetDef::from_row(&row(
+            "sns",
+            Some(TOPIC),
+            r#"{"maximum_message_size":1048576}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            t.template_vars(),
+            serde_json::json!({"maximum_message_size": 1048576})
+        );
+    }
+
+    #[test]
+    fn sns_refuses_bad_endpoints_and_vars() {
+        let ok = "{}";
+        assert!(TargetDef::from_row(&row("sns", None, ok)).is_err());
+        assert!(TargetDef::from_row(&row("sns", Some(&format!("{TOPIC},{TOPIC}")), ok)).is_err());
+        // the scheme, and no plain service URL, no other aws- scheme
+        assert!(
+            TargetDef::from_row(&row("sns", Some("https://sns.eu-west-1.amazonaws.com"), ok))
+                .is_err()
+        );
+        assert!(TargetDef::from_row(&row("sns", Some(QUEUE), ok)).is_err());
+        // the account, the topic and the region are in the endpoint, not in vars
+        for v in [
+            r#"{"region":"eu-west-1"}"#,
+            r#"{"account_id":"123456789012"}"#,
+            r#"{"topic_name":"orders"}"#,
+            r#"{"topic_arn":"arn:aws:sns:eu-west-1:123456789012:orders"}"#,
+        ] {
+            assert!(
+                TargetDef::from_row(&row("sns", Some(TOPIC), v)).is_err(),
+                "{v}"
+            );
+        }
+        // the endpoint: the account is twelve digits, the topic name is a topic name
+        for url in [
+            "aws-sns://eu-west-1/12345678901/orders",
+            "aws-sns://eu-west-1/123456789012x/orders",
+            "aws-sns://eu-west-1/123456789012/",
+            "aws-sns://eu-west-1/123456789012/order.s",
+            "aws-sns://eu-west-1/123456789012/orders.fif",
+            "aws-sns://eu-west-1/123456789012/ord ers",
+            "aws-sns://eu-west-1/123456789012",
+        ] {
+            assert!(
+                TargetDef::from_row(&row("sns", Some(url), ok)).is_err(),
+                "{url}"
+            );
+        }
+        // MaximumMessageSize: what a topic can hold, no more
+        for v in [
+            r#"{"maximum_message_size":0}"#,
+            r#"{"maximum_message_size":1048577}"#,
+            r#"{"maximum_message_size":"262144"}"#,
+            r#"{"maximum_message_size":null}"#,
+        ] {
+            assert!(
+                TargetDef::from_row(&row("sns", Some(TOPIC), v)).is_err(),
+                "{v}"
+            );
+        }
+        // userinfo and literal credentials are refused
+        assert!(
+            TargetDef::from_row(&row("sns", Some("aws-sns://u:p@123456789012/orders"), ok))
+                .is_err()
+        );
+        assert!(TargetDef::from_row(&row(
+            "sns",
+            Some(TOPIC),
+            r#"{"access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
+        ))
+        .is_err());
+        // the other kinds refuse an aws-sns:// endpoint
+        assert!(TargetDef::from_row(&row("http", Some(TOPIC), "{}")).is_err());
+    }
+
     #[test]
     fn kind_properties() {
         assert_eq!(Kind::parse("kinesis").unwrap(), Kind::Kinesis);
@@ -1384,6 +1506,12 @@ mod aws_endpoint_tests {
         assert!(Kind::EventBridge.append_only());
         assert_eq!(Kind::EventBridge.batch_bytes_limit(), Some(1_048_576));
         assert!(Kind::EventBridge.is_http());
+        assert_eq!(Kind::parse("sns").unwrap(), Kind::Sns);
+        assert_eq!(Kind::Sns.name(), "sns");
+        assert!(Kind::Sns.reports_items());
+        assert!(Kind::Sns.append_only());
+        assert_eq!(Kind::Sns.batch_bytes_limit(), Some(262_144));
+        assert!(Kind::Sns.is_http());
     }
 
     #[test]

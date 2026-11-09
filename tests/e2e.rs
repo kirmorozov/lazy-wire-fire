@@ -6057,9 +6057,10 @@ impl Moto {
             .unwrap_or(0)
     }
 
-    /// The event envelopes of the queue, each message received once (received messages stay
-    /// hidden): what the rule with its SQS target delivered.
-    async fn drain(&self, url: &str) -> Vec<Value> {
+    /// The messages of the queue as the service holds them, each received once (received
+    /// messages stay hidden): `Body` as written and the attributes (`MessageGroupId` and
+    /// `MessageDeduplicationId` of a FIFO subscription among them).
+    async fn receive(&self, url: &str) -> Vec<Value> {
         let mut out = Vec::new();
         loop {
             let v = self
@@ -6077,11 +6078,18 @@ impl Moto {
             if got.is_empty() {
                 return out;
             }
-            out.extend(
-                got.iter()
-                    .map(|m| serde_json::from_str(m["Body"].as_str().unwrap()).unwrap()),
-            );
+            out.extend(got);
         }
+    }
+
+    /// The event envelopes of the queue, each message received once (received messages stay
+    /// hidden): what the rule with its SQS target delivered.
+    async fn drain(&self, url: &str) -> Vec<Value> {
+        self.receive(url)
+            .await
+            .iter()
+            .map(|m| serde_json::from_str(m["Body"].as_str().unwrap()).unwrap())
+            .collect()
     }
 }
 
@@ -6215,5 +6223,457 @@ async fn eventbridge_refuses_a_bad_entry_and_delivers_the_good_ones() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["1", "2", "3"], "the good entries went through");
+    inst.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// `sns` targets, against moto (`LAZYWF_TEST_SNS`, e.g. http://127.0.0.1:34569; the `sns` compose
+// profile). One action is one `PublishBatch` in the query protocol: a form body whose entries are
+// `PublishBatchRequestEntries.member.<n>.<Field>` with `n` from 1 (`{{add @index 1}}`), and an XML
+// answer that says per entry what happened. The topic is read back the way AWS delivers: a
+// subscription of an SQS queue on the topic, the queue drained through the SQS API, which gives
+// the notification envelope with the published message in its `Message` field.
+
+const SNS_PUBLISH_BATCH: &str = r#"POST / HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}}{{#each docs}}&PublishBatchRequestEntries.member.{{add @index 1}}.Id={{@index}}&PublishBatchRequestEntries.member.{{add @index 1}}.Message={{url_encode (json doc)}}{{/each}}"#;
+
+/// The same, for a FIFO topic: every entry carries the key as its `MessageGroupId` and the row's
+/// `version` as its `MessageDeduplicationId` (both required of a FIFO topic's messages).
+const SNS_PUBLISH_FIFO: &str = r#"POST / HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}}{{#each docs}}&PublishBatchRequestEntries.member.{{add @index 1}}.Id={{@index}}&PublishBatchRequestEntries.member.{{add @index 1}}.Message={{url_encode (json doc)}}&PublishBatchRequestEntries.member.{{add @index 1}}.MessageGroupId={{url_encode key}}&PublishBatchRequestEntries.member.{{add @index 1}}.MessageDeduplicationId={{url_encode doc.version}}{{/each}}"#;
+
+/// The same without the `MessageGroupId`, which a FIFO topic requires: the target is to refuse it
+/// before the request goes out (`sns::entries_ok`).
+const SNS_PUBLISH_NO_GROUP: &str = r#"POST / HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}}{{#each docs}}&PublishBatchRequestEntries.member.{{add @index 1}}.Id={{@index}}&PublishBatchRequestEntries.member.{{add @index 1}}.Message={{url_encode (json doc)}}&PublishBatchRequestEntries.member.{{add @index 1}}.MessageDeduplicationId={{url_encode doc.version}}{{/each}}"#;
+
+fn sns_root() -> Option<String> {
+    std::env::var("LAZYWF_TEST_SNS")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+macro_rules! need_sns {
+    () => {
+        match sns_root() {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "LAZYWF_TEST_SNS not set: skipping (docker compose --profile sns up -d moto)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+impl Moto {
+    /// One call of the query protocol (`Action=…&Version=…`, the `param.n` notation), which is
+    /// how the SNS API documents itself; the status and the answer's text. The values of these
+    /// calls hold no `&` or `=`, so they go in as they are.
+    async fn query(&self, service: &str, params: &[(String, String)]) -> (u16, String) {
+        let mut pairs: Vec<String> = Vec::new();
+        for (k, v) in params {
+            pairs.push(format!("{k}={v}"));
+        }
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: pairs.join("&").into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header(
+            "Content-Type",
+            "application/x-www-form-urlencoded".to_string(),
+        );
+        req.set_header(
+            "Authorization",
+            format!("AWS4-HMAC-SHA256 Credential=lazywf/20260101/us-east-1/{service}/aws4_request, SignedHeaders=content-type;host, Signature=00"),
+        );
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(10))
+            .await
+            .unwrap();
+        (
+            resp.status,
+            String::from_utf8_lossy(&resp.body).into_owned(),
+        )
+    }
+
+    async fn sns(&self, action: &str, params: &[(&str, &str)]) -> String {
+        let mut pairs: Vec<(String, String)> = vec![
+            ("Action".to_string(), action.to_string()),
+            ("Version".to_string(), "2010-03-31".to_string()),
+        ];
+        pairs.extend(params.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let (status, xml) = self.query("sns", &pairs).await;
+        assert_eq!(status, 200, "SNS {action}: {xml}");
+        xml
+    }
+
+    /// The text of the first `<tag>…</tag>` of an answer.
+    fn tag(xml: &str, name: &str) -> String {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let from = xml
+            .find(&open)
+            .unwrap_or_else(|| panic!("no {open} in {xml}"))
+            + open.len();
+        let end = xml[from..]
+            .find(&close)
+            .unwrap_or_else(|| panic!("no {close} in {xml}"));
+        xml[from..from + end].to_string()
+    }
+
+    /// Creates the topic (a FIFO one when `name` ends in `.fifo`) and returns its ARN.
+    async fn create_topic(&self, name: &str) -> String {
+        let mut params: Vec<(&str, &str)> = vec![("Name", name)];
+        if name.ends_with(".fifo") {
+            params.push(("Attributes.entry.1.key", "FifoTopic"));
+            params.push(("Attributes.entry.1.value", "true"));
+        }
+        let xml = self.sns("CreateTopic", &params).await;
+        Self::tag(&xml, "TopicArn")
+    }
+
+    /// Creates the queue (FIFO when `fifo`) and returns its URL, as the read-back of a topic.
+    async fn create_queue(&self, name: &str, fifo: bool) -> String {
+        let body = if fifo {
+            json!({"QueueName": name, "Attributes": {"FifoQueue": "true", "ContentBasedDeduplication": "true"}})
+        } else {
+            json!({"QueueName": name})
+        };
+        self.sqs("CreateQueue", body).await;
+        format!("{}/123456789012/{name}", self.root)
+    }
+
+    /// Subscribes the queue (by its ARN) to the topic: what AWS then delivers to the queue.
+    async fn subscribe(&self, topic_arn: &str, queue_arn: &str) {
+        self.sns(
+            "Subscribe",
+            &[
+                ("TopicArn", topic_arn),
+                ("Protocol", "sqs"),
+                ("Endpoint", queue_arn),
+            ],
+        )
+        .await;
+    }
+
+    /// The topic with one queue subscribed to it: the ARN (what the target publishes to) and the
+    /// queue URL (what the test drains).
+    async fn pipe_topic(&self, topic: &str, queue: &str, fifo: bool) -> (String, String) {
+        let arn = self.create_topic(topic).await;
+        let url = self.create_queue(queue, fifo).await;
+        self.subscribe(&arn, &format!("arn:aws:sqs:us-east-1:123456789012:{queue}"))
+            .await;
+        (arn, url)
+    }
+}
+
+fn sns_vars(extra: Option<(&str, Value)>) -> String {
+    std::env::set_var("LWF_TEST_SNS_AK", "lazywf");
+    std::env::set_var("LWF_TEST_SNS_SK", "lazywfsecret");
+    let mut vars = json!({"access_key_ref": "env:LWF_TEST_SNS_AK",
+                          "secret_key_ref": "env:LWF_TEST_SNS_SK"});
+    if let Some((k, v)) = extra {
+        vars.as_object_mut().unwrap().insert(k.into(), v);
+    }
+    vars.to_string()
+}
+
+/// A customers table (with `rev` and a `payload`) and the rule `topic` that publishes each
+/// changed row to `topic` (one PublishBatch per flush, `batch_max_keys` at the documented
+/// maximum of 10). `extra` adds target vars (a raised `maximum_message_size`).
+async fn sns_rule(
+    db: &Db,
+    root: &str,
+    topic: &str,
+    template: &str,
+    selects: &str,
+    extra: Option<(&str, Value)>,
+) {
+    db.exec(
+        "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL, payload MEDIUMTEXT NULL)",
+    )
+    .await;
+    tables(db).await;
+    db.target(
+        "topic",
+        "sns",
+        &format!("aws-sns://us-east-1/123456789012/{topic}?endpoint={root}"),
+        Some("JSON_EXTRACT(body, '$.MessageId') IS NOT NULL"),
+        &sns_vars(extra),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('topic', 'topic', 'batch', 10, ?, ?, 100)",
+        (selects, template),
+    )
+    .await;
+    db.trigger("topic", "customers", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// The documents of the messages the queue holds, in key order: what a subscription of the topic
+/// delivered, each message received once. A message is the document, as the template published it.
+async fn published(moto: &Moto, url: &str) -> Vec<Value> {
+    let mut docs: Vec<Value> = moto
+        .drain(url)
+        .await
+        .iter()
+        .map(|e| {
+            let message = e["Message"].as_str().unwrap_or_default();
+            serde_json::from_str(message)
+                .unwrap_or_else(|e| panic!("the message is not the document: {message}: {e}"))
+        })
+        .collect();
+    docs.sort_by_key(|d| d["id"].as_i64().unwrap_or(0));
+    docs
+}
+
+/// The documents of the FIFO messages the queue holds, with what the subscription carried of
+/// each: `(document, MessageGroupId, MessageDeduplicationId)`, in key order.
+async fn published_fifo(moto: &Moto, url: &str) -> Vec<(Value, String, String)> {
+    let mut docs: Vec<(Value, String, String)> = moto
+        .receive(url)
+        .await
+        .iter()
+        .map(|e| {
+            let envelope = e["Body"].as_str().unwrap_or_default();
+            let envelope: Value = serde_json::from_str(envelope)
+                .unwrap_or_else(|err| panic!("the body is not a notification: {envelope}: {err}"));
+            let message = envelope["Message"].as_str().unwrap_or_default();
+            (
+                serde_json::from_str(message).unwrap_or_else(|err| {
+                    panic!("the message is not the document: {message}: {err}")
+                }),
+                e["Attributes"]["MessageGroupId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                e["Attributes"]["MessageDeduplicationId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    docs.sort_by_key(|(d, _, _)| d["id"].as_i64().unwrap_or(0));
+    docs
+}
+
+/// Every changed key arrives once, as a message of the topic: the document is the message, read
+/// back through the SQS subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sns_every_changed_key_arrives_as_a_message() {
+    let root = need_db!();
+    let endpoint = need_sns!();
+    let moto = Moto::new(&endpoint).await;
+    let topic = format!("lwf-sns-every-{}", std::process::id());
+    let queue = topic.replace('-', "_");
+    let db = Db::fresh(&root, "sns_every").await;
+    let (_arn, url) = moto.pipe_topic(&topic, &queue, false).await;
+    sns_rule(
+        &db,
+        &endpoint,
+        &topic,
+        SNS_PUBLISH_BATCH,
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+        None,
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec(
+        "INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy'),(4,'Di'),(5,'Ed')",
+    )
+    .await;
+    wait_for(Duration::from_secs(20), "five messages", || async {
+        (moto.count(&url).await == 5).then_some(())
+    })
+    .await;
+    sleep_ms(2000).await;
+    assert_eq!(moto.count(&url).await, 5, "a key was sent twice");
+    let names = ["Ann", "Bob", "Cy", "Di", "Ed"];
+    let docs = published(&moto, &url).await;
+    assert_eq!(docs.len(), 5);
+    for (i, d) in docs.iter().enumerate() {
+        assert_eq!(
+            *d,
+            json!({"id": i as i64 + 1, "name": names[i]}),
+            "the message is the document of its key"
+        );
+    }
+    assert!(
+        db.status("topic").await.and_then(|s| s.3).is_none(),
+        "accepted entries left an error"
+    );
+    inst.stop().await;
+}
+
+/// One message of a batch is larger than the topic takes (its document holds a 300 KB `payload`):
+/// the service refuses that entry (`InvalidParameter`: Message too long) while the other entries
+/// of the same request are delivered, and only the refused key drops. The target states the
+/// topic's `MaximumMessageSize` as 1 MiB, which is what lets the large message be sent at all; the
+/// topic's own attribute is the default 256 KiB, so it is the service's answer that ends that key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sns_batch_with_one_message_too_long_refuses_only_that_key() {
+    let root = need_db!();
+    let endpoint = need_sns!();
+    let moto = Moto::new(&endpoint).await;
+    let topic = format!("lwf-sns-long-{}", std::process::id());
+    let queue = topic.replace('-', "_");
+    let db = Db::fresh(&root, "sns_long").await;
+    let (_arn, url) = moto.pipe_topic(&topic, &queue, false).await;
+    sns_rule(
+        &db,
+        &endpoint,
+        &topic,
+        SNS_PUBLISH_BATCH,
+        "SELECT c.id AS _key, c.id, c.name, c.payload FROM customers c WHERE c.id IN (:keys)",
+        Some(("maximum_message_size", json!(1_048_576))),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // Key 4 is the one whose message is over the topic's 256 KiB.
+    db.exec(
+        "INSERT INTO customers (id, name, payload) VALUES \
+         (1,'Ann','a'),(2,'Bob','b'),(3,'Cy','c'),(4,'Di',REPEAT('x',300000))",
+    )
+    .await;
+    wait_for(Duration::from_secs(30), "three messages", || async {
+        (moto.count(&url).await == 3).then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(30), "the refused entry", || async {
+        db.status("topic")
+            .await
+            .and_then(|s| s.3)
+            .filter(|e| e.contains("Message too long"))
+            .map(|_| ())
+    })
+    .await;
+    sleep_ms(2000).await;
+    assert_eq!(moto.count(&url).await, 3, "the refused key was sent");
+    let ids: Vec<i64> = published(&moto, &url)
+        .await
+        .iter()
+        .map(|d| d["id"].as_i64().unwrap_or(0))
+        .collect();
+    assert_eq!(ids, [1, 2, 3], "the good entries went through");
+    inst.stop().await;
+}
+
+/// A FIFO topic: every entry carries its `MessageGroupId` (the key) and its
+/// `MessageDeduplicationId` (the row's `version`), and the batch goes out and arrives once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sns_fifo_topic_delivers_each_key_once() {
+    let root = need_db!();
+    let endpoint = need_sns!();
+    let moto = Moto::new(&endpoint).await;
+    let topic = format!("lwf-sns-fifo-{}.fifo", std::process::id());
+    let queue = topic.replace('-', "_");
+    let db = Db::fresh(&root, "sns_fifo").await;
+    let (_arn, url) = moto.pipe_topic(&topic, &queue, true).await;
+    sns_rule(
+        &db,
+        &endpoint,
+        &topic,
+        SNS_PUBLISH_FIFO,
+        "SELECT c.id AS _key, c.id, c.name, c.rev AS version FROM customers c WHERE c.id IN (:keys)",
+        None,
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // Every row has its own version: the emulator's FIFO queue deduplicates by
+    // `MessageDeduplicationId` alone, where AWS scopes the dedup to the message group (the key),
+    // so four rows at version 1 would arrive as one message here. Distinct versions are what a
+    // stream of updates holds anyway, and they let the test tell the group from the dedup id.
+    db.exec(
+        "INSERT INTO customers (id, name, rev) VALUES (1,'Ann',7),(2,'Bob',8),(3,'Cy',9),(4,'Di',10)",
+    )
+    .await;
+    wait_for(Duration::from_secs(20), "four messages", || async {
+        (moto.count(&url).await == 4).then_some(())
+    })
+    .await;
+    sleep_ms(2000).await;
+    assert_eq!(moto.count(&url).await, 4, "a key was sent twice");
+    let names = ["Ann", "Bob", "Cy", "Di"];
+    let got = published_fifo(&moto, &url).await;
+    for (i, (doc, group, dedup)) in got.iter().enumerate() {
+        let key = i as i64 + 1;
+        assert_eq!(
+            *doc,
+            json!({"id": key, "name": names[i], "version": 6 + key}),
+            "the message is the document of its key"
+        );
+        // What the two fields of the entry are for: the key keeps the messages of one row in
+        // order, the row's version is what a redelivery of the same change is deduplicated by.
+        assert_eq!(
+            group,
+            &key.to_string(),
+            "the group of a FIFO entry is its key"
+        );
+        assert_eq!(
+            dedup,
+            &(6 + key).to_string(),
+            "the dedup id of a FIFO entry is the row's version"
+        );
+    }
+    assert!(
+        db.status("topic").await.and_then(|s| s.3).is_none(),
+        "accepted entries left an error"
+    );
+    inst.stop().await;
+}
+
+/// A FIFO entry without its `MessageGroupId` is refused where it is rendered, before the request
+/// goes out: the status names the field, and nothing reaches the topic (a request that went out
+/// would answer `InvalidParameter` instead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sns_fifo_entry_without_a_group_id_is_refused_before_it_is_sent() {
+    let root = need_db!();
+    let endpoint = need_sns!();
+    let moto = Moto::new(&endpoint).await;
+    let topic = format!("lwf-sns-nogroup-{}.fifo", std::process::id());
+    let queue = topic.replace('-', "_");
+    let db = Db::fresh(&root, "sns_nogroup").await;
+    let (_arn, url) = moto.pipe_topic(&topic, &queue, true).await;
+    sns_rule(
+        &db,
+        &endpoint,
+        &topic,
+        SNS_PUBLISH_NO_GROUP,
+        "SELECT c.id AS _key, c.id, c.name, c.rev AS version FROM customers c WHERE c.id IN (:keys)",
+        None,
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1)")
+        .await;
+    wait_for(Duration::from_secs(30), "the refusal", || async {
+        db.status("topic")
+            .await
+            .and_then(|s| s.3)
+            .filter(|e| e.contains("MessageGroupId"))
+            .map(|_| ())
+    })
+    .await;
+    let error = db.status("topic").await.and_then(|s| s.3).unwrap();
+    assert!(
+        error.contains("non-empty value"),
+        "the refusal says what is missing: {error}"
+    );
+    assert_eq!(moto.count(&url).await, 0, "a refused batch was sent");
     inst.stop().await;
 }

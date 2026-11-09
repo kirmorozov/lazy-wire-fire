@@ -203,7 +203,9 @@ pub fn uri_encode(s: &str, encode_slash: bool) -> String {
     out
 }
 
-fn percent_decode(s: &str) -> String {
+/// A percent-decoded (`%XX`, and `+` as a space) piece of a URL or a form body. `sns` reads its
+/// rendered batch this way (`crate::sns::form_pairs`).
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -642,6 +644,94 @@ impl EventBridgeUrl {
     }
 }
 
+// ---- `aws-sns://` endpoints ----
+//
+// `aws-sns://[<region>/]<account-id>/<topic-name>`, with the usual optional `?endpoint=`
+// (emulators). `PublishBatch` is a query-protocol call to the service root
+// (`Action=PublishBatch&Version=2010-03-31`, the `param.n` notation with `n` from 1), so nothing
+// in the URL is a path: the topic is named by its ARN, as `SqsUrl` names the queue URL. SigV4
+// signs with service `sns`, the host is `sns.<region>.amazonaws.com`.
+// Source: PublishBatch API (docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html).
+
+/// The most entries a PublishBatch request takes: 10 ("Publishes up to 10 messages to the
+/// specified topic in a single batch"; more is `TooManyEntriesInBatchRequest`). Source:
+/// docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html
+pub const SNS_MAX_ENTRIES: usize = 10;
+
+/// The default largest individual message and the default largest total payload of one
+/// PublishBatch (the sum of the lengths of the batched messages): 256 KiB. Source: the same
+/// page: "By default, the maximum allowed individual message size and the maximum total payload
+/// size … are both 256 KiB (262,144 bytes)".
+pub const SNS_MAX_BYTES: usize = 262_144;
+
+/// The most a topic's `MaximumMessageSize` raises those two: 1 MiB (the same page). A topic
+/// attribute, so `vars.maximum_message_size` states it for the target and raises the load-time
+/// check with it, as kafka's `vars.message_max_bytes` does.
+pub const SNS_MAX_MESSAGE_SIZE: usize = 1_048_576;
+
+/// An `aws-sns://` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnsUrl {
+    pub region: Option<String>,
+    pub account: String,
+    pub topic: String,
+    /// `?endpoint=`, as written (a validated http(s) URL).
+    pub endpoint: Option<String>,
+}
+
+impl SnsUrl {
+    /// `aws-sns://<account-id>/<topic-name>` or
+    /// `aws-sns://<region>/<account-id>/<topic-name>`.
+    pub fn parse(url: &str) -> Result<SnsUrl> {
+        let shown = crate::secrets::redact_url(url);
+        let (segs, endpoint) = split_aws_url(url, "sns")?;
+        let (region, account, topic) = match segs.as_slice() {
+            [a, t] => (None, a, t),
+            [r, a, t] => (Some(r), a, t),
+            _ => bail!(
+                "`{shown}`: kind sns takes `aws-sns://<account-id>/<topic-name>` or `aws-sns://<region>/<account-id>/<topic-name>`"
+            ),
+        };
+        if let Some(r) = region {
+            if !valid_region(r) {
+                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+            }
+        }
+        if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("`{shown}`: the account id is twelve digits");
+        }
+        // A topic name is 1 to 256 letters, digits, `_` or `-`; a FIFO topic's name ends in
+        // `.fifo` (CreateTopic, Name; docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html).
+        let stem = topic.strip_suffix(".fifo").unwrap_or(topic);
+        let name_ok = !stem.is_empty()
+            && topic.len() <= 256
+            && stem
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+        if !name_ok {
+            bail!("`{shown}`: the topic name is 1 to 256 letters, digits, `-` or `_`, optionally ending in `.fifo`");
+        }
+        Ok(SnsUrl {
+            region: region.cloned(),
+            account: account.clone(),
+            topic: topic.clone(),
+            endpoint,
+        })
+    }
+
+    /// A FIFO topic: its name ends in `.fifo`.
+    pub fn fifo(&self) -> bool {
+        self.topic.ends_with(".fifo")
+    }
+
+    /// The topic's ARN, as `PublishBatch`'s `TopicArn` takes it:
+    /// `arn:aws:sns:<region>:<account-id>:<topic-name>` (CreateTopic returns exactly this form,
+    /// with no `topic/` resource prefix before the name).
+    pub fn arn(&self, region: &str) -> String {
+        format!("arn:aws:sns:{region}:{}:{}", self.account, self.topic)
+    }
+}
+
 // ---- `aws-lambda://` endpoints ----
 //
 // `aws-lambda://[<region>/]<function-name>[:<qualifier>]`, with `?invocation=sync` (the default,
@@ -998,9 +1088,12 @@ pub fn config_region(text: &str, profile: &str) -> Option<String> {
     None
 }
 
-/// The error code of an AWS JSON-protocol answer: the `x-amzn-ErrorType` header, else the
-/// `__type` field of a JSON body. The namespace (`com.amazonaws.sqs#`) and any `:<uri>` suffix
-/// are dropped.
+/// The error code of an AWS answer: the `x-amzn-ErrorType` header, else the `__type` field of a
+/// JSON body, else the `<Code>` of the query protocol's error document (which carries no
+/// `x-amzn-ErrorType` header at all: SNS and SQS answer a refusal as
+/// `<ErrorResponse><Error><Code>Throttling</Code>…`). Without the last one a throttled batch
+/// request would read as a refusal of its keys rather than as "not now". The namespace
+/// (`com.amazonaws.sqs#`) and any `:<uri>` suffix are dropped.
 pub fn error_code(headers: &[(String, String)], body: &[u8]) -> Option<String> {
     let raw = headers
         .iter()
@@ -1012,8 +1105,24 @@ pub fn error_code(headers: &[(String, String)], body: &[u8]) -> Option<String> {
                 .get("__type")?
                 .as_str()
                 .map(str::to_string)
-        })?;
+        })
+        .or_else(|| query_error_code(body))?;
     let code = raw.split(':').next()?.rsplit('#').next()?.trim();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+/// The `<Code>` of the query protocol's error document, whose text the code is a word of
+/// (`NotFound`, `Throttling`): the first `<Code>` inside the `<Error>` element is it. Only a
+/// document that opens an `<Error>` element counts, so the `Code` of a `BatchResultErrorEntry`
+/// in an answer that succeeded is not read as one. Source: AWS General Reference, errors of the
+/// query protocol (docs.aws.amazon.com/general/latest/gr/query-error-responses.html).
+fn query_error_code(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let start = text.find("<Error")?;
+    let text = &text[start..];
+    let open = text.find("<Code>")? + "<Code>".len();
+    let close = text[open..].find("</Code>")?;
+    let code = text[open..open + close].trim();
     (!code.is_empty()).then(|| code.to_string())
 }
 
@@ -1024,6 +1133,11 @@ pub fn error_code(headers: &[(String, String)], body: &[u8]) -> Option<String> {
 /// `RequestThrottled` (SQS SendMessageBatch, HTTP 400: "The request was denied due to request
 /// throttling. Exceeds the permitted request rate for the queue or for the recipient of the
 /// request."). Source: docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
+/// `InternalError` ("Indicates an internal service error") and `KMSThrottling` ("The request was
+/// denied due to request throttling") are the two of SNS `PublishBatch` that answer with a code
+/// of their own rather than one of the common ones, and its `KMSThrottling` comes as HTTP 400, so
+/// without them a throttled batch would read as a refusal of every key in it. Source:
+/// docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html (Errors).
 pub fn transient_code(code: &str) -> bool {
     matches!(
         code,
@@ -1032,6 +1146,8 @@ pub fn transient_code(code: &str) -> bool {
             | "RequestThrottled"
             | "ServiceUnavailable"
             | "InternalFailure"
+            | "InternalError"
+            | "KMSThrottling"
     )
 }
 
@@ -1484,6 +1600,24 @@ mod classify_tests {
         );
         assert_eq!(error_code(&[], b"<Error/>"), None);
         assert_eq!(error_code(&[], br#"{"message":"no type"}"#), None);
+        // The query protocol's error document: no header, the code in the XML.
+        assert_eq!(
+            error_code(
+                &[],
+                br#"<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/"><Error><Type>Sender</Type><Code>ThrottlingException</Code><Message>Rate exceeded</Message></Error><RequestId>x</RequestId></ErrorResponse>"#
+            )
+            .as_deref(),
+            Some("ThrottlingException")
+        );
+        // The `Code` of a `Failed` entry of an answer that did answer is not an error code: the
+        // document opens no `<Error>` element.
+        assert_eq!(
+            error_code(
+                &[],
+                br#"<PublishBatchResponse><PublishBatchResult><Failed><member><Id>1</Id><Code>InvalidParameter</Code><SenderFault>true</SenderFault></member></Failed></PublishBatchResult></PublishBatchResponse>"#
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1494,6 +1628,9 @@ mod classify_tests {
             "RequestThrottled",
             "ServiceUnavailable",
             "InternalFailure",
+            // SNS PublishBatch's own two (aws::transient_code).
+            "InternalError",
+            "KMSThrottling",
         ] {
             assert!(transient_code(c), "{c}");
         }
@@ -1502,6 +1639,12 @@ mod classify_tests {
             "ValidationError",
             "InvalidParameterValue",
             "SlowDown",
+            // What the `sns` kind refuses: a clear no about this batch.
+            "InvalidParameter",
+            "NotFound",
+            "TooManyEntriesInBatchRequest",
+            "BatchRequestTooLong",
+            "KMSAccessDenied",
         ] {
             assert!(!transient_code(c), "{c}");
         }

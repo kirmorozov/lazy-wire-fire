@@ -1837,6 +1837,72 @@ impl Moto {
         format!("{}/123456789012/{queue}", self.root)
     }
 
+    /// One call of the query protocol, which is how the SNS API documents itself (`Action=…`,
+    /// `Version=2010-03-31`); the status and the answer's text.
+    async fn query(&self, service: &str, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+        let body = std::iter::once(("Action", action))
+            .chain(std::iter::once(("Version", "2010-03-31")))
+            .chain(params.iter().copied())
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header(
+            "Content-Type",
+            "application/x-www-form-urlencoded".to_string(),
+        );
+        req.set_header(
+            "Authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=lazywf/20260101/us-east-1/{service}/aws4_request, \
+                 SignedHeaders=content-type;host, Signature=00"
+            ),
+        );
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        (
+            resp.status,
+            String::from_utf8_lossy(&resp.body).into_owned(),
+        )
+    }
+
+    /// Creates the topic and subscribes a queue to it (what AWS then delivers to the queue); the
+    /// queue URL. moto answers as the account 123456789012.
+    async fn pipe_topic(&self, topic: &str, queue: &str) -> String {
+        let (status, xml) = self.query("sns", "CreateTopic", &[("Name", topic)]).await;
+        assert_eq!(status, 200, "CreateTopic: {xml}");
+        let open = "<TopicArn>";
+        let from = xml.find(open).unwrap() + open.len();
+        let arn = xml[from..xml[from..].find("</TopicArn>").unwrap() + from].to_string();
+        self.call("AmazonSQS.CreateQueue", "sqs", json!({"QueueName": queue}))
+            .await;
+        let (status, xml) = self
+            .query(
+                "sns",
+                "Subscribe",
+                &[
+                    ("TopicArn", &arn),
+                    ("Protocol", "sqs"),
+                    (
+                        "Endpoint",
+                        &format!("arn:aws:sqs:us-east-1:123456789012:{queue}"),
+                    ),
+                ],
+            )
+            .await;
+        assert_eq!(status, 200, "Subscribe: {xml}");
+        format!("{}/123456789012/{queue}", self.root)
+    }
+
     async fn count(&self, url: &str) -> u64 {
         let mut req = lazy_wire_fire::http::RawRequest {
             method: "POST".into(),
@@ -1932,6 +1998,74 @@ Content-Type: application/x-amz-json-1.1
         &[
             ("bus secret key", AWS_SK),
             ("bus session token", AWS_SESSION),
+        ],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// The `sns` target against moto (`LAZYWF_TEST_SNS`): every batch is signed with the fake
+/// reference credentials, and the topic is read back through a subscription of an SQS queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_sns() {
+    let root = need_db!();
+    let Ok(moto_root) = std::env::var("LAZYWF_TEST_SNS") else {
+        return eprintln!("LAZYWF_TEST_SNS not set: skipping the sns flow (make test-e2e-queues)");
+    };
+    install();
+    let moto = Moto::new(&moto_root).await;
+    let topic = format!("lwf_logssns_{}", std::process::id());
+    let url = moto.pipe_topic(&topic, &topic).await;
+    let db = Db::fresh(&root, "logsns").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+    std::env::set_var("LWF_LOGSNS_AK", AWS_AK);
+    std::env::set_var("LWF_LOGSNS_SK", AWS_SK);
+    std::env::set_var("LWF_LOGSNS_ST", AWS_SESSION);
+    db.target(
+        "topic",
+        "sns",
+        &format!("aws-sns://us-east-1/123456789012/{topic}?endpoint={moto_root}"),
+        None,
+        &json!({"access_key_ref": "env:LWF_LOGSNS_AK",
+                "secret_key_ref": "env:LWF_LOGSNS_SK",
+                "session_token_ref": "env:LWF_LOGSNS_ST"})
+        .to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('topic', 'topic', 'batch', 10, ?, ?, 100)",
+        (
+            "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+            r#"POST / HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}}{{#each docs}}&PublishBatchRequestEntries.member.{{add @index 1}}.Id={{@index}}&PublishBatchRequestEntries.member.{{add @index 1}}.Message={{url_encode (json doc)}}{{/each}}"#,
+        ),
+    )
+    .await;
+    db.trigger("topic", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann'), (2, 'Bob')")
+        .await;
+    wait_for(Duration::from_secs(30), "two messages", || async {
+        (moto.count(&url).await >= 2).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    inst.stop().await;
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    let leaks = leaks(
+        &out,
+        &[
+            ("topic secret key", AWS_SK),
+            ("topic session token", AWS_SESSION),
         ],
     );
     if !leaks.is_empty() {

@@ -51,7 +51,8 @@ pub struct Target {
     pub ctx: Value,
     pub endpoints: Vec<Endpoint>,
     pub expect: Expect,
-    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`, `kinesis`, `lambda`, `eventbridge`).
+    /// SigV4 signing for the AWS kinds (`http.s3`, `sqs`, `kinesis`, `lambda`, `eventbridge`,
+    /// `sns`).
     aws: Option<AwsSign>,
     /// Webhook signing for the http kinds (`src/sign.rs`); the secret is resolved on every use.
     sign: Option<crate::sign::Spec>,
@@ -60,6 +61,8 @@ pub struct Target {
     /// The effective batch limit of a `kafka` target, when `vars.message_max_bytes` raises the
     /// kind's default (the broker's `message.max.bytes`).
     kafka: Option<usize>,
+    /// The `aws-sns://` endpoint of an `sns` target and its batch byte limit.
+    sns: Option<Sns>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
 }
@@ -69,6 +72,14 @@ struct AwsSign {
     service: &'static str,
     region: String,
     provider: aws::Provider,
+}
+
+/// What an `sns` target knows about its topic beyond the endpoint: whether it is FIFO (every
+/// entry then needs a `MessageGroupId`) and its `MaximumMessageSize`, which is the batch's byte
+/// limit (`vars.maximum_message_size` states it; see [`crate::sns::maximum_message_size`]).
+struct Sns {
+    url: aws::SnsUrl,
+    max_bytes: usize,
 }
 
 /// The outcome of one item of a batch request (see [`Target::send_items`]).
@@ -289,6 +300,7 @@ impl Target {
         let mut endpoints = Vec::new();
         let mut aws_rt = None;
         let mut lambda_url = None;
+        let mut sns = None;
         match def.kind {
             Kind::MySql | Kind::PgSql => {
                 use crate::sqlwire::{Credentials, MySqlClient, PgClient, SqlAddr};
@@ -518,6 +530,44 @@ impl Target {
                     provider,
                 });
             }
+            Kind::Sns => {
+                // from_row: exactly one `aws-sns://[<region>/]<account-id>/<topic-name>` endpoint.
+                // The request goes to the service root (`/`); the topic is named by its ARN in
+                // the body, as `sqs` names its queue by `endpoint.url`.
+                let url = aws::SnsUrl::parse(
+                    def.endpoints
+                        .first()
+                        .ok_or_else(|| anyhow!("kind sns needs its aws-sns:// endpoint"))?,
+                )?;
+                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
+                let mut base = aws::address("sns", url.endpoint.as_deref(), &region)?;
+                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
+                                 "region": region, "topic": url.topic,
+                                 "topic_arn": url.arn(&region), "fifo": url.fifo()});
+                base.base = String::new();
+                let host_header = base.host_header();
+                let client = HttpClient::new(base, &def.tls)?;
+                endpoints.push(Endpoint {
+                    ctx,
+                    transport: Transport::Http {
+                        client,
+                        prefix: String::new(),
+                        host_header,
+                    },
+                });
+                let provider = aws::Provider::new(aws_refs(&def), &region);
+                aws_rt = Some(AwsSign {
+                    service: "sns",
+                    region,
+                    provider,
+                });
+                // The topic's MaximumMessageSize is the batch's byte limit; a var that does not
+                // state it is refused here as at load (`TargetDef::from_row` checks it too).
+                sns = Some(Sns {
+                    url,
+                    max_bytes: crate::sns::maximum_message_size(&def.vars)?,
+                });
+            }
             Kind::Kafka => {
                 // from_row: exactly one endpoint, `kafka(s)://<broker>[:port][,…]/<topic>` —
                 // one broker set and the topic the records of an action go to.
@@ -564,6 +614,7 @@ impl Target {
             sign,
             lambda: lambda_url,
             kafka,
+            sns,
             pool,
         }))
     }
@@ -574,11 +625,15 @@ impl Target {
     }
 
     /// The largest rendered action this target takes, when it has one: the kind's own limit, the
-    /// payload limit of the Lambda invocation (6 MB sync, 1 MB event), or the `kafka` target's
-    /// broker limit raised by `vars.message_max_bytes`.
+    /// payload limit of the Lambda invocation (6 MB sync, 1 MB event), the `kafka` target's
+    /// broker limit raised by `vars.message_max_bytes`, or the `sns` target's topic
+    /// `MaximumMessageSize` stated by `vars.maximum_message_size`.
     pub fn batch_bytes_limit(&self) -> Option<usize> {
         if let Some(n) = self.kafka {
             return Some(n);
+        }
+        if let Some(s) = &self.sns {
+            return Some(s.max_bytes);
         }
         match &self.lambda {
             Some(u) => Some(u.payload_limit()),
@@ -926,6 +981,14 @@ impl Target {
                 return Err(rejected(format!("the rendered request: {why}")));
             }
         }
+        if self.def.kind == Kind::Sns {
+            // The batch is answered per entry, by its `Id`: check the rendered form body before
+            // the request goes out (see [`crate::sns::entries_ok`]).
+            let fifo = self.sns.as_ref().is_some_and(|s| s.url.fifo());
+            if let Err(why) = crate::sns::entries_ok(&req.body, n, fifo) {
+                return Err(rejected(format!("the rendered request: {why}")));
+            }
+        }
         let req = self.prepare(req, prefix, host_header).await?;
         let resp = client
             .send(&req, self.def.timeout)
@@ -949,14 +1012,28 @@ impl Target {
                 rejected(msg)
             });
         }
-        let answer: Value = serde_json::from_slice(&resp.body).with_context(|| {
-            format!(
-                "{} {}: the answer is not JSON: {}",
-                req.method,
-                client.base.url(),
-                resp.body_snippet()
-            )
-        })?;
+        let answer: Value = if self.def.kind == Kind::Sns {
+            // `PublishBatch` is the query protocol, whose answer is XML: read into the same
+            // `Successful`/`Failed` shape the mapping below reads (see
+            // [`crate::sns::batch_answer`]).
+            crate::sns::batch_answer(&resp.body).with_context(|| {
+                format!(
+                    "{} {}: the answer is not a PublishBatchResult: {}",
+                    req.method,
+                    client.base.url(),
+                    resp.body_snippet()
+                )
+            })?
+        } else {
+            serde_json::from_slice(&resp.body).with_context(|| {
+                format!(
+                    "{} {}: the answer is not JSON: {}",
+                    req.method,
+                    client.base.url(),
+                    resp.body_snippet()
+                )
+            })?
+        };
         if self.def.kind == Kind::Kinesis {
             // `Records[i]` answers item i. `expect` per record, as for the entries below.
             let records = answer
@@ -1418,6 +1495,18 @@ mod allow_tests {
             (
                 "eventbridge",
                 "aws-eventbridge://eu-west-1/orders?endpoint=http://127.0.0.1:34569",
+                "{}",
+                "127.0.0.1",
+            ),
+            (
+                "sns",
+                "aws-sns://eu-west-1/123456789012/orders",
+                "{}",
+                "sns.eu-west-1.amazonaws.com",
+            ),
+            (
+                "sns",
+                "aws-sns://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34569",
                 "{}",
                 "127.0.0.1",
             ),
