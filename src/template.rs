@@ -49,6 +49,7 @@ fn leak(name: &str) -> &'static str {
         "regex_escape" => "regex_escape",
         "url_encode" => "url_encode",
         "json" => "json",
+        "add" => "add",
         "yaml" => "yaml",
         "replace" => "replace",
         _ => "redis_quote",
@@ -102,6 +103,37 @@ fn h_regex_escape(h: &Helper<'_>) -> Result<Value, RenderError> {
 
 fn h_url_encode(h: &Helper<'_>) -> Result<Value, RenderError> {
     Ok(Value::String(url_encode(&text(param(h, 0, "url_encode")?))))
+}
+
+/// `{{add a b}}`: the sum of two whole numbers, as a number. The query protocol's kinds number
+/// the entries of a batch `…member.1`, `…member.2` — "`param.n` notation. Values of `n` are
+/// integers starting from 1" (docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html) — while
+/// `each` gives only `@index`, from 0, so the template of an `sns` target numbers its entries
+/// `{{add @index 1}}`. A value that is not a whole number is an error rather than an empty
+/// string: a batch whose entries cannot be numbered is not one AWS can answer per entry, so
+/// rendering it would send a request no key can be booked against.
+fn h_add(h: &Helper<'_>) -> Result<Value, RenderError> {
+    fn whole(v: &Value, what: &str) -> Result<i64, RenderErrorReason> {
+        match v {
+            Value::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| RenderErrorReason::Other(format!("{what} is not a whole number"))),
+            // A column can hold the number as text.
+            Value::String(s) => s.trim().parse::<i64>().map_err(|_| {
+                RenderErrorReason::Other(format!("{what} is `{s}`, not a whole number"))
+            }),
+            other => Err(RenderErrorReason::Other(format!(
+                "{what} is `{}`, not a whole number",
+                text(other)
+            ))),
+        }
+    }
+    let a = whole(param(h, 0, "add")?, "the first number of `add`")?;
+    let b = whole(param(h, 1, "add")?, "the second number of `add`")?;
+    let sum = a.checked_add(b).ok_or_else(|| {
+        RenderErrorReason::Other(format!("`add`: {a} + {b} is out of the range of a number"))
+    })?;
+    Ok(Value::Number(sum.into()))
 }
 
 fn h_json(h: &Helper<'_>) -> Result<Value, RenderError> {
@@ -726,7 +758,7 @@ impl Templates {
         hb.register_escape_fn(neutralize);
         hb.set_strict_mode(false);
         hb.set_prevent_indent(true);
-        let simple: [(&str, HelperFn); 8] = [
+        let simple: [(&str, HelperFn); 9] = [
             ("join", h_join),
             ("upper", h_upper),
             ("lower", h_lower),
@@ -734,6 +766,7 @@ impl Templates {
             ("url_encode", h_url_encode),
             ("json", h_json),
             ("base64", h_base64),
+            ("add", h_add),
             ("redis_quote", h_redis_quote),
         ];
         for (name, f) in simple {
@@ -944,6 +977,44 @@ mod tests {
             "y"
         );
         assert_eq!(render("{{x}}", json!({"x": "<&>"})), "<&>");
+    }
+
+    #[test]
+    fn add_helper() {
+        // The reason it exists: the query protocol numbers the entries of a batch from 1, where
+        // `each` counts from 0 (aws::SNS_MAX_ENTRIES and the `sns` kind's templates).
+        assert_eq!(
+            render(
+                "{{#each docs}}m{{add @index 1}}={{json this}} {{/each}}",
+                json!({"docs": [{"a": 1}, {"a": 2}, {"a": 3}]})
+            ),
+            "m1={\"a\":1} m2={\"a\":2} m3={\"a\":3} "
+        );
+        assert_eq!(render("{{add 2 3}}", json!({})), "5");
+        assert_eq!(render("{{add x 1}}", json!({"x": 41})), "42");
+        // A column can hold the number as text.
+        assert_eq!(render("{{add x 1}}", json!({"x": " 7 "})), "8");
+        assert_eq!(render("{{add x -1}}", json!({"x": 7})), "6");
+        assert_eq!(render("{{add 0 0}}", json!({})), "0");
+        // What it cannot add is an error, not an empty string.
+        let bad = |src: &str, ctx: Value| -> String {
+            let mut t = Templates::new();
+            t.add("t", src, ACTION_ROOTS).unwrap();
+            format!("{:#}", t.render("t", &ctx).unwrap_err())
+        };
+        for (src, ctx) in [
+            ("{{add x 1}}", json!({"x": "seven"})),
+            ("{{add x 1}}", json!({"x": true})),
+            ("{{add x 1}}", json!({"x": {"a": 1}})),
+            ("{{add x 1}}", json!({"x": 1.5})),
+            ("{{add x 1}}", json!({})),
+        ] {
+            let e = bad(src, ctx);
+            assert!(e.contains("not a whole number"), "{src}: {e}");
+        }
+        // And so is one number instead of two: a template that cannot count is not sent.
+        let e = bad("{{add x}}", json!({"x": 1}));
+        assert!(e.contains("index 1"), "{e}");
     }
 
     #[test]

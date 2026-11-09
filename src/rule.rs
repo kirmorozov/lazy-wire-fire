@@ -157,6 +157,10 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>,
 ///   `MessageDeduplicationId` (decision D5).
 /// - `eventbridge`: a batch holds at most 10 keys (`batch_max_keys`, required: 10 entries per
 ///   PutEvents) and 1 MB.
+/// - `sns`: a batch holds at most 10 keys (`batch_max_keys`, required: 10 entries per
+///   PublishBatch) and 256 KiB — or the topic's `MaximumMessageSize`, up to 1 MiB, as the
+///   target's `vars.maximum_message_size` states it. A FIFO topic (its name ends in `.fifo`)
+///   needs a `version` column: it is the `MessageDeduplicationId`, as for a FIFO queue.
 /// - `kafka`: a batch holds at most the target's limit (the broker's `message.max.bytes`,
 ///   raised by its `vars.message_max_bytes`).
 pub fn kind_errors(
@@ -211,14 +215,19 @@ pub fn kind_errors(
     if kind == Kind::Smtp {
         out.extend(crate::smtp::rule_errors(def.fire_per));
     }
-    if matches!(kind, Kind::Sqs | Kind::Kinesis | Kind::EventBridge) {
+    if matches!(
+        kind,
+        Kind::Sqs | Kind::Kinesis | Kind::EventBridge | Kind::Sns
+    ) {
         // Purge-like `once` actions: a queue purge (`PurgeQueue`), a stream delete
-        // (`DeleteStream`, which drops every record) or an event bus delete (`DeleteEventBus`,
-        // which takes the bus and every rule on it). Recognized by text, as the only names of
+        // (`DeleteStream`, which drops every record), an event bus delete (`DeleteEventBus`,
+        // which takes the bus and every rule on it) or a topic delete (`DeleteTopic`, which takes
+        // the topic and every subscription on it). Recognized by text, as the only names of
         // such actions the templates can show us.
         let (word, action) = match kind {
             Kind::Sqs => ("purgequeue", "PurgeQueue"),
             Kind::EventBridge => ("deleteeventbus", "DeleteEventBus"),
+            Kind::Sns => ("deletetopic", "DeleteTopic"),
             _ => ("deletestream", "DeleteStream"),
         };
         for s in &def.reset_steps {
@@ -311,6 +320,41 @@ pub fn kind_errors(
         {
             out.push(
                 "`batch_max_bytes` is over 1048576 (1 MB), the most a PutEvents request takes"
+                    .into(),
+            );
+        }
+    }
+    if kind == Kind::Sns {
+        // One action is one PublishBatch: the same number bounds one message and the whole batch,
+        // the topic's MaximumMessageSize (256 KiB by default, at most 1 MiB), which
+        // `vars.maximum_message_size` states for the target (checked at load, so it cannot fail
+        // here). The engine splits by bytes, never by count, so the count is a load-time
+        // requirement as for sqs and eventbridge.
+        let limit =
+            crate::sns::maximum_message_size(&target.vars).unwrap_or(crate::aws::SNS_MAX_BYTES);
+        if def.fire_per == FirePer::Batch {
+            match def.batch_max_keys {
+                None => out.push(
+                    "kind sns needs `batch_max_keys` (1 to 10: entries per PublishBatch)".into(),
+                ),
+                Some(n) if n > crate::aws::SNS_MAX_ENTRIES => out.push(format!(
+                    "`batch_max_keys` {n} is over {}, the most entries a PublishBatch takes",
+                    crate::aws::SNS_MAX_ENTRIES
+                )),
+                Some(_) => {}
+            }
+        }
+        if def.batch_max_bytes.is_some_and(|n| n > limit) {
+            out.push(format!(
+                "`batch_max_bytes` is over {limit} bytes, the largest message and the largest batch the topic takes (its MaximumMessageSize, 262144 by default and at most 1048576; `vars.maximum_message_size` states it)"
+            ));
+        }
+        let fifo = endpoints
+            .iter()
+            .any(|e| crate::aws::SnsUrl::parse(e).is_ok_and(|u| u.fifo()));
+        if fifo && !columns.iter().any(|c| c == "version") {
+            out.push(
+                "a FIFO topic (a topic name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
                     .into(),
             );
         }
