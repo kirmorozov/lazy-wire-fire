@@ -5800,3 +5800,315 @@ async fn allowed_hosts_refuse_unlisted_endpoints() {
     assert!(mock.requests().iter().all(|r| r.body == "7"));
     inst.stop().await;
 }
+
+// `eventbridge` targets, against moto (`LAZYWF_TEST_EVENTBRIDGE`, e.g. http://127.0.0.1:34569;
+// the `eventbridge` compose profile). The bus is read back the way AWS delivers: a rule on the
+// bus with an SQS queue as its target, the queue drained through the SQS API. An entry's
+// `DetailType` is the key, its `Detail` the document; the queue message is the event envelope.
+
+const EB_PUT_EVENTS: &str = r#"POST / HTTP/1.1
+X-Amz-Target: AWSEvents.PutEvents
+Content-Type: application/x-amz-json-1.1
+
+{"Entries": [{{#each docs}}{"Source": "lazywf", "DetailType": {{json key}}, "Detail": {{json (json doc)}}, "EventBusName": {{json endpoint.bus}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+/// The same, for the `rev` column: the entry of a row whose `rev` is NULL carries `not-json`
+/// as its `Detail`, which EventBridge refuses entry by entry (`MalformedDetail`).
+const EB_PUT_EVENTS_BAD_DETAIL: &str = r#"POST / HTTP/1.1
+X-Amz-Target: AWSEvents.PutEvents
+Content-Type: application/x-amz-json-1.1
+
+{"Entries": [{{#each docs}}{"Source": "lazywf", "DetailType": {{json key}}, "Detail": {{#if doc.rev}}{{json (json doc)}}{{else}}{{json "not-json"}}{{/if}}, "EventBusName": {{json endpoint.bus}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+fn eventbridge_root() -> Option<String> {
+    std::env::var("LAZYWF_TEST_EVENTBRIDGE")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+macro_rules! need_eventbridge {
+    () => {
+        match eventbridge_root() {
+            Some(u) => u,
+            None => {
+                eprintln!("LAZYWF_TEST_EVENTBRIDGE not set: skipping (docker compose --profile eventbridge up -d moto)");
+                return;
+            }
+        }
+    };
+}
+
+/// moto: the EventBridge JSON API (the very API the target calls) and the SQS JSON API the
+/// read-back queues are created and drained with. moto answers as the account 123456789012,
+/// does not check signatures, and dispatches by the service of the credential scope.
+struct Moto {
+    root: String,
+    client: lazy_wire_fire::http::Client,
+}
+
+impl Moto {
+    /// Waits for the server: compose has no healthcheck for it (the other emulators' precedent).
+    async fn new(root: &str) -> Moto {
+        let moto = Moto {
+            root: root.to_string(),
+            client: lazy_wire_fire::http::Client::new(
+                lazy_wire_fire::http::BaseUrl::parse(root).unwrap(),
+                &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            )
+            .unwrap(),
+        };
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        req.set_header("Host", root.trim_start_matches("http://").to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(moto.client.send(&req, Duration::from_secs(2)).await, Ok(r) if r.status < 500)
+            {
+                return moto;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "moto at {root} did not come up within 30 s"
+            );
+            sleep_ms(200).await;
+        }
+    }
+
+    async fn call(&self, target: &str, service: &str, body: Value) -> Value {
+        let mut req = lazy_wire_fire::http::RawRequest {
+            method: "POST".into(),
+            target: "/".into(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("Host", self.root.trim_start_matches("http://").to_string());
+        req.set_header("Content-Type", "application/x-amz-json-1.1".into());
+        req.set_header("X-Amz-Target", target.into());
+        req.set_header(
+            "Authorization",
+            format!("AWS4-HMAC-SHA256 Credential=lazywf/20260101/us-east-1/{service}/aws4_request, SignedHeaders=content-type;host;x-amz-target, Signature=00"),
+        );
+        let resp = self
+            .client
+            .send(&req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            resp.status == 200,
+            "{target}: {} {}",
+            resp.status,
+            resp.body_snippet()
+        );
+        if resp.body.is_empty() {
+            return Value::Null;
+        }
+        serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    async fn eb(&self, action: &str, body: Value) -> Value {
+        self.call(&format!("AWSEvents.{action}"), "events", body)
+            .await
+    }
+
+    async fn sqs(&self, action: &str, body: Value) -> Value {
+        self.call(&format!("AmazonSQS.{action}"), "sqs", body).await
+    }
+
+    /// Creates the bus and a queue, and the rule on the bus that delivers every event of it
+    /// to the queue (the SQS target, as AWS would); the queue URL.
+    async fn pipe(&self, bus: &str, queue: &str) -> String {
+        self.eb("CreateEventBus", json!({"Name": bus})).await;
+        self.sqs("CreateQueue", json!({"QueueName": queue})).await;
+        let url = format!("{}/123456789012/{queue}", self.root);
+        self.eb(
+            "PutRule",
+            json!({"Name": format!("{bus}-rule"), "EventBusName": bus, "EventPattern": "{}"}),
+        )
+        .await;
+        self.eb(
+            "PutTargets",
+            json!({"EventBusName": bus, "Rule": format!("{bus}-rule"),
+                   "Targets": [{"Id": "sqs",
+                                "Arn": format!("arn:aws:sqs:us-east-1:123456789012:{queue}")}]}),
+        )
+        .await;
+        url
+    }
+
+    async fn count(&self, url: &str) -> u64 {
+        let v = self
+            .sqs(
+                "GetQueueAttributes",
+                json!({"QueueUrl": url, "AttributeNames": ["ApproximateNumberOfMessages"]}),
+            )
+            .await;
+        v["Attributes"]["ApproximateNumberOfMessages"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// The event envelopes of the queue, each message received once (received messages stay
+    /// hidden): what the rule with its SQS target delivered.
+    async fn drain(&self, url: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        loop {
+            let v = self
+                .sqs(
+                    "ReceiveMessage",
+                    json!({"QueueUrl": url, "MaxNumberOfMessages": 10, "WaitTimeSeconds": 0,
+                           "VisibilityTimeout": 600, "AttributeNames": ["All"]}),
+                )
+                .await;
+            let got = v
+                .get("Messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if got.is_empty() {
+                return out;
+            }
+            out.extend(
+                got.iter()
+                    .map(|m| serde_json::from_str(m["Body"].as_str().unwrap()).unwrap()),
+            );
+        }
+    }
+}
+
+fn eventbridge_creds() -> String {
+    std::env::set_var("LWF_TEST_EVENTBRIDGE_AK", "lazywf");
+    std::env::set_var("LWF_TEST_EVENTBRIDGE_SK", "lazywfsecret");
+    json!({"access_key_ref": "env:LWF_TEST_EVENTBRIDGE_AK",
+           "secret_key_ref": "env:LWF_TEST_EVENTBRIDGE_SK"})
+    .to_string()
+}
+
+/// A customers table (with a `rev` column) and the rule `bus` that puts each changed row to
+/// `bus` (one PutEvents per flush, `batch_max_keys` at the documented maximum of 10).
+async fn eventbridge_rule(db: &Db, root: &str, bus: &str, template: &str, selects: &str) {
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), rev INT NULL)")
+        .await;
+    tables(db).await;
+    db.target(
+        "bus",
+        "eventbridge",
+        &format!("aws-eventbridge://us-east-1/{bus}?endpoint={root}"),
+        Some("JSON_EXTRACT(body, '$.EventId') IS NOT NULL"),
+        &eventbridge_creds(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
+         VALUES ('bus', 'bus', 'batch', 10, ?, ?, 100)",
+        (selects, template),
+    )
+    .await;
+    db.trigger("bus", "customers", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// Every changed key arrives once, as an event on the bus: `DetailType` is the key, `Detail`
+/// the document, read back through the rule with its SQS target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eventbridge_every_changed_key_arrives_as_an_event() {
+    let root = need_db!();
+    let endpoint = need_eventbridge!();
+    let moto = Moto::new(&endpoint).await;
+    let bus = format!("lwf-eb-every-{}", std::process::id());
+    let db = Db::fresh(&root, "eb_every").await;
+    let url = moto.pipe(&bus, &bus.replace('-', "_")).await;
+    eventbridge_rule(
+        &db,
+        &endpoint,
+        &bus,
+        EB_PUT_EVENTS,
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec(
+        "INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy'),(4,'Di'),(5,'Ed')",
+    )
+    .await;
+    wait_for(Duration::from_secs(20), "five events", || async {
+        (moto.count(&url).await == 5).then_some(())
+    })
+    .await;
+    sleep_ms(2000).await;
+    assert_eq!(moto.count(&url).await, 5, "a key was sent twice");
+    let mut events = moto.drain(&url).await;
+    assert_eq!(events.len(), 5);
+    events.sort_by_key(|e| e["detail-type"].as_str().unwrap_or("").to_string());
+    let names = ["Ann", "Bob", "Cy", "Di", "Ed"];
+    for (i, e) in events.iter().enumerate() {
+        assert_eq!(e["source"], "lazywf", "the source of the event");
+        assert_eq!(
+            e["detail-type"],
+            Value::from((i + 1).to_string()),
+            "the detail-type is the row key"
+        );
+        assert_eq!(
+            e["detail"],
+            json!({"id": i + 1, "name": names[i]}),
+            "the detail is the document"
+        );
+    }
+    assert!(
+        db.status("bus").await.and_then(|s| s.3).is_none(),
+        "accepted entries left an error"
+    );
+    inst.stop().await;
+}
+
+/// One entry of a batch carries a `Detail` that is not JSON: the service refuses that entry
+/// (`MalformedDetail`) and the other entries of the same request are delivered; only the
+/// refused key drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eventbridge_refuses_a_bad_entry_and_delivers_the_good_ones() {
+    let root = need_db!();
+    let endpoint = need_eventbridge!();
+    let moto = Moto::new(&endpoint).await;
+    let bus = format!("lwf-eb-bad-{}", std::process::id());
+    let db = Db::fresh(&root, "eb_bad").await;
+    let url = moto.pipe(&bus, &bus.replace('-', "_")).await;
+    eventbridge_rule(
+        &db,
+        &endpoint,
+        &bus,
+        EB_PUT_EVENTS_BAD_DETAIL,
+        "SELECT c.id AS _key, c.id, c.name, c.rev FROM customers c WHERE c.id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // Key 4 is the one whose `Detail` renders as `not-json` (its `rev` is NULL).
+    db.exec("INSERT INTO customers (id, name, rev) VALUES (1,'Ann',1),(2,'Bob',1),(3,'Cy',1),(4,'Di',NULL)")
+        .await;
+    wait_for(Duration::from_secs(30), "three events", || async {
+        (moto.count(&url).await == 3).then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(30), "the refused entry", || async {
+        db.status("bus")
+            .await
+            .and_then(|s| s.3)
+            .filter(|e| e.contains("MalformedDetail"))
+            .map(|_| ())
+    })
+    .await;
+    sleep_ms(2000).await;
+    assert_eq!(moto.count(&url).await, 3, "the refused key was sent");
+    let mut keys: Vec<String> = moto
+        .drain(&url)
+        .await
+        .iter()
+        .map(|e| e["detail-type"].as_str().unwrap_or("").to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["1", "2", "3"], "the good entries went through");
+    inst.stop().await;
+}

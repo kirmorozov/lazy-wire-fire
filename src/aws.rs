@@ -527,6 +527,121 @@ impl KinesisUrl {
     }
 }
 
+// ---- `aws-eventbridge://` endpoints ----
+//
+// `aws-eventbridge://[<region>/]<event-bus-name-or-arn>`, with the usual optional `?endpoint=`
+// (emulators, VPC endpoints). PutEvents is a JSON 1.1 call to the service root: `X-Amz-Target:
+// AWSEvents.PutEvents`, `Content-Type: application/x-amz-json-1.1`, body `{"Entries": [...]}`;
+// SigV4 signs with service `events`, the host is `events.<region>.amazonaws.com`.
+// Source: PutEvents API (docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutEvents.html)
+// and the service endpoints reference (`events.<region>.amazonaws.com`).
+
+/// The most entries a PutEvents request takes: 10 (`Entries` array, "The maximum number of
+/// records per transaction is 10"). Source:
+/// docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutEvents.html
+pub const EVENTBRIDGE_MAX_ENTRIES: usize = 10;
+
+/// The largest sum of all the entries of one PutEvents request: 1 MB (1,048,576 bytes). The
+/// rendered request also carries the JSON around the entries, so the limit is applied to the
+/// rendered body (conservative, as for Kinesis). Source: "Event size" of the PutEvents
+/// user guide (docs.aws.amazon.com/eventbridge/latest/userguide/eb-putevents.html#eb-putevent-size).
+pub const EVENTBRIDGE_MAX_BYTES: usize = 1_048_576;
+
+/// An `aws-eventbridge://` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventBridgeUrl {
+    pub region: Option<String>,
+    /// The event bus, as `Entries[].EventBusName` takes it: the name, for an ARN endpoint the
+    /// ARN's resource name.
+    pub bus: String,
+    /// `?endpoint=`, as written (a validated http(s) URL).
+    pub endpoint: Option<String>,
+}
+
+/// An event bus name: 1 to 256 letters, digits, `-`, `_` or `.` (CreateEventBus, `Name`;
+/// docs.aws.amazon.com/eventbridge/latest/APIReference/API_CreateEventBus.html).
+fn check_bus_name(shown: &str, name: &str) -> Result<()> {
+    let ok = (1..=256).contains(&name.len())
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
+    if !ok {
+        bail!("`{shown}`: an event bus name is 1 to 256 letters, digits, `-`, `_` or `.`");
+    }
+    Ok(())
+}
+
+/// The region and the bus name of an event bus ARN:
+/// `arn:<partition>:events:<region>:<account-id>:event-bus/<name>` (CreateEventBus, Arn;
+/// docs.aws.amazon.com/eventbridge/latest/APIReference/API_CreateEventBus.html).
+fn bus_of_eventbus_arn(shown: &str, arn: &str) -> Result<(String, String)> {
+    let bad = || {
+        anyhow!("`{shown}`: an event bus ARN is `arn:aws:events:<region>:<account-id>:event-bus/<event-bus-name>`")
+    };
+    // The resource part (`event-bus/<name>`) is everything after the last colon: it is the
+    // only part a `/` can appear in (a bus name holds no `/`, and `split_aws_url` has just
+    // split the URL on `/`).
+    let (head, resource) = arn.rsplit_once(':').ok_or_else(bad)?;
+    let (res_type, name) = resource.split_once('/').ok_or_else(bad)?;
+    let parts: Vec<&str> = head.split(':').collect();
+    let [_, partition, service, region, account] = parts.as_slice() else {
+        return Err(bad());
+    };
+    if !matches!(*partition, "aws" | "aws-cn" | "aws-us-gov")
+        || *service != "events"
+        || res_type != "event-bus"
+    {
+        return Err(bad());
+    }
+    if !valid_region(region) {
+        bail!("`{shown}`: `{region}` is not an AWS region name, e.g. eu-west-1");
+    }
+    if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
+        bail!("`{shown}`: the account id is twelve digits");
+    }
+    check_bus_name(shown, name)?;
+    Ok((region.to_string(), name.to_string()))
+}
+
+impl EventBridgeUrl {
+    /// `aws-eventbridge://<bus>` or `aws-eventbridge://<region>/<bus>`, the bus a name or its
+    /// ARN (an ARN names its own region).
+    pub fn parse(url: &str) -> Result<EventBridgeUrl> {
+        let shown = crate::secrets::redact_url(url);
+        let (segs, endpoint) = split_aws_url(url, "eventbridge")?;
+        // The ARN's resource part (`event-bus/<name>`) contains a `/`, which `split_aws_url`
+        // has split on; it is rejoined here. A leading region segment therefore needs two
+        // ordinary segments, neither of which starts an ARN.
+        let (region, text) = match segs.as_slice() {
+            [r, name] if !r.starts_with("arn:") && !name.starts_with("arn:") => {
+                if !valid_region(r) {
+                    bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+                }
+                (Some(r.clone()), name.clone())
+            }
+            _ => (None, segs.join("/")),
+        };
+        if text.starts_with("arn:") {
+            let (arn_region, bus) = bus_of_eventbus_arn(&shown, &text)?;
+            Ok(EventBridgeUrl {
+                region: Some(arn_region),
+                bus,
+                endpoint,
+            })
+        } else {
+            if text.contains("/arn:") {
+                bail!("`{shown}`: an event bus ARN names its own region: write it alone, `aws-eventbridge://<arn>`, or use the bus name with a region");
+            }
+            check_bus_name(&shown, &text)?;
+            Ok(EventBridgeUrl {
+                region,
+                bus: text,
+                endpoint,
+            })
+        }
+    }
+}
+
 // ---- `aws-lambda://` endpoints ----
 //
 // `aws-lambda://[<region>/]<function-name>[:<qualifier>]`, with `?invocation=sync` (the default,
@@ -1517,6 +1632,71 @@ mod url_tests {
         );
         let e = kin("aws-sqs://123456789012/q").unwrap_err();
         assert!(format!("{e:#}").contains("not `aws-sqs://`"), "{e:#}");
+        let e = eb("https://example.com/bus").unwrap_err();
+        assert!(format!("{e:#}").contains("aws-eventbridge://"), "{e:#}");
+    }
+
+    fn eb(url: &str) -> Result<EventBridgeUrl> {
+        EventBridgeUrl::parse(url)
+    }
+
+    #[test]
+    fn eventbridge_url_forms() {
+        let u = eb("aws-eventbridge://orders").unwrap();
+        assert_eq!((u.region, u.bus.as_str()), (None, "orders"));
+        assert_eq!(u.endpoint, None);
+        let u = eb("aws-eventbridge://eu-west-1/orders.v2_a-b").unwrap();
+        assert_eq!(u.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(u.bus, "orders.v2_a-b");
+        let u = eb("aws-eventbridge://orders?endpoint=http://127.0.0.1:34569").unwrap();
+        assert_eq!(u.endpoint.as_deref(), Some("http://127.0.0.1:34569"));
+        // the ARN: its region is the region, the bus is the resource name
+        let u =
+            eb("aws-eventbridge://arn:aws:events:eu-west-1:123456789012:event-bus/orders").unwrap();
+        assert_eq!(u.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(u.bus, "orders");
+        let u = eb("aws-eventbridge://arn:aws-cn:events:cn-north-1:123456789012:event-bus/default")
+            .unwrap();
+        assert_eq!(u.region.as_deref(), Some("cn-north-1"));
+        assert_eq!(u.bus, "default");
+    }
+
+    #[test]
+    fn eventbridge_refuses_bad_urls() {
+        for url in [
+            "https://events.eu-west-1.amazonaws.com",
+            "aws-sqs://123456789012/orders",
+            "eventbridge://orders",
+            "aws-eventbridge://",
+            "aws-eventbridge://orders/",
+            "aws-eventbridge://eu-west-1/bad name",
+            "aws-eventbridge://eu-west-1/a/b",
+            "aws-eventbridge://u:p@orders",
+            "aws-eventbridge://orders?endpoint=ftp://127.0.0.1:21",
+            "aws-eventbridge://orders?region=eu-west-1",
+            "aws-eventbridge://eu-west-1/orders?endpoint=http://127.0.0.1:34569/x",
+            // not region/bus (the first segment is no region, the second no ARN)
+            "aws-eventbridge://Orders/orders",
+            // the ARN: seven parts, events, event-bus, twelve-digit account, valid region and name
+            "aws-eventbridge://arn:aws:events:eu-west-1:123456789012:event-bus",
+            "aws-eventbridge://arn:aws:events:eu-west-1:123456789012:rule/orders",
+            "aws-eventbridge://arn:aws:sqs:eu-west-1:123456789012:event-bus/orders",
+            "aws-eventbridge://arn:aws:events:eu-west-1:12345678901:event-bus/orders",
+            "aws-eventbridge://arn:aws:events:eu-west-1:123456789012:event-bus/bad*name",
+            // the ARN carries its region, so a region segment before it is a mistake
+            "aws-eventbridge://eu-west-1/arn:aws:events:eu-west-1:123456789012:event-bus/orders",
+        ] {
+            assert!(eb(url).is_err(), "{url} should be refused");
+        }
+        // 256 characters are the longest name
+        assert!(eb(&format!("aws-eventbridge://{}", "b".repeat(256))).is_ok());
+        assert!(eb(&format!("aws-eventbridge://{}", "b".repeat(257))).is_err());
+    }
+
+    #[test]
+    fn eventbridge_limits_are_the_documented_ones() {
+        assert_eq!(EVENTBRIDGE_MAX_ENTRIES, 10);
+        assert_eq!(EVENTBRIDGE_MAX_BYTES, 1_048_576);
     }
 
     #[test]

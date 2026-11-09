@@ -126,6 +126,8 @@ pub enum Kind {
     Kinesis,
     /// AWS Lambda `Invoke` (one invocation per action; `batchItemFailures` per item).
     Lambda,
+    /// Amazon EventBridge `PutEvents` (one request per action, an answer per entry).
+    EventBridge,
     /// RabbitMQ: one publish with a confirm per action (see `amqp.rs`).
     Amqp,
     /// SMTP: one mail per action (see `smtp.rs`).
@@ -151,6 +153,7 @@ impl Kind {
             "sqs" => Kind::Sqs,
             "kinesis" => Kind::Kinesis,
             "lambda" => Kind::Lambda,
+            "eventbridge" => Kind::EventBridge,
             "amqp" => Kind::Amqp,
             "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
@@ -159,7 +162,7 @@ impl Kind {
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
             ),
         })
     }
@@ -182,6 +185,7 @@ impl Kind {
             Kind::Sqs => "sqs",
             Kind::Kinesis => "kinesis",
             Kind::Lambda => "lambda",
+            Kind::EventBridge => "eventbridge",
             Kind::Amqp => "amqp",
             Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
@@ -195,7 +199,10 @@ impl Kind {
     /// Kinds whose answer says, per item of a batch, which items went through (see
     /// `Target::send_items`). The others answer per action.
     pub fn reports_items(self) -> bool {
-        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka)
+        matches!(
+            self,
+            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka | Kind::EventBridge
+        )
     }
 
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
@@ -203,7 +210,13 @@ impl Kind {
     pub fn append_only(self) -> bool {
         matches!(
             self,
-            Kind::Sqs | Kind::Kinesis | Kind::Amqp | Kind::Smtp | Kind::PubSub | Kind::Kafka
+            Kind::Sqs
+                | Kind::Kinesis
+                | Kind::EventBridge
+                | Kind::Amqp
+                | Kind::Smtp
+                | Kind::PubSub
+                | Kind::Kafka
         )
     }
 
@@ -216,6 +229,9 @@ impl Kind {
             Kind::Kinesis => Some(5_242_880),
             // topics.publish: 10 MB per request (base64 `data` is in the rendered text).
             Kind::PubSub => Some(10_000_000),
+            // PutEvents: 1 MB is the limit for the sum of the entries; the rendered request
+            // carries the JSON around them, so it is the text that is measured (aws::EVENTBRIDGE_MAX_BYTES).
+            Kind::EventBridge => Some(crate::aws::EVENTBRIDGE_MAX_BYTES),
             // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
             // (see `Target::batch_bytes_limit`).
             Kind::Kafka => Some(crate::kafka::MESSAGE_MAX_BYTES),
@@ -240,7 +256,7 @@ impl Kind {
             Kind::HttpBasic => &["password", "sign_secret_ref"],
             Kind::HttpBearer => &["token", "sign_secret_ref"],
             Kind::HttpHeader => &["value", "sign_secret_ref"],
-            Kind::HttpS3 | Kind::Sqs | Kind::Kinesis | Kind::Lambda => {
+            Kind::HttpS3 | Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::EventBridge => {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
             Kind::PubSub => &["credentials_ref"],
@@ -428,6 +444,20 @@ impl TargetDef {
                 )?;
                 aws_refs(&vars)?;
             }
+            Kind::EventBridge => {
+                // `aws-eventbridge://[<region>/]<event-bus>` (name or ARN): the bus and the
+                // region are in the URL.
+                match endpoints.as_slice() {
+                    [url] => {
+                        aws::EventBridgeUrl::parse(url)?;
+                    }
+                    _ => bail!(
+                        "kind eventbridge takes exactly one endpoint: aws-eventbridge://[<region>/]<event-bus-name-or-arn>"
+                    ),
+                }
+                refuse_vars(&vars, &["region", "event_bus_name", "event_bus_arn"], kind, "the region and the event bus go in the endpoint: aws-eventbridge://[<region>/]<event-bus-name-or-arn>")?;
+                aws_refs(&vars)?;
+            }
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
@@ -447,13 +477,16 @@ impl TargetDef {
                 kind.name()
             );
         }
-        if !matches!(kind, Kind::Sqs | Kind::Kinesis | Kind::Lambda) {
+        if !matches!(
+            kind,
+            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::EventBridge
+        ) {
             if let Some(e) = endpoints
                 .iter()
                 .find(|e| crate::aws::scheme_of(e).is_some_and(|s| s.starts_with("aws-")))
             {
                 bail!(
-                    "`{e}` is an endpoint of kind sqs, kinesis or lambda, not of kind {}",
+                    "`{e}` is an endpoint of kind sqs, kinesis, lambda or eventbridge, not of kind {}",
                     kind.name()
                 );
             }
@@ -1276,6 +1309,68 @@ mod aws_endpoint_tests {
         assert!(TargetDef::from_row(&row("http", Some("https://example.com"), "{}")).is_ok());
     }
 
+    const BUS: &str = "aws-eventbridge://eu-west-1/orders";
+
+    #[test]
+    fn eventbridge_accepts_the_url_forms_with_references() {
+        let t =
+            TargetDef::from_row(&row("eventbridge", Some(BUS), &format!("{{{CREDS}}}"))).unwrap();
+        assert_eq!(t.kind, Kind::EventBridge);
+        assert_eq!(t.endpoints, vec![BUS.to_string()]);
+        assert_eq!(t.template_vars(), serde_json::json!({}));
+        let ok = |url: &str| TargetDef::from_row(&row("eventbridge", Some(url), "{}")).is_ok();
+        assert!(ok("aws-eventbridge://orders"));
+        assert!(ok(
+            "aws-eventbridge://orders?endpoint=http://127.0.0.1:34569"
+        ));
+        assert!(ok(
+            "aws-eventbridge://arn:aws:events:eu-west-1:123456789012:event-bus/orders"
+        ));
+    }
+
+    #[test]
+    fn eventbridge_refuses_bad_endpoints() {
+        let ok = "{}";
+        assert!(TargetDef::from_row(&row("eventbridge", None, ok)).is_err());
+        assert!(
+            TargetDef::from_row(&row("eventbridge", Some(&format!("{BUS},{BUS}")), ok)).is_err()
+        );
+        // the scheme, and no plain service URL, no other aws- scheme
+        assert!(TargetDef::from_row(&row(
+            "eventbridge",
+            Some("https://events.eu-west-1.amazonaws.com"),
+            ok
+        ))
+        .is_err());
+        assert!(TargetDef::from_row(&row("eventbridge", Some(QUEUE), ok)).is_err());
+        // the bus and the region are not in vars
+        for v in [
+            r#"{"region":"eu-west-1"}"#,
+            r#"{"event_bus_name":"orders"}"#,
+            r#"{"event_bus_arn":"arn:aws:events:eu-west-1:123456789012:event-bus/orders"}"#,
+        ] {
+            assert!(
+                TargetDef::from_row(&row("eventbridge", Some(BUS), v)).is_err(),
+                "{v}"
+            );
+        }
+        // userinfo and literal credentials are refused
+        assert!(TargetDef::from_row(&row(
+            "eventbridge",
+            Some("aws-eventbridge://u:p@orders"),
+            ok
+        ))
+        .is_err());
+        assert!(TargetDef::from_row(&row(
+            "eventbridge",
+            Some(BUS),
+            r#"{"access_key_ref":"AKIA","secret_key_ref":"env:SK"}"#
+        ))
+        .is_err());
+        // the other kinds refuse an aws-eventbridge:// endpoint
+        assert!(TargetDef::from_row(&row("http", Some("aws-eventbridge://orders"), "{}")).is_err());
+    }
+
     #[test]
     fn kind_properties() {
         assert_eq!(Kind::parse("kinesis").unwrap(), Kind::Kinesis);
@@ -1283,6 +1378,12 @@ mod aws_endpoint_tests {
         assert!(Kind::Kinesis.append_only());
         assert_eq!(Kind::Kinesis.batch_bytes_limit(), Some(5_242_880));
         assert!(Kind::Kinesis.is_http());
+        assert_eq!(Kind::parse("eventbridge").unwrap(), Kind::EventBridge);
+        assert_eq!(Kind::EventBridge.name(), "eventbridge");
+        assert!(Kind::EventBridge.reports_items());
+        assert!(Kind::EventBridge.append_only());
+        assert_eq!(Kind::EventBridge.batch_bytes_limit(), Some(1_048_576));
+        assert!(Kind::EventBridge.is_http());
     }
 
     #[test]
