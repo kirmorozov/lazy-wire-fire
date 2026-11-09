@@ -63,7 +63,7 @@ services:
   # The SQS API for the `sqs` target tests (ElasticMQ, native build). Not started by `make
   # servers`: `docker compose -f docker-compose.test.yml --profile sqs up -d --wait elasticmq`.
   elasticmq:
-    image: softwaremill/elasticmq-native:1.6.12
+    image: softwaremill/elasticmq-native:1.6.16
     profiles: ["sqs"]
     ports: ["127.0.0.1:34561:9324"]
 
@@ -71,7 +71,7 @@ services:
   # servers`: `docker compose -f docker-compose.test.yml --profile kinesis up -d --wait kinesis-mock`.
   # Plain HTTP on 4568 (4567 is TLS; it does not check signatures); the tests create their own streams.
   kinesis-mock:
-    image: ghcr.io/etspaceman/kinesis-mock:0.2.2@sha256:23c2ff9b225e74fdb52cb426352130e74a65445b3d4b1391f0cf566ab8336d8f
+    image: ghcr.io/etspaceman/kinesis-mock:0.2.7@sha256:adb6587e83985d617299e0dff1adba1b31dc8576fee8c66494367d5989142a0e
     profiles: ["kinesis"]
     ports: ["127.0.0.1:34562:4568"]
 
@@ -101,7 +101,7 @@ services:
   # pinned by digest; ~1.1 GB). Not started by `make servers`: `docker compose -f
   # docker-compose.test.yml --profile pubsub up -d --wait pubsub-emulator`. REST and gRPC on 8085.
   pubsub-emulator:
-    image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:c3b114528245d315af73d92d95d8e2fed9747ce29003ad46232f22b4542da036
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:f81c8c688f09b97b5c78c80e732517f88584eafa5eff50d4ae6b2a5025a37079
     profiles: ["pubsub"]
     command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=lwf-test"]
     ports: ["127.0.0.1:34563:8085"]
