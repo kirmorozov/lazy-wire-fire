@@ -16,9 +16,11 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
 use crate::binlog::{Flavor, Position};
+use crate::dedup::buffer::IdSet;
+use crate::dedup::key::Key;
 use crate::docs::{self, Doc, Merger, Plan};
 use crate::fence;
-use crate::keyset::KeySet;
+use crate::keyspace::text_set;
 use crate::model::{FirePer, StepKind};
 use crate::rule::{self, Rule};
 use crate::target::{Item, Sent, Target};
@@ -945,7 +947,7 @@ pub async fn fire_once(rule: &Rule, template: &str, reset: Value) -> Fired {
 }
 
 /// Every key, from `snapshot_keys_sql`.
-pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<KeySet> {
+pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<IdSet> {
     let q = rule
         .def
         .snapshot_keys_sql
@@ -953,14 +955,14 @@ pub async fn snapshot_keys(env: &Env, rule: &Rule) -> Result<KeySet> {
         .ok_or_else(|| anyhow!("the rule has no snapshot_keys_sql"))?;
     let mut conn = env.query.get_conn().await?;
     let rows: Vec<Row> = conn.exec(q, ()).await.context("snapshot_keys_sql")?;
-    Ok(keys_of(rows).into_iter().collect())
+    Ok(text_set(keys_of(rows).iter().map(String::as_str)))
 }
 
 const MAX_PAGES: usize = 1_000_000;
 
 /// Stray candidates per endpoint for reset step `step`: the target's keys (paged with the
 /// step's `list_template`) that the snapshot, read after the listing, does not have.
-pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeySet>> {
+pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<IdSet>> {
     let target = rule
         .target
         .clone()
@@ -977,9 +979,9 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeyS
     let mut exprs = vec![keys.as_str()];
     exprs.extend(next.as_deref());
     let read = crate::response::Values::new(&exprs)?;
-    let mut listed: Vec<KeySet> = Vec::new();
+    let mut listed: Vec<IdSet> = Vec::new();
     for (i, ep) in target.endpoints.iter().enumerate() {
-        let mut listed_keys = KeySet::new();
+        let mut listed_keys = IdSet::default();
         let mut cursor = Value::Null;
         for page in 0..MAX_PAGES {
             let reset = json!({"step": s.name, "keys": [], "next": cursor, "page": page});
@@ -1002,7 +1004,7 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeyS
             let fresh = page_keys
                 .iter()
                 .filter(|k| crate::template::valid_key(k))
-                .filter(|k| listed_keys.insert(k))
+                .filter(|k| listed_keys.insert(Key::from_text(k)))
                 .count();
             if next.is_none() {
                 break;
@@ -1030,7 +1032,15 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<KeyS
     let snapshot = snapshot_keys(env, rule).await?;
     Ok(listed
         .iter()
-        .map(|l| l.iter().filter(|k| !snapshot.contains(k)).collect())
+        .map(|l| {
+            let mut kept = IdSet::default();
+            for k in l.to_keys() {
+                if !snapshot.contains(&k) {
+                    kept.insert(k);
+                }
+            }
+            kept
+        })
         .collect())
 }
 

@@ -1314,6 +1314,93 @@ async fn xa_fires_only_after_commit() {
     inst.stop().await;
 }
 
+/// The XA floor across a restart: an XA that starts before a plain transaction but commits
+/// after it must keep the rule's saved position at its start while its keys are unflushed —
+/// or the restart resumes past its COMMIT and the keys are lost (the core's `pin` is what
+/// keeps the floor the minimum, `apply` in `src/engine.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xa_committed_after_a_later_transaction_keeps_its_floor_across_a_restart() {
+    let root = need_db!();
+    {
+        // A failed earlier run may have left 'lwf3' prepared on the shared server.
+        let mut c = mysql_async::Conn::new(
+            mysql_async::Opts::from_url(&format!("{root}/?prefer_socket=false")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let _ = c.query_drop("XA ROLLBACK 'lwf3'").await;
+        c.disconnect().await.ok();
+    }
+    let db = Db::fresh(&root, "xafloor").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    // Nothing may be confirmed while the keys are pending: every flush is refused, so the
+    // saved position is the pinned floor alone (like `failures_retry_and_hold_the_position`).
+    mock.respond(|_| (500, "unavailable".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('o', 'hook', 'POST /k HTTP/1.1\n\n{{join keys \",\"}}', 100)").await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    sleep_ms(300).await;
+    // The XA opens first: its start is the position the floor must stay at.
+    let xa_at = binlog_end(&db).await;
+    let mut c = db.conn().await;
+    for q in [
+        "XA START 'lwf3'",
+        "INSERT INTO orders VALUES (31, 1, 'x', 1)",
+        "XA END 'lwf3'",
+        "XA PREPARE 'lwf3'",
+    ] {
+        c.query_drop(q).await.unwrap();
+    }
+    // A filler event, then the plain transaction, then the COMMIT lands after both: the
+    // XA's rows and its (older) start reach the engine at the COMMIT.
+    db.exec("UPDATE customers SET name = 'filler' WHERE id = 1")
+        .await;
+    let plain_at = binlog_end(&db).await;
+    assert!(xa_at < plain_at, "the filler must move the position");
+    db.exec("INSERT INTO orders VALUES (32, 1, 'n', 1)").await;
+    c.query_drop("XA COMMIT 'lwf3'").await.unwrap();
+    // The flush is refused, both keys stay pending, and the rule's saved position must
+    // hold at the XA start — not climb to the plain transaction's.
+    wait_for(Duration::from_secs(10), "the refused flush", || async {
+        (!mock.requests().is_empty()).then_some(())
+    })
+    .await;
+    sleep_ms(600).await;
+    let (f, p, _, err) = db.status("o").await.unwrap();
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("500")),
+        "the flush was not refused: {err:?}"
+    );
+    assert!(
+        (f.clone(), p) <= xa_at,
+        "the rule position climbed past the XA start while its keys are unflushed: \
+         saved ({f},{p}), xa start {xa_at:?}"
+    );
+    // Restart with the target still down, then let it through: a resume point above the
+    // XA start would skip its PREPARE/COMMIT and lose key 31 forever.
+    inst.stop().await;
+    mock.clear(); // only deliveries after the restart may be seen
+    let inst = Instance::ready(config(&db, &[])).await;
+    mock.respond(|_| (200, r#"{"errors":false}"#.into()));
+    wait_for(
+        Duration::from_secs(15),
+        "both keys after the restart",
+        || async {
+            let all: Vec<String> = mock
+                .requests()
+                .iter()
+                .flat_map(|r| r.body.split(',').map(str::to_string).collect::<Vec<_>>())
+                .collect();
+            (all.contains(&"31".to_string()) && all.contains(&"32".to_string())).then_some(all)
+        },
+    )
+    .await;
+    c.disconnect().await.ok();
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ddl_resets_and_rules_change_live() {
     let root = need_db!();
