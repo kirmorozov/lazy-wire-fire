@@ -23,10 +23,10 @@ object.
 | `name` | referenced by rules |
 | `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`) (these four can sign their requests: [Webhook signing](#webhook-signing)), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
 SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
-Lambda function, below), `amqp` (an AMQP 0-9-1
-broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). An action goes to every endpoint |
-| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets)) |
+Lambda function, below), `eventbridge` (SigV4, an Amazon EventBridge event bus, below), `amqp` (an AMQP 0-9-1
+broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). An action goes to every endpoint |
+| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
@@ -70,6 +70,14 @@ body); the tool writes the request (`POST /2015-03-31/functions/<function>/invoc
 `sqs` and `kinesis`: [AWS credentials](#aws-credentials). One invocation per action, the answer
 per item when the function lists `batchItemFailures`: [below](#lambda-targets).
 
+**`eventbridge`**: the endpoint is the event bus, as
+`aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the bus a name or its ARN, which names
+its own region; the `aws-` URL form: below). One action is one `PutEvents` request to the service
+root (`POST /`): the template names the action (`X-Amz-Target: AWSEvents.PutEvents`) and lists
+the entries in the body, one per key. Credentials as `sqs`, `kinesis` and `lambda`:
+[AWS credentials](#aws-credentials). The tool signs the request SigV4 for service `events`. The
+answer per entry: [below](#eventbridge-targets).
+
 **`pubsub`**: the endpoint is the topic, as `gc-pubsub://<project>/<topic>` (`?endpoint=` for
 the emulator, below). Credentials: `vars.credentials_ref`, a reference to a service-account key
 (never a literal), else [Application Default Credentials](#pubsub-targets). One action is one
@@ -85,8 +93,15 @@ credentials: `vars.username` and `vars.password`, references or literals (as `re
 take them), resolved on each connect, or no credentials at all for an anonymous session. One
 mail per action, the server's reply the answer: [below](#smtp-targets).
 
-**The `aws-sqs://`, `aws-kinesis://` and `aws-lambda://` URL form** (the `endpoints` of the kinds
-`sqs`, `kinesis` and `lambda`, and of no other kind):
+**`kafka`**: the endpoint is one broker set and the topic it writes to, as
+`kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (default ports 9092 / 9093; `kafkas://`
+is TLS), without credentials: `vars.sasl` (`plain`, `scram-sha-256` or `scram-sha-512`) with
+`vars.username` (a reference or a literal) and `vars.password` (a reference, never a literal),
+or no SASL at all for an anonymous connection. One action is one produce of a batch of records,
+record *i* answered by key *i*: [below](#kafka-targets).
+
+**The `aws-sqs://`, `aws-kinesis://`, `aws-lambda://` and `aws-eventbridge://` URL form** (the
+`endpoints` of the kinds `sqs`, `kinesis`, `lambda` and `eventbridge`, and of no other kind):
 
 * `sqs`: `aws-sqs://[<region>/]<account-id>/<queue-name>` — the account id is twelve digits, the
   queue name 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo` (a FIFO queue).
@@ -97,12 +112,18 @@ mail per action, the server's reply the answer: [below](#smtp-targets).
   qualifier is a version or an alias (letters, digits, `-`, `_`), `$LATEST` or
   `$LATEST.PUBLISHED`. `?invocation=sync` (the default: the answer is the function's result) or
   `?invocation=event` (queued; answered 202 before the function runs), once each.
+* `eventbridge`: `aws-eventbridge://[<region>/]<event-bus>` — the event bus is a name (1 to 256
+  letters, digits, `-`, `_` or `.`) or its ARN
+  (`arn:<partition>:events:<region>:<account-id>:event-bus/<name>`, the partition `aws`,
+  `aws-cn` or `aws-us-gov`, the account id twelve digits). An ARN names its own region and is
+  written alone: a region in front of it is refused, naming the reason.
 * The region comes from the URL when the URL gives one; otherwise from the AWS default settings:
   `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `region` in the shared config file's profile
   (`AWS_CONFIG_FILE`, default `~/.aws/config`; the profile is `AWS_PROFILE`, default
   `default`). When none of these gives a region, the target does not load (the error names both
-  ways to set one). `vars.region` is refused by the three kinds (`vars.stream_name` and
-  `vars.stream_arn` by `kinesis`); `http.s3` is unchanged and still takes `vars.region`.
+  ways to set one). `vars.region` is refused by the four kinds (`vars.stream_name` and
+  `vars.stream_arn` by `kinesis`, `vars.event_bus_name` and `vars.event_bus_arn` by
+  `eventbridge`); `http.s3` is unchanged and still takes `vars.region`.
 * `?endpoint=http(s)://host:port` (the only other query parameter, once, no path) sends the
   request to that address instead of the regional one — an emulator or a VPC endpoint. The
   signing still uses the region and the service name; for `sqs`, `endpoint.url` is the queue URL
@@ -117,8 +138,8 @@ scheme); `?endpoint=` there is the only query parameter.
 
 ### AWS credentials
 
-The kinds `http.s3`, `sqs`, `kinesis` and `lambda` sign their requests SigV4 with one of two
-sources, chosen per target:
+The kinds `http.s3`, `sqs`, `kinesis`, `lambda` and `eventbridge` sign their requests SigV4
+with one of two sources, chosen per target:
 
 * **References in the target's `vars`**: `vars.access_key_ref` and `vars.secret_key_ref`
   (together; `vars.session_token_ref` optional). They must be references (`env:NAME` or
@@ -184,8 +205,15 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
   ([below](#lambda-targets)).
 * For `pubsub`, `expect` runs over the whole publish answer (`status`, `headers`, `body` the
   `{"messageIds": […]}` object); the outcome is whole-action ([below](#pubsub-targets)).
-* On `http.s3`, `sqs`, `kinesis` and `lambda`, an error answer is transient when its code (the
-  `x-amzn-errortype` header, else the body's `__type`) is `ThrottlingException`,
+* For `kafka`, the produce answer maps per partition onto that partition's records, so `expect`
+  runs once per record: `body` is the record's `{"topic": …, "partition": …, "offset": …}`
+  object, the other columns NULL. A record whose `expect` is not met is refused on its own.
+* For `eventbridge`, the answer of one `PutEvents` gives its entries in request order, so
+  `expect` runs once per entry: `status` is the request's HTTP status and `body` is the entry's
+  own JSON (its `EventId`, or its `ErrorCode` and `ErrorMessage`). An entry whose `expect` is
+  not met is refused on its own.
+* On `http.s3`, `sqs`, `kinesis`, `lambda` and `eventbridge`, an error answer is transient when
+  its code (the `x-amzn-errortype` header, else the body's `__type`) is `ThrottlingException`,
   `RequestThrottled`, `ProvisionedThroughputExceededException`, `ServiceUnavailable` or
   `InternalFailure`, whatever the status (AWS JSON errors come as HTTP 400); every other error
   code is a refusal.
@@ -210,6 +238,8 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | an SMTP mail (the server accepted it) | `status = 250` |
 | a Lambda invoke (the result names the stored id) | `JSON_EXTRACT(body, '$.id') IS NOT NULL` |
 | a Pub/Sub publish (at least one message id) | `JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0` |
+| a Kafka produce (per record, the offset answered) | `JSON_EXTRACT(body, '$.offset') IS NOT NULL` |
+| an EventBridge entry (per entry, the event stored) | `JSON_EXTRACT(body, '$.EventId') IS NOT NULL` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
 | an API that answers 200 with a state | `JSON_UNQUOTE(JSON_EXTRACT(body, '$.state')) = 'stored'` |
 | a header | `JSON_UNQUOTE(JSON_EXTRACT(headers, '$."x-ack"')) = 'yes'` |
@@ -246,9 +276,9 @@ receiver reads (a stray-cleanup listing of these kinds is signed too):
   literal `sign_secret_ref`, a signing setting without `vars.sign`, a header name that is not a
   header name, an encoding that is neither `hex` nor `base64`, a `sign_prefix` that is not a
   string, and the three `hmac`-only settings on `standard` (that scheme fixes its headers).
-* A signing setting on any other kind — `http.s3`, `sqs`, `kinesis`, `lambda`, `pubsub`, `amqp`,
-  `smtp`, `redis`, `mysql`, `pgsql` — is a load error too: `http.s3` signs SigV4 and the queue
-  kinds their own protocols, so the setting would point at nothing.
+* A signing setting on any other kind — `http.s3`, `sqs`, `kinesis`, `lambda`, `eventbridge`,
+  `pubsub`, `kafka`, `amqp`, `smtp`, `redis`, `mysql`, `pgsql` — is a load error too: `http.s3`
+  signs SigV4 and the queue kinds their own protocols, so the setting would point at nothing.
 * The secret is a credential of the kind: it stays out of the template context (`target.vars`
   holds the scheme and the header form, not the secret) and out of the logs
   ([security](#security)).
@@ -389,6 +419,57 @@ through in `batchItemFailures`.
   invocation whose answer was lost is sent again with the newest state, and an event invocation
   may be delivered more than once. A long function raises the target's `timeout_ms`
   (synchronous invocations wait for their result).
+
+### EventBridge targets
+
+`eventbridge` sends to an Amazon EventBridge event bus: one `PutEvents` per action (AWS JSON
+1.1, `X-Amz-Target: AWSEvents.PutEvents`, signed SigV4 for service `events`), one entry per key,
+and the answer gives the entries back in request order — entry *i* of the answer is entry *i* of
+the request, so the kind's answer is per item, not per action.
+
+* **The endpoint.** `aws-eventbridge://[<region>/]<event-bus>`: the bus a name (1 to 256
+  letters, digits, `-`, `_` or `.`) or its ARN, which names its own region; exactly one endpoint,
+  and `?endpoint=` for emulators and VPC endpoints, as for `sqs` and `kinesis`. The region comes
+  from the URL or the AWS default settings (above). `vars.region`, `vars.event_bus_name` and
+  `vars.event_bus_arn` are refused: the region and the bus go in the endpoint. Credentials: as
+  `sqs`, `kinesis` and `lambda` — [AWS credentials](#aws-credentials).
+* **Batch limits.** With `fire_per = batch`, `batch_max_keys` is required and holds 1 to 10 (the
+  most entries a `PutEvents` takes); a rule without it, or with more, does not load.
+  `batch_max_bytes` defaults to 1048576 (1 MB, the most the entries of one request sum to, the
+  JSON around them counted) and cannot be set higher. With `fire_per = key` each key is its own
+  one-entry request, so no batch is sized.
+* **The rendered request.** The template renders the whole request (as for `sqs` and `kinesis`):
+  the `POST /` line with `X-Amz-Target: AWSEvents.PutEvents`, `Content-Type:
+  application/x-amz-json-1.1`, and a `{"Entries": […]}` body — exactly one entry per key
+  (`Entries[i]` is answered by position), each entry holding `Source`, `DetailType` and `Detail`
+  as non-empty strings (PutEvents requires all three on every entry; `Detail` is the document's
+  JSON in `{{json (json doc)}}`), the bus from the endpoint (`"EventBusName": {{json
+  endpoint.bus}}`), and the optional `Resources`, `Time` and `TraceHeader`. The entries are
+  checked before the request is signed and sent: a batch whose entries are wrong is a
+  whole-request refusal, bisected down to the key that fails alone (as with `http`).
+  `endpoint.bus` and `endpoint.region` name the bus and the region.
+* **Outcomes.** An entry with an `EventId` was stored, and `expect` is evaluated for it: met,
+  its key is confirmed and never sent again; not met, the entry is refused on its own. An entry
+  whose `ErrorCode` is `ThrottlingException`, `ProvisionedThroughputExceededException`,
+  `RequestThrottled`, `ServiceUnavailable` or `InternalFailure` is transient: its key waits and
+  is sent again later with its newest document. Any other `ErrorCode` refuses that entry on its
+  own (no bisection: the answer names it by position); five such refusals, while other keys went
+  through, drop the key and name it in `last_error`. An entry the answer says nothing about
+  (neither `EventId` nor `ErrorCode`) waits — only the entries that did not go through wait.
+  A non-2xx answer follows the usual rules: 5xx, 408, 429 and the AWS throttling codes are
+  transient, every other error is a refusal; an answer that is not JSON fails the whole action
+  as transient.
+* **Reset steps.** The kind only appends: an event that went out cannot be recalled. A
+  `for_each: stray` step does not load ("a stray cleanup needs a target that can delete keys;
+  kind eventbridge only appends"), and neither does a `once` step whose template deletes the bus
+  (`DeleteEventBus`, which would take the bus and every rule on it; recognized by text, so a
+  delete built from variables is not caught). Still allowed: `once` (an announcement entry),
+  `for_each: snapshot` (every key is sent again; consumers must tolerate that) and
+  `reset_requested`.
+* **Contract.** The bus receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: an entry can arrive twice (a retry after a lost answer; a snapshot
+  reset). Consumers apply an entry as the key's current state and drop what they applied already.
+  No order is guaranteed, within one key or across keys.
 
 ### AMQP targets
 
@@ -560,6 +641,88 @@ not by key, so one publish is either met, refused or transient for all of its me
   dedupes by the `key` attribute and keeps the newest message per key. Several changes of one
   key within the debounce window arrive as one message, and a delete is the key's last state.
 
+### Kafka targets
+
+`kafka` produces to a broker of the Kafka protocol (Apache Kafka, Redpanda, Amazon MSK and
+Azure Event Hubs all speak it): one action is one produce of a batch of records, one record per
+key, and the answer maps the produce answer of each partition onto that partition's records, so
+the kind's answer is per item, not per action. The client is `rskafka`, pure Rust: no librdkafka,
+so the image grows no native Kafka dependency.
+
+* **The endpoint.** `kafka://<broker>[:port][,<broker>[:port]…]/<topic>`, or `kafkas://` for
+  TLS (default ports 9092 / 9093); exactly one endpoint: one broker set and the one topic it
+  writes to (a batch is answered per item, which the engine sends to a single endpoint — as
+  `sqs`, `kinesis` and `lambda` take one endpoint too). The topic is 1 to 249 letters, digits,
+  `-` or `.`; the target never creates one: a topic the broker does not list is refused (below).
+  No credentials in the URL (a `@` is a load error), no query string and no fragment; a
+  `kafka://` or `kafkas://` URL belongs to `kind kafka` only. The endpoint context names the
+  topic (`endpoint.topic`) and the broker set (`endpoint.brokers`: `{host, port}` per broker),
+  and [LAZYWF_ALLOWED_HOSTS](#security) matches every broker of the set.
+* **Credentials and TLS.** `vars.sasl` selects the SASL mechanism — `plain`, `scram-sha-256` or
+  `scram-sha-512` — and needs `vars.username` (a reference or a literal, as `amqp` takes it) and
+  `vars.password` (a reference, never a literal; it is a secret of the kind); both are resolved
+  on every connect, so a rotated secret file applies at the next connection. Without
+  `vars.sasl` the connection is anonymous. `kafkas://` is TLS, `verify-full` by default: the
+  chain against the Mozilla roots and the `tls.ca` files, and the host name of every broker;
+  `tls.server_name` is refused (each broker's own name is checked) and so is `disabled` on
+  `kafkas://`.
+* **The rendered action.** One action, one produce: the template renders `POST /` with a body
+  of
+
+  ```text
+  POST / HTTP/1.1
+  Content-Type: application/json
+
+  {"records": [{"value": …, "headers": {"op": "upsert"}}, {"value": …}]}
+  ```
+
+  Record *i* takes the document key `keys[i]` as its record key, its rendered `value` (one JSON
+  value, serialized compactly; null is refused — render an empty object for a delete) and
+  optional `headers` (string to string); a record carries `value` and `headers` only, and the
+  records' count must match the keys'. A `once` reset step has no keys: its records are keyless
+  and land on partition 0. A blank render sends nothing; a body that is not that JSON is
+  refused.
+* **Partition choice.** The record key is the document key, and the partition is what the
+  brokers' own default partitioner makes of it — the murmur2 hash of the key, made positive and
+  taken modulo the topic's partition count — so one key always lands on the same partition, and
+  its records arrive in order. Across keys no order is guaranteed.
+* **Compression and the batch limit.** The produce's batch is compressed per target:
+  `vars.compression` is `none`, `gzip`, `lz4` or `zstd` (zstd by default). The largest batch a
+  target takes is the broker's `message.max.bytes`, 1 MiB by default, raised per target by
+  `vars.message_max_bytes` (1 to 4294967295); with `fire_per = batch`, `batch_max_bytes` above
+  the target's limit does not load, and a batch is split to it when unset.
+* **Outcomes.** The produce answer of a partition maps onto that partition's records. A base
+  offset: sent — `expect` then sees, per record, `body` `{"topic": …, "partition": …, "offset":
+  …}` (no `expect`: met), and a record whose condition is not met is refused on its own.
+  Retriable broker errors (leader not available, not leader for the partition, a timeout,
+  throttling, the network), a whole-call connection failure, a produce's
+  `UnknownTopicOrPartition` (stale routing: the failed step clears the cached partitions, so the
+  next attempt re-reads them) and any code the client cannot judge (the broker's
+  `UnknownServerError`, an unrecognised code) are transient: a retry cannot drop a key. Record
+  too large, message too large, an unknown topic at the metadata check (the topic must exist:
+  the target does not create one), an invalid record, an authorization or a SASL failure and an
+  unsupported compression are refused. The broker refuses a whole record set over one record of
+  it and names none — so a batch refused over a size or a format code is split in two and both
+  halves produced again: the record the broker will not have is refused alone and its neighbours
+  go through (bounded by 64 extra produces per action; a batch refused whole costs one produce).
+  A failed step drops the connection and its cached partitions; the next action reconnects and
+  re-reads the metadata.
+* **One produce at a time.** Produces to one endpoint run one at a time (the endpoint's lock is
+  held over all of an action's partition produces: one batch of records per partition, in one
+  produce each, keeps the order of the action), as `amqp` holds its session; different targets
+  and rules run in parallel. Every partition step is bounded by the target's `timeout_ms`.
+* **Reset steps.** The kind only appends: a produced record cannot be recalled. A
+  `for_each: stray` step does not load ("a stray cleanup needs a target that can delete keys;
+  kind kafka only appends"), and the target cannot list keys either. Still allowed: `once` (one
+  produce of keyless records, an announcement for example) and `for_each: snapshot` (every key
+  is produced again, as new records) and `reset_requested`.
+* **Contract.** The topic receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: a record can arrive twice (a retry after a lost answer; a snapshot
+  reset), so a consumer reads the partition log and keeps the newest record per key. Several
+  changes of one key within the debounce window arrive as one record, and a delete is the key's
+  last state. One key's records keep their order (one key, one partition); across keys no order
+  is guaranteed.
+
 ## Rules
 
 `lazy_wire_fire_rule`
@@ -571,12 +734,16 @@ not by key, so one publish is either met, refused or transient for all of its me
 | `selects` | zero or more queries: SQL separated by `;`, or a JSON array of strings or `{"name", "sql"}`. Each returns `_key` plus [path-named columns](#documents-from-path-named-columns) and uses `:keys` for the changed keys (`WHERE id IN (:keys)`). They run concurrently, each on its own connection |
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
-| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)) |
+| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge` and `kafka` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [Kafka targets](#kafka-targets)) |
 | `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
 is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
-5242880 ([Kinesis targets](#kinesis-targets)). `pubsub`: `batch_max_keys` is required with
+5242880 ([Kinesis targets](#kinesis-targets)). `eventbridge`: `batch_max_keys` is required with
+`fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 1048576
+([EventBridge targets](#eventbridge-targets)). `pubsub`: `batch_max_keys` is required with
 `fire_per = batch` and holds 1 to 1000, and `batch_max_bytes` cannot exceed 10000000
-([Pub/Sub targets](#pubsub-targets)) |
+([Pub/Sub targets](#pubsub-targets)). `kafka`: `batch_max_bytes` cannot exceed the target's
+produce limit, the broker's `message.max.bytes` (1 MiB by default) raised by its
+`vars.message_max_bytes` ([Kafka targets](#kafka-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
 | `reset_steps` | JSON array, [below](#reset-steps) |
 | `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded |
@@ -693,7 +860,7 @@ Handlebars, never HTML-escaped. Context:
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `pubsub` also `project` and `topic`) of the endpoint the action goes to |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker)) of the endpoint the action goes to |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -746,6 +913,12 @@ What a template renders:
   Blank output sends nothing.
 * **pubsub**: the raw request as for `http`, but only the topic's `:publish` path is sent
   ([Pub/Sub targets](#pubsub-targets)). Blank output sends nothing.
+* **kafka**: `POST /` with the `{"records": […]}` produce body (record *i* takes key *i*); the
+  tool groups the records by partition and produces them
+  ([Kafka targets](#kafka-targets)). Blank output sends nothing.
+* **eventbridge**: the raw request as for `http` — the `PutEvents` call — whose `Entries` are
+  checked before the request is signed and sent
+  ([EventBridge targets](#eventbridge-targets)). Blank output sends nothing.
 
 ## Reset steps
 
@@ -777,13 +950,14 @@ and resets only when that part of the binlog was purged. An interrupted reset st
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
-* An append-only kind (`sqs`, `kinesis`, `amqp`, `smtp`, `pubsub`) refuses a `for_each: stray` step at
-  load (a sent message cannot be recalled), `lambda` refuses one too (a function cannot list
-  what it was invoked with), `sqs` and `kinesis` refuse a `once` step that purges what it has
-  sent (a queue's `PurgeQueue`, a stream's `DeleteStream`), and `pubsub` a step that does
-  anything but publish — [SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets),
-  [Lambda targets](#lambda-targets), [AMQP targets](#amqp-targets),
-  [Pub/Sub targets](#pubsub-targets).
+* An append-only kind (`sqs`, `kinesis`, `eventbridge`, `amqp`, `smtp`, `pubsub`, `kafka`)
+  refuses a `for_each: stray` step at load (a sent message cannot be recalled), `lambda` refuses
+  one too (a function cannot list what it was invoked with), `sqs`, `kinesis` and `eventbridge`
+  refuse a `once` step that purges what it has sent (a queue's `PurgeQueue`, a stream's
+  `DeleteStream`, an event bus's `DeleteEventBus`), and `pubsub` a step that does anything but
+  publish — [SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets),
+  [Lambda targets](#lambda-targets), [EventBridge targets](#eventbridge-targets),
+  [AMQP targets](#amqp-targets), [Pub/Sub targets](#pubsub-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
@@ -887,7 +1061,9 @@ literal, or a CIDR range, with an optional `:port` (an IPv6 pattern with a port 
 
 Every endpoint's effective host and port — the name lazywf connects to, after a `?endpoint=`
 override, the derived AWS and Google service hosts, and the S3 virtual-hosted bucket host (the
-bucket name in front of the service host) — must match a pattern. Matching is on that name:
+bucket name in front of the service host) — must match a pattern. A `kafka` endpoint lists every
+broker of its set: the check matches all of them, not only the first, and the one off the list is
+the host the error names. Matching is on that name:
 nothing is resolved in DNS, so an IP pattern matches IP-literal endpoints only, and `localhost`
 never matches `127.0.0.1`. An unmatched endpoint is a target load error that names the host and
 the setting; it shows in the rule's `last_error`, and the check runs when a target is loaded —
