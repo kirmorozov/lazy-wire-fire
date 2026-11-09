@@ -4366,24 +4366,69 @@ fn docker(args: &[&str]) {
 }
 
 /// One shell command inside the broker's container, bounded by `timeout` (an `rpk` that waits
-/// for records that never come must not hang the suite). Its stdout.
-fn rpk(cmd: &str) -> String {
-    let out = std::process::Command::new("docker")
+/// for records that never come must not hang the suite).
+fn rpk_run(cmd: &str, secs: u64) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("docker")
         .args([
             "exec",
             KAFKA_CONTAINER,
             "sh",
             "-c",
-            &format!("timeout 60 {cmd}"),
+            &format!("timeout {secs} {cmd}"),
         ])
         .output()
-        .unwrap_or_else(|e| panic!("docker exec `sh -c {cmd}`: {e}"));
+}
+
+/// As `rpk_run`, panicking when the command fails. Its stdout.
+fn rpk(cmd: &str) -> String {
+    let out = rpk_run(cmd, 60).unwrap_or_else(|e| panic!("docker exec `sh -c {cmd}`: {e}"));
     assert!(
         out.status.success(),
         "rpk `{cmd}`: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// As `rpk`, but `None` instead of a panic, and bounded by `secs` inside the container: for asking
+/// a broker that is still starting, where a slow or refusing `rpk` only means "not yet".
+fn rpk_try(cmd: &str, secs: u64) -> Option<String> {
+    let out = rpk_run(cmd, secs).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// The container's health as the compose health check sees it (`"starting"`, `"healthy"`,
+/// `"unhealthy"`; empty while the container is down).
+fn container_health() -> String {
+    std::process::Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Health.Status}}",
+            KAFKA_CONTAINER,
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether the text of `rpk cluster health` reports the cluster up with every partition having a
+/// leader: `Healthy:  true`, and the counts `Leaderless partitions (0):  []` and
+/// `Under-replicated partitions (0):  []`.
+fn cluster_is_healthy(health: &str) -> bool {
+    let count = |name: &str| -> Option<usize> {
+        let (_, rest) = health
+            .lines()
+            .find(|l| l.starts_with(name))?
+            .split_once('(')?;
+        rest.split(')').next()?.parse().ok()
+    };
+    health.lines().any(|l| {
+        l.starts_with("Healthy:") && l.split_once(':').is_some_and(|(_, v)| v.trim() == "true")
+    }) && count("Leaderless partitions") == Some(0)
+        && count("Under-replicated partitions") == Some(0)
 }
 
 /// The partition the broker's own default partitioner gives each of `keys`: the records are
@@ -4430,8 +4475,18 @@ struct Recd {
 }
 
 /// The test's own rskafka client: it makes the topics and reads the records back.
+///
+/// A client is built for every call rather than held across them: rskafka caches the cluster
+/// metadata for the life of a client (its `MetadataCache` has no expiry) and answers the leader
+/// read of `partition_client` from that cache, retrying a `LeaderNotAvailable` out of it without
+/// asking the broker again. A client built while the broker has no leader for a partition keeps
+/// answering `LeaderNotAvailable` after the broker has healed, which is how the `queues` job lost
+/// 120 s over a broker whose leaders were back within a second.
 struct Kafka {
-    client: rskafka::client::Client,
+    broker: String,
+    /// How long one rskafka request (the connect, the leader read, a fetch) waits out a transient
+    /// broker state inside its client before the call is retried with a fresh client.
+    retry: Duration,
 }
 
 impl Kafka {
@@ -4441,36 +4496,54 @@ impl Kafka {
         Kafka::with_retry(broker, 5).await
     }
 
-    /// As `new`, but each call (metadata, the leader read, a fetch) retries transient
-    /// broker states for `retry_secs`: a just-restarted broker keeps answering
-    /// `LeaderNotAvailable` while it re-elects the leaders.
+    /// As `new`, but each rskafka request waits out a transient broker state for `retry_secs`: a
+    /// just-restarted broker keeps answering `LeaderNotAvailable` while it re-elects the leaders.
+    /// Keep it short where the broker changes under the reader (a restart): the patience that
+    /// matters is the loop in `partition_client`, and every retry of that loop asks the broker
+    /// again.
     async fn with_retry(broker: &str, retry_secs: u64) -> Kafka {
+        let k = Kafka {
+            broker: broker.to_string(),
+            retry: Duration::from_secs(retry_secs),
+        };
+        k.client().await; // as `new` always did: the broker answers, or this panics.
+        k
+    }
+
+    /// A client for one call, connected (retrying while the broker is down). Its metadata is read
+    /// now, which is the point of building one per call: see the struct.
+    async fn client(&self) -> rskafka::client::Client {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            match rskafka::client::ClientBuilder::new(vec![broker.to_string()])
+            match rskafka::client::ClientBuilder::new(vec![self.broker.clone()])
                 .client_id("lazywf-e2e")
                 .backoff_config(rskafka::BackoffConfig {
-                    deadline: Some(Duration::from_secs(retry_secs)),
+                    deadline: Some(self.retry),
                     ..Default::default()
                 })
                 .build()
                 .await
             {
-                Ok(client) => {
-                    return Kafka { client };
-                }
+                Ok(client) => return client,
                 Err(e) if std::time::Instant::now() < deadline => {
-                    eprintln!("the kafka broker at {broker} is not up yet ({e:#}): retrying");
+                    eprintln!(
+                        "the kafka broker at {} is not up yet ({e:#}): retrying",
+                        self.broker
+                    );
                     sleep_ms(500).await;
                 }
-                Err(e) => panic!("the kafka broker at {broker} did not answer in 60 s: {e:#}"),
+                Err(e) => panic!(
+                    "the kafka broker at {} did not answer in 60 s: {e:#}",
+                    self.broker
+                ),
             }
         }
     }
 
     /// Creates the topic of `n` partitions and waits until the metadata lists it.
     async fn topic(&self, name: &str, n: i32) {
-        self.client
+        self.client()
+            .await
             .controller_client()
             .unwrap()
             .create_topic(name, n, 1, 10_000)
@@ -4481,7 +4554,8 @@ impl Kafka {
 
     /// Deletes the topic (best effort: a rerun makes a fresh one, the broker is shared).
     async fn drop_topic(&self, name: &str) {
-        self.client
+        self.client()
+            .await
             .controller_client()
             .unwrap()
             .delete_topic(name, 10_000)
@@ -4494,7 +4568,8 @@ impl Kafka {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let topics = self
-                .client
+                .client()
+                .await
                 .list_topics()
                 .await
                 .unwrap_or_else(|e| panic!("the topic list: {e:#}"));
@@ -4514,7 +4589,7 @@ impl Kafka {
 
     /// The partition client, waiting a leader election out: a just-restarted broker answers
     /// `LeaderNotAvailable` until it has re-elected every leader, which on a busy runner
-    /// outlasts the client's own retry deadline (the queues job failed there once).
+    /// outlasts one client's own retry deadline (the queues job failed there once).
     async fn partition_client(
         &self,
         name: &str,
@@ -4523,8 +4598,11 @@ impl Kafka {
         use rskafka::client::partition::UnknownTopicHandling;
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
+            // A fresh client per attempt: a held one answers the leader read from the metadata
+            // it was built with, and no retry inside rskafka asks the broker again.
             match self
-                .client
+                .client()
+                .await
                 .partition_client(name, pid, UnknownTopicHandling::Retry)
                 .await
             {
@@ -4597,10 +4675,33 @@ impl BrokerRestart {
         docker(&["stop", "-t", "5", KAFKA_CONTAINER]);
         self.down = true;
     }
-    /// Starts it again.
+    /// Starts it again: `docker start` returns when the process is launched, so the reader waits
+    /// for `healthy` before it asks the broker anything.
     fn start(&mut self) {
         docker(&["start", KAFKA_CONTAINER]);
         self.down = false;
+    }
+    /// Waits for the started broker to report healthy on both counts: the container's own health
+    /// check (compose asks `/v1/status/ready` every 2 s) and the broker's cluster health, which
+    /// counts the leaderless partitions. Reading a partition while it has no leader is what the
+    /// reader used to wait out for minutes.
+    async fn healthy(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let health = rpk_try("rpk cluster health", 10);
+            if container_health() == "healthy" && health.as_deref().is_some_and(cluster_is_healthy)
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the broker did not report healthy in 120 s: {}",
+                health
+                    .as_deref()
+                    .unwrap_or("`rpk cluster health` did not run")
+            );
+            sleep_ms(250).await;
+        }
     }
 }
 
@@ -4981,11 +5082,15 @@ async fn kafka_restart() {
         },
     )
     .await;
-    drop(k); // The client's connections are dead with the broker.
 
     restart.start();
-    // Leaders take a few seconds to re-elect: this reader waits them out instead of failing.
-    let k = Kafka::with_retry(&broker, 30).await;
+    // `docker start` only launches the process: wait for the broker's health check and for its
+    // leaders before anyone reads, so the reader below meets a healed broker and not a
+    // half-started one whose "no leader" answer it would then repeat from its own metadata.
+    restart.healthy().await;
+    // The reader after the heal: a client of its own per call, with short rskafka retries, so
+    // every retry of `partition_client` asks the broker again.
+    let k = Kafka::with_retry(&broker, 2).await;
     wait_for(Duration::from_secs(90), "key 2 after the heal", || async {
         k.records(&topic)
             .await
