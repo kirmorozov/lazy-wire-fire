@@ -132,6 +132,9 @@ pub enum Kind {
     Smtp,
     /// Google Cloud Pub/Sub `topics.publish` (one request per action, a whole-action answer).
     PubSub,
+    /// Kafka: one produce of a batch of records per action, an answer per partition (see
+    /// `kafka.rs`).
+    Kafka,
     Redis,
     MySql,
     PgSql,
@@ -151,11 +154,12 @@ impl Kind {
             "amqp" => Kind::Amqp,
             "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
+            "kafka" => Kind::Kafka,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, smtp, pubsub, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
             ),
         })
     }
@@ -163,7 +167,7 @@ impl Kind {
     pub fn is_http(self) -> bool {
         !matches!(
             self,
-            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql
+            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka
         )
     }
 
@@ -181,6 +185,7 @@ impl Kind {
             Kind::Amqp => "amqp",
             Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
+            Kind::Kafka => "kafka",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -190,7 +195,7 @@ impl Kind {
     /// Kinds whose answer says, per item of a batch, which items went through (see
     /// `Target::send_items`). The others answer per action.
     pub fn reports_items(self) -> bool {
-        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Lambda)
+        matches!(self, Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka)
     }
 
     /// Kinds that can only append: a sent message cannot be recalled or deleted by key, so
@@ -198,7 +203,7 @@ impl Kind {
     pub fn append_only(self) -> bool {
         matches!(
             self,
-            Kind::Sqs | Kind::Kinesis | Kind::Amqp | Kind::Smtp | Kind::PubSub
+            Kind::Sqs | Kind::Kinesis | Kind::Amqp | Kind::Smtp | Kind::PubSub | Kind::Kafka
         )
     }
 
@@ -211,6 +216,9 @@ impl Kind {
             Kind::Kinesis => Some(5_242_880),
             // topics.publish: 10 MB per request (base64 `data` is in the rendered text).
             Kind::PubSub => Some(10_000_000),
+            // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
+            // (see `Target::batch_bytes_limit`).
+            Kind::Kafka => Some(crate::kafka::MESSAGE_MAX_BYTES),
             _ => None,
         }
     }
@@ -236,7 +244,9 @@ impl Kind {
                 &["access_key_ref", "secret_key_ref", "session_token_ref"]
             }
             Kind::PubSub => &["credentials_ref"],
-            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql => &["password"],
+            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka => {
+                &["password"]
+            }
         }
     }
 }
@@ -421,6 +431,7 @@ impl TargetDef {
             Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
+            Kind::Kafka => crate::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         // Webhook signing is an option of the plain http kinds; on the others the settings
@@ -448,6 +459,7 @@ impl TargetDef {
             }
         }
         crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
+        crate::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }

@@ -155,13 +155,16 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>,
 /// - `sqs`: a batch holds at most 10 keys (`batch_max_keys`, required) and 256 KiB.
 /// - A FIFO queue (the endpoint names a `.fifo` queue) needs a `version` column: it is the
 ///   `MessageDeduplicationId` (decision D5).
+/// - `kafka`: a batch holds at most the target's limit (the broker's `message.max.bytes`,
+///   raised by its `vars.message_max_bytes`).
 pub fn kind_errors(
     def: &RuleDef,
-    kind: crate::model::Kind,
-    endpoints: &[String],
+    target: &crate::model::TargetDef,
     columns: &[String],
 ) -> Vec<String> {
     use crate::model::Kind;
+    let kind = target.kind;
+    let endpoints = &target.endpoints;
     let mut out = Vec::new();
     if kind.append_only() || kind == Kind::Lambda {
         // A Lambda function cannot list what it was invoked with, so a stray listing has nothing
@@ -237,6 +240,13 @@ pub fn kind_errors(
     }
     if kind == Kind::PubSub {
         out.extend(crate::pubsub::rule_errors(def));
+    }
+    if kind == Kind::Kafka {
+        // The batch's byte limit: the target's own (the broker's `message.max.bytes`, raised
+        // by its `vars.message_max_bytes` — checked at load, so it cannot fail here).
+        let limit = crate::kafka::message_max_bytes(&target.vars)
+            .unwrap_or(crate::kafka::MESSAGE_MAX_BYTES);
+        out.extend(crate::kafka::rule_errors(def, limit));
     }
     if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
         match def.batch_max_keys {
@@ -400,12 +410,7 @@ pub async fn compile(
         if t.endpoints.is_empty() {
             errors.push(format!("target `{}` has no endpoints", def.target));
         }
-        errors.extend(kind_errors(
-            &def,
-            t.def.kind,
-            &t.def.endpoints,
-            &select_columns,
-        ));
+        errors.extend(kind_errors(&def, &t.def, &select_columns));
         if let Err(e) = t.expect.validate(conn).await {
             errors.push(format!("target `{}` `expect`: {e:#}", def.target));
         }
@@ -456,10 +461,23 @@ pub fn trigger_parse_error(id: u64, e: &anyhow::Error) -> anyhow::Error {
     anyhow!("trigger {id}: {e:#}")
 }
 
+/// A rule-load target of `kind` with one endpoint and `vars` (the tests' kind targets load).
+#[cfg(test)]
+fn test_target(kind: &str, endpoint: &str, vars: &str) -> crate::model::TargetDef {
+    crate::model::TargetDef::from_row(&crate::model::RawTarget {
+        name: "t".into(),
+        kind: Some(kind.into()),
+        endpoints: Some(endpoint.into()),
+        vars: Some(vars.into()),
+        ..Default::default()
+    })
+    .unwrap()
+}
+
 #[cfg(test)]
 mod kind_tests {
     use super::*;
-    use crate::model::{Kind, RawRule, ResetStep};
+    use crate::model::{FirePer, RawRule, ResetStep, TargetDef};
 
     const QUEUE: &str = "aws-sqs://eu-west-1/123456789012/orders";
     const FIFO: &str = "aws-sqs://eu-west-1/123456789012/orders.fifo";
@@ -495,6 +513,12 @@ mod kind_tests {
         }
     }
 
+    /// The target of a rule of kind `kind` on `endpoint` (its load checks pass; the tests
+    /// exercise the rule side).
+    fn target(kind: &str, endpoint: &str, vars: &str) -> TargetDef {
+        test_target(kind, endpoint, vars)
+    }
+
     #[test]
     fn lambda_refuses_strays_and_oversized_payloads() {
         const FN: &str = "aws-lambda://eu-west-1/orders";
@@ -502,50 +526,63 @@ mod kind_tests {
         // a stray listing does not exist for a function
         let mut d = def();
         d.reset_steps = vec![step(stray(), None)];
-        let e = kind_errors(&d, Kind::Lambda, &[FN.into()], &[]);
+        let e = kind_errors(&d, &target("lambda", FN, "{}"), &[]);
         assert_eq!(e.len(), 1, "{e:?}");
         assert!(e[0].contains("can list keys; kind lambda cannot"), "{e:?}");
         // the sync payload limit is 6 MB; the event limit is 1 MB
         let mut d = def();
         d.batch_max_bytes = Some(6_291_456);
-        assert!(kind_errors(&d, Kind::Lambda, &[FN.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("lambda", FN, "{}"), &[]).is_empty());
         d.batch_max_bytes = Some(6_291_457);
-        assert_eq!(kind_errors(&d, Kind::Lambda, &[FN.into()], &[]).len(), 1);
+        assert_eq!(kind_errors(&d, &target("lambda", FN, "{}"), &[]).len(), 1);
         let mut d = def();
         d.batch_max_bytes = Some(1_048_577);
-        assert_eq!(kind_errors(&d, Kind::Lambda, &[EVENT.into()], &[]).len(), 1);
+        assert_eq!(
+            kind_errors(&d, &target("lambda", EVENT, "{}"), &[]).len(),
+            1
+        );
         d.batch_max_bytes = Some(1_048_576);
-        assert!(kind_errors(&d, Kind::Lambda, &[EVENT.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("lambda", EVENT, "{}"), &[]).is_empty());
         // no batch_max_keys is needed: a batch is bounded by bytes
         let mut d = def();
         d.batch_max_keys = None;
-        assert!(kind_errors(&d, Kind::Lambda, &[FN.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("lambda", FN, "{}"), &[]).is_empty());
     }
 
     #[test]
     fn stray_steps_are_refused_for_append_only_kinds_only() {
         let mut d = def();
         d.reset_steps = vec![step(stray(), None)];
-        let e = kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &cols(&["version"]));
+        let e = kind_errors(&d, &target("sqs", QUEUE, "{}"), &cols(&["version"]));
         assert_eq!(e.len(), 1, "{e:?}");
         assert!(e[0].contains("only appends"));
-        assert!(kind_errors(&d, Kind::Http, &["https://h".into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("http", "https://h", "{}"), &[]).is_empty());
+        // kafka appends too (its stray step is refused by the same check).
+        let e = kind_errors(
+            &d,
+            &target("kafka", "kafka://broker:9092/orders", "{}"),
+            &[],
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("only appends"));
     }
 
     #[test]
     fn amqp_refuses_stray_steps_and_batches() {
+        let t = "amqp://broker";
+        let v = r#"{"username": "u", "password": "env:P"}"#;
         let mut d = def();
         d.fire_per = FirePer::Key;
         d.reset_steps = vec![step(stray(), None)];
-        let e = kind_errors(&d, Kind::Amqp, &["amqp://broker".into()], &cols(&["_key"]));
+        let e = kind_errors(&d, &target("amqp", t, v), &cols(&["_key"]));
         assert_eq!(e.len(), 1, "{e:?}");
         assert!(e[0].contains("only appends"));
         d.reset_steps = Vec::new();
         d.fire_per = FirePer::Batch;
-        let e = kind_errors(&d, Kind::Amqp, &["amqp://broker".into()], &[]);
+        let e = kind_errors(&d, &target("amqp", t, v), &[]);
         assert_eq!(e.len(), 1, "{e:?}");
         d.fire_per = FirePer::Key;
-        assert!(kind_errors(&d, Kind::Amqp, &["amqp://broker".into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("amqp", t, v), &[]).is_empty());
     }
 
     #[test]
@@ -555,42 +592,44 @@ mod kind_tests {
             StepKind::Once,
             Some("X-Amz-Target: AmazonSQS.PurgeQueue\n\n{}"),
         )];
-        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        assert_eq!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).len(), 1);
         d.reset_steps = vec![step(
             StepKind::Once,
             Some("POST / HTTP/1.1\n\n{\"announce\":true}"),
         )];
-        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).is_empty());
     }
 
     #[test]
     fn sqs_batches_hold_at_most_ten_keys_and_256_kib() {
         let mut d = def();
         d.batch_max_keys = None;
-        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        assert_eq!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).len(), 1);
         d.batch_max_keys = Some(11);
-        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        assert_eq!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).len(), 1);
         d.batch_max_keys = Some(10);
-        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).is_empty());
         d.batch_max_bytes = Some(262_145);
-        assert_eq!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).len(), 1);
+        assert_eq!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).len(), 1);
         // One key per action has no batch to size.
         d.fire_per = FirePer::Key;
         d.batch_max_keys = None;
         d.batch_max_bytes = None;
-        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).is_empty());
     }
 
     #[test]
     fn fifo_queues_need_a_version_column() {
         let d = def();
         assert_eq!(
-            kind_errors(&d, Kind::Sqs, &[FIFO.into()], &cols(&["_key"])).len(),
+            kind_errors(&d, &target("sqs", FIFO, "{}"), &cols(&["_key"])).len(),
             1
         );
-        assert!(kind_errors(&d, Kind::Sqs, &[FIFO.into()], &cols(&["_key", "version"])).is_empty());
+        assert!(
+            kind_errors(&d, &target("sqs", FIFO, "{}"), &cols(&["_key", "version"])).is_empty()
+        );
         // A standard queue does not need one.
-        assert!(kind_errors(&d, Kind::Sqs, &[QUEUE.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("sqs", QUEUE, "{}"), &[]).is_empty());
     }
 
     const STREAM: &str = "aws-kinesis://eu-west-1/orders";
@@ -600,35 +639,35 @@ mod kind_tests {
         let mut d = def();
         d.batch_max_keys = None;
         assert_eq!(
-            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).len(),
             1
         );
         d.batch_max_keys = Some(501);
         assert_eq!(
-            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).len(),
             1
         );
         d.batch_max_keys = Some(500);
-        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).is_empty());
         d.batch_max_bytes = Some(5_242_881);
         assert_eq!(
-            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).len(),
             1
         );
         d.batch_max_bytes = Some(5_242_880);
-        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).is_empty());
         // One key per action has no batch to size.
         d.fire_per = FirePer::Key;
         d.batch_max_keys = None;
         d.batch_max_bytes = None;
-        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).is_empty());
     }
 
     #[test]
     fn kinesis_refuses_stray_and_stream_delete_resets() {
         let mut d = def();
         d.reset_steps = vec![step(stray(), None)];
-        let e = kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]);
+        let e = kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]);
         assert_eq!(e.len(), 1, "{e:?}");
         assert!(e[0].contains("only appends"));
 
@@ -637,7 +676,7 @@ mod kind_tests {
             Some("POST / HTTP/1.1\nX-Amz-Target: Kinesis_20131202.DeleteStream\n\n{}"),
         )];
         assert_eq!(
-            kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).len(),
+            kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).len(),
             1
         );
         // An announce record is a legitimate `once` action.
@@ -645,14 +684,37 @@ mod kind_tests {
             StepKind::Once,
             Some("POST / HTTP/1.1\nX-Amz-Target: Kinesis_20131202.PutRecords\n\n{}"),
         )];
-        assert!(kind_errors(&d, Kind::Kinesis, &[STREAM.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &target("kinesis", STREAM, "{}"), &[]).is_empty());
+    }
+
+    const KAFKA: &str = "kafka://broker:9092/orders";
+
+    #[test]
+    fn kafka_batches_are_bounded_by_the_broker_limit() {
+        let mut d = def();
+        // Both fire_per values are fine; a batch is bounded by bytes only…
+        d.fire_per = FirePer::Key;
+        d.batch_max_keys = None;
+        assert!(kind_errors(&d, &target("kafka", KAFKA, "{}"), &[]).is_empty());
+        d.fire_per = FirePer::Batch;
+        d.batch_max_bytes = Some(1_048_576);
+        assert!(kind_errors(&d, &target("kafka", KAFKA, "{}"), &[]).is_empty());
+        // …and over the broker's `message.max.bytes` is refused at load.
+        d.batch_max_bytes = Some(1_048_577);
+        let e = kind_errors(&d, &target("kafka", KAFKA, "{}"), &[]);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("batch_max_bytes"), "{e:?}");
+        // The target's `vars.message_max_bytes` raises the allowance with it.
+        d.batch_max_bytes = Some(2_000_000);
+        let raised = r#"{"message_max_bytes": 2097152}"#;
+        assert!(kind_errors(&d, &target("kafka", KAFKA, raised), &[]).is_empty());
     }
 }
 
 #[cfg(test)]
 mod pubsub_kind_tests {
     use super::*;
-    use crate::model::{Kind, RawRule, ResetStep};
+    use crate::model::{FirePer, RawRule, ResetStep};
 
     const TOPIC: &str = "gc-pubsub://lwf-test/orders";
 
@@ -678,7 +740,7 @@ mod pubsub_kind_tests {
     #[test]
     fn pubsub_refuses_stray_steps_purges_and_oversized_batches() {
         let d = def();
-        assert!(kind_errors(&d, Kind::PubSub, &[TOPIC.into()], &[]).is_empty());
+        assert!(kind_errors(&d, &test_target("pubsub", TOPIC, "{}"), &[]).is_empty());
         // Stray cleanup: the kind only appends (the append-only check).
         let mut s = def();
         s.reset_steps.push(step(
@@ -689,7 +751,10 @@ mod pubsub_kind_tests {
             },
             "POST /",
         ));
-        assert_eq!(kind_errors(&s, Kind::PubSub, &[TOPIC.into()], &[]).len(), 1);
+        assert_eq!(
+            kind_errors(&s, &test_target("pubsub", TOPIC, "{}"), &[]).len(),
+            1
+        );
         // A seek, a delete or a subscription-level request in a once/snapshot step is refused.
         for bad in [
             "POST /v1/projects/p/topics/t:publish\n\n:seek",
@@ -701,7 +766,7 @@ mod pubsub_kind_tests {
             let mut r = def();
             r.reset_steps.push(step(StepKind::Once, bad));
             assert!(
-                !kind_errors(&r, Kind::PubSub, &[TOPIC.into()], &[]).is_empty(),
+                !kind_errors(&r, &test_target("pubsub", TOPIC, "{}"), &[]).is_empty(),
                 "accepted {bad}"
             );
         }
@@ -710,24 +775,24 @@ mod pubsub_kind_tests {
             StepKind::Once,
             "POST /v1/projects/p/topics/t:publish HTTP/1.1",
         ));
-        assert!(kind_errors(&ok, Kind::PubSub, &[TOPIC.into()], &[]).is_empty());
+        assert!(kind_errors(&ok, &test_target("pubsub", TOPIC, "{}"), &[]).is_empty());
         // Batch limits: 1000 messages and 10 MB per publish.
         let mut none = def();
         none.batch_max_keys = None;
         assert_eq!(
-            kind_errors(&none, Kind::PubSub, &[TOPIC.into()], &[]).len(),
+            kind_errors(&none, &test_target("pubsub", TOPIC, "{}"), &[]).len(),
             1
         );
         let mut over = def();
         over.batch_max_keys = Some(1001);
         assert_eq!(
-            kind_errors(&over, Kind::PubSub, &[TOPIC.into()], &[]).len(),
+            kind_errors(&over, &test_target("pubsub", TOPIC, "{}"), &[]).len(),
             1
         );
         let mut bytes = def();
         bytes.batch_max_bytes = Some(10_000_001);
         assert_eq!(
-            kind_errors(&bytes, Kind::PubSub, &[TOPIC.into()], &[]).len(),
+            kind_errors(&bytes, &test_target("pubsub", TOPIC, "{}"), &[]).len(),
             1
         );
     }

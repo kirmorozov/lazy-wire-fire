@@ -41,6 +41,8 @@ enum Transport {
     Pg(crate::sqlwire::PgClient),
     /// Google Cloud Pub/Sub (`src/pubsub.rs`): one publish per action.
     PubSub(Box<crate::pubsub::Client>),
+    /// One Kafka endpoint (`src/kafka.rs`): one produce of a batch of records per action.
+    Kafka(Box<crate::kafka::Client>),
 }
 
 pub struct Target {
@@ -55,6 +57,9 @@ pub struct Target {
     sign: Option<crate::sign::Spec>,
     /// The `aws-lambda://` endpoint of a `lambda` target (its function, qualifier, invocation).
     lambda: Option<aws::LambdaUrl>,
+    /// The effective batch limit of a `kafka` target, when `vars.message_max_bytes` raises the
+    /// kind's default (the broker's `message.max.bytes`).
+    kafka: Option<usize>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
 }
@@ -176,16 +181,33 @@ fn var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
 }
 
 /// Every endpoint's host (the `ctx` host: the name or IP literal lazywf connects to) and port
-/// must match the allow-list. The first one that does not names the host and the setting.
+/// must match the allow-list. The first one that does not names the host and the setting. A
+/// `kafka` endpoint's `ctx` lists every broker of its set (the `brokers` array) alongside the
+/// first one.
 fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
     for ep in endpoints {
-        let host = ep.ctx["host"].as_str().unwrap_or_default();
-        let port = ep.ctx["port"]
-            .as_u64()
-            .and_then(|p| u16::try_from(p).ok())
-            .unwrap_or(0);
-        if !list.allows(host, port) {
-            bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
+        let mut hosts = vec![(
+            ep.ctx["host"].as_str().unwrap_or_default().to_string(),
+            ep.ctx["port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .unwrap_or(0),
+        )];
+        if let Some(bs) = ep.ctx["brokers"].as_array() {
+            for b in bs {
+                hosts.push((
+                    b["host"].as_str().unwrap_or_default().to_string(),
+                    b["port"]
+                        .as_u64()
+                        .and_then(|p| u16::try_from(p).ok())
+                        .unwrap_or(0),
+                ));
+            }
+        }
+        for (host, port) in hosts {
+            if !list.allows(&host, port) {
+                bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
+            }
         }
     }
     Ok(())
@@ -399,6 +421,17 @@ impl Target {
                 });
                 lambda_url = Some(url);
             }
+            Kind::Kafka => {
+                // from_row: exactly one endpoint, `kafka(s)://<broker>[:port][,…]/<topic>` —
+                // one broker set and the topic the records of an action go to.
+                for e in &def.endpoints {
+                    let (ctx, client) = crate::kafka::Client::new(&def, e)?;
+                    endpoints.push(Endpoint {
+                        ctx,
+                        transport: Transport::Kafka(Box::new(client)),
+                    });
+                }
+            }
             _ => {
                 for e in &def.endpoints {
                     let base = BaseUrl::parse(e)?;
@@ -422,6 +455,9 @@ impl Target {
         }
         let sign = crate::sign::spec(&def.vars)?;
         let ctx = json!({"name": def.name, "vars": def.template_vars()});
+        let kafka = (def.kind == Kind::Kafka)
+            .then(|| crate::kafka::message_max_bytes(&def.vars))
+            .and_then(|r| r.ok());
         Ok(Arc::new(Target {
             def,
             ctx,
@@ -430,6 +466,7 @@ impl Target {
             aws: aws_rt,
             sign,
             lambda: lambda_url,
+            kafka,
             pool,
         }))
     }
@@ -439,9 +476,13 @@ impl Target {
         self.def.kind.reports_items()
     }
 
-    /// The largest rendered action this target takes, when it has one: the kind's own limit, or
-    /// the payload limit of the Lambda invocation (6 MB sync, 1 MB event).
+    /// The largest rendered action this target takes, when it has one: the kind's own limit, the
+    /// payload limit of the Lambda invocation (6 MB sync, 1 MB event), or the `kafka` target's
+    /// broker limit raised by `vars.message_max_bytes`.
     pub fn batch_bytes_limit(&self) -> Option<usize> {
+        if let Some(n) = self.kafka {
+            return Some(n);
+        }
         match &self.lambda {
             Some(u) => Some(u.payload_limit()),
             None => self.def.kind.batch_bytes_limit(),
@@ -644,6 +685,10 @@ impl Target {
                 crate::pubsub::send(client, rendered, self.def.timeout, &self.expect, &self.pool)
                     .await
             }
+            Transport::Kafka(client) => {
+                // A `once` reset step: no keys, the records take partition 0 (see `kafka.rs`).
+                crate::kafka::send(client, rendered, &self.expect, &self.pool).await
+            }
             Transport::MySql(_) | Transport::Pg(_) => {
                 let sql = match crate::sqlwire::single_statement(rendered) {
                     Ok(Some(s)) => s,
@@ -719,6 +764,7 @@ impl Target {
             Transport::PubSub(_) => {
                 bail!("pubsub targets only publish: a listing is refused")
             }
+            Transport::Kafka(_) => bail!("kind kafka appends: it cannot list keys"),
             Transport::MySql(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
@@ -749,6 +795,16 @@ impl Target {
                 None => Ok(vec![Item::Ok; n]),
                 Some(failed) => lambda_items(&failed, keys),
             };
+        }
+        if self.def.kind == Kind::Kafka {
+            let Some(endpoint) = self.endpoints.get(ep) else {
+                bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+            };
+            let Transport::Kafka(client) = &endpoint.transport else {
+                bail!("target `{}` is not a kafka target", self.def.name);
+            };
+            return crate::kafka::send_items(client, rendered, keys, &self.expect, &self.pool)
+                .await;
         }
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
@@ -1161,6 +1217,12 @@ mod allow_tests {
                 "{}",
                 "mail.example.test",
             ),
+            (
+                "kafka",
+                "kafka://mq.example.test:9094/orders",
+                "{}",
+                "mq.example.test",
+            ),
         ];
         for (kind, endpoint, vars, host) in cases {
             let listed = load(kind, endpoint, vars, host);
@@ -1181,6 +1243,30 @@ mod allow_tests {
         }
         // Unset: no check, whatever the host.
         assert!(load("http", "https://api.example.test/hook", "{}", "").is_ok());
+    }
+
+    /// Every broker of a `kafka` endpoint is matched, not only the first: one off the list is
+    /// refused, and the error names it. (The multi-broker URL holds one endpoint, so the
+    /// endpoints column is the JSON-array form: a bare comma would split it.)
+    #[test]
+    fn every_kafka_broker_is_matched() {
+        let both = r#"["kafka://mq.example.test:9094,mq2.example.test:9094/orders"]"#;
+        let ok = load(
+            "kafka",
+            both,
+            "{}",
+            "mq.example.test:9094, mq2.example.test:9094",
+        );
+        assert!(ok.is_ok(), "{:?}", ok.err().map(|e| format!("{e:#}")));
+        let refused = load("kafka", both, "{}", "mq.example.test:9094").err();
+        let msg = format!(
+            "{:#}",
+            refused.unwrap_or_else(|| panic!("the second broker was not refused"))
+        );
+        assert!(
+            msg.contains("mq2.example.test") && msg.contains("LAZYWF_ALLOWED_HOSTS"),
+            "{msg}"
+        );
     }
 
     #[test]

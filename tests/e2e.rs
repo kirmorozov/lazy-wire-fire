@@ -4312,6 +4312,714 @@ async fn smtp_refusal() {
     );
     inst.stop().await;
 }
+// ---------------------------------------------------------------------------------------------
+// The kafka kind against a Redpanda dev container (`LAZYWF_TEST_KAFKA=127.0.0.1:34564`, compose
+// profile `kafka`). The tests read the topics back through their own rskafka client: a record's
+// key is the row key, its value the document, and its `op` header names the operation.
+
+/// The rendered action: one record per key (record i takes key i), each with its document and
+/// the `op` header.
+const KAFKA_PUT: &str = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"records": [{{#each docs}}{"value": {{json doc}}, "headers": {"op": {{json op}}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+/// The target's `expect`: the produce answered with an offset.
+const KAFKA_EXPECT: &str = "JSON_EXTRACT(body, '$.offset') IS NOT NULL";
+
+/// The broker's `host:port`, when the suite has one.
+fn kafka_broker() -> Option<String> {
+    std::env::var("LAZYWF_TEST_KAFKA").ok()
+}
+
+macro_rules! need_kafka {
+    () => {
+        match kafka_broker() {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "LAZYWF_TEST_KAFKA not set: skipping (make servers with the kafka profile)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// One test at a time on the shared broker (the restart test stops it).
+static KAFKA_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The shared Redpanda of the suite (the compose project `lazywf-test`).
+const KAFKA_CONTAINER: &str = "lazywf-test-kafka-1";
+
+/// One docker call on the host of the suite.
+fn docker(args: &[&str]) {
+    let out = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("docker {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "docker {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// One shell command inside the broker's container, bounded by `timeout` (an `rpk` that waits
+/// for records that never come must not hang the suite). Its stdout.
+fn rpk(cmd: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args([
+            "exec",
+            KAFKA_CONTAINER,
+            "sh",
+            "-c",
+            &format!("timeout 60 {cmd}"),
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("docker exec `sh -c {cmd}`: {e}"));
+    assert!(
+        out.status.success(),
+        "rpk `{cmd}`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The partition the broker's own default partitioner gives each of `keys`: the records are
+/// produced with no partition chosen, so the client's partitioner decides, and read back. The
+/// test compares this with `partition_of`, which is what makes "a key lands on the partition the
+/// brokers' partitioner picks" a checked fact and not a claim about the hash.
+///
+/// `keys` are read as lines of `<key>\t<value>` and must be plain (no `%`, no `'`, no tab).
+fn broker_partitions(broker: &str, topic: &str, keys: &[&str]) -> Vec<(String, i32)> {
+    let input: String = keys.iter().map(|k| format!("{k}\\tv\\n")).collect();
+    // `rpk produce` prints what it wrote; its own reading of the topic says the same, and a
+    // short print (a lost record) is caught by the compare below.
+    let produced = rpk(&format!(
+        "printf '{input}' | rpk topic produce {topic} --format '%k\\t%v\\n' -X brokers={broker}"
+    ));
+    assert_eq!(
+        produced
+            .lines()
+            .filter(|l| l.starts_with("Produced to partition"))
+            .count(),
+        keys.len(),
+        "rpk did not produce every key"
+    );
+    let n = keys.len();
+    rpk(&format!(
+        "rpk topic consume {topic} -f '%p %k\\n' -o start -n {n} -X brokers={broker}"
+    ))
+    .lines()
+    .filter_map(|line| {
+        let (partition, key) = line.split_once(' ')?;
+        Some((key.to_string(), partition.parse().ok()?))
+    })
+    .collect()
+}
+
+/// One record of a topic as the test reads it.
+#[derive(Debug)]
+struct Recd {
+    partition: i32,
+    offset: i64,
+    key: Option<String>,
+    value: Value,
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+/// The test's own rskafka client: it makes the topics and reads the records back.
+struct Kafka {
+    client: rskafka::client::Client,
+}
+
+impl Kafka {
+    /// Connects, retrying until the broker's metadata answers (a fresh or a just-restarted
+    /// broker takes a few seconds).
+    async fn new(broker: &str) -> Kafka {
+        Kafka::with_retry(broker, 5).await
+    }
+
+    /// As `new`, but each call (metadata, the leader read, a fetch) retries transient
+    /// broker states for `retry_secs`: a just-restarted broker keeps answering
+    /// `LeaderNotAvailable` while it re-elects the leaders.
+    async fn with_retry(broker: &str, retry_secs: u64) -> Kafka {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match rskafka::client::ClientBuilder::new(vec![broker.to_string()])
+                .client_id("lazywf-e2e")
+                .backoff_config(rskafka::BackoffConfig {
+                    deadline: Some(Duration::from_secs(retry_secs)),
+                    ..Default::default()
+                })
+                .build()
+                .await
+            {
+                Ok(client) => {
+                    return Kafka { client };
+                }
+                Err(e) if std::time::Instant::now() < deadline => {
+                    eprintln!("the kafka broker at {broker} is not up yet ({e:#}): retrying");
+                    sleep_ms(500).await;
+                }
+                Err(e) => panic!("the kafka broker at {broker} did not answer in 60 s: {e:#}"),
+            }
+        }
+    }
+
+    /// Creates the topic of `n` partitions and waits until the metadata lists it.
+    async fn topic(&self, name: &str, n: i32) {
+        self.client
+            .controller_client()
+            .unwrap()
+            .create_topic(name, n, 1, 10_000)
+            .await
+            .unwrap_or_else(|e| panic!("creating the topic `{name}`: {e:#}"));
+        self.partitions(name).await;
+    }
+
+    /// Deletes the topic (best effort: a rerun makes a fresh one, the broker is shared).
+    async fn drop_topic(&self, name: &str) {
+        self.client
+            .controller_client()
+            .unwrap()
+            .delete_topic(name, 10_000)
+            .await
+            .ok();
+    }
+
+    /// The topic's partitions, sorted (0..n).
+    async fn partitions(&self, name: &str) -> Vec<i32> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let topics = self
+                .client
+                .list_topics()
+                .await
+                .unwrap_or_else(|e| panic!("the topic list: {e:#}"));
+            if let Some(t) = topics.iter().find(|t| t.name == name) {
+                let ps: Vec<i32> = t.partitions.iter().copied().collect();
+                if !ps.is_empty() {
+                    return ps;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the topic `{name}` did not appear in the metadata in 30 s"
+            );
+            sleep_ms(200).await;
+        }
+    }
+
+    /// The partition client, waiting a leader election out: a just-restarted broker answers
+    /// `LeaderNotAvailable` until it has re-elected every leader, which on a busy runner
+    /// outlasts the client's own retry deadline (the queues job failed there once).
+    async fn partition_client(
+        &self,
+        name: &str,
+        pid: i32,
+    ) -> rskafka::client::partition::PartitionClient {
+        use rskafka::client::partition::UnknownTopicHandling;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match self
+                .client
+                .partition_client(name, pid, UnknownTopicHandling::Retry)
+                .await
+            {
+                Ok(pc) => return pc,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    eprintln!("the leader of `{name}/{pid}` is not ready yet ({e:#}): retrying");
+                    sleep_ms(250).await;
+                }
+                Err(e) => panic!("the leader of `{name}/{pid}`: {e:#}"),
+            }
+        }
+    }
+
+    /// Every record of the topic, partition by partition, in offset order.
+    async fn records(&self, name: &str) -> Vec<Recd> {
+        use rskafka::client::partition::OffsetAt;
+        let pids = self.partitions(name).await;
+        let mut out = Vec::new();
+        for pid in pids {
+            let pc = self.partition_client(name, pid).await;
+            let mut offset = pc
+                .get_offset(OffsetAt::Earliest)
+                .await
+                .unwrap_or_else(|e| panic!("the earliest offset of `{name}/{pid}`: {e:#}"));
+            loop {
+                let (recs, hw) = pc
+                    .fetch_records(offset, 0..1_048_576, 500)
+                    .await
+                    .unwrap_or_else(|e| panic!("the records of `{name}/{pid}`: {e:#}"));
+                if recs.is_empty() {
+                    if hw <= offset {
+                        break;
+                    }
+                    offset = hw;
+                    continue;
+                }
+                for r in &recs {
+                    out.push(Recd {
+                        partition: pid,
+                        offset: r.offset,
+                        key: r.record.key.clone().map(|k| String::from_utf8(k).unwrap()),
+                        value: serde_json::from_slice(r.record.value.clone().unwrap().as_slice())
+                            .unwrap(),
+                        headers: r
+                            .record
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), String::from_utf8(v.clone()).unwrap()))
+                            .collect(),
+                    });
+                }
+                offset = recs.last().unwrap().offset + 1;
+            }
+        }
+        out
+    }
+}
+
+/// The shared broker's container, kept up when a test ends between its stop and its start.
+struct BrokerRestart {
+    down: bool,
+}
+
+impl BrokerRestart {
+    fn new() -> Self {
+        Self { down: false }
+    }
+    /// Stops the container (graceful, 5 s).
+    fn stop(&mut self) {
+        docker(&["stop", "-t", "5", KAFKA_CONTAINER]);
+        self.down = true;
+    }
+    /// Starts it again.
+    fn start(&mut self) {
+        docker(&["start", KAFKA_CONTAINER]);
+        self.down = false;
+    }
+}
+
+impl Drop for BrokerRestart {
+    fn drop(&mut self) {
+        if self.down {
+            let _ = std::process::Command::new("docker")
+                .args(["start", KAFKA_CONTAINER])
+                .status();
+        }
+    }
+}
+
+/// Every changed key arrives once, on the partition of its key, with its document and the `op`
+/// header; an update appends a record, a delete appends one with an empty document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_every_key_arrives_once() {
+    let root = need_db!();
+    let broker = need_kafka!();
+    let _lock = KAFKA_LOCK.lock().await;
+    let k = Kafka::new(&broker).await;
+    let topic = format!("lwf-kafka-every-{}", std::process::id());
+    k.topic(&topic, 4).await;
+    let db = Db::fresh(&root, "kafka_every").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    db.target(
+        "events",
+        "kafka",
+        &format!("kafka://{broker}/{topic}"),
+        Some(KAFKA_EXPECT),
+        "{}",
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'events', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            KAFKA_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec(
+        "INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1),(3,'C-3',5),(4,'D-4',2),(5,'E-5',9)",
+    )
+    .await;
+    wait_for(Duration::from_secs(30), "the five records", || async {
+        (k.records(&topic).await.len() == 5).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let pids = k.partitions(&topic).await;
+    let recs = k.records(&topic).await;
+    assert_eq!(recs.len(), 5, "one record per key: {recs:?}");
+    for (id, sku, qty) in [
+        (1, "A-1", 3),
+        (2, "B-2", 1),
+        (3, "C-3", 5),
+        (4, "D-4", 2),
+        (5, "E-5", 9),
+    ] {
+        let key = id.to_string();
+        let r = recs
+            .iter()
+            .find(|r| r.key.as_deref() == Some(key.as_str()))
+            .unwrap();
+        assert_eq!(
+            r.partition,
+            lazy_wire_fire::kafka::partition_of(&key, &pids),
+            "{key}: the partition is the murmur2 of the key mod the count"
+        );
+        assert_eq!(
+            r.value,
+            json!({"sku": sku, "qty": qty}),
+            "{key}: the document"
+        );
+        assert_eq!(
+            r.headers.get("op"),
+            Some(&"upsert".to_string()),
+            "{key}: the op header"
+        );
+    }
+
+    // The partitions above are the ones lazywf chose. Here is the broker agreeing with them:
+    // the same keys, produced by `rpk` with no partition chosen, land on the partitions
+    // `partition_of` picks — so a key lazywf writes is where any other client's default
+    // partitioner would put it.
+    let ptopic = format!("lwf-kafka-parts-{}", std::process::id());
+    k.topic(&ptopic, 4).await;
+    let keys = ["1", "2", "3", "4", "5"];
+    let pids = k.partitions(&ptopic).await;
+    let mut want: Vec<(String, i32)> = keys
+        .iter()
+        .map(|k| (k.to_string(), lazy_wire_fire::kafka::partition_of(k, &pids)))
+        .collect();
+    want.sort();
+    // `rpk` reads the partitions at once, so the pairs come back in no particular order.
+    let mut got = broker_partitions(&broker, &ptopic, &keys);
+    got.sort();
+    assert_eq!(
+        got, want,
+        "the broker's own partitioner chooses the same partitions"
+    );
+    k.drop_topic(&ptopic).await;
+
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    db.exec("UPDATE orders SET sku = 'C-3x', qty = 6 WHERE id = 3")
+        .await;
+    wait_for(Duration::from_secs(30), "the seven records", || async {
+        (k.records(&topic).await.len() == 7).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let recs = k.records(&topic).await;
+    let by_key = |key: &str| -> Vec<&Recd> {
+        recs.iter()
+            .filter(|r| r.key.as_deref() == Some(key))
+            .collect()
+    };
+    assert_eq!(by_key("1").len(), 2, "the update appends: {recs:?}");
+    assert_eq!(
+        by_key("1").last().unwrap().value,
+        json!({"sku": "A-1", "qty": 4})
+    );
+    assert_eq!(by_key("3").len(), 2);
+    assert_eq!(
+        by_key("3").last().unwrap().value,
+        json!({"sku": "C-3x", "qty": 6})
+    );
+    for key in ["2", "4", "5"] {
+        assert_eq!(by_key(key).len(), 1, "{key} was not changed");
+    }
+
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    wait_for(Duration::from_secs(30), "the eight records", || async {
+        (k.records(&topic).await.len() == 8).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let recs = k.records(&topic).await;
+    let key2: Vec<&Recd> = recs
+        .iter()
+        .filter(|r| r.key.as_deref() == Some("2"))
+        .collect();
+    assert_eq!(key2.len(), 2, "the delete appends a record: {key2:?}");
+    assert_eq!(key2[0].headers.get("op"), Some(&"upsert".to_string()));
+    assert_eq!(key2[1].value, json!({}), "the delete's document is empty");
+    assert_eq!(key2[1].headers.get("op"), Some(&"delete".to_string()));
+    inst.stop().await;
+    k.drop_topic(&topic).await;
+}
+
+/// A key fired one at a time keeps its order on its partition: one record per fire, in the
+/// order of the fires, with the document of each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_ordering() {
+    let root = need_db!();
+    let broker = need_kafka!();
+    let _lock = KAFKA_LOCK.lock().await;
+    let k = Kafka::new(&broker).await;
+    let topic = format!("lwf-kafka-order-{}", std::process::id());
+    k.topic(&topic, 1).await;
+    let db = Db::fresh(&root, "kafka_order").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    db.target(
+        "events",
+        "kafka",
+        &format!("kafka://{broker}/{topic}"),
+        Some(KAFKA_EXPECT),
+        "{}",
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'events', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty FROM orders WHERE id IN (:keys)",
+            KAFKA_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the first record", || async {
+        (!k.records(&topic).await.is_empty()).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+
+    for (i, qty) in [4, 5].into_iter().enumerate() {
+        db.exec(&format!("UPDATE orders SET qty = {qty} WHERE id = 1"))
+            .await;
+        let want = i + 2;
+        wait_for(
+            Duration::from_secs(30),
+            &format!("the record {want}"),
+            || async { (k.records(&topic).await.len() == want).then_some(()) },
+        )
+        .await;
+        inst.quiet().await;
+    }
+
+    let recs = k.records(&topic).await;
+    assert_eq!(recs.len(), 3, "one record per fire: {recs:?}");
+    let mut offsets = Vec::new();
+    for (i, r) in recs.iter().enumerate() {
+        let qty = [3, 4, 5][i];
+        assert_eq!(r.partition, 0, "{i}");
+        assert_eq!(r.key, Some("1".to_string()), "{i}");
+        assert_eq!(
+            r.value,
+            json!({"sku": "A-1", "qty": qty}),
+            "{i}: the document of its fire"
+        );
+        offsets.push(r.offset);
+    }
+    assert!(
+        offsets.windows(2).all(|w| w[0] < w[1]),
+        "the offsets grow: {offsets:?}"
+    );
+    inst.stop().await;
+    k.drop_topic(&topic).await;
+}
+
+/// A record the broker takes no (the topic's `max.message.bytes`) is refused alone: the batch it
+/// travelled in is split until the record stands by itself, so the other keys of the flush
+/// arrive, only the refused one is struck, the position moves on and `last_error` says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_refusal() {
+    let root = need_db!();
+    let broker = need_kafka!();
+    let _lock = KAFKA_LOCK.lock().await;
+    let k = Kafka::new(&broker).await;
+    let topic = format!("lwf-kafka-refusal-{}", std::process::id());
+    k.topic(&topic, 1).await;
+    // The topic takes 50000 bytes per record set (the target itself assumes the broker's
+    // default 1 MiB, which is why the batch is produced at all): a record of 190000 is refused.
+    docker(&[
+        "exec",
+        KAFKA_CONTAINER,
+        "rpk",
+        "topic",
+        "alter-config",
+        &topic,
+        "--set",
+        "max.message.bytes=50000",
+        "--no-confirm",
+        "-X",
+        &format!("brokers={broker}"),
+    ]);
+    let db = Db::fresh(&root, "kafka_refusal").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, payload MEDIUMTEXT)")
+        .await;
+    tables(&db).await;
+    db.target(
+        "events",
+        "kafka",
+        &format!("kafka://{broker}/{topic}"),
+        Some(KAFKA_EXPECT),
+        &json!({"compression": "none"}).to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'events', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, payload FROM orders WHERE id IN (:keys)",
+            KAFKA_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    // One flush, one batch: the two small records travel with the too-large one.
+    db.exec_params(
+        "INSERT INTO orders VALUES (1, 'small'), (2, ?), (3, 'also small')",
+        ("A".repeat(190_000),),
+    )
+    .await;
+    let err = wait_for(
+        Duration::from_secs(60),
+        "the too-large record refused and the position moved on",
+        || async {
+            let (f, p, _, err) = db.status("orders").await?;
+            let err = err?;
+            (err.contains("`2` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(
+        err.contains("MessageTooLarge") || err.contains("RecordListTooLarge"),
+        "{err}"
+    );
+
+    // The batch was split until record 2 stood alone: its neighbours arrived, it did not.
+    let recs = k.records(&topic).await;
+    let keys: Vec<&str> = recs.iter().filter_map(|r| r.key.as_deref()).collect();
+    assert_eq!(
+        keys,
+        ["1", "3"],
+        "only the two small records arrive: {recs:?}"
+    );
+    assert_eq!(recs[0].value, json!({"payload": "small"}));
+    assert_eq!(recs[1].value, json!({"payload": "also small"}));
+    inst.stop().await;
+    k.drop_topic(&topic).await;
+}
+
+/// The broker goes down (a restart, seen from lazywf): a key fired while it is down is not
+/// lost; it arrives after the heal, with the document of its fire (at-least-once).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_restart() {
+    let root = need_db!();
+    let broker = need_kafka!();
+    let _lock = KAFKA_LOCK.lock().await;
+    let mut restart = BrokerRestart::new();
+    let k = Kafka::new(&broker).await;
+    let topic = format!("lwf-kafka-restart-{}", std::process::id());
+    k.topic(&topic, 1).await;
+    let db = Db::fresh(&root, "kafka_restart").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    db.target(
+        "events",
+        "kafka",
+        &format!("kafka://{broker}/{topic}"),
+        Some(KAFKA_EXPECT),
+        "{}",
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'events', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty FROM orders WHERE id IN (:keys)",
+            KAFKA_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the first record", || async {
+        (!k.records(&topic).await.is_empty()).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+
+    restart.stop();
+    db.exec("INSERT INTO orders VALUES (2, 'B-2', 1)").await;
+    // The engine holds key 2: its produce cannot reach the broker.
+    wait_for(
+        Duration::from_secs(30),
+        "key 2 pending while the broker is down",
+        || async {
+            let s = inst.health.status();
+            s["rules"]["orders"]["pending_keys"]
+                .as_u64()
+                .is_some_and(|n| n >= 1)
+                .then_some(())
+        },
+    )
+    .await;
+    drop(k); // The client's connections are dead with the broker.
+
+    restart.start();
+    // Leaders take a few seconds to re-elect: this reader waits them out instead of failing.
+    let k = Kafka::with_retry(&broker, 30).await;
+    wait_for(Duration::from_secs(90), "key 2 after the heal", || async {
+        k.records(&topic)
+            .await
+            .iter()
+            .any(|r| r.key.as_deref() == Some("2"))
+            .then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let recs = k.records(&topic).await;
+    let by_key = |key: &str| -> Vec<&Recd> {
+        recs.iter()
+            .filter(|r| r.key.as_deref() == Some(key))
+            .collect()
+    };
+    assert_eq!(
+        by_key("1").len(),
+        1,
+        "key 1 fired before the cut, once: {recs:?}"
+    );
+    assert!(
+        !by_key("2").is_empty(),
+        "key 2 arrived after the heal: {recs:?}"
+    );
+    assert_eq!(
+        by_key("2").last().unwrap().value,
+        json!({"sku": "B-2", "qty": 1})
+    );
+    for r in &by_key("2") {
+        assert_eq!(r.partition, 0);
+    }
+    inst.stop().await;
+    k.drop_topic(&topic).await;
+}
 
 /// Commits the commit fence has written for lazywf (0 before the first one; the table is made by
 /// the first flush).

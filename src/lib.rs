@@ -24,6 +24,7 @@ pub mod gcp;
 pub mod health;
 pub mod http;
 pub mod intset;
+pub mod kafka;
 pub mod keyset;
 pub mod lock;
 pub mod logging;
