@@ -43,6 +43,8 @@ enum Transport {
     PubSub(Box<crate::pubsub::Client>),
     /// One Kafka endpoint (`src/kafka.rs`): one produce of a batch of records per action.
     Kafka(Box<crate::kafka::Client>),
+    /// One NATS JetStream endpoint (`src/nats.rs`): one publish per message of an action.
+    Nats(Box<crate::nats::Client>),
 }
 
 pub struct Target {
@@ -273,6 +275,19 @@ fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
                 .unwrap_or(0),
         )];
         if let Some(bs) = ep.ctx["brokers"].as_array() {
+            for b in bs {
+                hosts.push((
+                    b["host"].as_str().unwrap_or_default().to_string(),
+                    b["port"]
+                        .as_u64()
+                        .and_then(|p| u16::try_from(p).ok())
+                        .unwrap_or(0),
+                ));
+            }
+        }
+        // The extra servers a nats endpoint names besides the first: the client dials each of
+        // them, so each must be on the list (`nats.rs` puts them in `servers`).
+        if let Some(bs) = ep.ctx["servers"].as_array() {
             for b in bs {
                 hosts.push((
                     b["host"].as_str().unwrap_or_default().to_string(),
@@ -579,6 +594,17 @@ impl Target {
                     });
                 }
             }
+            Kind::Nats => {
+                // from_row: exactly one endpoint, `nats(s)://<host>[:port][,…]/<subject>` —
+                // one server set and the subject the messages of an action go to.
+                for e in &def.endpoints {
+                    let (ctx, client) = crate::nats::Client::new(&def, e)?;
+                    endpoints.push(Endpoint {
+                        ctx,
+                        transport: Transport::Nats(Box::new(client)),
+                    });
+                }
+            }
             _ => {
                 for e in &def.endpoints {
                     let base = BaseUrl::parse(e)?;
@@ -841,6 +867,10 @@ impl Target {
                 // A `once` reset step: no keys, the records take partition 0 (see `kafka.rs`).
                 crate::kafka::send(client, rendered, &self.expect, &self.pool).await
             }
+            Transport::Nats(client) => {
+                // A `once` reset step: no keys, the messages take no key (see `nats.rs`).
+                crate::nats::send(client, rendered, &self.expect, &self.pool).await
+            }
             Transport::MySql(_) | Transport::Pg(_) => {
                 let sql = match crate::sqlwire::single_statement(rendered) {
                     Ok(Some(s)) => s,
@@ -917,6 +947,7 @@ impl Target {
                 bail!("pubsub targets only publish: a listing is refused")
             }
             Transport::Kafka(_) => bail!("kind kafka appends: it cannot list keys"),
+            Transport::Nats(_) => bail!("kind nats appends: it cannot list keys"),
             Transport::MySql(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
@@ -957,6 +988,15 @@ impl Target {
             };
             return crate::kafka::send_items(client, rendered, keys, &self.expect, &self.pool)
                 .await;
+        }
+        if self.def.kind == Kind::Nats {
+            let Some(endpoint) = self.endpoints.get(ep) else {
+                bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+            };
+            let Transport::Nats(client) = &endpoint.transport else {
+                bail!("target `{}` is not a nats target", self.def.name);
+            };
+            return crate::nats::send_items(client, rendered, keys, &self.expect, &self.pool).await;
         }
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);

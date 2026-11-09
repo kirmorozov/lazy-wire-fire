@@ -139,6 +139,9 @@ pub enum Kind {
     /// Kafka: one produce of a batch of records per action, an answer per partition (see
     /// `kafka.rs`).
     Kafka,
+    /// NATS JetStream: one publish with an awaited PubAck per item of an action (see
+    /// `nats.rs`).
+    Nats,
     Redis,
     MySql,
     PgSql,
@@ -161,11 +164,12 @@ impl Kind {
             "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
             "kafka" => Kind::Kafka,
+            "nats" => Kind::Nats,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, nats, redis, mysql or pgsql)"
             ),
         })
     }
@@ -173,7 +177,13 @@ impl Kind {
     pub fn is_http(self) -> bool {
         !matches!(
             self,
-            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka
+            Kind::Amqp
+                | Kind::Smtp
+                | Kind::Redis
+                | Kind::MySql
+                | Kind::PgSql
+                | Kind::Kafka
+                | Kind::Nats
         )
     }
 
@@ -194,6 +204,7 @@ impl Kind {
             Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
             Kind::Kafka => "kafka",
+            Kind::Nats => "nats",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -205,7 +216,13 @@ impl Kind {
     pub fn reports_items(self) -> bool {
         matches!(
             self,
-            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka | Kind::EventBridge | Kind::Sns
+            Kind::Sqs
+                | Kind::Kinesis
+                | Kind::Lambda
+                | Kind::Kafka
+                | Kind::EventBridge
+                | Kind::Sns
+                | Kind::Nats
         )
     }
 
@@ -222,6 +239,7 @@ impl Kind {
                 | Kind::Smtp
                 | Kind::PubSub
                 | Kind::Kafka
+                | Kind::Nats
         )
     }
 
@@ -275,6 +293,9 @@ impl Kind {
             Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka => {
                 &["password"]
             }
+            // `token` / `password` are the plain credentials, `nkey` the ed25519 seed and
+            // `jwt` the account claim, both of which are credentials of the same account.
+            Kind::Nats => &["token", "password", "nkey", "jwt"],
         }
     }
 }
@@ -489,6 +510,7 @@ impl TargetDef {
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Kafka => crate::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::Nats => crate::nats::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         // Webhook signing is an option of the plain http kinds; on the others the settings
@@ -520,6 +542,7 @@ impl TargetDef {
         }
         crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
         crate::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
+        crate::nats::refuse_scheme(kind == Kind::Nats, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }

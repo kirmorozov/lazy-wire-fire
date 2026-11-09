@@ -6677,3 +6677,882 @@ async fn sns_fifo_entry_without_a_group_id_is_refused_before_it_is_sent() {
     assert_eq!(moto.count(&url).await, 0, "a refused batch was sent");
     inst.stop().await;
 }
+// ---------------------------------------------------------------------------
+// nats target — e2e against the `nats` compose profile
+// ---------------------------------------------------------------------------
+
+// The nats kind against a NATS server with JetStream (`LAZYWF_TEST_NATS=127.0.0.1:34570`, the
+// compose profile `nats`). A target never makes a stream, so the tests do: each makes its own,
+// bound to its own subject, and reads its messages back with a client of its own. A message's
+// payload is the document, its headers the rendered ones and the `key` of the row, which is how
+// a test tells whose message it is.
+
+/// The rendered action: one message per key (message i takes key i), each with its document and
+/// the `op` and `key` headers.
+const NATS_PUT: &str = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"value": {{json doc}}, "headers": {"op": {{json op}}, "key": "{{key}}"}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+/// The target's `expect`: the server acknowledged the publish with a sequence.
+const NATS_EXPECT: &str = "JSON_EXTRACT(body, '$.seq') IS NOT NULL";
+
+/// The server's `host:port`, when the suite has one.
+fn nats_server() -> Option<String> {
+    std::env::var("LAZYWF_TEST_NATS")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// The token-protected server of the same profile, and the token it asks for.
+fn nats_auth_server() -> Option<String> {
+    std::env::var("LAZYWF_TEST_NATS_AUTH")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+macro_rules! need_nats {
+    () => {
+        match nats_server() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "LAZYWF_TEST_NATS not set: skipping (make servers with the nats profile)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// One test at a time on the shared server (the restart test stops it).
+static NATS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The shared server's container (the compose project `lazywf-test`).
+const NATS_CONTAINER: &str = "lazywf-test-nats-1";
+
+/// One stored message of a stream, as the target should have left it.
+#[derive(Debug)]
+struct Msg {
+    seq: u64,
+    subject: String,
+    payload: Value,
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+impl Msg {
+    /// A header's value, when the message has it.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(&name.to_lowercase()).map(|v| v.as_str())
+    }
+
+    /// The `key` header, which says whose message this is.
+    fn key(&self) -> Option<&str> {
+        self.header("key")
+    }
+}
+
+/// The test's own JetStream client: it makes the streams a target never makes, and reads them
+/// back without consuming anything.
+struct Nats {
+    ctx: async_nats::jetstream::Context,
+}
+
+impl Nats {
+    /// Connects to `host:port`, retrying until the server answers (a fresh or a just-restarted
+    /// one takes a few seconds; `DISCONNECT - SERVER DOWN` is its way of saying so).
+    async fn new(server: &str) -> Nats {
+        Nats::with_token(server, None).await
+    }
+
+    /// As `new`, authenticating with `token` when the server asks for one.
+    async fn with_token(server: &str, token: Option<&str>) -> Nats {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut opts = async_nats::ConnectOptions::new();
+            if let Some(t) = token {
+                opts = opts.token(t.to_string());
+            }
+            match opts.connect(vec![format!("nats://{server}")]).await {
+                Ok(client) => {
+                    return Nats {
+                        ctx: async_nats::jetstream::ContextBuilder::new()
+                            .timeout(Duration::from_secs(30))
+                            .build(client),
+                    };
+                }
+                Err(e) if std::time::Instant::now() < deadline => {
+                    eprintln!("the nats server at {server} is not up yet ({e}): waiting");
+                    sleep_ms(500).await;
+                }
+                Err(e) => panic!("the nats server at {server} did not answer in 60 s: {e}"),
+            }
+        }
+    }
+
+    /// Creates a stream bound to `subject`, deduplicating by message id for an hour.
+    async fn stream(&self, name: &str, subject: &str) {
+        self.stream_with(name, subject, None).await;
+    }
+
+    /// As `stream`, capping the size of one message (the server's own 1 MiB `max_payload` is
+    /// left alone: this is the stream's limit, which the server answers with a refusal).
+    async fn stream_with(&self, name: &str, subject: &str, max_message_size: Option<i32>) {
+        use async_nats::jetstream::stream::Config;
+        let cfg = Config {
+            name: name.to_string(),
+            subjects: vec![subject.to_string()],
+            max_age: Duration::from_secs(3600),
+            duplicate_window: Duration::from_secs(3600),
+            max_message_size: max_message_size.unwrap_or(-1),
+            ..Default::default()
+        };
+        self.ctx
+            .create_stream(cfg)
+            .await
+            .unwrap_or_else(|e| panic!("creating the stream `{name}`: {e}"));
+    }
+
+    /// Deletes the stream (best effort: a rerun makes a fresh one, the server is shared).
+    async fn drop_stream(&self, name: &str) {
+        self.ctx.delete_stream(name).await.ok();
+    }
+
+    /// How many messages the stream holds.
+    async fn count(&self, name: &str) -> u64 {
+        self.ctx
+            .get_stream(name)
+            .await
+            .unwrap_or_else(|e| panic!("the stream `{name}`: {e}"))
+            .info()
+            .await
+            .unwrap_or_else(|e| panic!("the info of `{name}`: {e}"))
+            .state
+            .messages
+    }
+
+    /// Every message of the stream, oldest first, without consuming anything (the direct read,
+    /// so no consumer of the test's is left behind to count as a subscriber).
+    async fn messages(&self, name: &str) -> Vec<Msg> {
+        let mut stream = self
+            .ctx
+            .get_stream(name)
+            .await
+            .unwrap_or_else(|e| panic!("the stream `{name}`: {e}"));
+        let (first, messages) = {
+            let info = stream
+                .info()
+                .await
+                .unwrap_or_else(|e| panic!("the info of `{name}`: {e}"));
+            (info.state.first_sequence, info.state.messages)
+        };
+        let mut out = Vec::new();
+        for seq in first..first + messages {
+            let m = stream
+                .get_raw_message(seq)
+                .await
+                .unwrap_or_else(|e| panic!("message {seq} of `{name}`: {e}"));
+            out.push(Msg {
+                seq: m.sequence,
+                subject: m.subject.to_string(),
+                payload: serde_json::from_slice(&m.payload)
+                    .unwrap_or_else(|e| panic!("message {seq} of `{name}` is not JSON: {e}")),
+                headers: m
+                    .headers
+                    .iter()
+                    .map(|(k, vs)| {
+                        let name: &str = k.as_ref();
+                        (
+                            name.to_lowercase(),
+                            vs.first()
+                                .map(|v| v.as_str().to_string())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        out
+    }
+}
+
+/// The shared server's container, kept up when a test ends between its stop and its start.
+struct ServerRestart {
+    down: bool,
+}
+
+impl ServerRestart {
+    fn new() -> Self {
+        Self { down: false }
+    }
+    /// Stops the container (graceful, 5 s).
+    fn stop(&mut self) {
+        docker(&["stop", "-t", "5", NATS_CONTAINER]);
+        self.down = true;
+    }
+    /// Starts it again and waits for the client port to answer.
+    fn start(&mut self) {
+        docker(&["start", NATS_CONTAINER]);
+        let addr = nats_server().expect("LAZYWF_TEST_NATS");
+        for _ in 0..120 {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        self.down = false;
+    }
+}
+
+impl Drop for ServerRestart {
+    fn drop(&mut self) {
+        if self.down {
+            let _ = std::process::Command::new("docker")
+                .args(["start", NATS_CONTAINER])
+                .status();
+        }
+    }
+}
+
+/// A rule of the nats kind over `orders`, its target with these `vars`, ready to fire.
+async fn nats_rule(
+    db: &Db,
+    rule: &str,
+    target: &str,
+    endpoint: &str,
+    vars: &str,
+    fire_per: &str,
+    columns: &str,
+) {
+    db.target(target, "nats", endpoint, Some(NATS_EXPECT), vars)
+        .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES (?, ?, ?, ?, ?, 100)",
+        (
+            rule,
+            target,
+            fire_per,
+            format!("SELECT id AS _key, {columns} FROM orders WHERE id IN (:keys)"),
+            NATS_PUT,
+        ),
+    )
+    .await;
+    db.trigger(rule, "orders", Some("{{new.id}}"), None).await;
+}
+
+/// Every changed key arrives once, in the order of the batch, with its document and the `op` and
+/// `key` headers; an update appends a message, a delete appends one with an empty document. The
+/// host is one `LAZYWF_ALLOWED_HOSTS` lists, so the endpoint's servers go through the allow-list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_every_key_arrives_once() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-every-{}", std::process::id());
+    let subject = format!("lwf.every.{}", std::process::id());
+    n.drop_stream(&stream).await;
+    n.stream(&stream, &subject).await;
+
+    let db = Db::fresh(&root, "nats_every").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        r#"{"dedup": "none"}"#,
+        "batch",
+        "sku, qty, NULL AS _op",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[("LAZYWF_ALLOWED_HOSTS", "127.0.0.1")])).await;
+
+    db.exec(
+        "INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1),(3,'C-3',5),(4,'D-4',2),(5,'E-5',9)",
+    )
+    .await;
+    wait_for(Duration::from_secs(30), "the five messages", || async {
+        (n.count(&stream).await == 5).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let msgs = n.messages(&stream).await;
+    assert_eq!(msgs.len(), 5, "one message per key: {msgs:?}");
+    let mut seqs = Vec::new();
+    for (id, sku, qty) in [
+        (1, "A-1", 3),
+        (2, "B-2", 1),
+        (3, "C-3", 5),
+        (4, "D-4", 2),
+        (5, "E-5", 9),
+    ] {
+        let key = id.to_string();
+        let m = msgs
+            .iter()
+            .find(|m| m.key() == Some(key.as_str()))
+            .unwrap_or_else(|| panic!("no message for {key}: {msgs:?}"));
+        assert_eq!(m.subject, subject, "{key}: the subject of the endpoint");
+        assert_eq!(
+            m.payload,
+            json!({"sku": sku, "qty": qty}),
+            "{key}: the document"
+        );
+        assert_eq!(m.header("op"), Some("upsert"), "{key}: the op header");
+        assert_eq!(m.header("key"), Some(key.as_str()), "{key}: the key header");
+        seqs.push(m.seq);
+    }
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "the server stored the batch in its row order: {seqs:?}"
+    );
+
+    // An update appends a message with the new document; a delete appends one whose document is
+    // empty, and nothing is ever removed.
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    wait_for(Duration::from_secs(30), "the seven messages", || async {
+        (n.count(&stream).await == 7).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let msgs = n.messages(&stream).await;
+    let by_key =
+        |key: &str| -> Vec<&Msg> { msgs.iter().filter(|m| m.key() == Some(key)).collect() };
+    assert_eq!(by_key("1").len(), 2, "the update appends: {msgs:?}");
+    assert_eq!(
+        by_key("1")[1].payload,
+        json!({"sku": "A-1", "qty": 4}),
+        "the message of the update carries the new document"
+    );
+    assert_eq!(by_key("2").len(), 2, "the delete appends: {msgs:?}");
+    assert_eq!(
+        by_key("2")[1].payload,
+        json!({}),
+        "the delete's document is empty"
+    );
+    assert_eq!(by_key("2")[1].header("op"), Some("delete"));
+    for key in ["3", "4", "5"] {
+        assert_eq!(by_key(key).len(), 1, "{key} was not changed");
+    }
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// Keys fired one at a time keep their order: one message per fire, in the order of the fires,
+/// each with the document as of that fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_ordering() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-order-{}", std::process::id());
+    let subject = format!("lwf.order.{}", std::process::id());
+    n.drop_stream(&stream).await;
+    n.stream(&stream, &subject).await;
+
+    let db = Db::fresh(&root, "nats_order").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        r#"{"dedup": "none"}"#,
+        "key",
+        "sku, qty",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the first message", || async {
+        (n.count(&stream).await == 1).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    for qty in [4, 5] {
+        db.exec(&format!("UPDATE orders SET qty = {qty} WHERE id = 1"))
+            .await;
+        let want = n.count(&stream).await + 1;
+        wait_for(Duration::from_secs(30), "the next message", || async {
+            (n.count(&stream).await == want).then_some(())
+        })
+        .await;
+        inst.quiet().await;
+    }
+
+    let msgs = n.messages(&stream).await;
+    assert_eq!(msgs.len(), 3, "one message per fire: {msgs:?}");
+    let mut seqs = Vec::new();
+    for (i, qty) in [3, 4, 5].into_iter().enumerate() {
+        assert_eq!(
+            msgs[i].payload,
+            json!({"sku": "A-1", "qty": qty}),
+            "{i}: the document of that fire"
+        );
+        assert_eq!(msgs[i].key(), Some("1"), "{i}");
+        seqs.push(msgs[i].seq);
+    }
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "the sequence grows with the fires: {seqs:?}"
+    );
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// A subject no stream binds: the target asks the server, gets nothing, and refuses the rows —
+/// it does not report them sent, and it does not drop them either. The stream appears (the
+/// operator notices) and the held keys go through on the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_missing_stream_is_held_until_it_appears() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-nostream-{}", std::process::id());
+    let subject = format!("lwf.nostream.{}", std::process::id());
+    n.drop_stream(&stream).await;
+
+    let db = Db::fresh(&root, "nats_nostream").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        "{}",
+        "batch",
+        "sku, qty",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    assert!(
+        n.ctx.stream_by_subject(subject.clone()).await.is_err(),
+        "the server itself knows no stream for {subject}"
+    );
+
+    db.exec("INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1)")
+        .await;
+    // The keys are marked and nothing is stored: the target says nobody answers for the subject.
+    wait_for(Duration::from_secs(30), "both keys held", || async {
+        let s = inst.health.status();
+        (s["rules"]["orders"]["pending_keys"]
+            .as_u64()
+            .is_some_and(|k| k >= 2))
+        .then_some(())
+    })
+    .await;
+    assert!(
+        n.ctx.stream_by_subject(subject.clone()).await.is_err(),
+        "the target made no stream of its own"
+    );
+
+    // The stream arrives. The target asks the server again on its next attempt — it does not
+    // hold on to the answer of a failed call — and the held keys are published.
+    n.stream(&stream, &subject).await;
+    wait_for(
+        Duration::from_secs(60),
+        "the held keys after the stream appeared",
+        || async { (n.count(&stream).await == 2).then_some(()) },
+    )
+    .await;
+    inst.quiet().await;
+    let msgs = n.messages(&stream).await;
+    let mut keys: Vec<&str> = msgs.iter().filter_map(|m| m.key()).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["1", "2"],
+        "each held key was published once: {msgs:?}"
+    );
+    assert_eq!(msgs[0].payload, json!({"sku": "A-1", "qty": 3}));
+    assert_eq!(msgs[1].payload, json!({"sku": "B-2", "qty": 1}));
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// A message the stream will not take (over its `max_message_size`) is refused alone: its
+/// neighbours of the same flush arrive, only that key is struck, the position moves on and
+/// `last_error` says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_oversized_message_is_refused_alone() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-big-{}", std::process::id());
+    let subject = format!("lwf.big.{}", std::process::id());
+    n.drop_stream(&stream).await;
+    n.stream_with(&stream, &subject, Some(1024)).await;
+
+    let db = Db::fresh(&root, "nats_big").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, payload MEDIUMTEXT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        "{}",
+        "batch",
+        "payload",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec_params(
+        "INSERT INTO orders VALUES (1, 'small'), (2, ?), (3, 'also small')",
+        ("B".repeat(4000),),
+    )
+    .await;
+    let err = wait_for(
+        Duration::from_secs(60),
+        "the oversized message refused and the position moved on",
+        || async {
+            let (f, p, _, err) = db.status("orders").await?;
+            let err = err?;
+            (err.contains("`2` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(
+        err.to_lowercase()
+            .contains("the server refused the message"),
+        "{err}"
+    );
+
+    // The batch travelled together: the two small messages are stored, the big one is not.
+    let msgs = n.messages(&stream).await;
+    let keys: Vec<&str> = msgs.iter().filter_map(|m| m.key()).collect();
+    assert_eq!(
+        keys,
+        ["1", "3"],
+        "only the two small messages arrive: {msgs:?}"
+    );
+    assert_eq!(msgs[0].payload, json!({"payload": "small"}));
+    assert_eq!(msgs[1].payload, json!({"payload": "also small"}));
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// With `dedup: content` the same key with the same document is one message: the server sees the
+/// message id it derives from the two and drops the second, and lazywf still calls that sent.
+/// The same document under another key is a different message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_dedup_by_content() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-dedup-{}", std::process::id());
+    let subject = format!("lwf.dedup.{}", std::process::id());
+    n.drop_stream(&stream).await;
+    n.stream(&stream, &subject).await;
+
+    let db = Db::fresh(&root, "nats_dedup").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        r#"{"dedup": "content"}"#,
+        "batch",
+        "sku, qty",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // A, then B, then A again for key 1: the third publish is the same message as the first.
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the first message", || async {
+        (n.count(&stream).await == 1).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let ids: Vec<Option<String>> = n
+        .messages(&stream)
+        .await
+        .iter()
+        .map(|m| m.header("nats-msg-id").map(|s| s.to_string()))
+        .collect();
+    assert!(
+        ids.iter()
+            .all(|id| id.as_deref().is_some_and(|i| i.len() == 64)),
+        "every message carries the hex id of its key and document: {ids:?}"
+    );
+
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    wait_for(Duration::from_secs(30), "the changed document", || async {
+        (n.count(&stream).await == 2).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+
+    db.exec("UPDATE orders SET qty = 3 WHERE id = 1").await;
+    db.exec("INSERT INTO orders VALUES (2, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the new key", || async {
+        (n.count(&stream).await == 3).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let msgs = n.messages(&stream).await;
+    assert_eq!(
+        msgs.len(),
+        3,
+        "the document key 1 already had is not stored again: {msgs:?}"
+    );
+    assert_eq!(
+        msgs.iter().filter(|m| m.key() == Some("1")).count(),
+        2,
+        "key 1 is stored for its two documents, not its three fires"
+    );
+    // The duplicate is a sent row, not a failure: nothing was refused or struck for it.
+    let (_, _, _, err) = db.status("orders").await.unwrap();
+    let err = err.unwrap_or_default();
+    assert!(
+        !err.contains("refused") && !err.to_lowercase().contains("duplicate"),
+        "a duplicate PubAck is a sent row, not an error: {err}"
+    );
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// Without deduplication the same document is stored again — which is why it is off by default
+/// and why the ids of the test above are the target's, not the server's guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_without_dedup_a_repeated_document_is_stored() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-nodedup-{}", std::process::id());
+    let subject = format!("lwf.nodedup.{}", std::process::id());
+    n.drop_stream(&stream).await;
+    n.stream(&stream, &subject).await;
+
+    let db = Db::fresh(&root, "nats_nodedup").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        "{}",
+        "batch",
+        "sku, qty",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the first message", || async {
+        (n.count(&stream).await == 1).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    // The document goes away and comes back, one fire each: without deduplication both of its
+    // visits are stored, so the same bytes are in the stream twice.
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    wait_for(Duration::from_secs(30), "the second message", || async {
+        (n.count(&stream).await == 2).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    db.exec("UPDATE orders SET qty = 3 WHERE id = 1").await;
+    wait_for(Duration::from_secs(30), "the third message", || async {
+        (n.count(&stream).await == 3).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let msgs = n.messages(&stream).await;
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| m.payload == json!({"sku": "A-1", "qty": 3}))
+            .count(),
+        2,
+        "the document that came back is stored again: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().all(|m| m.header("nats-msg-id").is_none()),
+        "the target made no message id up: {msgs:?}"
+    );
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// The server goes down and comes back: a key fired while it was down is not lost and not
+/// stored twice, and the target reconnects by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_restart_loses_nothing() {
+    let root = need_db!();
+    let server = need_nats!();
+    let _lock = NATS_LOCK.lock().await;
+    let mut restart = ServerRestart::new();
+    let n = Nats::new(&server).await;
+    let stream = format!("lwf-nats-restart-{}", std::process::id());
+    let subject = format!("lwf.restart.{}", std::process::id());
+    n.drop_stream(&stream).await;
+    n.stream(&stream, &subject).await;
+
+    let db = Db::fresh(&root, "nats_restart").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "orders",
+        "events",
+        &format!("nats://{server}/{subject}"),
+        r#"{"dedup": "content"}"#,
+        "key",
+        "sku, qty",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    wait_for(Duration::from_secs(30), "the first message", || async {
+        (n.count(&stream).await == 1).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+
+    restart.stop();
+    db.exec("INSERT INTO orders VALUES (2, 'B-2', 1)").await;
+    // The engine holds key 2: its publish cannot reach the server, and it is not an error the
+    // key can be struck for.
+    wait_for(
+        Duration::from_secs(30),
+        "key 2 pending while the server is down",
+        || async {
+            let s = inst.health.status();
+            s["rules"]["orders"]["pending_keys"]
+                .as_u64()
+                .is_some_and(|k| k >= 1)
+                .then_some(())
+        },
+    )
+    .await;
+    drop(n); // The client's connection is dead with the server.
+
+    restart.start();
+    let n = Nats::new(&server).await;
+    wait_for(Duration::from_secs(90), "key 2 after the heal", || async {
+        (n.count(&stream).await == 2).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let msgs = n.messages(&stream).await;
+    assert_eq!(msgs.len(), 2, "one message per key: {msgs:?}");
+    assert_eq!(msgs[0].key(), Some("1"), "key 1 fired before the cut");
+    assert_eq!(msgs[1].key(), Some("2"), "key 2 arrived after the heal");
+    assert_eq!(msgs[1].payload, json!({"sku": "B-2", "qty": 1}));
+    assert!(msgs[0].seq < msgs[1].seq, "the sequence spans the restart");
+    inst.stop().await;
+    n.drop_stream(&stream).await;
+}
+
+/// A server that asks for a token (`--auth`, its own compose service): the target authenticates
+/// with `vars.token` as an `env:` reference and delivers; a wrong token is refused, struck and
+/// dropped, and the refusal carries no credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_token_auth() {
+    let root = need_db!();
+    let _server = need_nats!();
+    let auth = match nats_auth_server() {
+        Some(a) => a,
+        None => {
+            eprintln!("LAZYWF_TEST_NATS_AUTH not set: skipping");
+            return;
+        }
+    };
+    let token = std::env::var("LWF_TEST_NATS_TOKEN").expect("LWF_TEST_NATS_TOKEN");
+    let _lock = NATS_LOCK.lock().await;
+    let n = Nats::with_token(&auth, Some(&token)).await;
+    let good = format!("lwf-nats-auth-{}", std::process::id());
+    let good_subject = format!("lwf.auth.{}", std::process::id());
+    let bad = format!("lwf-nats-bad-{}", std::process::id());
+    let bad_subject = format!("lwf.bad.{}", std::process::id());
+    n.drop_stream(&good).await;
+    n.drop_stream(&bad).await;
+    n.stream(&good, &good_subject).await;
+    n.stream(&bad, &bad_subject).await;
+
+    let db = Db::fresh(&root, "nats_auth").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    nats_rule(
+        &db,
+        "good",
+        "good",
+        &format!("nats://{auth}/{good_subject}"),
+        r#"{"token": "env:LWF_TEST_NATS_TOKEN"}"#,
+        "batch",
+        "sku, qty",
+    )
+    .await;
+    nats_rule(
+        &db,
+        "bad",
+        "bad",
+        &format!("nats://{auth}/{bad_subject}"),
+        r#"{"token": "env:LWF_TEST_NATS_WRONG_TOKEN"}"#,
+        "batch",
+        "sku, qty",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1)")
+        .await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(30),
+        "the accepted token delivering",
+        || async { (n.count(&good).await == 2).then_some(()) },
+    )
+    .await;
+    // The wrong token: the server turns the connection away, so nothing of that rule is stored
+    // and its keys are held (the target never calls them sent).
+    wait_for(
+        Duration::from_secs(30),
+        "the wrong token holding its keys",
+        || async {
+            let s = inst.health.status();
+            (s["rules"]["bad"]["pending_keys"]
+                .as_u64()
+                .is_some_and(|k| k >= 2))
+            .then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        n.count(&bad).await,
+        0,
+        "the rule with the wrong token stored nothing"
+    );
+    let msgs = n.messages(&good).await;
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].payload, json!({"sku": "A-1", "qty": 3}));
+    inst.stop().await;
+    n.drop_stream(&good).await;
+    n.drop_stream(&bad).await;
+}

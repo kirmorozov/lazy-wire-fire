@@ -97,7 +97,8 @@ fn install() -> &'static Capture {
         let filter = lazy_wire_fire::logging::filter(Some(
             "trace,aws_sigv4=trace,aws_config=trace,aws_credential_types=trace,\
              aws_smithy_runtime=trace,aws_smithy_runtime_api=trace,aws_smithy_http_client=trace,\
-             lapin=trace,amq_protocol_tcp=trace,lettre=trace,rskafka=trace,rsasl=trace",
+             lapin=trace,amq_protocol_tcp=trace,lettre=trace,rskafka=trace,rsasl=trace,\
+             async_nats=trace",
         ));
         let sub = tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -2072,4 +2073,119 @@ Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}
         dump(&out);
     }
     assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// The token of the `nats-auth` server of the `nats` compose profile
+/// (`docker-compose.test.yml`): a fixture of that file, like the S3 secret key, and the same
+/// kind of thing an operator's real token is.
+const NATS_TOKEN: &str = "lwf-test-nats-token-9d3e";
+
+/// A JetStream context of the flow, authenticated the way the server asks.
+async fn nats_jetstream(server: &str, token: &str) -> async_nats::jetstream::Context {
+    let client = async_nats::ConnectOptions::new()
+        .token(token.to_string())
+        .connect(vec![format!("nats://{server}")])
+        .await
+        .unwrap_or_else(|e| panic!("connecting to the nats server at {server}: {e}"));
+    async_nats::jetstream::ContextBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build(client)
+}
+
+/// How many messages a stream holds.
+async fn nats_count(js: &async_nats::jetstream::Context, name: &str) -> u64 {
+    let mut stream = js
+        .get_stream(name)
+        .await
+        .unwrap_or_else(|e| panic!("the stream `{name}`: {e}"));
+    stream
+        .info()
+        .await
+        .unwrap_or_else(|e| panic!("the info of `{name}`: {e}"))
+        .state
+        .messages
+}
+
+/// The `nats` target against the token-protected server (`LAZYWF_TEST_NATS_AUTH`): the token is
+/// given only as `vars.token: env:…`, it goes over the wire in the CONNECT message — whose
+/// `trace` event is the one a client without redaction would echo — and the messages read back
+/// from the stream say the flow really published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_nats() {
+    let root = need_db!();
+    let Ok(auth) = std::env::var("LAZYWF_TEST_NATS_AUTH") else {
+        return eprintln!(
+            "LAZYWF_TEST_NATS_AUTH not set: skipping the nats flow (make test-e2e-queues)"
+        );
+    };
+    install();
+    let subject = format!("lwf.lognats.{}", std::process::id());
+    let stream = format!("lwf-lognats-{}", std::process::id());
+    let js = nats_jetstream(&auth, NATS_TOKEN).await;
+    use async_nats::jetstream::stream::Config;
+    js.create_stream(Config {
+        name: stream.clone(),
+        subjects: vec![subject.clone()],
+        max_age: Duration::from_secs(600),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|e| panic!("creating the stream `{stream}`: {e}"));
+
+    let db = Db::fresh(&root, "lognats").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    std::env::set_var("LWF_LOGNATS_TOKEN", NATS_TOKEN);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, vars) VALUES ('events', 'nats', ?, ?)",
+        (
+            format!("nats://{auth}/{subject}"),
+            json!({"token": "env:LWF_LOGNATS_TOKEN"}).to_string(),
+        ),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'events', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"value": {{json doc}}, "headers": {"op": {{json op}}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    wait_for(
+        Duration::from_secs(30),
+        "two published messages",
+        || async { (nats_count(&js, &stream).await == 2).then_some(()) },
+    )
+    .await;
+    inst.quiet().await;
+    inst.stop().await;
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    assert!(
+        out.contains("lazywf.nats.published"),
+        "no nats publish event in the capture: the assertion below would be vacuous"
+    );
+    assert!(
+        out.contains("write operation: CONNECT"),
+        "the client's CONNECT trace is not in the capture: the assertion below would be vacuous"
+    );
+    // The CONNECT message the client writes carries the token; its `trace` event is the form a
+    // client without a redacting `Debug` would leave in the log.
+    let leaks = leaks(&out, &[("nats token", NATS_TOKEN)]);
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+    js.delete_stream(&stream).await.ok();
 }

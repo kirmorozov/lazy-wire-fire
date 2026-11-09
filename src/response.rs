@@ -134,6 +134,19 @@ impl Row {
         }
     }
 
+    /// The result of one JetStream publish as `body`:
+    /// `{"stream": …, "seq": …, "duplicate": …}` (the stream the server stored it in, its
+    /// sequence there, and whether a message with this id was already there).
+    pub fn nats(uses: Uses, stream: &str, seq: u64, duplicate: bool) -> Row {
+        Row {
+            body: uses.body.then(|| {
+                serde_json::json!({"stream": stream, "seq": seq, "duplicate": duplicate})
+                    .to_string()
+            }),
+            ..Row::default()
+        }
+    }
+
     /// A JSON answer as `body` (the rows of a SQL listing).
     pub fn json(uses: Uses, v: &Value) -> Row {
         Row {
