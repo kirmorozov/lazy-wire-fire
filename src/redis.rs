@@ -520,3 +520,30 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod token_tests {
+    use super::tokenize;
+
+    #[test]
+    fn quoted_arguments_unescape_the_control_characters() {
+        // A value written by hand may need a real tab or BEL in it; an unescaped one would
+        // end the argument.
+        let got = tokenize(r#"SET "a\nb\rc\td\be\af""#).unwrap();
+        assert_eq!(got, vec![b"SET".to_vec(), b"a\nb\rc\td\x08e\x07f".to_vec()]);
+        let got = tokenize(r#"SET "\q""#).unwrap();
+        assert_eq!(got[1], b"q", "an unknown escape is the character itself");
+    }
+
+    #[test]
+    fn a_single_quote_must_close_before_the_next_argument() {
+        let err = tokenize("SET 'a").unwrap_err().to_string();
+        assert_eq!(err, "unbalanced single quote in redis command");
+        let err = tokenize("SET 'a'b").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "closing quote must be followed by a space in redis command"
+        );
+        assert_eq!(tokenize(r#"DEL 'it\'s'"#).unwrap()[1], b"it's");
+    }
+}

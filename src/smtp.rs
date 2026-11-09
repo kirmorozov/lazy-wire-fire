@@ -916,3 +916,71 @@ mod tests {
         assert!(rule_errors(FirePer::Key).is_empty());
     }
 }
+
+#[cfg(test)]
+mod reply_row_tests {
+    use super::*;
+
+    fn vars(s: &str) -> Map<String, Value> {
+        serde_json::from_str(s).unwrap()
+    }
+
+    /// A 4xx is the server saying "not now": the row it is checked against has to
+    /// carry its code and text like a 2xx or a 5xx does, or an `expect` that reads
+    /// `status` sees an empty row and the key is decided from nothing.
+    #[test]
+    fn a_transient_reply_is_a_row_of_its_own() {
+        let all = Uses {
+            status: true,
+            text: true,
+            ..Uses::default()
+        };
+        let tr = Reply::Transient {
+            code: 451,
+            text: "4.7.1 greylisted, try again later".into(),
+        };
+        let r = tr.row(all);
+        assert_eq!(
+            (r.status, r.text.as_deref()),
+            (Some(451), Some("4.7.1 greylisted, try again later"))
+        );
+        // The columns are only filled when named, and nothing else of `r` exists.
+        let r = tr.row(Uses {
+            status: true,
+            ..Uses::default()
+        });
+        assert_eq!(
+            (r.status, r.text, r.body, r.affected_rows),
+            (Some(451), None, None, None)
+        );
+        // …and the engine reads it as a retry, not as a refusal of this key.
+        assert!(matches!(tr.outcome(), Err(Outcome::Transient(_))));
+    }
+
+    /// A `vars.recipients` of the wrong shape is refused at load: read as "no limit",
+    /// a message with a thousand recipients would be refused by the server for every
+    /// key of the batch.
+    #[test]
+    fn a_recipients_limit_that_is_not_a_number_is_refused() {
+        for bad in [
+            r#"{"recipients": true}"#,
+            r#"{"recipients": []}"#,
+            r#"{"recipients": {"n": 3}}"#,
+        ] {
+            let e = format!("{:#}", recipients_limit(&vars(bad)).err().unwrap());
+            assert!(
+                e.contains("`vars.recipients`") && e.contains("number"),
+                "{bad}: {e}"
+            );
+        }
+        // A JSON number that is not a whole number is refused by name too.
+        let e = format!(
+            "{:#}",
+            recipients_limit(&vars(r#"{"recipients": 2.5}"#))
+                .err()
+                .unwrap()
+        );
+        assert!(e.contains("whole number"), "{e}");
+        assert!(recipients_limit(&vars(r#"{"recipients": null}"#)).is_ok());
+    }
+}
