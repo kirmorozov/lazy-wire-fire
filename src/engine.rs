@@ -390,6 +390,9 @@ pub struct Engine {
     filter_checked: HashSet<String>,
     /// The checked schemas the filters drop (shown on `/status`).
     binlog_filtered: BTreeSet<String>,
+    /// A binlog dump error whose message says nothing about the position (see `binlog_unusable`):
+    /// the position is kept and the dump retried; shown on `/status` until the stream recovers.
+    stream_error: Option<String>,
 }
 
 fn server_code(e: &anyhow::Error) -> Option<u16> {
@@ -400,9 +403,49 @@ fn server_code(e: &anyhow::Error) -> Option<u16> {
         })
 }
 
+fn server_messages(e: &anyhow::Error) -> impl Iterator<Item = String> + '_ {
+    e.chain()
+        .filter_map(|c| match c.downcast_ref::<mysql_async::Error>() {
+            Some(mysql_async::Error::Server(se)) => Some(se.message.clone()),
+            _ => c
+                .downcast_ref::<mysql_async::ServerError>()
+                .map(|se| se.message.clone()),
+        })
+}
+
+/// The 1236 wordings that say the requested position can never be served: the binlog file was
+/// purged or is gone, the position is past the end of the file, or the GTIDs needed are gone.
+/// From the servers' own sources — MySQL/Percona `sql/rpl_binlog_sender.cc` (8.0, 8.4, 9.x) and
+/// MariaDB `sql/sql_repl.cc` (10.11–13.1); a purged file or GTIDs is already caught by
+/// `binlog::is_missing_binlog`. Every other 1236 message — an event larger than
+/// `max_allowed_packet`, a damaged event, the binlog closed, a GTID mode mismatch — reports a
+/// server-side problem that says nothing about the position, so the position is kept and the
+/// dump retried; an unknown message retries too, since the default must never re-send a target.
+fn position_unavailable(e: &anyhow::Error) -> bool {
+    const LOST: [&str; 7] = [
+        "position > file size",    // MySQL: the position is past the end of the file
+        "position < 4",            // MySQL: the position is before the first event
+        "impossible position",     // MariaDB: the position is outside the file
+        "could not find next log", // MySQL / MariaDB: the next file is gone
+        "missing the gtid",        // MariaDB: a requested GTID is in no binlog
+        "not in the master's binlog", // MariaDB: a requested GTID is above what the server has
+        "has more gtids than",     // MySQL: the replica asks for GTIDs the source lost
+    ];
+    server_messages(e).any(|m| {
+        let m = m.to_ascii_lowercase();
+        LOST.iter().any(|p| m.contains(p))
+    })
+}
+
+/// Whether the stream lost its continuity: the requested binlog is purged or gone, or a 1236
+/// dump error whose own message says the requested position cannot be served. A 1236 with any
+/// other message (or none recognised) is the server failing to read its own binlog — not a lost
+/// position — and is retried in place by the callers below.
 fn binlog_unusable(e: &anyhow::Error) -> bool {
     binlog::is_missing_binlog(e)
-        || (server_code(e) == Some(1236) && !binlog::is_duplicate_server_id(e))
+        || (server_code(e) == Some(1236)
+            && !binlog::is_duplicate_server_id(e)
+            && position_unavailable(e))
 }
 
 async fn connect_wait(
@@ -631,6 +674,7 @@ pub async fn run(
         invalid_keys: 0,
         filter_checked: HashSet::new(),
         binlog_filtered: BTreeSet::new(),
+        stream_error: None,
         cfg,
     };
     e.reload_config(true).await?;
@@ -879,7 +923,17 @@ impl Engine {
         }
     }
 
+    /// A 1236 whose message says nothing about the requested position (see `binlog_unusable`):
+    /// the server failed to read its own binlog. Nothing is re-sent: the position stays, the
+    /// caller retries the dump with the capped backoff, and the server's message is shown on
+    /// `/status` (`stream_error`) until the stream delivers events again.
+    fn on_kept_binlog_error(&mut self, e: &anyhow::Error, at: &Position, retry_in: Duration) {
+        self.stream_error = Some(format!("{e:#} at {at}"));
+        warn!("binlog dump at {at} failed ({e:#}); the position is kept, retrying in {retry_in:?}");
+    }
+
     async fn on_missing_binlog(&mut self, e: &anyhow::Error) -> Result<()> {
+        self.stream_error = None;
         if let Some(rw) = self.rewound.take() {
             // Purged before the replay began: only the rules enabled again lose continuity, the
             // others go on from where the stream was.
@@ -1261,6 +1315,10 @@ impl Engine {
         let mut pos = start;
         let mut item_failures = 0u32;
         let mut failed_at: Option<Position> = None;
+        // The last reconnect ended on a 1236 that keeps the position (`binlog_unusable`): the
+        // capped backoff must keep growing while that error repeats, even though each attempt
+        // still delivers the events before the offending one.
+        let mut kept_position = false;
         let silence = (self.cfg.heartbeat * 3).max(Duration::from_secs(15));
         self.health.set_phase("streaming");
         'reconnect: loop {
@@ -1299,7 +1357,12 @@ impl Engine {
                     if binlog::is_access_denied(&e) {
                         return Err(e);
                     }
-                    warn!("binlog connect failed: {e:#}; retrying in {backoff:?}");
+                    if server_code(&e) == Some(1236) && !binlog::is_duplicate_server_id(&e) {
+                        self.on_kept_binlog_error(&e, &pos, backoff);
+                        kept_position = true;
+                    } else {
+                        warn!("binlog connect failed: {e:#}; retrying in {backoff:?}");
+                    }
                     if self.idle(backoff, &mut rx, shutdown).await? {
                         break 'reconnect;
                     }
@@ -1311,6 +1374,7 @@ impl Engine {
             self.health.set_streaming(true);
             let mut last_event = Instant::now();
             let mut delivered = false;
+            let mut hit_1236 = false;
             loop {
                 self.health.beat();
                 let wake = self.next_wakeup();
@@ -1325,7 +1389,9 @@ impl Engine {
                             Ok(Some(item)) => {
                                 if !delivered {
                                     delivered = true;
-                                    backoff = Duration::from_millis(500);
+                                    if !kept_position {
+                                        backoff = Duration::from_millis(500);
+                                    }
                                 }
                                 // The time a rows event was logged (statement start); 0 is unknown.
                                 if let Item::Rows { event, .. } = &item {
@@ -1355,6 +1421,11 @@ impl Engine {
                                     self.on_missing_binlog(&e).await?;
                                 } else if binlog::is_duplicate_server_id(&e) {
                                     self.reroll_server_id();
+                                } else if server_code(&e) == Some(1236) {
+                                    let at = self.boundary.clone();
+                                    self.on_kept_binlog_error(&e, &at, backoff);
+                                    hit_1236 = true;
+                                    kept_position = true;
                                 } else {
                                     warn!("binlog stream error: {e:#}; reconnecting");
                                 }
@@ -1391,12 +1462,22 @@ impl Engine {
             self.txn_marks.clear();
             self.xa_current = None;
             pos = self.boundary.clone();
-            let pause = if delivered {
+            // A connection that delivered events without a kept 1236: the stream recovered, so
+            // the error is no longer current and the backoff starts over. While a 1236 that keeps
+            // the position repeats, the capped backoff grows even though each attempt delivers
+            // the events before the offending one.
+            let recovered = delivered && !hit_1236;
+            if recovered {
+                kept_position = false;
+                self.stream_error = None;
+                backoff = Duration::from_millis(500);
+            }
+            let pause = if recovered {
                 Duration::from_millis(200)
             } else {
                 backoff
             };
-            if !delivered {
+            if !recovered {
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
             if self.idle(pause, &mut rx, shutdown).await? {
@@ -2563,6 +2644,7 @@ impl Engine {
             "instance": self.cfg.instance,
             "position": resume.to_string(),
             "stream_lag_ms": self.stream_lag_ms(),
+            "stream_error": self.stream_error,
             "rules": summary,
             "binlog_filtered_schemas": self.binlog_filtered.iter().collect::<Vec<_>>(),
         }));
@@ -2740,6 +2822,115 @@ mod tests {
         assert!(tip.len() == 1 && !tip[0].0 && tip[0].1.contains("gtid_mode=ON"));
         // MariaDB: no gtid_mode to read, no tip.
         assert!(notes(Ok(Some(48)), None).is_empty());
+    }
+
+    /// A server error as it arrives from the dump thread, wrapped the way the reader wraps it.
+    fn server_error(code: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: message.into(),
+            state: "HY000".into(),
+        }))
+    }
+
+    /// A 1236 (the server's catch-all for a failed binlog dump) resets the rules only when its
+    /// own message says the requested position cannot be served. The wordings are the servers'
+    /// (MySQL 8.0/8.4/9.x `sql/rpl_binlog_sender.cc`, MariaDB 10.11–13.1 `sql/sql_repl.cc`);
+    /// a purged file or GTIDs is caught by `binlog::is_missing_binlog`, the rest by
+    /// `position_unavailable`.
+    #[test]
+    fn only_a_1236_that_says_the_position_is_gone_loses_continuity() {
+        for wording in [
+            // purged or gone binlog file
+            "Could not find first log file name in binary log index file",
+            "Could not open log file",
+            "binlog.000003 not found (ENOENT: No such file or directory)",
+            "could not find next log",
+            // the position is outside the file
+            "Client requested source to start replication from position > file size",
+            "Client requested source to start replication from position < 4",
+            "Client requested master to start replication from impossible position; the first \
+             event 'mariadb-bin.000011' at 55212580, the last event read from \
+             '/var/lib/mysql/mariadb-bin.000011' at 4, the last byte read from \
+             '/var/lib/mysql/mariadb-bin.000011' at 4.",
+            // the GTIDs the position needs are gone
+            "Cannot replicate because the source purged required binary logs. Replicate the \
+             missing transactions from elsewhere, or provision a new replica from backup.",
+            "Could not find GTID state requested by slave in any binlog files. Probably the \
+             slave state is too old and required binlog files have been purged.",
+            "The binlog on the master is missing the GTID requested by the slave (even though \
+             both a prior and a subsequent sequence number does exist), and GTID strict mode is \
+             enabled.",
+            "Error: connecting slave requested to start from GTID 0-1-9999, which is not in the \
+             master's binlog. Since the master's binlog contains GTIDs with higher sequence \
+             numbers, it probably means that the slave has diverged due to executing extra \
+             erroneous transactions",
+            "Replica has more GTIDs than the source has, using the source's SERVER_UUID. This \
+             may indicate that the the last binary log file was truncated or lost",
+        ] {
+            assert!(
+                binlog_unusable(&server_error(1236, wording)),
+                "{wording:?} must mean the position is gone"
+            );
+        }
+        // The reader's own error for a position the server no longer has.
+        let e = anyhow::Error::new(binlog::MissingBinlog {
+            from: Position {
+                file: "binlog.000001".into(),
+                pos: 4,
+            },
+            message: "gone".into(),
+        });
+        assert!(binlog_unusable(&e.context("starting the binlog dump")));
+    }
+
+    /// The other 1236 answers report a server-side failure to read its own binlog (an event
+    /// larger than `max_allowed_packet`, a damaged event, the binlog closed) and say nothing
+    /// about the position: the rules keep their positions and the dump is retried with the
+    /// capped backoff. An unknown message retries too — the default must never re-send a target.
+    #[test]
+    fn a_1236_about_the_servers_own_binlog_keeps_the_position() {
+        for wording in [
+            // an event the server cannot hand out: fix the server, keep the position
+            "log event entry exceeded max_allowed_packet; Increase max_allowed_packet on source",
+            "log event entry exceeded max_allowed_packet; Increase max_allowed_packet on master",
+            "binlog truncated in the middle of event; consider out of disk space on source",
+            "bogus data in log event",
+            "memory allocation failed reading log event",
+            "event read from binlog did not pass crc check",
+            // the server or the request is misconfigured, the binlog is fine
+            "Binary log is not open",
+            "Binary log is not open and failed to open index file to retrieve next file.",
+            "Misconfigured source - source server_id is 0",
+            "The replication sender thread cannot start in AUTO_POSITION mode: this server has \
+             GTID_MODE = OFF instead of ON.",
+            "Replica can not handle replication events with the checksum that source is \
+             configured to log",
+            "Slave can not handle replication events with the checksum that master is \
+             configured to log",
+            // a message no server has ever sent: the safe default is to retry
+            "Got an error reading communication packets",
+            "unknown error reading log event on the master",
+        ] {
+            let e = server_error(1236, wording).context("starting the binlog dump");
+            assert!(
+                !binlog_unusable(&e),
+                "{wording:?} says nothing about the position: retry, never reset"
+            );
+            assert!(!binlog::is_access_denied(&e));
+        }
+        // The duplicate server id keeps its own path (roll the id, keep the position).
+        let rival = server_error(
+            1236,
+            "A replica with the same server_uuid/server_id as this replica has connected to \
+             the source; the first event 'binlog.000009' at 4",
+        );
+        assert!(!binlog_unusable(&rival) && binlog::is_duplicate_server_id(&rival));
+        // A server error that is not 1236 is not a lost position either.
+        assert!(!binlog_unusable(&server_error(
+            2013,
+            "Lost connection to MySQL server during query"
+        )));
     }
 
     #[test]
