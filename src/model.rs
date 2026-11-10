@@ -408,6 +408,23 @@ impl TargetDef {
         let kind = Kind::parse(r.kind.as_deref().unwrap_or("http"))?;
         let endpoints = list(r.endpoints.as_deref()).context("`endpoints`")?;
         let vars = json_object("vars", r.vars.as_deref())?;
+        // An endpoint that is a reference (`env:NAME` / `file:/path`) is for the plain http kinds:
+        // there the URL itself can be the credential — the incoming webhook of Slack, Microsoft
+        // Teams Workflows, Google Chat or Discord. Every other kind takes its address in plain
+        // text and keeps its secrets in `vars`, so a reference there would only hide the address.
+        if let Some(e) = endpoints.iter().find(|e| crate::secrets::is_reference(e)) {
+            if !matches!(
+                kind,
+                Kind::Http | Kind::HttpBasic | Kind::HttpBearer | Kind::HttpHeader
+            ) {
+                bail!(
+                    "`{e}`: an endpoint reference (`env:NAME` or `file:/path`) is for kind http, \
+                     http.basic, http.bearer and http.header; kind {} takes its address in plain \
+                     text and its credentials in `vars`",
+                    kind.name()
+                );
+            }
+        }
         let need = |k: &str| -> Result<()> {
             if var_str(&vars, k).is_none() {
                 bail!("kind {:?} needs `vars.{k}`", kind);

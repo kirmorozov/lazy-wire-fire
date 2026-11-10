@@ -1,7 +1,10 @@
 //! A target at runtime: its endpoints, how a rendered action reaches each of them, and whether
 //! the answer meets `expect` (a SQL condition the source database evaluates).
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -10,12 +13,13 @@ use serde_json::{json, Value};
 
 use crate::allow::HostList;
 use crate::aws;
-use crate::http::{BaseUrl, Client as HttpClient, RawRequest};
+use crate::http::{BaseUrl, Client as HttpClient, RawRequest, Response, SecretUrl};
 use crate::model::{Kind, TargetDef};
 use crate::redis::{self, Client as RedisClient, RedisAddr, Reply};
 use crate::response::{Expect, Row, Uses};
 use crate::s3::S3Spec;
 use crate::secrets;
+use crate::tls::TlsSpec;
 
 const USER_AGENT: &str = concat!("lazywf/", env!("CARGO_PKG_VERSION"));
 
@@ -27,10 +31,21 @@ pub struct Endpoint {
 
 enum Transport {
     Http {
-        client: HttpClient,
+        client: Arc<HttpClient>,
         /// Prepended to the rendered path (base URL path, or `/<bucket>` for path-style S3).
         prefix: String,
         host_header: String,
+    },
+    /// An http endpoint whose URL is a secret: `env:NAME` or `file:/path` (see
+    /// [`crate::secrets`]), whose value is a full http(s) URL. It is resolved on every request,
+    /// like the other credentials, so a rotated file applies without a reload.
+    HttpSecret {
+        /// The reference itself. The value it names is never kept: it is resolved, used for one
+        /// request and dropped.
+        reference: String,
+        /// One keep-alive client per origin the reference has named (`scheme://host:port`). The
+        /// key is the origin, never the URL: a pool entry cannot carry the secret.
+        clients: Mutex<HashMap<String, Arc<HttpClient>>>,
     },
     Redis(RedisClient),
     /// One RabbitMQ endpoint (see `amqp.rs`).
@@ -69,6 +84,9 @@ pub struct Target {
     grpc: Option<usize>,
     /// The `aws-sns://` endpoint of an `sns` target and its batch byte limit.
     sns: Option<Sns>,
+    /// `LAZYWF_ALLOWED_HOSTS`, kept for the endpoints that are resolved per request: a rotated
+    /// secret file must not be able to move a target to a host the operator did not allow.
+    allowed: Option<HostList>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
 }
@@ -265,10 +283,48 @@ fn var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// One http request with its endpoint resolved: the client that owns the connection, the
+/// request the template rendered, and the two ways a message may name it.
+///
+/// A secret endpoint's URL is not part of this. Its path and query join the request line only as
+/// the bytes are written ([`Client::send_to`]), and both message forms name the endpoint by its
+/// origin alone ([`BaseUrl::origin`]), so a log line at any level, `/status` and `last_error`
+/// see `POST https://hooks.example.test/…` and nothing more. Every place that names an http
+/// request goes through these two fields: that is the one redacting display.
+struct HttpRequest {
+    client: Arc<HttpClient>,
+    req: RawRequest,
+    /// The endpoint's own path and query, for an endpoint whose URL is a secret.
+    secret: Option<SecretUrl>,
+    /// The endpoint as a message may name it: its base URL, or its origin and an ellipsis
+    /// (`https://hooks.example.test/…`) when its URL is a secret.
+    url: String,
+    /// `<METHOD> <url>`: what a connection error names.
+    at: String,
+    /// `<METHOD> <url><target>`: what a status or an unmet `expect` names. For a secret endpoint
+    /// this is `at` — the target is the secret.
+    at_target: String,
+}
+
+impl HttpRequest {
+    async fn send(&self, timeout: Duration) -> Result<Response> {
+        match &self.secret {
+            // The secret path and query exist for these bytes and for nowhere else.
+            Some(url) => {
+                self.client
+                    .send_to(&self.req, &url.target(&self.req.target), timeout)
+                    .await
+            }
+            None => self.client.send(&self.req, timeout).await,
+        }
+    }
+}
+
 /// Every endpoint's host (the `ctx` host: the name or IP literal lazywf connects to) and port
 /// must match the allow-list. The first one that does not names the host and the setting. A
 /// `kafka` endpoint's `ctx` lists every broker of its set (the `brokers` array) alongside the
-/// first one.
+/// first one. A secret endpoint's `ctx` holds the host of the URL its reference held when the
+/// target was loaded; every request checks the resolved host again (see [`Target::http_bind`]).
 fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
     for ep in endpoints {
         let mut hosts = vec![(
@@ -290,12 +346,52 @@ fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
             }
         }
         for (host, port) in hosts {
-            if !list.allows(&host, port) {
-                bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
-            }
+            check_host(list, &host, port)?;
         }
     }
     Ok(())
+}
+
+/// One host against the allow-list, with the message every refusal of it uses (at load and on
+/// a request): the host and the setting, nothing else — a caller that resolves a secret URL
+/// must be able to say this without naming the URL.
+fn check_host(list: &HostList, host: &str, port: u16) -> Result<()> {
+    if !list.allows(host, port) {
+        bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
+    }
+    Ok(())
+}
+
+/// The URL behind a secret endpoint's reference, resolved and checked. `reference` is what an
+/// error names: the value it holds is the secret and never appears in a message.
+fn secret_url(reference: &str) -> Result<SecretUrl> {
+    let value = secrets::resolve(reference).with_context(|| format!("endpoint `{reference}`"))?;
+    SecretUrl::parse(&value).with_context(|| format!("endpoint `{reference}`"))
+}
+
+/// The keep-alive client of a secret endpoint's origin: one per `scheme://host:port`, never one
+/// per URL, so nothing cached here can carry the secret part of it. A reference that keeps
+/// naming new origins is bounded by replacing the pool rather than growing without end.
+fn secret_client(
+    clients: &Mutex<HashMap<String, Arc<HttpClient>>>,
+    url: &SecretUrl,
+    tls: &TlsSpec,
+) -> Result<Arc<HttpClient>> {
+    let key = format!(
+        "{}://{}",
+        if url.base.secure { "https" } else { "http" },
+        url.base.host_header()
+    );
+    let mut pool = clients.lock().expect("the endpoint's client pool");
+    if let Some(client) = pool.get(&key) {
+        return Ok(client.clone());
+    }
+    if pool.len() >= 16 {
+        pool.clear();
+    }
+    let client = Arc::new(HttpClient::new(url.base.clone(), tls)?);
+    pool.insert(key, client.clone());
+    Ok(client)
 }
 
 impl Target {
@@ -389,7 +485,7 @@ impl Target {
                     let (base, prefix) = spec.address(&svc);
                     let ctx = json!({"host": base.host, "port": base.port, "url": format!("{}{prefix}", base.url())});
                     let host_header = base.host_header();
-                    let client = HttpClient::new(base, &def.tls)?;
+                    let client = Arc::new(HttpClient::new(base, &def.tls)?);
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Http {
@@ -427,7 +523,7 @@ impl Target {
                                  "region": region, "stream": url.stream});
                 base.base = String::new();
                 let host_header = base.host_header();
-                let client = HttpClient::new(base, &def.tls)?;
+                let client = Arc::new(HttpClient::new(base, &def.tls)?);
                 endpoints.push(Endpoint {
                     ctx,
                     transport: Transport::Http {
@@ -458,7 +554,7 @@ impl Target {
                                  "region": region, "queue": url.queue});
                 base.base = String::new();
                 let host_header = base.host_header();
-                let client = HttpClient::new(base, &def.tls)?;
+                let client = Arc::new(HttpClient::new(base, &def.tls)?);
                 endpoints.push(Endpoint {
                     ctx,
                     transport: Transport::Http {
@@ -490,7 +586,7 @@ impl Target {
                                  "invocation": if url.invocation == aws::Invocation::Event { "event" } else { "sync" }});
                 base.base = String::new();
                 let host_header = base.host_header();
-                let client = HttpClient::new(base, &def.tls)?;
+                let client = Arc::new(HttpClient::new(base, &def.tls)?);
                 endpoints.push(Endpoint {
                     ctx,
                     transport: Transport::Http {
@@ -520,7 +616,7 @@ impl Target {
                                  "region": region, "bus": url.bus});
                 base.base = String::new();
                 let host_header = base.host_header();
-                let client = HttpClient::new(base, &def.tls)?;
+                let client = Arc::new(HttpClient::new(base, &def.tls)?);
                 endpoints.push(Endpoint {
                     ctx,
                     transport: Transport::Http {
@@ -552,7 +648,7 @@ impl Target {
                                  "topic_arn": url.arn(&region), "fifo": url.fifo()});
                 base.base = String::new();
                 let host_header = base.host_header();
-                let client = HttpClient::new(base, &def.tls)?;
+                let client = Arc::new(HttpClient::new(base, &def.tls)?);
                 endpoints.push(Endpoint {
                     ctx,
                     transport: Transport::Http {
@@ -599,18 +695,40 @@ impl Target {
                 }
             }
             _ => {
+                // The plain http kinds. An endpoint is an address, or a reference whose value is
+                // the full URL — for an incoming webhook the URL *is* the credential, so it
+                // belongs behind `env:` / `file:` like any other secret.
                 for e in &def.endpoints {
-                    let base = BaseUrl::parse(e)?;
-                    let ctx = json!({"host": base.host, "port": base.port, "url": base.url()});
-                    let host_header = base.host_header();
-                    let prefix = base.base.clone();
-                    let client = HttpClient::new(base, &def.tls)?;
+                    if !secrets::is_reference(e) {
+                        let base = BaseUrl::parse(e)?;
+                        let ctx = json!({"host": base.host, "port": base.port, "url": base.url()});
+                        let host_header = base.host_header();
+                        let prefix = base.base.clone();
+                        let client = Arc::new(HttpClient::new(base, &def.tls)?);
+                        endpoints.push(Endpoint {
+                            ctx,
+                            transport: Transport::Http {
+                                client,
+                                prefix,
+                                host_header,
+                            },
+                        });
+                        continue;
+                    }
+                    // Resolved once here to check the form and the allow-list; every request
+                    // resolves it again, so a rotated file applies without a reload.
+                    let url = secret_url(e)?;
+                    let ctx = json!({
+                        "host": url.base.host,
+                        "port": url.base.port,
+                        // The origin alone: a template cannot reach past it (see `BaseUrl::origin`).
+                        "url": url.base.origin(),
+                    });
                     endpoints.push(Endpoint {
                         ctx,
-                        transport: Transport::Http {
-                            client,
-                            prefix,
-                            host_header,
+                        transport: Transport::HttpSecret {
+                            reference: e.clone(),
+                            clients: Mutex::new(HashMap::new()),
                         },
                     });
                 }
@@ -638,6 +756,7 @@ impl Target {
             kafka,
             grpc,
             sns,
+            allowed: allowed.cloned(),
             pool,
         }))
     }
@@ -677,14 +796,9 @@ impl Target {
         let (Some(endpoint), Some(url)) = (self.endpoints.get(ep), self.lambda.as_ref()) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
-        let Transport::Http {
-            client,
-            prefix,
-            host_header,
-        } = &endpoint.transport
-        else {
+        if !matches!(endpoint.transport, Transport::Http { .. }) {
             bail!("target `{}` is not a lambda target", self.def.name);
-        };
+        }
         if rendered.trim().is_empty() {
             return Ok(None);
         }
@@ -708,12 +822,9 @@ impl Target {
             ],
             body: rendered.as_bytes().to_vec(),
         };
-        let req = self.prepare(req, prefix, host_header).await?;
-        let at = format!("{} {}{}", req.method, client.base.url(), req.target);
-        let resp = client
-            .send(&req, self.def.timeout)
-            .await
-            .with_context(|| at.clone())?;
+        let h = self.http_bind(endpoint, req).await?;
+        let at = h.at_target.clone();
+        let resp = h.send(self.def.timeout).await.with_context(|| at.clone())?;
         if !(200..300).contains(&resp.status) {
             let msg = format!("{at}: status {}: {}", resp.status, resp.body_snippet());
             let transient = resp.status >= 500
@@ -784,36 +895,24 @@ impl Target {
             };
         }
         match &endpoint.transport {
-            Transport::Http {
-                client,
-                prefix,
-                host_header,
-            } => {
+            Transport::Http { .. } | Transport::HttpSecret { .. } => {
                 let req = match RawRequest::parse(rendered) {
                     Ok(Some(r)) => r,
                     Ok(None) => return Ok(Sent::Skipped),
                     Err(e) => return Err(rejected(format!("the rendered request: {e:#}"))),
                 };
-                let req = self.prepare(req, prefix, host_header).await?;
-                let resp = client
-                    .send(&req, self.def.timeout)
+                let h = self.http_bind(endpoint, req).await?;
+                let resp = h
+                    .send(self.def.timeout)
                     .await
-                    .with_context(|| format!("{} {}", req.method, client.base.url()))?;
+                    .with_context(|| h.at.clone())?;
                 let verdict = self
                     .expect
                     .http(&self.pool, resp.status, &resp.headers, &resp.body)
                     .await
-                    .with_context(|| {
-                        format!("{} {}{}", req.method, client.base.url(), req.target)
-                    })?;
+                    .with_context(|| h.at_target.clone())?;
                 if let Err(e) = verdict {
-                    let msg = format!(
-                        "{} {}{}: {e}: {}",
-                        req.method,
-                        client.base.url(),
-                        req.target,
-                        resp.body_snippet()
-                    );
+                    let msg = format!("{}: {e}: {}", h.at_target, resp.body_snippet());
                     // 5xx, 408 and 429 say "not now", and so do AWS throttling codes; other
                     // refusals are about this request.
                     let transient = resp.status >= 500
@@ -905,21 +1004,15 @@ impl Target {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
         match &endpoint.transport {
-            Transport::Http {
-                client,
-                prefix,
-                host_header,
-            } => {
+            Transport::Http { .. } | Transport::HttpSecret { .. } => {
                 let req = RawRequest::parse(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
-                let req = self.prepare(req, prefix, host_header).await?;
-                let resp = client.send(&req, self.def.timeout).await?;
+                let h = self.http_bind(endpoint, req).await?;
+                let resp = h.send(self.def.timeout).await?;
                 if !(200..300).contains(&resp.status) {
                     bail!(
-                        "{} {}{}: status {}: {}",
-                        req.method,
-                        client.base.url(),
-                        req.target,
+                        "{}: status {}: {}",
+                        h.at_target,
                         resp.status,
                         resp.body_snippet()
                     );
@@ -1000,14 +1093,9 @@ impl Target {
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
-        let Transport::Http {
-            client,
-            prefix,
-            host_header,
-        } = &endpoint.transport
-        else {
+        if !matches!(endpoint.transport, Transport::Http { .. }) {
             bail!("target `{}` does not answer per item", self.def.name);
-        };
+        }
         let req = match RawRequest::parse(rendered) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(vec![Item::Ok; n]),
@@ -1028,17 +1116,15 @@ impl Target {
                 return Err(rejected(format!("the rendered request: {why}")));
             }
         }
-        let req = self.prepare(req, prefix, host_header).await?;
-        let resp = client
-            .send(&req, self.def.timeout)
+        let h = self.http_bind(endpoint, req).await?;
+        let resp = h
+            .send(self.def.timeout)
             .await
-            .with_context(|| format!("{} {}", req.method, client.base.url()))?;
+            .with_context(|| h.at.clone())?;
         if !(200..300).contains(&resp.status) {
             let msg = format!(
-                "{} {}{}: status {}: {}",
-                req.method,
-                client.base.url(),
-                req.target,
+                "{}: status {}: {}",
+                h.at_target,
                 resp.status,
                 resp.body_snippet()
             );
@@ -1057,20 +1143,14 @@ impl Target {
             // [`crate::sns::batch_answer`]).
             crate::sns::batch_answer(&resp.body).with_context(|| {
                 format!(
-                    "{} {}: the answer is not a PublishBatchResult: {}",
-                    req.method,
-                    client.base.url(),
+                    "{}: the answer is not a PublishBatchResult: {}",
+                    h.at,
                     resp.body_snippet()
                 )
             })?
         } else {
             serde_json::from_slice(&resp.body).with_context(|| {
-                format!(
-                    "{} {}: the answer is not JSON: {}",
-                    req.method,
-                    client.base.url(),
-                    resp.body_snippet()
-                )
+                format!("{}: the answer is not JSON: {}", h.at, resp.body_snippet())
             })?
         };
         if self.def.kind == Kind::Kinesis {
@@ -1087,7 +1167,7 @@ impl Target {
                         .expect
                         .http(&self.pool, resp.status, &resp.headers, &bytes)
                         .await
-                        .with_context(|| format!("record {i} of {}", client.base.url()))?
+                        .with_context(|| format!("record {i} of {}", h.url))?
                     {
                         Ok(()) => Item::Ok,
                         Err(why) => Item::Rejected(format!("record {i}: {why}")),
@@ -1114,7 +1194,7 @@ impl Target {
                         .expect
                         .http(&self.pool, resp.status, &resp.headers, &bytes)
                         .await
-                        .with_context(|| format!("entry {i} of {}", client.base.url()))?
+                        .with_context(|| format!("entry {i} of {}", h.url))?
                     {
                         Ok(()) => Item::Ok,
                         Err(why) => Item::Rejected(format!("entry {i}: {why}")),
@@ -1154,7 +1234,7 @@ impl Target {
                 .expect
                 .http(&self.pool, resp.status, &resp.headers, &bytes)
                 .await
-                .with_context(|| format!("item {i} of {}", client.base.url()))?
+                .with_context(|| format!("item {i} of {}", h.url))?
             {
                 Ok(()) => Item::Ok,
                 Err(why) => Item::Rejected(format!("item {i}: {why}")),
@@ -1177,6 +1257,57 @@ impl Target {
             .enumerate()
             .map(|(i, it)| it.unwrap_or_else(|| Item::Transient(format!("item {i}: no answer"))))
             .collect())
+    }
+
+    /// Resolves `endpoint` and prepares `req` for it: the URL, the `Host` header, the kind's
+    /// credential, the webhook signature. An endpoint whose URL is a secret is resolved here, on
+    /// every request (so a rotated file applies), its host is checked against the allow-list
+    /// again, and the answer names it by its origin only: the path and the query join the request
+    /// line as [`HttpRequest::send`] writes the bytes, and reach no message.
+    async fn http_bind(&self, endpoint: &Endpoint, req: RawRequest) -> Result<HttpRequest> {
+        match &endpoint.transport {
+            Transport::Http {
+                client,
+                prefix,
+                host_header,
+            } => {
+                let req = self.prepare(req, prefix, host_header).await?;
+                let url = client.base.url();
+                Ok(HttpRequest {
+                    at: format!("{} {url}", req.method),
+                    at_target: format!("{} {url}{}", req.method, req.target),
+                    client: client.clone(),
+                    req,
+                    secret: None,
+                    url,
+                })
+            }
+            Transport::HttpSecret { reference, clients } => {
+                let url = secret_url(reference)?;
+                if let Some(list) = &self.allowed {
+                    // Refused, not waited out: a host the operator did not allow will not start
+                    // allowing this target, whatever the file says later.
+                    check_host(list, &url.base.host, url.base.port)
+                        .map_err(|e| rejected(e.to_string()))?;
+                }
+                let host_header = url.base.host_header();
+                // No prefix: the endpoint's path belongs to the request line, not in front of it.
+                let req = self.prepare(req, "", &host_header).await?;
+                let client = secret_client(clients, &url, &self.def.tls)?;
+                let url_shown = url.base.origin();
+                let at = format!("{} {url_shown}", req.method);
+                Ok(HttpRequest {
+                    // The target is the secret: a message stops at the origin.
+                    at_target: at.clone(),
+                    client,
+                    req,
+                    secret: Some(url),
+                    url: url_shown,
+                    at,
+                })
+            }
+            _ => bail!("target `{}` is not an http target", self.def.name),
+        }
     }
 
     async fn prepare(
@@ -2042,5 +2173,405 @@ mod dispatch_tests {
             .err()
             .unwrap();
         assert!(is_rejected(&e), "{e:#} is not a refusal");
+    }
+}
+
+#[cfg(test)]
+mod secret_endpoint_tests {
+    use super::*;
+    use crate::model::{RawTarget, TargetDef};
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The secret part of a webhook URL. It must reach the wire and nowhere else.
+    const MARKER: &str = "SECMARK-4c7e";
+    const HOST: &str = "hooks.example.test";
+
+    fn raw_target(kind: &str, endpoints: &str, vars: &str) -> RawTarget {
+        RawTarget {
+            name: "t".into(),
+            kind: Some(kind.into()),
+            endpoints: Some(endpoints.into()),
+            vars: Some(vars.into()),
+            ..Default::default()
+        }
+    }
+
+    fn load(kind: &str, endpoint: &str, vars: &str, allowed: &str) -> Result<Arc<Target>> {
+        let def = TargetDef::from_row(&raw_target(kind, endpoint, vars))?;
+        let list = HostList::parse(allowed)?;
+        let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+        Target::new(def, pool, list.as_ref())
+    }
+
+    /// The whole error of a load that should have failed.
+    fn load_err(kind: &str, endpoint: &str, vars: &str, allowed: &str) -> anyhow::Error {
+        match load(kind, endpoint, vars, allowed) {
+            Ok(_) => panic!("load should have failed"),
+            Err(e) => e,
+        }
+    }
+
+    /// Where a secret file of these tests lives.
+    fn secret_dir() -> std::path::PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join("tmp/out/secret-endpoints")
+    }
+
+    /// One http server on loopback: it keeps the head of every request it is sent and answers
+    /// `status` with `body` (and `Connection: close`, so no connection is pooled).
+    async fn serve(status: u16, body: &str) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (status, body, sink) = (status, body.to_string(), got.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let (body, sink) = (body.clone(), sink.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    // Read the body the client is still writing: answering while it has more to
+                    // send makes the client's write fail, and the test would see a connection
+                    // error where it wanted the status code.
+                    if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let text = String::from_utf8_lossy(&head[..end]).into_owned();
+                        let want = text
+                            .lines()
+                            .find_map(|l| {
+                                let (n, v) = l.split_once(':')?;
+                                if n.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0usize);
+                        let mut have = head.len() - (end + 4);
+                        while have < want {
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => have += n,
+                            }
+                        }
+                    }
+                    sink.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        (addr, got)
+    }
+
+    /// An address nothing listens on.
+    async fn closed_port() -> SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        addr
+    }
+
+    /// The whole message of an error: the chain, as the log and `last_error` show it.
+    fn chain(e: &anyhow::Error) -> String {
+        format!("{e:#}")
+    }
+
+    #[tokio::test]
+    async fn a_reference_endpoint_loads_and_shows_only_its_origin() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let dir = secret_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("teams"),
+            format!("https://{HOST}/hooks/b4b0f4/MARKER-ignored\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("wrong"), "not a url\n").unwrap();
+        std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("https://{HOST}/services/T0000/B0000/{MARKER}"),
+        );
+
+        for endpoint in [
+            "env:LWF_UNIT_WEBHOOK_URL".to_string(),
+            format!("file:{}/teams", dir.display()),
+        ] {
+            let t = load("http", &endpoint, "{}", "").unwrap();
+            let ctx = &t.endpoints[0].ctx;
+            // The origin, and nothing below it.
+            assert_eq!(ctx["host"], serde_json::json!(HOST));
+            assert_eq!(ctx["port"], serde_json::json!(443));
+            assert_eq!(ctx["url"], serde_json::json!(format!("https://{HOST}/…")));
+            assert!(
+                !serde_json::to_string(ctx).unwrap().contains(MARKER),
+                "the template context holds the secret: {ctx}"
+            );
+            assert!(
+                !serde_json::to_string(&t.ctx).unwrap().contains(MARKER),
+                "the target context holds the secret"
+            );
+        }
+
+        // The reference is what a `{:?}` shows, never the value it names.
+        let def =
+            TargetDef::from_row(&raw_target("http", "env:LWF_UNIT_WEBHOOK_URL", "{}")).unwrap();
+        let shown = format!("{def:?}");
+        assert!(shown.contains("env:LWF_UNIT_WEBHOOK_URL"), "{shown}");
+        assert!(!shown.contains(MARKER), "{shown}");
+
+        // A value that is not a plain http URL, or carries userinfo, is a load error that names
+        // the reference and not the secret.
+        std::env::set_var("LWF_UNIT_WEBHOOK_BAD", format!("ftp://{HOST}/x/{MARKER}"));
+        let e = load_err("http", "env:LWF_UNIT_WEBHOOK_BAD", "{}", "");
+        let msg = chain(&e);
+        assert!(msg.contains("endpoint `env:LWF_UNIT_WEBHOOK_BAD`"), "{msg}");
+        assert!(msg.contains("full http(s) URL"), "{msg}");
+        assert!(!msg.contains(MARKER), "{msg}");
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_PW",
+            format!("https://u:{MARKER}@{HOST}/x"),
+        );
+        let e = load_err("http", "env:LWF_UNIT_WEBHOOK_PW", "{}", "");
+        let msg = chain(&e);
+        // One fixed message for anything `BaseUrl::parse` refuses: its own words would
+        // quote the authority it was given, which can be a piece of the secret.
+        assert!(msg.contains("not valid"), "{msg}");
+        assert!(!msg.contains(MARKER), "{msg}");
+        let e = load_err("http", &format!("file:{}/wrong", dir.display()), "{}", "");
+        assert!(!chain(&e).contains("not a url"), "{e:#}");
+        // A reference that names nothing at all is a load error too.
+        let e = load_err("http", "env:LWF_UNIT_WEBHOOK_MISSING", "{}", "");
+        assert!(chain(&e).contains("LWF_UNIT_WEBHOOK_MISSING"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn the_secret_path_reaches_the_wire_and_no_message() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("https://{HOST}/services/T0000/B0000/{MARKER}"),
+        );
+        let t = load("http", "env:LWF_UNIT_WEBHOOK_URL", "{}", "").unwrap();
+        let rendered =
+            "POST / HTTP/1.1\nContent-Type: application/json\n\n{\"text\":\"out of stock\"}";
+
+        // Every message one of these requests can produce.
+        let mut messages: Vec<String> = Vec::new();
+        // A connection that is refused (transient), and an answer that is not a 2xx (refused).
+        let closed = closed_port().await;
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("http://{closed}/services/T0000/B0000/{MARKER}"),
+        );
+        let e = t.send(0, rendered).await.unwrap_err();
+        assert!(!is_rejected(&e), "a refused connection is transient");
+        messages.push(chain(&e));
+        let (addr, got) = serve(500, "the service is unwell").await;
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("http://{addr}/services/T0000/B0000/{MARKER}"),
+        );
+        let e = t.send(0, rendered).await.unwrap_err();
+        assert!(!is_rejected(&e), "a 500 says not now, so it is transient");
+        messages.push(chain(&e));
+        // A refusal that is about this request: the webhook was revoked, say, or the payload is
+        // not allowed. It is refused for good, and the message still stops at the origin.
+        let (denied, _) = serve(403, "the webhook is no longer active").await;
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("http://{denied}/services/T0000/B0000/{MARKER}"),
+        );
+        let e = t.send(0, rendered).await.unwrap_err();
+        assert!(is_rejected(&e), "a 403 is a refusal");
+        messages.push(chain(&e));
+        // A listing whose answer is not a 2xx.
+        let e = t
+            .fetch(0, "GET / HTTP/1.1\n\n", Uses::default())
+            .await
+            .unwrap_err();
+        messages.push(chain(&e));
+        // The endpoint is gone, and a reference that names nothing.
+        messages.push(chain(&t.send(9, rendered).await.unwrap_err()));
+        std::env::set_var("LWF_UNIT_WEBHOOK_URL", "");
+        messages.push(chain(&t.send(0, rendered).await.unwrap_err()));
+
+        for m in &messages {
+            assert!(!m.contains(MARKER), "the secret is in a message: {m}");
+        }
+        // The origin is in them, so an operator can still tell which endpoint failed.
+        assert!(
+            messages[1].contains(&format!("http://{addr}/…")),
+            "{}",
+            messages[1]
+        );
+        assert!(messages[1].contains("POST"), "{}", messages[1]);
+        assert!(messages[1].contains("status 500"), "{}", messages[1]);
+        // And the request the wire actually carried holds the path, once, exactly.
+        let sent = got.lock().unwrap().remove(0);
+        assert!(
+            sent.starts_with(&format!("POST /services/T0000/B0000/{MARKER} HTTP/1.1\r\n")),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_s_path_and_query_are_the_request_line() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let (addr, got) = serve(200, "ok").await;
+
+        // The webhook: the request line says `/`, the URL says where that is.
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("http://{addr}/services/T0000/B0000/{MARKER}"),
+        );
+        let t = load("http", "env:LWF_UNIT_WEBHOOK_URL", "{}", "").unwrap();
+        t.send(0, "POST / HTTP/1.1\n\nhello").await.unwrap();
+        // A query in the endpoint's URL, and a path below it.
+        std::env::set_var(
+            "LWF_UNIT_WEBHOOK_URL",
+            format!("http://{addr}/v1/spaces/AAA?key={MARKER}&token=BBB"),
+        );
+        t.send(0, "POST / HTTP/1.1\n\nhello").await.unwrap();
+        t.send(0, "GET /media/1.png HTTP/1.1\n\n").await.unwrap();
+        // A request line that asks for no path stays what it was.
+        std::env::set_var("LWF_UNIT_WEBHOOK_URL", format!("http://{addr}"));
+        t.send(0, "OPTIONS * HTTP/1.1\n\n").await.unwrap();
+
+        let lines: Vec<String> = got
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.lines().next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                format!("POST /services/T0000/B0000/{MARKER} HTTP/1.1"),
+                format!("POST /v1/spaces/AAA?key={MARKER}&token=BBB HTTP/1.1"),
+                format!("GET /v1/spaces/AAA/media/1.png?key={MARKER}&token=BBB HTTP/1.1"),
+                "OPTIONS * HTTP/1.1".to_string(),
+            ],
+            "{lines:#?}"
+        );
+        // `Host` comes from the resolved URL, and the body went with the request.
+        let first = got.lock().unwrap()[0].clone();
+        assert!(first.contains(&format!("Host: {addr}\r\n")), "{first}");
+        assert!(first.ends_with("\r\n\r\nhello"), "{first}");
+
+        // A plain endpoint is still sent exactly as it was before: the base path in front of
+        // the rendered target, and `POST /` on a base of `/base/` keeps its trailing slash.
+        let (addr, got) = serve(200, "ok").await;
+        let t = load("http", &format!("http://{addr}/base/"), "{}", "").unwrap();
+        t.send(0, "POST / HTTP/1.1\n\nx").await.unwrap();
+        t.send(0, "POST /idx/_bulk HTTP/1.1\n\ny").await.unwrap();
+        let lines: Vec<String> = got
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.lines().next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "POST /base/ HTTP/1.1".to_string(),
+                "POST /base/idx/_bulk HTTP/1.1".to_string(),
+            ],
+            "{lines:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_allow_list_checks_the_resolved_host() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let dir = secret_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+        let file = format!("file:{}/rotate", dir.display());
+
+        // An endpoint whose host is not allowed never loads.
+        std::fs::write(dir.join("rotate"), "https://hooks.example.test/a/b\n").unwrap();
+        let e = load_err("http", &file, "{}", "hooks.other.test");
+        let msg = chain(&e);
+        assert!(msg.contains("LAZYWF_ALLOWED_HOSTS"), "{msg}");
+        assert!(msg.contains("hooks.example.test"), "{msg}");
+        assert!(load("http", &file, "{}", "hooks.example.test").is_ok());
+
+        // A file rotated to another host is caught on the request, refused rather than waited
+        // out, and named by its host and the setting — not by the URL.
+        let t = load("http", &file, "{}", "hooks.example.test").unwrap();
+        std::fs::write(
+            dir.join("rotate"),
+            format!("https://evil.example.test/a/{MARKER}\n"),
+        )
+        .unwrap();
+        let e = t.send(0, "POST / HTTP/1.1\n\nx").await.unwrap_err();
+        assert!(
+            is_rejected(&e),
+            "a host the operator did not allow is not retried"
+        );
+        let msg = chain(&e);
+        assert!(msg.contains("LAZYWF_ALLOWED_HOSTS"), "{msg}");
+        assert!(msg.contains("evil.example.test"), "{msg}");
+        assert!(!msg.contains(MARKER), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_reference_endpoint_is_for_the_http_kinds_only() {
+        for kind in ["http", "http.basic", "http.bearer", "http.header"] {
+            let vars = match kind {
+                "http.basic" => r#"{"username":"u","password":"p"}"#,
+                "http.bearer" => r#"{"token":"t"}"#,
+                "http.header" => r#"{"header":"X-Key","value":"v"}"#,
+                _ => "{}",
+            };
+            assert!(
+                TargetDef::from_row(&raw_target(kind, "env:LWF_UNIT_ANY", vars)).is_ok(),
+                "{kind}"
+            );
+        }
+        let err = |kind: &str, vars: &str| {
+            TargetDef::from_row(&raw_target(kind, "env:LWF_UNIT_ANY", vars))
+                .unwrap_err()
+                .to_string()
+        };
+        for (kind, vars) in [
+            ("http.s3", r#"{"bucket":"b","region":"eu-west-1"}"#),
+            ("redis", "{}"),
+            ("sqs", "{}"),
+            ("kinesis", "{}"),
+            ("lambda", "{}"),
+            ("eventbridge", "{}"),
+            ("sns", "{}"),
+            ("amqp", r#"{"username":"u","password":"p"}"#),
+            ("smtp", r#"{"username":"u","password":"p"}"#),
+            ("pubsub", r#"{"topic":"t"}"#),
+            ("kafka", "{}"),
+            ("mysql", r#"{"username":"u","password":"p"}"#),
+            ("pgsql", r#"{"username":"u","password":"p"}"#),
+        ] {
+            let e = err(kind, vars);
+            assert!(
+                e.contains("endpoint reference") && e.contains("env:LWF_UNIT_ANY"),
+                "{kind}: {e}"
+            );
+        }
     }
 }
