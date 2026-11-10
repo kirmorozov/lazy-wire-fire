@@ -45,7 +45,7 @@ servers:
 servers-down:
 	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease \
 	  --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
-	  --profile kafka --profile eventbridge --profile sns down -v
+	  --profile kafka --profile eventbridge --profile sns --profile nats down -v
 
 # The integration servers and test threads; override them to run against other servers.
 E2E_DSN ?= mysql://root:root@127.0.0.1:34184
@@ -77,15 +77,15 @@ test-e2e-search:
 
 # The queue kinds against their emulators (sqs: ElasticMQ, kinesis: kinesis-mock, amqp:
 # RabbitMQ, pubsub: Google's emulator, smtp: Mailpit, kafka: a Redpanda single node, eventbridge
-# and sns: moto; compose profiles of the same names). The seven services are small enough to run
-# together on the host; the tests are run per kind with their env vars, and the services are
-# stopped even when a test fails. The kafka tests run one at a time (the restart one stops the
-# shared broker). The log_secrets binary runs against the emulators too (the same vars; its
-# lambda flow needs none of them); its other flows need the default `make servers` set (MySQL, S3
-# and Redis among it).
+# and sns: moto, nats: a NATS server with JetStream; compose profiles of the same names). The nine
+# services are small enough to run together on the host; the tests are run per kind with their env
+# vars, and the services are stopped even when a test fails. The kafka and nats tests run one at a
+# time (their restart tests stop the shared server). The log_secrets binary runs against the
+# emulators too (the same vars; its lambda flow needs none of them); its other flows need the
+# default `make servers` set (MySQL, S3 and Redis among it).
 QUEUE_PROFILES := --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
-  --profile kafka --profile eventbridge --profile sns
-QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka moto
+  --profile kafka --profile eventbridge --profile sns --profile nats
+QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka moto nats nats-auth
 test-e2e-queues:
 	$(COMPOSE) $(QUEUE_PROFILES) up -d --wait $(QUEUE_SERVICES); rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
@@ -97,11 +97,15 @@ test-e2e-queues:
 	  $(E2E_DB) LAZYWF_TEST_KAFKA=127.0.0.1:34564 $(CARGO) test --test e2e kafka_ -- --test-threads=1 || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_EVENTBRIDGE=http://127.0.0.1:34569 $(CARGO) test --test e2e eventbridge_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_SNS=http://127.0.0.1:34569 $(CARGO) test --test e2e sns_ || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_NATS=127.0.0.1:34570 LAZYWF_TEST_NATS_AUTH=127.0.0.1:34571 \
+	    LWF_TEST_NATS_TOKEN=lwf-test-nats-token-9d3e LWF_TEST_NATS_WRONG_TOKEN=lwf-test-nats-wrong-1a2b \
+	    $(CARGO) test --test e2e nats_ -- --test-threads=1 || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_SQS=http://127.0.0.1:34561 LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 \
 	    LAZYWF_TEST_AMQP=127.0.0.1:34560 LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 \
 	    LAZYWF_TEST_SMTP=127.0.0.1:34565 LAZYWF_TEST_EVENTBRIDGE=http://127.0.0.1:34569 \
 	    LAZYWF_TEST_SNS=http://127.0.0.1:34569 \
 	    LAZYWF_TEST_KAFKA=127.0.0.1:34564 LAZYWF_TEST_KAFKA_ADMIN=http://127.0.0.1:34567 \
+	    LAZYWF_TEST_NATS=127.0.0.1:34570 LAZYWF_TEST_NATS_AUTH=127.0.0.1:34571 \
 	    $(CARGO) test --test log_secrets -- --test-threads=$(E2E_THREADS) || rc=1; \
 	fi; \
 	$(COMPOSE) $(QUEUE_PROFILES) stop $(QUEUE_SERVICES); exit $$rc

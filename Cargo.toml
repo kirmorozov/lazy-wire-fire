@@ -59,6 +59,12 @@ rskafka = { version = "0.6", default-features = false, features = [
     "compression-zstd",
     "transport-tls",
 ] }
+# NATS JetStream publish for the nats kind (src/nats.rs). Default features off: they select
+# rustls with the aws-lc provider, which builds with cmake. `ring` is the crypto backend, as for
+# every other TLS here, and `nkeys` the ed25519 signer for the NATS account authentication
+# (`nkey:` + `jwt:`); both are pure Rust.
+async-nats = { version = "0.52", default-features = false, features = ["ring", "jetstream", "nkeys"] }
+nkeys = "0.4"
 # AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
 # aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }

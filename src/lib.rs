@@ -29,6 +29,7 @@ pub mod keyset;
 pub mod lock;
 pub mod logging;
 pub mod model;
+pub mod nats;
 pub mod path;
 pub mod pubsub;
 pub mod redis;

@@ -11,6 +11,7 @@
 #   docker compose -f docker-compose.test.yml --profile amqp up -d --wait      # + RabbitMQ (the amqp target tests)
 #   docker compose -f docker-compose.test.yml --profile smtp up -d --wait      # + Mailpit (the smtp target tests)
 #   docker compose -f docker-compose.test.yml --profile kafka up -d --wait     # + Redpanda (the kafka target tests, host network)
+#   docker compose -f docker-compose.test.yml --profile nats up -d --wait      # + NATS JetStream (the nats target tests)
 #   make servers-down        # every profile, volumes included
 #
 # MySQL and Percona run with GTIDs on except MySQL 8.0 (off, as in RDS for MySQL's default
@@ -139,6 +140,30 @@ services:
     image: motoserver/moto:5.2.5@sha256:59a1965d845249b04def37a0e2565f9cc6c44543cb89b68e90f28f344b3b0d1a
     profiles: ["eventbridge", "sns"]
     ports: ["127.0.0.1:34569:5000"]
+
+  # The NATS JetStream server for the `nats` target tests (compose profile `nats`, not started by
+  # `make servers`): `docker compose -f docker-compose.test.yml --profile nats up -d --wait nats`.
+  # 34570: the queue emulators take 34560-34569. `-js -sd /data` turns JetStream on with its store
+  # in the container's own filesystem, so `docker restart` keeps what the server had (the restart
+  # test needs that) while `make servers-down` starts from nothing. `-m 8222` is the monitoring
+  # port the healthcheck reads. The tests create their own streams and never rely on a leftover one.
+  nats:
+    image: nats:2.15.2-alpine@sha256:afae2fdbe2e326c65e1246cb83b9d05d319188734f3bd577ac8072daae78a10f
+    profiles: ["nats"]
+    ports: ["127.0.0.1:34570:4222"]
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    healthcheck: { test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/jsz >/dev/null || exit 1"], interval: 2s, retries: 30 }
+
+  # The same server, asking for a token (`--auth`): the log-secrets flow (`tests/log_secrets.rs`)
+  # aims a `nats` target at it, so the credential really goes over the wire and an un-capped debug
+  # log of the handshake would echo it. The token is a test fixture of this file, like the MySQL
+  # root password; the target is given it only as `vars.token: env:…`.
+  nats-auth:
+    image: nats:2.15.2-alpine@sha256:afae2fdbe2e326c65e1246cb83b9d05d319188734f3bd577ac8072daae78a10f
+    profiles: ["nats"]
+    ports: ["127.0.0.1:34571:4222"]
+    command: ["-js", "-sd", "/data", "--auth", "lwf-test-nats-token-9d3e", "-m", "8222"]
+    healthcheck: { test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/jsz >/dev/null || exit 1"], interval: 2s, retries: 30 }
 
   opensearch:
     image: opensearchproject/opensearch:2.19.7
