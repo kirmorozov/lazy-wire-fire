@@ -60,6 +60,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     set -eux; mkdir -p src; echo 'fn main() {}' > src/main.rs; : > src/lib.rs; \
     cargo zigbuild --release --locked --target "$(cat /rust-target)"; rm -rf src
 COPY src ./src
+# The gRPC contract the binary embeds with `include_bytes!` (src/grpc/contract.rs): a .proto and
+# its compiled descriptor set, committed, so building the image needs no protoc.
+COPY proto ./proto
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     set -eux; t="$(cat /rust-target)"; \

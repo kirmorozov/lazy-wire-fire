@@ -139,6 +139,9 @@ pub enum Kind {
     /// Kafka: one produce of a batch of records per action, an answer per partition (see
     /// `kafka.rs`).
     Kafka,
+    /// gRPC: the rule's documents as protobuf messages, pushed onto one long-lived
+    /// bidirectional stream per endpoint and acknowledged item by item (see `grpc.rs`).
+    Grpc,
     Redis,
     MySql,
     PgSql,
@@ -161,11 +164,12 @@ impl Kind {
             "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
             "kafka" => Kind::Kafka,
+            "grpc" => Kind::Grpc,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, grpc, redis, mysql or pgsql)"
             ),
         })
     }
@@ -173,7 +177,13 @@ impl Kind {
     pub fn is_http(self) -> bool {
         !matches!(
             self,
-            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka
+            Kind::Amqp
+                | Kind::Smtp
+                | Kind::Redis
+                | Kind::MySql
+                | Kind::PgSql
+                | Kind::Kafka
+                | Kind::Grpc
         )
     }
 
@@ -194,6 +204,7 @@ impl Kind {
             Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
             Kind::Kafka => "kafka",
+            Kind::Grpc => "grpc",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -205,7 +216,13 @@ impl Kind {
     pub fn reports_items(self) -> bool {
         matches!(
             self,
-            Kind::Sqs | Kind::Kinesis | Kind::Lambda | Kind::Kafka | Kind::EventBridge | Kind::Sns
+            Kind::Sqs
+                | Kind::Kinesis
+                | Kind::Lambda
+                | Kind::Kafka
+                | Kind::Grpc
+                | Kind::EventBridge
+                | Kind::Sns
         )
     }
 
@@ -222,6 +239,7 @@ impl Kind {
                 | Kind::Smtp
                 | Kind::PubSub
                 | Kind::Kafka
+                | Kind::Grpc
         )
     }
 
@@ -244,6 +262,9 @@ impl Kind {
             // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
             // (see `Target::batch_bytes_limit`).
             Kind::Kafka => Some(crate::kafka::MESSAGE_MAX_BYTES),
+            // The server's own maximum message size, 4 MiB in the usual implementations;
+            // `vars.max_message_bytes` raises it (see `Target::batch_bytes_limit`).
+            Kind::Grpc => Some(crate::grpc::MAX_MESSAGE_BYTES),
             _ => None,
         }
     }
@@ -275,6 +296,8 @@ impl Kind {
             Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka => {
                 &["password"]
             }
+            // `token` is a reference, not a value, but a path in a template is one leak too far.
+            Kind::Grpc => &["token", "descriptor_set"],
         }
     }
 }
@@ -489,6 +512,7 @@ impl TargetDef {
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Kafka => crate::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::Grpc => crate::grpc::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         // Webhook signing is an option of the plain http kinds; on the others the settings
@@ -520,6 +544,7 @@ impl TargetDef {
         }
         crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
         crate::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
+        crate::grpc::refuse_scheme(kind == Kind::Grpc, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }

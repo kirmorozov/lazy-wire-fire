@@ -1,5 +1,7 @@
-# Only Cargo.toml, Cargo.lock and src/ are needed to build the image.
+# Only Cargo.toml, Cargo.lock, src/ and proto/ are needed to build the image: the latter holds
+# the gRPC contract, which the binary embeds (`include_bytes!`), so nothing extra ships in it.
 *
 !Cargo.toml
 !Cargo.lock
 !src
+!proto

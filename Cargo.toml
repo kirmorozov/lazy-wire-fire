@@ -59,6 +59,14 @@ rskafka = { version = "0.6", default-features = false, features = [
     "compression-zstd",
     "transport-tls",
 ] }
+# gRPC (src/grpc/): dynamic protobuf messages from a descriptor set, so a schema is
+# configuration: no codegen and no protoc at build time. prost-reflect brings prost and
+# prost-types (the same prost 0.14 both use).
+prost = "0.14"
+prost-reflect = "0.16"
+# The xxh3-64 content hash of each item, echoed by its ack (src/grpc/). Pure Rust; already
+# in the tree through rskafka.
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_64"] }
 # AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
 # aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
@@ -73,6 +81,9 @@ tokio-postgres = { version = "0.7", default-features = false, features = ["runti
 # Tests only: a receiver for the `yaml` helper's bodies (the tool itself never parses YAML).
 # The YAML organization's maintained serde_yaml successor; pure Rust (libyaml-rs), no C build.
 yaml_serde = "0.10"
+# Tests only: compiles a .proto with no protoc (pure Rust), so the tests build the descriptor
+# sets they need and check the one shipped for lazywf's own contract against its .proto.
+protox = "0.10"
 
 [profile.release]
 lto = true

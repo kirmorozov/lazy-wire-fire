@@ -21,6 +21,7 @@ pub mod engine;
 pub mod fence;
 pub mod filters;
 pub mod gcp;
+pub mod grpc;
 pub mod health;
 pub mod http;
 pub mod intset;

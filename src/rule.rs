@@ -103,16 +103,23 @@ impl Rule {
     }
 }
 
-/// Column names a statement returns, from a prepare (nothing runs).
-async fn columns(conn: &mut Conn, sql: &str) -> Result<Vec<String>> {
+/// Column names and types a statement returns, from a prepare (nothing runs).
+async fn columns(conn: &mut Conn, sql: &str) -> Result<Vec<docs::Field>> {
     let stmt = conn.prep(sql).await?;
-    let names = stmt
+    let out = stmt
         .columns()
         .iter()
-        .map(|c| c.name_str().into_owned())
+        .map(|c| {
+            docs::Field::new(
+                c.name_str(),
+                Some(c.column_type()),
+                c.flags()
+                    .contains(mysql_async::consts::ColumnFlags::BINARY_FLAG),
+            )
+        })
         .collect();
     conn.close(stmt).await.ok();
-    Ok(names)
+    Ok(out)
 }
 
 /// `:keys` (the only placeholder selects take) expanded to `n` parameters.
@@ -120,8 +127,11 @@ pub fn expand_keys(sql: &str, n: usize) -> String {
     sql::expand(sql, |_| n).0
 }
 
-/// The selects, and every column they return (for [`kind_errors`]).
-async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>, Vec<String>)> {
+/// The selects, and every payload column they return (for [`kind_errors`]).
+async fn compile_selects(
+    conn: &mut Conn,
+    def: &RuleDef,
+) -> Result<(Vec<Select>, Vec<docs::Field>)> {
     let mut plans = Vec::new();
     let mut out = Vec::new();
     let mut all_columns = Vec::new();
@@ -131,12 +141,15 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>,
                 bail!("{}: `:{}` (selects take only `:keys`)", s.name, p.name);
             }
         }
-        let names = columns(conn, &expand_keys(&s.sql, 1))
+        let cols = columns(conn, &expand_keys(&s.sql, 1))
             .await
             .with_context(|| format!("{} does not prepare", s.name))?;
-        let plan = Plan::new(&names).with_context(|| s.name.clone())?;
+        let plan = Plan::with_fields(&cols).with_context(|| s.name.clone())?;
+        // The plan's payload columns, not the raw ones: a target that checks its schema against
+        // them wants the document key each column fills (`lines[].sku` fills `lines`, and as an
+        // array), and the protocol columns are not part of any document.
+        all_columns.extend_from_slice(plan.fields());
         plans.push((s.name.clone(), plan));
-        all_columns.extend(names);
         out.push(Select {
             name: s.name.clone(),
             sql: s.sql.clone(),
@@ -163,10 +176,13 @@ async fn compile_selects(conn: &mut Conn, def: &RuleDef) -> Result<(Vec<Select>,
 ///   needs a `version` column: it is the `MessageDeduplicationId`, as for a FIFO queue.
 /// - `kafka`: a batch holds at most the target's limit (the broker's `message.max.bytes`,
 ///   raised by its `vars.message_max_bytes`).
+/// - `grpc`: the rule's payload columns are the item message's fields, so they are checked
+///   against the target's descriptor set, and a batch is held to the target's
+///   `vars.max_message_bytes` (see [`crate::grpc::rule_errors`]).
 pub fn kind_errors(
     def: &RuleDef,
     target: &crate::model::TargetDef,
-    columns: &[String],
+    fields: &[docs::Field],
 ) -> Vec<String> {
     use crate::model::Kind;
     let kind = target.kind;
@@ -291,7 +307,7 @@ pub fn kind_errors(
         let fifo = endpoints
             .iter()
             .any(|e| crate::aws::SqsUrl::parse(e).is_ok_and(|u| u.fifo()));
-        if fifo && !columns.iter().any(|c| c == "version") {
+        if fifo && !fields.iter().any(|f| f.column == "version") {
             out.push(
                 "a FIFO queue (a queue name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
                     .into(),
@@ -352,12 +368,18 @@ pub fn kind_errors(
         let fifo = endpoints
             .iter()
             .any(|e| crate::aws::SnsUrl::parse(e).is_ok_and(|u| u.fifo()));
-        if fifo && !columns.iter().any(|c| c == "version") {
+        if fifo && !fields.iter().any(|f| f.column == "version") {
             out.push(
                 "a FIFO topic (a topic name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
                     .into(),
             );
         }
+    }
+    if kind == Kind::Grpc {
+        // The rule's columns are the item message's fields: check them against the target's
+        // descriptor set now, so a schema that does not fit is a rule that never started
+        // rather than a flush whose documents are all refused (see [`crate::grpc::rule_errors`]).
+        out.extend(crate::grpc::rule_errors(def, target, fields));
     }
     out
 }
@@ -404,7 +426,7 @@ async fn compile_trigger(
             let cols = self::columns(conn, &sql)
                 .await
                 .with_context(|| format!("trigger {} `keys_sql` does not prepare", t.id))?;
-            if !cols.iter().any(|c| c == "_key") {
+            if !cols.iter().any(|c| c.column == "_key") {
                 bail!("trigger {} `keys_sql` returns no `_key` column", t.id);
             }
             Some(KeysSql {
@@ -459,7 +481,7 @@ pub async fn compile(
     };
     if let Some(q) = &def.snapshot_keys_sql {
         match columns(conn, q).await {
-            Ok(c) if c.iter().any(|c| c == "_key") => {}
+            Ok(c) if c.iter().any(|c| c.column == "_key") => {}
             Ok(_) => errors.push("`snapshot_keys_sql` returns no `_key` column".into()),
             Err(e) => errors.push(format!("`snapshot_keys_sql` does not prepare: {e:#}")),
         }
@@ -562,8 +584,10 @@ mod kind_tests {
         d
     }
 
-    fn cols(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn cols(v: &[&str]) -> Vec<docs::Field> {
+        v.iter()
+            .map(|s| docs::Field::new(*s, None, false))
+            .collect()
     }
 
     fn stray() -> StepKind {
