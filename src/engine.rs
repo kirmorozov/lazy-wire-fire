@@ -17,8 +17,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use indexmap::{IndexMap, IndexSet};
-
-use crate::keyset::KeySet;
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
@@ -30,9 +28,11 @@ use crate::action::{self, Env, FenceSpec, Fired, KeyQuery};
 use crate::analyze;
 use crate::binlog::{self, BinlogReader, Flavor, Item, Position, RowsKind};
 use crate::config::Config;
+use crate::dedup::{buffer, key};
 use crate::fence;
 use crate::filters::{self, Role};
 use crate::health::Health;
+use crate::keyspace::{op_text, text_set, IdSets, KeySpaces};
 use crate::lock;
 use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
 use crate::rows::{Catalog, Layout, LayoutMismatch};
@@ -78,20 +78,30 @@ impl Backoff {
 /// Keys one transaction marked for one rule.
 #[derive(Debug, Default)]
 struct Marks {
-    keys: KeySet,
+    ids: IdSets,
     queries: IndexMap<String, KeyQuery>,
     rows: u64,
 }
 
-/// Marked keys waiting for their flush.
-#[derive(Debug, Default)]
+/// Marked keys waiting for their flush: the dedup core's buffer of ids per key space (a key
+/// that is an integer, or a prefix and one, lives as a number in the space of its prefix;
+/// anything else as a tuple in the text space, see [`crate::keyspace`]), with the host's
+/// clocks around it.
+///
+/// The core owns the position floor: every mark carries the start of the transaction that
+/// marked it, the first mark of a pending cycle pins it, a taken generation keeps pinning
+/// until its last chunk completed, and retried ids come back carrying it — a rule's position
+/// never runs ahead of what is unflushed. `since_ts`, `first` and `last` are the debounce and
+/// max_delay clocks (the core's counterpart of those is the plan's 6G, not vendored yet).
+#[derive(Debug)]
 struct Buffer {
-    keys: KeySet,
-    /// `keys_sql` to run at flush time, deduplicated by parameters.
+    core: buffer::Buffer<Position, String>,
+    keys: KeySpaces,
+    /// `keys_sql` to run at flush time, deduplicated by parameters. The core holds a pending
+    /// query as `Item::User` under its id (which pins the position floor exactly like a
+    /// marked key does); this map holds the payload itself, 1:1 with the pending items.
     queries: IndexMap<String, KeyQuery>,
-    /// Stream position before the oldest transaction that marked something here.
-    since: Option<Position>,
-    /// Commit time (unix seconds) of that transaction.
+    /// Commit time (unix seconds) of the oldest transaction that marked something here.
     since_ts: u32,
     first: Option<Instant>,
     last: Option<Instant>,
@@ -99,13 +109,17 @@ struct Buffer {
 
 impl Buffer {
     fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.queries.is_empty()
+        self.core.pending_len() == 0
     }
 
-    fn hold(&mut self, since: &Position, ts: u32) {
-        if self.since.as_ref().is_none_or(|s| since < s) {
-            self.since = Some(since.clone());
-        }
+    /// Keys waiting to fire: the pending items are the queries, and payload and items are
+    /// 1:1.
+    fn pending_keys(&self) -> usize {
+        self.core.pending_len() - self.queries.len()
+    }
+
+    /// Remembers the oldest commit time (`ts` 0: unknown, kept out of the minimum).
+    fn hold_ts(&mut self, ts: u32) {
         if self.since_ts == 0 || (ts != 0 && ts < self.since_ts) {
             self.since_ts = ts;
         }
@@ -118,11 +132,62 @@ impl Buffer {
         let (f, l) = (self.first?, self.last?);
         Some((l + debounce).min(f + max_delay))
     }
+
+    /// Where key `k` lives, in this rule's spaces.
+    fn locate(&mut self, k: &str) -> (key::SpaceId, key::Key) {
+        self.keys.locate(k)
+    }
+
+    /// Marks one key; `origin`: the start of the transaction that marked it.
+    fn mark(&mut self, s: key::SpaceId, k: key::Key, origin: &Position) {
+        self.core.mark(s, k, origin);
+    }
+
+    /// A pending `keys_sql` query: the payload here, an item in the core (which holds the
+    /// position floor like a marked key).
+    fn add_query(&mut self, q: KeyQuery, origin: &Position) {
+        let id = q.id();
+        self.queries.insert(id.clone(), q);
+        self.core.item(key::Item::User(id), origin);
+    }
+
+    /// Puts back the queries of a failed flush (the items are re-added separately: `done`
+    /// carries them when the generation is still there).
+    fn put_back_queries(&mut self, queries: Vec<KeyQuery>) {
+        for q in queries {
+            self.queries.entry(q.id()).or_insert(q);
+        }
+    }
+
+    /// The payloads of the queries one taken generation carried, in item order.
+    fn take_query_payloads(&mut self, items: &[key::Item<String>]) -> Vec<KeyQuery> {
+        let mut out = Vec::with_capacity(items.len());
+        for i in items {
+            if let key::Item::User(id) = i {
+                if let Some(q) = self.queries.shift_remove(id) {
+                    out.push(q);
+                }
+            }
+        }
+        out
+    }
+}
+
+impl Default for Buffer {
+    fn default() -> Self {
+        Self {
+            core: buffer::Buffer::new(KeySpaces::SPACES),
+            keys: KeySpaces::default(),
+            queries: IndexMap::new(),
+            since_ts: 0,
+            first: None,
+            last: None,
+        }
+    }
 }
 
 enum Lane {
     Flush {
-        since: Option<Position>,
         since_ts: u32,
         first: Option<Instant>,
         /// Keys of this flush that have strikes.
@@ -188,13 +253,13 @@ enum Phase {
     Waiting,
     /// Snapshot keys still to send; `batch` is in flight (kept until confirmed).
     Batches {
-        keys: KeySet,
+        keys: buffer::IdSet,
         total: u64,
         done: u64,
         batch: Option<Vec<String>>,
     },
     Strays {
-        per_ep: Vec<KeySet>,
+        per_ep: Vec<buffer::IdSet>,
         ep: usize,
         done: u64,
         batch: Option<Vec<String>>,
@@ -209,7 +274,7 @@ struct ResetRun {
     step: usize,
     phase: Phase,
     /// Keys marked since the current stray step began (never deleted as strays).
-    touched: Option<KeySet>,
+    touched: Option<buffer::IdSet>,
     backoff: Backoff,
 }
 
@@ -288,11 +353,11 @@ enum Outcome {
     },
     Snapshot {
         run: u64,
-        keys: Result<KeySet, String>,
+        keys: Result<buffer::IdSet, String>,
     },
     Strays {
         run: u64,
-        per_ep: Result<Vec<KeySet>, String>,
+        per_ep: Result<Vec<buffer::IdSet>, String>,
     },
 }
 
@@ -718,11 +783,10 @@ impl Engine {
                 p = q.clone();
             }
         };
-        if let Some(s) = &st.buffer.since {
-            lower(s);
-        }
-        if let Some(Lane::Flush { since: Some(s), .. }) = &st.lane {
-            lower(s);
+        // The core's floor: the oldest unflushed mark (pending, or the generation a flush
+        // took until its last chunk completed).
+        if let Some(o) = st.buffer.core.pinned() {
+            lower(o);
         }
         if let Some(f) = &st.frozen_at {
             lower(f);
@@ -910,11 +974,23 @@ impl Engine {
         self.settled = p.clone();
         self.xa_pending.clear();
         for st in self.rules.values_mut() {
-            if st.buffer.since.is_some() {
-                st.buffer.since = Some(p.clone());
-            }
-            if let Some(Lane::Flush { since: Some(s), .. }) = &mut st.lane {
-                *s = p.clone();
+            // The core cannot raise an origin: everything pending (and any generation in
+            // flight) comes back re-marked at `p`. A flush job still out gets its refused
+            // ids re-marked at `p` too once it reports (`on_done` sees no generation).
+            if st.buffer.core.pinned().is_some() {
+                let (sets, items) = st.buffer.core.drain();
+                for (i, set) in sets.into_iter().enumerate() {
+                    let s = key::SpaceId(i as u16);
+                    for v in set.ints.to_sorted_vec() {
+                        st.buffer.core.mark_int(s, v, p);
+                    }
+                    for t in set.keys {
+                        st.buffer.core.mark_tuple(s, t, p);
+                    }
+                }
+                for i in items {
+                    st.buffer.core.item(i, p);
+                }
             }
             st.skip_until = None;
             if st.frozen_at.is_some() {
@@ -1779,9 +1855,9 @@ impl Engine {
         rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
     ) {
         let op = match kind {
-            RowsKind::Insert => "insert",
-            RowsKind::Update => "update",
-            RowsKind::Delete => "delete",
+            RowsKind::Insert => key::Op::Insert,
+            RowsKind::Update => key::Op::Update,
+            RowsKind::Delete => key::Op::Delete,
         };
         let mut invalid: Vec<(String, u64, String)> = Vec::new();
         for (before, after) in rows {
@@ -1838,7 +1914,9 @@ impl Engine {
                                 }
                                 let k = k.trim();
                                 if template::valid_key(k) {
-                                    marks.keys.insert(k);
+                                    let (s, key) =
+                                        self.rules.get_mut(name).expect("present").buffer.locate(k);
+                                    marks.ids.insert(s, key);
                                 } else if !k.is_empty() {
                                     invalid.push((name.clone(), t.def.id, k.to_string()));
                                 }
@@ -1848,13 +1926,19 @@ impl Engine {
                             let obj = objects[ii]
                                 .get_or_insert_with(|| w.layout.object(img))
                                 .clone();
-                            let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op, "table": w.table});
+                            let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op_text(op), "table": w.table});
                             for tpl in lines {
                                 match rule.templates.render(tpl, &ctx) {
                                     Ok(s) => {
                                         let k = s.trim();
                                         if template::valid_key(k) {
-                                            marks.keys.insert(k);
+                                            let (s2, key) = self
+                                                .rules
+                                                .get_mut(name)
+                                                .expect("present")
+                                                .buffer
+                                                .locate(k);
+                                            marks.ids.insert(s2, key);
                                         } else if !k.is_empty() {
                                             invalid.push((name.clone(), t.def.id, k.to_string()));
                                         }
@@ -1929,15 +2013,38 @@ impl Engine {
                 continue;
             }
             st.counters.events += m.rows;
-            if m.keys.is_empty() && m.queries.is_empty() {
+            if m.ids.is_empty() && m.queries.is_empty() {
                 continue;
             }
+            // The newest release of this buffer: what the flush fences on.
+            st.buffer.core.released(end);
             if let Some(t) = st.reset.as_mut().and_then(|r| r.touched.as_mut()) {
-                t.extend(m.keys.clone());
+                t.extend(text_set(
+                    st.buffer
+                        .keys
+                        .render(m.ids.as_map())
+                        .iter()
+                        .map(String::as_str),
+                ));
             }
-            st.buffer.keys.extend(m.keys);
-            st.buffer.queries.extend(m.queries);
-            st.buffer.hold(since, ts);
+            for (s, set) in m.ids.into_pairs() {
+                for v in set.ints.to_sorted_vec() {
+                    st.buffer.mark(s, key::Key::Int(v), since);
+                }
+                for t in set.keys {
+                    st.buffer.mark(s, key::Key::Tuple(t), since);
+                }
+            }
+            for q in m.queries.into_values() {
+                st.buffer.add_query(q, since);
+            }
+            // The old `hold` kept the MINIMUM of the positions it was given. `mark` and
+            // `item` pin the origin only when there is none, and marks do not all arrive in
+            // binlog order: an XA's rows are applied at its COMMIT with the XA's START as
+            // `since`, which is older than everything marked between PREPARE and COMMIT.
+            // So lower the floor here (retried ids re-pin themselves in `done`).
+            st.buffer.core.pin(since);
+            st.buffer.hold_ts(ts);
             st.buffer.first.get_or_insert(now);
             st.buffer.last = Some(now);
         }
@@ -2070,9 +2177,24 @@ impl Engine {
         };
         let (env, tx) = (self.env.clone(), self.tx.clone());
         let st = self.rules.get_mut(name).expect("present");
-        let buf = std::mem::take(&mut st.buffer);
-        let keys: Vec<String> = buf.keys.into_vec();
-        let queries: Vec<KeyQuery> = buf.queries.into_values().collect();
+        let buf = &mut st.buffer;
+        // The whole buffer in one generation, taken at once (unbounded, as always).
+        // `schedule` calls this only when the buffer is due (so it is not empty) and the
+        // lane is free (so no generation is in flight, see the report); a scheduling slip
+        // must still not take the engine down: skipping one tick costs nothing.
+        if !buf.core.begin() {
+            warn!(rule = %name, "flush skipped: empty or a generation is already in flight");
+            return;
+        }
+        // `begin` moved the non-empty pending sets into the generation, so this cannot be
+        // `None` (that would mean `begin` took pending ids and the generation lost them).
+        let taken = buf
+            .core
+            .take(usize::MAX, usize::MAX)
+            .expect("begin moved the pending ids into the generation");
+        let maps: BTreeMap<key::SpaceId, buffer::IdSet> = taken.ids.into_iter().collect();
+        let keys: Vec<String> = buf.keys.render(&maps);
+        let queries: Vec<KeyQuery> = buf.take_query_payloads(&taken.items);
         // Only the keys with strikes are remembered (to clear them once confirmed).
         let struck = if st.strikes.is_empty() {
             Vec::new()
@@ -2083,12 +2205,14 @@ impl Engine {
                 .collect()
         };
         st.lane = Some(Lane::Flush {
-            since: buf.since,
             since_ts: buf.since_ts,
             first: buf.first,
             struck,
             queries: queries.clone(),
         });
+        buf.since_ts = 0;
+        buf.first = None;
+        buf.last = None;
         let (rule, incarnation, name) = (st.rule.clone(), st.incarnation, name.to_string());
         let failed = Outcome::Flush {
             fired: Fired::failed(keys.clone()),
@@ -2177,7 +2301,7 @@ impl Engine {
                     }
                     StepKind::Stray { .. } => {
                         run.phase = Phase::Waiting;
-                        run.touched = Some(KeySet::new());
+                        run.touched = Some(buffer::IdSet::default());
                         st.prep = true;
                         let (rule, env, tx, rname) =
                             (rule.clone(), env.clone(), tx.clone(), rname.clone());
@@ -2201,13 +2325,13 @@ impl Engine {
                     batch: pending,
                 } => {
                     if pending.is_none() {
-                        let next = keys.take(batch);
-                        if next.is_empty() {
+                        let chunk = keys.take(batch);
+                        if chunk.is_empty() {
                             run.step += 1;
                             run.phase = Phase::Start;
                             continue;
                         }
-                        *pending = Some(next);
+                        *pending = Some(idset_texts(&chunk));
                     }
                     if !lane_free {
                         return;
@@ -2261,8 +2385,10 @@ impl Engine {
                                 continue;
                             }
                             next = taken
+                                .to_keys()
                                 .into_iter()
                                 .filter(|k| touched.is_none_or(|t| !t.contains(k)))
+                                .map(|k| key_text(&k))
                                 .collect();
                         }
                         if next.is_empty() {
@@ -2313,7 +2439,6 @@ impl Engine {
                 resolved,
             } => {
                 let Some(Lane::Flush {
-                    since,
                     since_ts,
                     first,
                     struck,
@@ -2326,21 +2451,20 @@ impl Engine {
                 st.counters.actions_failed += fired.failed;
                 st.counters.select_ms = fired.select_time.as_millis() as u64;
                 if let Some(t) = st.reset.as_mut().and_then(|r| r.touched.as_mut()) {
-                    for k in &resolved {
-                        t.insert(k);
-                    }
+                    t.extend(text_set(resolved.iter().map(String::as_str)));
                 }
                 let keyless = fired.error.is_some()
                     && fired.failed_keys.is_empty()
                     && fired.rejected.is_empty();
                 let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
                 st.report_dropped(&d.rule, &target, &dropped, now_ms);
-                let mut again: KeySet = fired.failed_keys.into_iter().collect();
-                for k in &retry {
-                    again.insert(k);
+                let mut again = IdSets::default();
+                for k in fired.failed_keys.iter().chain(retry.iter()) {
+                    let (s, key) = st.buffer.locate(k);
+                    again.insert(s, key);
                 }
                 for k in &struck {
-                    if !again.contains(k) {
+                    if !again.contains_text(&st.buffer.keys, k) {
                         st.strikes.remove(k);
                     }
                 }
@@ -2348,21 +2472,42 @@ impl Engine {
                     _ if again.is_empty() && !keyless => {
                         st.backoff.ok();
                         target_ok = !fired.target_error;
+                        if st.buffer.core.in_flight() {
+                            // Nothing goes back: this completes the flush's only chunk.
+                            st.buffer.core.done(Vec::new(), Vec::new());
+                        }
                     }
                     err => {
                         let err = err.unwrap_or_else(|| "some actions failed".into());
-                        // Back into the buffer, ahead of what was marked meanwhile.
-                        let mut keys = again;
-                        keys.extend(std::mem::take(&mut st.buffer.keys));
-                        st.buffer.keys = keys;
-                        if keep_queries {
-                            for q in queries {
-                                st.buffer.queries.entry(q.id()).or_insert(q);
+                        // Back into the buffer, carrying the position the generation was
+                        // taken at (the core re-pins it; today's `hold` of the lane's since).
+                        let items: Vec<key::Item<String>> = if keep_queries {
+                            queries.iter().map(|q| key::Item::User(q.id())).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        if st.buffer.core.in_flight() {
+                            st.buffer.core.done(again.into_pairs(), items);
+                        } else {
+                            // A rebase drained the generation meanwhile: the refused keys
+                            // go back at the position everything rebased to.
+                            let origin = self.settled.clone();
+                            for (s, set) in again.into_pairs() {
+                                for v in set.ints.to_sorted_vec() {
+                                    st.buffer.core.mark_int(s, v, &origin);
+                                }
+                                for t in set.keys {
+                                    st.buffer.core.mark_tuple(s, t, &origin);
+                                }
+                            }
+                            for i in items {
+                                st.buffer.core.item(i, &origin);
                             }
                         }
-                        if let Some(s) = since {
-                            st.buffer.hold(&s, since_ts);
+                        if keep_queries {
+                            st.buffer.put_back_queries(queries);
                         }
+                        st.buffer.hold_ts(since_ts);
                         let now = Instant::now();
                         st.buffer.first = [first, st.buffer.first]
                             .into_iter()
@@ -2435,7 +2580,7 @@ impl Engine {
                 match keys {
                     Ok(keys) => {
                         info!(rule = %d.rule, "reset step {}: {} keys in the snapshot", run.step + 1, keys.len());
-                        let total = keys.len();
+                        let total = keys.len() as u64;
                         run.phase = Phase::Batches {
                             keys,
                             total,
@@ -2459,7 +2604,7 @@ impl Engine {
                 };
                 match per_ep {
                     Ok(per_ep) => {
-                        info!(rule = %d.rule, "reset step {}: {} stray keys", run.step + 1, per_ep.iter().map(KeySet::len).sum::<u64>());
+                        info!(rule = %d.rule, "reset step {}: {} stray keys", run.step + 1, per_ep.iter().map(|s| s.len() as u64).sum::<u64>());
                         run.phase = Phase::Strays {
                             per_ep,
                             ep: 0,
@@ -2596,7 +2741,7 @@ impl Engine {
                 json!({
                     "position": pos.to_string(),
                     "lag_ms": lag,
-                    "pending_keys": st.buffer.keys.len(),
+                    "pending_keys": st.buffer.pending_keys() as u64,
                     "firing": st.lane.is_some(),
                     "events": st.counters.events,
                     "actions_ok": st.counters.actions_ok,
@@ -2692,9 +2837,21 @@ fn spawn_job(
 }
 
 fn merge_marks(into: &mut Marks, m: Marks) {
-    into.keys.extend(m.keys);
+    into.ids.extend(m.ids);
     into.queries.extend(m.queries);
     into.rows += m.rows;
+}
+
+/// The key as text: the core's form round-trips what `Key::from_text` made.
+fn key_text(k: &key::Key) -> String {
+    let mut s = String::new();
+    k.to_text(&mut s);
+    s
+}
+
+/// The keys of a flat set as text (a reset batch of snapshot or stray keys).
+fn idset_texts(set: &buffer::IdSet) -> Vec<String> {
+    set.to_keys().iter().map(key_text).collect()
 }
 
 fn first_words(q: &str) -> String {
@@ -2725,9 +2882,9 @@ async fn flush_job(
     if !queries.is_empty() {
         match action::resolve_keys(env, &queries).await {
             Ok(found) => {
-                let mut seen: KeySet = keys.iter().map(String::as_str).collect();
+                let mut seen = text_set(keys.iter().map(String::as_str));
                 for k in found {
-                    if seen.insert(&k) {
+                    if seen.insert(key::Key::from_text(&k)) {
                         keys.push(k.clone());
                         resolved.push(k);
                     }
@@ -2940,7 +3097,12 @@ mod tests {
             .due(Duration::from_secs(1), Duration::from_secs(5))
             .is_none());
         let t0 = Instant::now();
-        b.keys.insert("a");
+        let p = |n| Position {
+            file: "binlog.000001".into(),
+            pos: n,
+        };
+        let (s, k) = b.locate("a");
+        b.mark(s, k, &p(10));
         b.first = Some(t0);
         b.last = Some(t0 + Duration::from_secs(3));
         assert_eq!(
@@ -2952,14 +3114,137 @@ mod tests {
             b.due(Duration::from_secs(1), Duration::from_secs(5)),
             Some(t0 + Duration::from_secs(5))
         );
+        // The floor of this cycle is its oldest start. Row marks arrive in binlog order,
+        // but an XA's rows arrive late (at the COMMIT, with the XA's start) and `apply`
+        // lowers the floor for them with the core's `pin` (the old `hold` min).
+        assert_eq!(b.core.pinned(), Some(&p(10)));
+    }
+
+    #[test]
+    fn the_core_holds_the_position_and_the_retry_carries_it() {
         let p = |n| Position {
             file: "binlog.000001".into(),
             pos: n,
         };
-        b.hold(&p(50), 0);
-        b.hold(&p(10), 0);
-        b.hold(&p(30), 0);
-        assert_eq!(b.since, Some(p(10)));
+        let mut b = Buffer::default();
+        let (s, k) = b.locate("item_7");
+        b.mark(s, k.clone(), &p(50));
+        let (s2, k2) = b.locate("7");
+        b.mark(s2, k2, &p(30));
+        assert_eq!(b.pending_keys(), 2);
+        assert_eq!(
+            b.core.pinned(),
+            Some(&p(50)),
+            "the first mark pins the floor"
+        );
+        assert!(b.core.begin());
+        let taken = b
+            .core
+            .take(usize::MAX, usize::MAX)
+            .expect("the pending ids");
+        assert_eq!(taken.origin, p(50));
+        assert_eq!(b.pending_keys(), 0);
+        let (sz, kz) = b.locate("z");
+        b.mark(sz, kz.clone(), &p(60));
+        assert_eq!(
+            b.core.pinned(),
+            Some(&p(50)),
+            "a generation pins until its last chunk completed"
+        );
+        // A refused id goes back carrying the generation's origin (the old `hold`).
+        let mut back = buffer::IdSet::default();
+        back.insert(k);
+        b.core.done(vec![(s, back)], Vec::new());
+        assert_eq!(
+            b.core.pinned(),
+            Some(&p(50)),
+            "the retry carries the origin"
+        );
+        assert_eq!(
+            b.pending_keys(),
+            2,
+            "the retried id and the one marked meanwhile"
+        );
+        assert!(b.core.begin());
+        b.core
+            .take(usize::MAX, usize::MAX)
+            .expect("the one pending id");
+        b.core.done(Vec::new(), Vec::new());
+        assert!(b.core.pinned().is_none(), "flushed: the floor is released");
+    }
+
+    #[test]
+    fn an_xa_start_late_at_the_commit_lowers_the_floor() {
+        let p = |n| Position {
+            file: "binlog.000001".into(),
+            pos: n,
+        };
+        let mut b = Buffer::default();
+        // A plain transaction marks at 50: the origin pins there.
+        let (s, k) = b.locate("a");
+        b.mark(s, k, &p(50));
+        assert_eq!(b.core.pinned(), Some(&p(50)));
+        // An XA that STARTED at 30 commits later: its marks arrive with the XA's start,
+        // and `apply` pins it next to them. `mark` alone would not lower the floor.
+        let (s, k) = b.locate("x");
+        b.mark(s, k, &p(30));
+        assert_eq!(
+            b.core.pinned(),
+            Some(&p(50)),
+            "mark without pin keeps the first origin"
+        );
+        b.core.pin(&p(30));
+        assert_eq!(
+            b.core.pinned(),
+            Some(&p(30)),
+            "the floor is the minimum again"
+        );
+        // The same while a generation is in flight: `pinned` mins the pending origin
+        // with the flight's, and a late pin reaches below both.
+        assert!(b.core.begin());
+        let (s, k) = b.locate("y");
+        b.mark(s, k, &p(70));
+        b.core.pin(&p(20));
+        assert_eq!(
+            b.core.pinned(),
+            Some(&p(20)),
+            "a late XA start lowers the floor even behind a flight"
+        );
+    }
+
+    #[test]
+    fn queries_hold_their_position_and_ride_the_flush() {
+        let p = |n| Position {
+            file: "binlog.000001".into(),
+            pos: n,
+        };
+        let mut b = Buffer::default();
+        let q = KeyQuery {
+            trigger: 1,
+            sql: "SELECT 1".into(),
+            params: vec![],
+        };
+        b.add_query(q.clone(), &p(20));
+        assert_eq!(b.pending_keys(), 0, "a query is not a key");
+        assert!(!b.is_empty(), "but it holds the position like one");
+        assert_eq!(b.core.pinned(), Some(&p(20)));
+        assert!(b.core.begin());
+        let taken = b.core.take(0, usize::MAX).expect("the item");
+        assert_eq!(taken.items.len(), 1);
+        let out = b.take_query_payloads(&taken.items);
+        assert_eq!(out, vec![q.clone()], "the payload rides the flush");
+        assert!(b.queries.is_empty());
+        b.core.done(Vec::new(), Vec::new());
+        assert!(
+            b.core.pinned().is_none(),
+            "a flushed query releases the floor"
+        );
+        // A failed flush puts payload and item back (the `keep_queries` retry).
+        b.put_back_queries(vec![q]);
+        b.core.item(key::Item::User("1:SELECT 1:[]".into()), &p(20));
+        assert!(!b.is_empty());
+        assert_eq!(b.core.pinned(), Some(&p(20)));
+        assert_eq!(b.pending_keys(), 0);
     }
 
     #[test]
