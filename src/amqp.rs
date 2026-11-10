@@ -742,3 +742,64 @@ mod tests {
         assert!(rule_errors(FirePer::Key).is_empty());
     }
 }
+
+#[cfg(test)]
+mod confirm_wire_tests {
+    use super::*;
+    use lapin::message::{BasicReturnMessage, Delivery};
+
+    fn returned(code: u16, text: &str) -> BasicReturnMessage {
+        BasicReturnMessage {
+            delivery: Delivery::mock(
+                1,
+                "orders".into(),
+                "orders/new".into(),
+                false,
+                b"{}".to_vec(),
+            ),
+            reply_code: code,
+            reply_text: text.into(),
+        }
+    }
+
+    /// What the broker's publisher confirm says about one publish. A `basic.return` is
+    /// this routing key having no queue behind it: the same message would be returned
+    /// again, so the key must take a strike rather than retry for good. A `nack` is the
+    /// broker unable to store it now, which is no verdict on the message at all.
+    #[test]
+    fn the_broker_answer_becomes_the_engines_verdict() {
+        assert_eq!(confirm(Confirmation::Ack(None)).unwrap(), Confirm::Ack);
+
+        let c = confirm(Confirmation::Ack(Some(returned(312, "NO_ROUTE")))).unwrap();
+        assert_eq!(
+            c,
+            Confirm::Return {
+                reply_code: 312,
+                reply_text: "NO_ROUTE".into()
+            }
+        );
+        match c.outcome() {
+            Outcome::Refused(why) => assert!(
+                why.contains("312") && why.contains("NO_ROUTE") && why.contains("routing key"),
+                "{why}"
+            ),
+            other => panic!("an unroutable message is refused, not retried: {other:?}"),
+        }
+
+        // A nack, with or without the message the broker also returned.
+        assert_eq!(confirm(Confirmation::Nack(None)).unwrap(), Confirm::Nack);
+        assert_eq!(
+            confirm(Confirmation::Nack(Some(returned(541, "INTERNAL_ERROR")))).unwrap(),
+            Confirm::Nack
+        );
+        assert!(matches!(
+            confirm(Confirmation::Nack(None)).unwrap().outcome(),
+            Outcome::Transient(_)
+        ));
+
+        // Publisher confirms were never turned on: there is no answer, and "no
+        // answer" must never read as "the broker took it".
+        let e = format!("{:#}", confirm(Confirmation::NotRequested).err().unwrap());
+        assert!(e.contains("no publisher confirm"), "{e}");
+    }
+}
