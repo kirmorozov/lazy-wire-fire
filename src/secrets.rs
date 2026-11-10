@@ -62,6 +62,16 @@ pub fn resolve_reference(field: &str, v: &str) -> Result<String> {
     resolve(v)
 }
 
+/// The bytes of a `file:` reference (a value that is not text: the descriptor set of a `grpc`
+/// target). Only `file:` carries bytes: `env:` holds what a shell can hold.
+pub fn read_bytes(field: &str, v: &str) -> Result<Vec<u8>> {
+    let path = v
+        .strip_prefix("file:")
+        .ok_or_else(|| anyhow!("`{field}` must be a `file:` reference to read bytes from"))?;
+    let real = allowed_file(path)?;
+    std::fs::read(&real).with_context(|| format!("reading file `{path}`"))
+}
+
 /// Whether `dir` is among the secret directories (for messages and tests).
 pub fn is_secret_dir(dir: &Path) -> bool {
     std::fs::canonicalize(dir).is_ok_and(|d| secret_dirs().contains(&d))

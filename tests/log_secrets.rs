@@ -4,9 +4,9 @@
 //! secrets (target credentials, an S3 session token, a SQL and a Redis password, a credential
 //! inside an endpoint, a separate binlog account, the webhook signing secrets, and, for the
 //! queue targets: AWS access / secret / session references, an AMQP account, a service-account
-//! key by reference and a SCRAM account of the Kafka broker), and the captured output must
-//! contain none of them, nor the DSN password (when it is long enough to tell apart from
-//! ordinary text).
+//! key by reference and a SCRAM account of the Kafka broker, and for a `grpc` target the bearer
+//! token of `vars.token` by reference), and the captured output must contain none of them, nor
+//! the DSN password (when it is long enough to tell apart from ordinary text).
 //! `make servers test-e2e`; the sqs, kinesis, amqp, pubsub, smtp and kafka flows are
 //! `make test-e2e-queues` (their emulators; skipped when absent).
 
@@ -59,6 +59,9 @@ const SA_KEY_FRAG: &str = "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDPP
 /// The SCRAM account the kafka flow creates on the test broker (dropped at its end).
 const KAFKA_USER: &str = "lwf_ls_kafka";
 const KAFKA_PW: &str = "LWFSECRET-kafka-pw-9d3e";
+/// The bearer token of the `grpc` flow (`vars.token`, an `env:` reference): its value is the
+/// `authorization` metadata of every call, so a leak would be a credential, not a path.
+const GRPC_TOKEN: &str = "LWFSECRET-grpc-token-4b1a";
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -2068,6 +2071,129 @@ Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}
             ("topic session token", AWS_SESSION),
         ],
     );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// The credential of a `grpc` target: `vars.token` is a reference whose value becomes the
+/// `authorization: Bearer …` metadata of every call. The kind has no server to reach yet (the
+/// stream is the next step of it), so this drives the target as far as it goes today — load,
+/// endpoint context, one action, and the refusals an owner can write — and checks the capture:
+/// neither the value nor the descriptor set's contents may appear in the log, and the
+/// configuration error of a credential in the URL must not repeat the URL either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_grpc() {
+    install();
+    // The same directory the other flows use: the var is process-wide.
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("tmp/out/secrets-logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("grpc-token"), format!("{GRPC_TOKEN}\n")).unwrap();
+    let desc = dir.join("logsecrets.desc");
+    std::fs::write(&desc, lazy_wire_fire::grpc::contract::DESCRIPTOR).unwrap();
+    // Not a descriptor set, and its bytes are the token: a refusal that quoted the file would
+    // be a leak of the credential.
+    let not_desc = dir.join("not-a-desc");
+    std::fs::write(&not_desc, format!("not protobuf: {GRPC_TOKEN}")).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+    std::env::set_var("LWF_LOGGRPC_TOKEN", GRPC_TOKEN);
+
+    let ep = "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push";
+    let good = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item","token":"env:LWF_LOGGRPC_TOKEN"}}"#,
+        desc.display()
+    );
+    let row = |vars: String, endpoint: &str| lazy_wire_fire::model::RawTarget {
+        name: "sink".into(),
+        kind: Some("grpc".into()),
+        endpoints: Some(endpoint.into()),
+        vars: Some(vars),
+        ..Default::default()
+    };
+
+    let def = lazy_wire_fire::model::TargetDef::from_row(&row(good.clone(), ep)).expect("loads");
+    // What a template can render, and what a Debug of the endpoint holds: the token is in
+    // neither, so nothing that logs them can print it.
+    tracing::debug!(vars = %def.template_vars(), "grpc target loaded");
+    let (ctx, client) = lazy_wire_fire::grpc::Client::new(&def, &def.endpoints[0]).expect("starts");
+    tracing::trace!(?ctx, ?client.opts, "the endpoint of a grpc target");
+
+    let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+    let target = lazy_wire_fire::target::Target::new(def, pool, None).expect("the target starts");
+    let items = target
+        .send_items(0, r#"{"docs":[]}"#, &["1".into(), "2".into()])
+        .await
+        .expect("the answer is per item");
+    assert!(
+        items
+            .iter()
+            .all(|i| matches!(i, lazy_wire_fire::target::Item::Transient(_))),
+        "{items:?}"
+    );
+    // A `once` step of the same target: refused until the stream lands, in a message that names
+    // the endpoint.
+    let e = target.send(0, "{}").await.unwrap_err();
+    tracing::debug!(error = %e, "a once step of a grpc target");
+    assert!(format!("{e:#}").contains("lazywf.v1.Sink/Push"), "{e:#}");
+
+    // A descriptor set that is not one is refused when the target starts (the row alone only
+    // says what the vars have to look like), and the refusal does not quote the file — whose
+    // bytes here are the token.
+    let bad = lazy_wire_fire::model::TargetDef::from_row(&row(
+        format!(
+            r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item","token":"env:LWF_LOGGRPC_TOKEN"}}"#,
+            not_desc.display()
+        ),
+        ep,
+    ))
+    .and_then(|def| {
+        lazy_wire_fire::target::Target::new(
+            def,
+            mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x"),
+            None,
+        )
+    })
+    .err()
+    .unwrap_or_else(|| panic!("accepted a file that is not a descriptor set"));
+    tracing::debug!(error = %bad, "a descriptor set that is not one");
+
+    // The refusals an owner can write with a credential: each names the var or the endpoint,
+    // none repeats what it was given.
+    for (what, vars, endpoint) in [
+        (
+            "a literal token",
+            format!(
+                r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item","token":"{GRPC_TOKEN}"}}"#,
+                desc.display()
+            ),
+            ep.to_string(),
+        ),
+        (
+            "credentials in the URL",
+            good.clone(),
+            format!("grpcs://{GRPC_TOKEN}@ingest.example.test:9000/lazywf.v1.Sink/Push"),
+        ),
+        (
+            "a token that is a bare path instead of a reference",
+            format!(
+                r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item","token":"{}"}}"#,
+                desc.display(),
+                dir.join("grpc-token").display()
+            ),
+            ep.to_string(),
+        ),
+    ] {
+        let e = lazy_wire_fire::model::TargetDef::from_row(&row(vars, &endpoint))
+            .err()
+            .unwrap_or_else(|| panic!("accepted {what}"));
+        tracing::debug!(error = %e, "a grpc target refused");
+    }
+
+    let out = captured();
+    let leaks = leaks(&out, &[("grpc bearer token", GRPC_TOKEN)]);
     if !leaks.is_empty() {
         dump(&out);
     }

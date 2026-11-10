@@ -30,25 +30,156 @@ enum Role {
     Member(usize, Path),
 }
 
+/// The JSON type a document field renders as. Targets that need the shape before they run,
+/// such as the gRPC one, check it against their schema at load time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueKind {
+    /// Any integer column, signed or not: protobuf has no unsigned 64-bit type, so even
+    /// `BIGINT UNSIGNED` goes out as a signed varint.
+    Int,
+    /// A `FLOAT`/`DOUBLE`/`DECIMAL`: a JSON number that may hold a fraction.
+    Double,
+    /// Text, and every column `to_json` renders as a string: dates and times become their
+    /// text, an unknown type is read as UTF-8.
+    Str,
+    /// A `BINARY`/`VARBINARY`/`BLOB`: `to_json` renders it as lossy UTF-8 text, so it fills
+    /// a string field and not protobuf's `bytes`, which wants base64.
+    Blob,
+    /// An array: the top-level key of a `path[]` collect column.
+    Array,
+    /// An object: the top-level key of a column with a path deeper than one step.
+    Object,
+    /// Whatever the column holds, read as JSON: a `JSON` column, one asked for as
+    /// `col:json`, or a value with no column behind it. Its shape is only known at run time.
+    Unknown,
+}
+
+impl ValueKind {
+    /// The kind a value of a column with this MySQL type renders as, following the table in
+    /// [`to_json`]. `binary` is the column's binary flag: `CHAR`/`VARCHAR` and `BINARY`/
+    /// `VARBINARY` share a type and are told apart by it. `None` is a value with no column
+    /// behind it.
+    pub fn of_column(ty: Option<ColumnType>, binary: bool) -> Self {
+        match ty {
+            None => Self::Unknown,
+            Some(
+                ColumnType::MYSQL_TYPE_TINY
+                | ColumnType::MYSQL_TYPE_SHORT
+                | ColumnType::MYSQL_TYPE_LONG
+                | ColumnType::MYSQL_TYPE_LONGLONG
+                | ColumnType::MYSQL_TYPE_INT24
+                | ColumnType::MYSQL_TYPE_YEAR
+                | ColumnType::MYSQL_TYPE_BIT,
+            ) => Self::Int,
+            Some(
+                ColumnType::MYSQL_TYPE_FLOAT
+                | ColumnType::MYSQL_TYPE_DOUBLE
+                | ColumnType::MYSQL_TYPE_DECIMAL
+                | ColumnType::MYSQL_TYPE_NEWDECIMAL,
+            ) => Self::Double,
+            // A JSON column is parsed, so it is whatever the document inside it is.
+            Some(ColumnType::MYSQL_TYPE_JSON) => Self::Unknown,
+            // A binary column arrives as bytes and is rendered as lossy UTF-8 text, which a
+            // protobuf `bytes` field would read as base64. It has to be told apart from text.
+            Some(
+                ColumnType::MYSQL_TYPE_TINY_BLOB
+                | ColumnType::MYSQL_TYPE_BLOB
+                | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+                | ColumnType::MYSQL_TYPE_LONG_BLOB,
+            ) => Self::Blob,
+            Some(ColumnType::MYSQL_TYPE_STRING | ColumnType::MYSQL_TYPE_VAR_STRING) if binary => {
+                Self::Blob
+            }
+            // Everything else, dates and times and `SET` and types not named here, becomes
+            // text.
+            Some(_) => Self::Str,
+        }
+    }
+}
+
+/// One column of a statement, with what its value does in the document.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    /// The column as the rule names it.
+    pub column: String,
+    /// The top-level document key its path fills.
+    pub key: String,
+    /// What lands there.
+    pub kind: ValueKind,
+}
+
+impl Field {
+    /// A column that fills its own document key. `ty` is its MySQL type and `binary` its
+    /// binary flag; `None` is a value with no column behind it.
+    pub fn new(column: impl Into<String>, ty: Option<ColumnType>, binary: bool) -> Self {
+        let column = column.into();
+        Field {
+            kind: ValueKind::of_column(ty, binary),
+            key: column.clone(),
+            column,
+        }
+    }
+}
+
+/// The payload entry for a column whose path starts at `path`'s first step.
+fn payload_field(column: &str, path: &Path, kind: ValueKind) -> Field {
+    // A path always starts with a field name (`Plan::build` refuses one that does not), so the
+    // fallback is only for a column that names its key itself.
+    let key = match path.0.first() {
+        Some(Step::Field(name)) => name.clone(),
+        _ => column.to_string(),
+    };
+    Field {
+        column: column.to_string(),
+        key,
+        kind,
+    }
+}
+
 /// How one select's columns map into documents.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     roles: Vec<(Role, bool)>,
     /// Array path of each collect group.
     groups: Vec<Path>,
+    /// The payload columns and what each lands as, in the order they were given.
+    fields: Vec<Field>,
     pub has_op: bool,
 }
 
 impl Plan {
     /// Builds the plan for a select's column names; errors are registration errors.
     pub fn new(names: &[String]) -> Result<Plan> {
-        let mut roles = Vec::with_capacity(names.len());
+        Plan::build(
+            &names
+                .iter()
+                .map(|n| Field::new(n, None, false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Builds the plan for a select's columns, keeping each one's MySQL type so a target can
+    /// check its schema against what the rule actually sends.
+    pub fn with_fields(fields: &[Field]) -> Result<Plan> {
+        Plan::build(fields)
+    }
+
+    /// The payload columns and what each lands as, in order. Protocol columns (`_key`,
+    /// `_op`, `_path`, `_value`) are not payload and are not listed.
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
+    }
+
+    fn build(columns: &[Field]) -> Result<Plan> {
+        let mut roles = Vec::with_capacity(columns.len());
         let mut groups: Vec<Path> = Vec::new();
+        let mut payload: Vec<Field> = Vec::new();
         let (mut key, mut dp, mut dv, mut has_op) = (false, false, false, false);
-        for name in names {
+        for column in columns {
+            let name = column.column.as_str();
             let (base, json) = match name.strip_suffix(":json") {
                 Some(b) => (b, true),
-                None => (name.as_str(), false),
+                None => (name, false),
             };
             let role = match base {
                 "_key" => {
@@ -74,7 +205,21 @@ impl Plan {
                         bail!("column `{name}` names no field");
                     }
                     match p.each_at() {
-                        None => Role::Set(p),
+                        None => {
+                            // A deeper path builds objects on the way down, so the key it
+                            // fills holds an object whatever the column itself holds.
+                            let kind = if p.0.len() == 1 {
+                                if json {
+                                    ValueKind::Unknown
+                                } else {
+                                    column.kind
+                                }
+                            } else {
+                                ValueKind::Object
+                            };
+                            payload.push(payload_field(name, &p, kind));
+                            Role::Set(p)
+                        }
                         Some(0) => bail!("column `{name}`: `[]` must follow a field name"),
                         Some(i) => {
                             if p.suffix(i + 1).each_at().is_some() {
@@ -84,10 +229,17 @@ impl Plan {
                             let g = match groups.iter().position(|g| *g == prefix) {
                                 Some(g) => g,
                                 None => {
-                                    groups.push(prefix);
+                                    groups.push(prefix.clone());
                                     groups.len() - 1
                                 }
                             };
+                            // The key holds the array, or the object that holds it.
+                            let kind = if prefix.0.len() == 1 {
+                                ValueKind::Array
+                            } else {
+                                ValueKind::Object
+                            };
+                            payload.push(payload_field(name, &prefix, kind));
                             Role::Member(g, p.suffix(i + 1))
                         }
                     }
@@ -104,6 +256,7 @@ impl Plan {
         let plan = Plan {
             roles,
             groups,
+            fields: payload,
             has_op,
         };
         // Within one select, written places must not overlap (members of one group excepted).

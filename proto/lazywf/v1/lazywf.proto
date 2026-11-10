@@ -1,0 +1,74 @@
+// lazywf's own wire contract for the `grpc` kind (src/grpc/). This file is the authority;
+// `lazywf.desc` beside it is its compiled form, which lazywf and a test server read with no
+// protoc (a unit test proves the two agree). A server in another language compiles this file
+// and implements `Sink` (or any service of its own with the same signature).
+//
+// The document itself is not here: it is the target's `vars.item_type`, a message of the
+// descriptor set the target names. `Item.item` holds it already encoded; the rest of `Item` is
+// what lazywf matches acknowledgements with.
+
+syntax = "proto3";
+
+package lazywf.v1;
+
+// One document of a flush, with what lazywf needs to match its acknowledgement.
+message Item {
+  // The sequence number of this item on this stream: from 1, by ones, restarting at 1 when the
+  // stream reconnects. An acknowledgement names it.
+  uint64 seq = 1;
+  // xxh3-64 (default seed) of `key` followed by `item`, with the length of `key` as 8
+  // little-endian bytes written before it, so the boundary between the two is part of the hash.
+  // The acknowledgement echoes it: after a reconnect the numbers start over and a key may be in
+  // flight twice with different content, so a stale acknowledgement that only matches the number
+  // cannot confirm the newer document. The key is in the hash as well, so two keys carrying the
+  // same document cannot confirm each other.
+  uint64 hash = 2;
+  // The document key, as the rule's `docs` hold it. A server that sees a key and a hash it has
+  // already stored may acknowledge the duplicate without processing it again.
+  string key = 3;
+  // The document: the rule's document, encoded as the target's `vars.item_type`.
+  bytes item = 4;
+}
+
+// One message pushed onto the stream: the items of a flush, in the order lazywf sent them. A
+// flush is one or more of these; a target's `vars.max_message_bytes` bounds one.
+message Envelope {
+  repeated Item items = 1;
+}
+
+// What a server says about one item it was given.
+message Ack {
+  enum Status {
+    // Never a verdict: an acknowledgement with no status says nothing about its item, so
+    // lazywf waits for one that does (a missing acknowledgement is transient, never a strike).
+    STATUS_UNSPECIFIED = 0;
+    // Stored. The key is done once the rule's `expect` agrees.
+    OK = 1;
+    // Refused for this item and this content: sending it again would be refused again, so the
+    // key takes a strike. `reason` says what the server saw.
+    REFUSED = 2;
+    // Not now: the key waits and is sent again (the server is unwell, or it is busy).
+    RETRY = 3;
+  }
+
+  // The sequence number of the item this acknowledges.
+  uint64 seq = 1;
+  // The `hash` of that item, echoed as it arrived.
+  uint64 hash = 2;
+  Status status = 3;
+  // For REFUSED and RETRY: what the server saw, for lazywf's log.
+  string reason = 4;
+}
+
+// One message of the response stream: the acknowledgements available so far. They may come in
+// any order, one per message or several at once.
+message Acks {
+  repeated Ack acks = 1;
+}
+
+// The shape a server implements. A server may name its service and its method as it likes (the
+// target's endpoint names them: `grpc://host:port/<package.Service>/<Method>`); the request and
+// response types are these.
+service Sink {
+  rpc Push(stream Envelope) returns (stream Acks);
+}

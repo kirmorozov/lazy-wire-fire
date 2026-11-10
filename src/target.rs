@@ -43,6 +43,9 @@ enum Transport {
     PubSub(Box<crate::pubsub::Client>),
     /// One Kafka endpoint (`src/kafka.rs`): one produce of a batch of records per action.
     Kafka(Box<crate::kafka::Client>),
+    /// One gRPC endpoint (`src/grpc/`): the rule's documents as protobuf messages on one
+    /// long-lived bidirectional stream, acknowledged item by item.
+    Grpc(Box<crate::grpc::Client>),
 }
 
 pub struct Target {
@@ -61,6 +64,9 @@ pub struct Target {
     /// The effective batch limit of a `kafka` target, when `vars.message_max_bytes` raises the
     /// kind's default (the broker's `message.max.bytes`).
     kafka: Option<usize>,
+    /// The effective batch limit of a `grpc` target, when `vars.max_message_bytes` raises the
+    /// kind's default (the server's own maximum message size).
+    grpc: Option<usize>,
     /// The `aws-sns://` endpoint of an `sns` target and its batch byte limit.
     sns: Option<Sns>,
     /// The source database, which evaluates `expect`.
@@ -579,6 +585,19 @@ impl Target {
                     });
                 }
             }
+            Kind::Grpc => {
+                // from_row: exactly one endpoint, `grpc(s)://<host>[:port]/<Service>/<Method>`.
+                // The descriptor set, the item type and the method's shape are all read here,
+                // so a schema that does not fit is a target that never started and says so
+                // (see `grpc::Client::new`); the stream itself is opened per flush.
+                for e in &def.endpoints {
+                    let (ctx, client) = crate::grpc::Client::new(&def, e)?;
+                    endpoints.push(Endpoint {
+                        ctx,
+                        transport: Transport::Grpc(Box::new(client)),
+                    });
+                }
+            }
             _ => {
                 for e in &def.endpoints {
                     let base = BaseUrl::parse(e)?;
@@ -605,6 +624,9 @@ impl Target {
         let kafka = (def.kind == Kind::Kafka)
             .then(|| crate::kafka::message_max_bytes(&def.vars))
             .and_then(|r| r.ok());
+        let grpc = (def.kind == Kind::Grpc)
+            .then(|| crate::grpc::options(&def.vars).map(|o| o.max_message_bytes))
+            .and_then(|r| r.ok());
         Ok(Arc::new(Target {
             def,
             ctx,
@@ -614,6 +636,7 @@ impl Target {
             sign,
             lambda: lambda_url,
             kafka,
+            grpc,
             sns,
             pool,
         }))
@@ -630,6 +653,9 @@ impl Target {
     /// `MaximumMessageSize` stated by `vars.maximum_message_size`.
     pub fn batch_bytes_limit(&self) -> Option<usize> {
         if let Some(n) = self.kafka {
+            return Some(n);
+        }
+        if let Some(n) = self.grpc {
             return Some(n);
         }
         if let Some(s) = &self.sns {
@@ -841,6 +867,9 @@ impl Target {
                 // A `once` reset step: no keys, the records take partition 0 (see `kafka.rs`).
                 crate::kafka::send(client, rendered, &self.expect, &self.pool).await
             }
+            Transport::Grpc(client) => {
+                crate::grpc::send(client, rendered, &self.expect, &self.pool).await
+            }
             Transport::MySql(_) | Transport::Pg(_) => {
                 let sql = match crate::sqlwire::single_statement(rendered) {
                     Ok(Some(s)) => s,
@@ -917,6 +946,7 @@ impl Target {
                 bail!("pubsub targets only publish: a listing is refused")
             }
             Transport::Kafka(_) => bail!("kind kafka appends: it cannot list keys"),
+            Transport::Grpc(_) => bail!("kind grpc pushes: it cannot list keys"),
             Transport::MySql(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
@@ -957,6 +987,15 @@ impl Target {
             };
             return crate::kafka::send_items(client, rendered, keys, &self.expect, &self.pool)
                 .await;
+        }
+        if self.def.kind == Kind::Grpc {
+            let Some(endpoint) = self.endpoints.get(ep) else {
+                bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+            };
+            let Transport::Grpc(client) = &endpoint.transport else {
+                bail!("target `{}` is not a grpc target", self.def.name);
+            };
+            return crate::grpc::send_items(client, rendered, keys, &self.expect, &self.pool).await;
         }
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
@@ -1584,6 +1623,51 @@ mod allow_tests {
         }
         // Unset: no check, whatever the host.
         assert!(load("http", "https://api.example.test/hook", "{}", "").is_ok());
+    }
+
+    /// `grpc` too: the host and port of the endpoint are the ones lazywf connects to, so they
+    /// are the ones the list is matched against. The descriptor set is the shipped contract,
+    /// read as a `file:` reference from a directory `LAZYWF_SECRET_DIRS` names.
+    #[test]
+    fn the_grpc_host_and_port_are_matched() {
+        let _env = crate::secrets::ENV_LOCK.blocking_lock();
+        let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
+        let dir = std::env::temp_dir().join(format!("lazywf-allow-grpc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let desc = dir.join("lazywf.desc");
+        std::fs::write(&desc, crate::grpc::contract::DESCRIPTOR).unwrap();
+        std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
+        let vars = format!(
+            r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item"}}"#,
+            desc.display()
+        );
+        let ep = "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push";
+        // Every load reads the descriptor set through the var, so they all happen while it is
+        // set; what they said is checked once it is back as it was.
+        let listed = load("grpc", ep, &vars, "ingest.example.test")
+            .err()
+            .map(|e| format!("{e:#}"));
+        let other_port = load("grpc", ep, &vars, "ingest.example.test:9001")
+            .err()
+            .map(|e| format!("{e:#}"));
+        let other = load("grpc", ep, &vars, "unrelated.example.test")
+            .err()
+            .map(|e| format!("{e:#}"));
+        match was {
+            Some(v) => std::env::set_var("LAZYWF_SECRET_DIRS", v),
+            None => std::env::remove_var("LAZYWF_SECRET_DIRS"),
+        }
+        assert!(listed.is_none(), "the listed host was refused: {listed:?}");
+        let msg = other_port.expect("the endpoint's port was not refused");
+        assert!(
+            msg.contains("ingest.example.test") && msg.contains("LAZYWF_ALLOWED_HOSTS"),
+            "{msg}"
+        );
+        let msg = other.expect("another host was not refused");
+        assert!(
+            msg.contains("ingest.example.test") && msg.contains("LAZYWF_ALLOWED_HOSTS"),
+            "{msg}"
+        );
     }
 
     /// Every broker of a `kafka` endpoint is matched, not only the first: one off the list is
