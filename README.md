@@ -9,8 +9,9 @@ Change-triggered actions from the MySQL binlog. Row changes in the tables you re
 document per key, renders one Handlebars template and fires the result at a target: an HTTP
 endpoint (any method, a whole raw request), an Amazon SQS queue (one `SendMessageBatch` per
 action), an Amazon Kinesis stream (one `PutRecords` per action), an AWS Lambda function
-(one `Invoke` per action), an Amazon EventBridge event bus (one `PutEvents` per action), a
-Google Cloud Pub/Sub topic (one `publish` per action), an AMQP broker (one publish per action),
+(one `Invoke` per action), an Amazon EventBridge event bus (one `PutEvents` per action), an
+Amazon SNS topic (one `PublishBatch` per action), a Google Cloud Pub/Sub topic (one `publish`
+per action), an AMQP broker (one publish per action),
 an SMTP server (one mail per action), a Kafka-protocol broker (one produce of a batch of records
 per action), Redis (one command), or MySQL / PostgreSQL (one SQL statement).
 
@@ -81,6 +82,10 @@ Values from rows go into templates through the helper of the place they land in 
 [security](docs/reference.md#security). More examples: a cache purge, a Redis command, an S3
 export, an SQS queue, a Kinesis stream, a Lambda function, an AMQP broker, a Pub/Sub topic,
 reset steps, in [docs/reference.md](docs/reference.md#examples).
+
+Vendor-by-vendor http recipes (Meilisearch, Typesense, ClickHouse, a CDN purge, a signed webhook,
+a chat hook), with the endpoint, credential and `expect` each one wants, in
+[docs/recipes.md](docs/recipes.md).
 
 ## Platforms
 
@@ -274,14 +279,15 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 | Amazon Kinesis Data Streams | `kinesis` ([Kinesis targets](docs/reference.md#kinesis-targets)) | `aws-kinesis://[<region>/]<stream-name>` | one `PutRecords` | per record, per key | refused at load (append-only; a stream-deleting `once` step too) | as `http.s3`; never in the URL | kinesis-mock 0.2 — CI (release gate) |
 | AWS Lambda | `lambda` ([Lambda targets](docs/reference.md#lambda-targets)) | `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (`?invocation=sync\|event`) | one `Invoke` | per item: the result's `batchItemFailures` | refused at load (a function cannot list its invocations) | as `http.s3`; never in the URL | a stand-in Invoke service — CI |
 | Amazon EventBridge | `eventbridge` ([EventBridge targets](docs/reference.md#eventbridge-targets)) | `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` | one `PutEvents` | per entry, per key | refused at load (append-only; a bus-deleting `once` step too) | as `http.s3`; never in the URL | moto 5.2.5 — CI (release gate) |
+| Amazon SNS | `sns` ([SNS targets](docs/reference.md#sns-targets)) | `aws-sns://[<region>/]<account-id>/<topic-name>` | one `PublishBatch` | per entry, per key | refused at load (append-only; a topic-deleting `once` step too) | as `http.s3`; never in the URL | moto 5.2.5 — CI (release gate) |
 | AMQP 0-9-1 broker | `amqp` ([AMQP targets](docs/reference.md#amqp-targets)) | `amqp(s)://host[:port][/vhost]` | one confirmed publish | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | RabbitMQ 4.3 — CI (release gate) |
 | SMTP server | `smtp` ([SMTP targets](docs/reference.md#smtp-targets)) | `smtp(s)://host[:port]` (587 / 465 by default) | one mail | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | Mailpit 1.33 — CI (release gate) |
 | Google Cloud Pub/Sub | `pubsub` ([Pub/Sub targets](docs/reference.md#pubsub-targets)) | `gc-pubsub://<project>/<topic>` | one `topics.publish` | for the action | refused at load (append-only; publish-only reset steps) | `vars.credentials_ref` (reference only), else Application Default Credentials; never in the URL | the Pub/Sub emulator — CI (release gate) |
 | Kafka-protocol broker (Apache Kafka, Redpanda, MSK, Event Hubs) | `kafka` ([Kafka targets](docs/reference.md#kafka-targets)) | `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` | one produce of a batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.sasl` (`plain`, `scram-sha-256`, `scram-sha-512`) with `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | Redpanda 26.1.20 — CI (release gate) |
 
 The append-only kinds and `lambda` refuse a stray cleanup at load, and `sqs` / `kinesis` /
-`eventbridge` / `pubsub` refuse purge-like or non-publishing reset steps; no other kind refuses
-one.
+`eventbridge` / `sns` / `pubsub` refuse purge-like or non-publishing reset steps; no other kind
+refuses one.
 
 ## Development
 
@@ -292,7 +298,7 @@ make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: M
 make test-matrix               # every other blocking line of "Supported servers", one at a time
 make test-prerelease           # the advisory MariaDB 13.1 RC and 13.2 preview
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
-make test-e2e-queues           # SQS, Kinesis, AMQP, Pub/Sub, SMTP, Kafka and EventBridge against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka and eventbridge compose profiles)
+make test-e2e-queues           # SQS, Kinesis, AMQP, Pub/Sub, SMTP, Kafka, EventBridge and SNS against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka, eventbridge and sns compose profiles)
 make coverage                  # unit tests + e2e under cargo-llvm-cov 0.9.1 into tmp/coverage (informational, not a gate)
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
@@ -311,8 +317,8 @@ Docker for the test servers.
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
 lint, unit tests, the integration suite on the default servers (Varnish included), on every other
 server (one runner each, pre-releases advisory), with the search engines, with the queue
-emulators (SQS, Kinesis, AMQP, Pub/Sub, SMTP, Kafka (Redpanda) and EventBridge (moto)), and the
-image for both platforms. Two jobs run on narrower
+emulators (SQS, Kinesis, AMQP, Pub/Sub, SMTP, Kafka (Redpanda), EventBridge (moto) and SNS
+(moto)), and the image for both platforms. Two jobs run on narrower
 triggers: the `coverage (informational)` job (pull requests and pushes to `main`; the table in the
 job summary, the lcov and HTML in the `coverage` artifact for 14 days) and the weekly
 `lazyview drift (advisory)` job (`scripts/sync-lazyview.sh --drift`, a warning per drifted file,
