@@ -87,6 +87,10 @@ Vendor-by-vendor http recipes (Meilisearch, Typesense, ClickHouse, a CDN purge, 
 a chat hook), with the endpoint, credential and `expect` each one wants, in
 [docs/recipes.md](docs/recipes.md).
 
+Business-app http recipes (Microsoft Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable,
+Notion), with the extra header each service wants and what its 2xx is worth, in
+[docs/recipes-apps.md](docs/recipes-apps.md).
+
 ## Platforms
 
 lazywf is built for Linux only: the image is `linux/amd64` and `linux/arm64`, with one static
@@ -328,13 +332,16 @@ base images and the test servers' patch builds weekly.
 
 Every file `vendor/lazyview.lock` lists is an unmodified copy of
 [lazyview](https://github.com/kirmorozov/lazyview)'s, pinned in that lock and updated with
-`scripts/sync-lazyview.sh`. Three of its groups are used by the engine: the binlog reader
+`scripts/sync-lazyview.sh`. Four of its groups are used by the engine: the binlog reader
 (`src/binlog.rs`), the commit fence (`src/fence.rs`, used by `src/engine.rs`, `src/action.rs` and
-`src/main.rs`) and the integer key set (`src/intset.rs`, the set `src/keyset.rs` keeps its numbers
-in). Two are not used by the engine yet: the view planner (`src/analyze.rs`, `src/analyzer/`,
-`src/access.rs`, `src/catalog.rs`, `src/datum.rs`), which startup only asks to refuse lazywf's own
-tables as view sources (`analyze::set_reserved`, `src/main.rs`), and the dedup core
-(`src/dedup/`). The weekly `lazyview drift (advisory)` job above warns when lazyview's `main` moves
-a locked file or adds one the copy set should gain.
+`src/main.rs`), the dedup core (`src/dedup/`: its `Buffer` is what the engine's per-rule flush
+buffer wraps, and its ids back the rule keys, which `src/keyspace.rs` maps from text onto the
+core's id spaces) and the integer key set (`src/intset.rs`, the set the core's integer spaces
+keep their numbers in); the core's tuple ids live on the copied tuple datum (`src/datum.rs`).
+One is not used by the engine: the view planner (`src/analyze.rs`, `src/analyzer/`,
+`src/access.rs`, `src/catalog.rs`), which startup only asks to refuse lazywf's own tables as view
+sources (`analyze::set_reserved`, `src/engine.rs` and `src/main.rs`). The weekly `lazyview drift
+(advisory)` job above warns when lazyview's `main` moves a locked file or adds one the copy set
+should gain.
 
 License: MIT.

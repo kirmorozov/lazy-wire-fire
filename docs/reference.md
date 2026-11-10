@@ -861,7 +861,7 @@ is such a problem.
 | `source_table` | `table` (the tool's schema) or `schema.table` |
 | `on` | which events: `insert`, `update`, `delete` (or `*` / `all` for everything), default all |
 | `changed_columns` | optional list: only updates that change one of these columns |
-| `key` | template over the row image giving the key; one key per line. `{{new.id}}`, `item_{{old.entity_id}}` |
+| `key` | template over the row image giving the key; one key per line. `{{new.id}}`, `item_{{old.item_id}}` |
 | `keys_sql` | alternative (or in addition): a query with `:old.<col>`, `:new.<col>` or `:row.<col>` parameters returning `_key` rows, e.g. the parents of a child |
 
 An insert looks at the new image only and a delete at the old one only. `old` and `new` both name
@@ -1020,7 +1020,12 @@ A JSON array, run in order; a failed step is retried, and the next one never sta
 succeeded. They run when continuity is lost (first start, purged binlog, another server, a new
 rule, a watched table replaced without row events) or on `reset_requested = 1`, in the background
 while streaming continues. A rule enabled again replays the binlog from where it stopped instead,
-and resets only when that part of the binlog was purged. An interrupted reset starts over after a restart.
+and resets only when that part of the binlog was purged. A server 1236 on the binlog dump resets
+only when its own message says the requested position cannot be served: a purged or missing
+binlog file, a position outside the file, or GTIDs the position needs are gone. Any other 1236
+keeps the position: the dump is retried with the capped backoff, the server's message is logged
+as a WARN and shown as `stream_error` on `/status` until the stream delivers events again
+([Status](#status)). An interrupted reset starts over after a restart.
 
 ```json
 [
@@ -1082,6 +1087,7 @@ and resets only when that part of the binlog was purged. An interrupted reset st
 | `select_ms` | the time of the rule's selects in its last flush |
 | `events` | the row changes that matched one of the rule's triggers since start (a row matching two triggers counts twice) |
 | `actions_ok`, `actions_failed` | the actions sent since start: one action may carry a batch of keys, so they are not key counts |
+| `stream_error` | instance only, not per rule: a binlog dump 1236 whose message says nothing about the requested position: the server's message with the position it failed at, shown while the dump is retried with that position kept, until the stream delivers events again; [Reset steps](#reset-steps) |
 | `binlog_filtered_schemas` | instance only, not per rule: the checked schemas the server's binlog filters drop (sorted); [Binlog filters](server-setup.md#binlog-filters) |
 
 The counters are in memory only: they start at 0 at each start and are not written to
