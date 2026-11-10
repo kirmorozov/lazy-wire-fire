@@ -1,6 +1,6 @@
 [package]
 name = "lazy-wire-fire"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Change-triggered actions from the MySQL binlog: rows change, keys are marked, queries render one action per batch and fire it at HTTP, S3, queue, stream, mail, Redis or SQL targets"
 license = "MIT"
