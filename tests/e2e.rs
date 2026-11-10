@@ -222,6 +222,11 @@ async fn documents_follow_the_rows() {
     inst.stop().await;
 }
 
+/// Where the server's binlog has reached *at this moment*. Other sessions (the engine's status
+/// writes, the tests running in parallel on this server) append to the same binlog, so this is a
+/// bound, never the start or end of someone else's transaction: use it as a lower bound after the
+/// writes you care about (the `>= after` pattern), or read the real position back afterwards, as
+/// [`xa_group_start`] does.
 async fn binlog_end(db: &Db) -> (String, u64) {
     let mut c = db.conn().await;
     let (major, minor, _) = c.server_version();
@@ -239,6 +244,89 @@ async fn binlog_end(db: &Db) -> (String, u64) {
         row.get::<String, _>(0).unwrap(),
         row.get::<u64, _>(1).unwrap(),
     )
+}
+
+/// Where the prepared XA transaction `xid` begins in the binlog: the position a rule holding one
+/// of its unflushed keys must stay at or below, and where a restart has to resume to see the
+/// PREPARE at all. A [`binlog_end`] snapshot taken before `XA START` is only a lower bound for
+/// it: another session — the engine's own status write, or one of the tests running in parallel
+/// on this server — can commit between the two, and then the XA's group starts that much later
+/// and the engine holds the floor at *that* position. `None`: no `XA PREPARE`/`XA START` of `xid`
+/// in the events after `from`, or that group is not in the window at all.
+async fn xa_group_start(db: &Db, from: &(String, u64), xid: &str) -> Option<(String, u64)> {
+    let hex: String = xid.bytes().map(|b| format!("{b:02x}")).collect();
+    let needle_hex = format!("X'{hex}'").to_uppercase();
+    let needle_prepare = format!("XA PREPARE '{xid}'").to_uppercase();
+    let needle_start = format!("XA START '{xid}'").to_uppercase();
+    let mut c = db.conn().await;
+    let rows: Vec<mysql_async::Row> = c
+        .query(format!(
+            "SHOW BINLOG EVENTS IN '{}' FROM {} LIMIT 10000",
+            from.0.replace('\'', "''"),
+            from.1
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("SHOW BINLOG EVENTS from {from:?}: {e}"));
+    c.disconnect().await.ok();
+    // What the engine pins is the transaction *boundary* it was holding when `XA START` arrived:
+    // the end of the last event that closed a transaction before it (`end_txn` in the engine, fed by
+    // `Xid`, `COMMIT`/`ROLLBACK`, a bare statement, `XA END`/`XA PREPARE`), which is exactly where
+    // the XA's group begins. So walk the same way instead of looking for a group opener: which
+    // event opens a group differs per server (`Gtid`, `Anonymous_Gtid` with GTIDs off, `Query
+    // BEGIN`), while what closes one does not.
+    let mut group = from.1;
+    for row in rows {
+        let kind: String = row.get(2).expect("Event_type");
+        let info: String = row.get(5).unwrap_or_default();
+        let up = info.to_uppercase();
+        let ours =
+            up.contains(&needle_hex) || up.contains(&needle_prepare) || up.contains(&needle_start);
+        if ours {
+            return Some((from.0.clone(), group));
+        }
+        if kind == "Xid"
+            || kind.eq_ignore_ascii_case("XA_prepare")
+            || (kind == "Query" && !up.starts_with("BEGIN"))
+        {
+            group = row.get(4).expect("End_log_pos");
+        }
+    }
+    None
+}
+
+/// The server's own clock as a `TIMESTAMP(3)` literal, so a status row can be asked whether the
+/// engine wrote it after a given moment without comparing two machines' clocks.
+async fn server_now(db: &Db) -> String {
+    let mut c = db.conn().await;
+    let row: mysql_async::Row = c
+        .query_first("SELECT DATE_FORMAT(CURRENT_TIMESTAMP(3), '%Y-%m-%d %H:%i:%s.%f')")
+        .await
+        .unwrap()
+        .expect("CURRENT_TIMESTAMP");
+    c.disconnect().await.ok();
+    row.get::<String, _>(0).unwrap()
+}
+
+/// `(file, pos, reset_state, last_error)` of a rule's status row, once the engine has *written* it
+/// after `written_after` (the server's clock from [`server_now`]). `status::write` stamps
+/// `updated_at = NOW(3)` on every write and `persist` rewrites a row whose position has moved, so
+/// this cannot hand back a row left over from an earlier persist.
+async fn status_row(
+    db: &Db,
+    rule: &str,
+    written_after: &str,
+) -> Option<(String, u64, String, Option<String>)> {
+    let mut c = db.conn().await;
+    let r = c
+        .exec_first(
+            "SELECT binlog_file, binlog_pos, reset_state, last_error FROM lazy_wire_fire_status \
+             WHERE rule = ? AND updated_at > ?",
+            (rule, written_after),
+        )
+        .await
+        .unwrap();
+    c.disconnect().await.ok();
+    r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1317,7 +1405,11 @@ async fn xa_fires_only_after_commit() {
 /// The XA floor across a restart: an XA that starts before a plain transaction but commits
 /// after it must keep the rule's saved position at its start while its keys are unflushed —
 /// or the restart resumes past its COMMIT and the keys are lost (the core's `pin` is what
-/// keeps the floor the minimum, `apply` in `src/engine.rs`).
+/// keeps the floor the minimum, `apply` in `src/engine.rs`). Two things are read back rather
+/// than assumed: the XA's start, from the binlog ([`xa_group_start`]) because the snapshot
+/// before `XA START` is only a lower bound once other sessions write to this server; and the
+/// saved position, from a status row written after both keys were refused ([`status_row`])
+/// because until the engine has applied the XA's rows the buffer holds only the later key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xa_committed_after_a_later_transaction_keeps_its_floor_across_a_restart() {
     let root = need_db!();
@@ -1342,7 +1434,8 @@ async fn xa_committed_after_a_later_transaction_keeps_its_floor_across_a_restart
     db.trigger("o", "orders", Some("{{new.id}}"), None).await;
     let inst = Instance::ready(config(&db, &[])).await;
     sleep_ms(300).await;
-    // The XA opens first: its start is the position the floor must stay at.
+    // The XA opens first, so its start is the position the floor must stay at. This snapshot is
+    // a lower bound for it only; the real one comes from the binlog after the COMMIT below.
     let xa_at = binlog_end(&db).await;
     let mut c = db.conn().await;
     for q in [
@@ -1353,30 +1446,63 @@ async fn xa_committed_after_a_later_transaction_keeps_its_floor_across_a_restart
     ] {
         c.query_drop(q).await.unwrap();
     }
-    // A filler event, then the plain transaction, then the COMMIT lands after both: the
-    // XA's rows and its (older) start reach the engine at the COMMIT.
-    db.exec("UPDATE customers SET name = 'filler' WHERE id = 1")
+    // A filler transaction of its own, so the plain transaction's group does not begin right after
+    // the XA's. (`shop` fills no tables, so the UPDATE this test used to run here matched no rows
+    // and wrote nothing to the binlog at all. `order_tags` has no rule, so it marks no keys.)
+    db.exec("INSERT INTO order_tags VALUES (31, 'filler')")
         .await;
     let plain_at = binlog_end(&db).await;
     assert!(xa_at < plain_at, "the filler must move the position");
     db.exec("INSERT INTO orders VALUES (32, 1, 'n', 1)").await;
     c.query_drop("XA COMMIT 'lwf3'").await.unwrap();
-    // The flush is refused, both keys stay pending, and the rule's saved position must
-    // hold at the XA start — not climb to the plain transaction's.
-    wait_for(Duration::from_secs(10), "the refused flush", || async {
-        (!mock.requests().is_empty()).then_some(())
-    })
+    // The flush is refused and both keys stay pending, so the rule's saved position must hold at
+    // the XA's start — not climb to the plain transaction's. Both keys have to have reached the
+    // target first: the XA's rows arrive with its COMMIT, and until the engine has applied them
+    // the buffer holds only the plain key, whose origin is legitimately above the XA's start.
+    wait_for(
+        Duration::from_secs(15),
+        "both keys refused at the target",
+        || async {
+            let keys: Vec<String> = mock
+                .requests()
+                .iter()
+                .flat_map(|r| r.body.split(',').map(|k| k.trim().to_string()))
+                .collect();
+            (keys.iter().any(|k| k == "31") && keys.iter().any(|k| k == "32")).then_some(())
+        },
+    )
     .await;
-    sleep_ms(600).await;
-    let (f, p, _, err) = db.status("o").await.unwrap();
+    // Then the status row the engine wrote *after* that moment. The XA's re-pin moves the position
+    // and `persist` rewrites a row whose position has moved, so this is the floor with the XA's key
+    // in the buffer — not the row the first refused flush left behind (the old test slept 600 ms
+    // and read whatever was there, which is why it hid the order of these two events).
+    let after = server_now(&db).await;
+    let (f, p, ..) = wait_for(
+        Duration::from_secs(30),
+        "the refused flush in the status row, rewritten after the XA landed",
+        || async {
+            status_row(&db, "o", &after)
+                .await
+                .filter(|(_, _, _, e)| e.as_deref().is_some_and(|e| e.contains("500")))
+        },
+    )
+    .await;
+    // The XA's own start, read back from the binlog: `xa_at` is only a lower bound, because
+    // another session can commit between the snapshot and `XA START` (the engine's status
+    // write, or a test running in parallel on this server), and then the XA's group starts
+    // that much later — and holding the floor there is right, not a climb past it.
+    let xa_start = xa_group_start(&db, &xa_at, "lwf3")
+        .await
+        .unwrap_or_else(|| panic!("no XA PREPARE for 'lwf3' in the binlog after {xa_at:?}"));
     assert!(
-        err.as_deref().is_some_and(|e| e.contains("500")),
-        "the flush was not refused: {err:?}"
+        xa_at <= xa_start && xa_start < plain_at,
+        "the XA's group must begin between {xa_at:?} (taken before XA START) and {plain_at:?} \
+         (taken before the plain transaction), got {xa_start:?}"
     );
     assert!(
-        (f.clone(), p) <= xa_at,
+        (f.clone(), p) <= xa_start,
         "the rule position climbed past the XA start while its keys are unflushed: \
-         saved ({f},{p}), xa start {xa_at:?}"
+         saved ({f},{p}), xa start {xa_start:?}"
     );
     // Restart with the target still down, then let it through: a resume point above the
     // XA start would skip its PREPARE/COMMIT and lose key 31 forever.
