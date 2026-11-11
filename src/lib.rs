@@ -38,6 +38,7 @@ pub mod rows;
 pub mod rule;
 pub mod s3;
 pub mod secrets;
+pub mod servicebus;
 pub mod sign;
 pub mod smtp;
 pub mod sns;

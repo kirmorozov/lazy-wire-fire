@@ -41,6 +41,19 @@ const AWS_SESSION: &str = "LWFSECRET-queue-session-8a2b";
 /// The AMQP account the flow creates on the test broker (dropped at its end).
 const AMQP_USER: &str = "lwf_ls_amqp";
 const AMQP_PW: &str = "LWFSECRET-amqp-pw-5e9c";
+
+/// The servicebus flow's own account and SAS rule key (both by reference only; the key is a
+/// Base64 string as Service Bus issues one).
+const SB_USER: &str = "lwf_ls_sb";
+const SB_PW: &str = "LWFSECRET-sb-pw-7b13";
+const SB_KEY: &str = "c2VjcmV0LXNlcnZpY2VidXMta2V5LTExLTAx";
+
+/// The rendered action of the servicebus flow: one message per key with its document (the
+/// template renders the document whole, so it serves either table).
+const SB_PUT: &str = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"value": {{json doc}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
 /// The SMTP account of the smtp flow: Mailpit's `any` AUTH accepts it (its `Username` in the
 /// API says the flow really authenticated).
 const SMTP_USER: &str = "lwf_ls_smtp";
@@ -977,6 +990,77 @@ impl Amqp {
     }
 }
 
+/// The test's own consumer of a queue the servicebus target writes over AMQP 1.0: the queue is
+/// declared over 0-9-1 (the same listener answers both) and read back the same way.
+struct Sbus {
+    _conn: lapin::Connection,
+    chan: lapin::Channel,
+    queue: String,
+    got: std::sync::Mutex<Vec<String>>,
+}
+
+impl Sbus {
+    async fn setup(broker: &str, queue: &str) -> Sbus {
+        use lapin::{options::*, types::FieldTable, ConnectionProperties};
+        let url = format!("amqp://lwftest:lwftest@{broker}/%2f");
+        let conn = lapin::Connection::connect(&url, ConnectionProperties::default())
+            .await
+            .unwrap();
+        let chan = conn.create_channel().await.unwrap();
+        chan.queue_delete(queue.into(), QueueDeleteOptions::default())
+            .await
+            .ok();
+        chan.queue_declare(
+            queue.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        Sbus {
+            _conn: conn,
+            chan,
+            queue: queue.into(),
+            got: Default::default(),
+        }
+    }
+
+    /// Waits until at least `n` messages have been read; their ids so far.
+    async fn ids(&self, n: usize) -> Vec<String> {
+        use lapin::options::BasicGetOptions;
+        wait_for(
+            Duration::from_secs(60),
+            &format!("{n} AMQP 1.0 messages"),
+            || async {
+                loop {
+                    let Some(m) = self
+                        .chan
+                        .basic_get(self.queue.as_str().into(), BasicGetOptions { no_ack: true })
+                        .await
+                        .unwrap()
+                    else {
+                        break;
+                    };
+                    self.got.lock().unwrap().push(
+                        m.delivery
+                            .properties
+                            .message_id()
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    );
+                }
+                let all = self.got.lock().unwrap().clone();
+                (all.len() >= n).then_some(all)
+            },
+        )
+        .await
+    }
+}
+
 /// The `amqp` target against RabbitMQ (`LAZYWF_TEST_AMQP`): one message per key under the
 /// flow's own account, whose password is a fake secret; the consumer reads the queue back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1050,6 +1134,165 @@ async fn no_secret_in_the_logs_amqp() {
         dump(&out);
     }
     assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// The servicebus kind over AMQP 1.0 (the same RabbitMQ answers 1.0 on its 5672, published here
+/// as `LAZYWF_TEST_SERVICEBUS=127.0.0.1:34610`): the SASL PLAIN password and the SAS key never
+/// appear in a log line — nor does the token built from the key — on a send that goes through
+/// (PLAIN) and on one that fails (this broker has no `$cbs` node, so CBS cannot answer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn servicebus_secrets_never_appear() {
+    let root = need_db!();
+    let Some(broker) = std::env::var("LAZYWF_TEST_SERVICEBUS").ok() else {
+        return eprintln!("LAZYWF_TEST_SERVICEBUS not set: skipping");
+    };
+    let db = Db::fresh(&root, "sb_secrets").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20))")
+        .await;
+    tables(&db).await;
+    // The flow's own account and its own SAS rule key; both by reference only.
+    let _ = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "lazywf-test-rabbitmq-1",
+            "rabbitmqctl",
+            "delete_user",
+            SB_USER,
+        ])
+        .output();
+    rabbitmqctl(&["add_user", SB_USER, SB_PW]);
+    rabbitmqctl(&["set_permissions", "-p", "/", SB_USER, ".*", ".*", ".*"]);
+    std::env::set_var("LWF_LOGSB_USER", SB_USER);
+    std::env::set_var("LWF_LOGSB_PW", SB_PW);
+    std::env::set_var("LWF_LOGSB_KEY", SB_KEY);
+    install();
+    let q = format!("lwf.logsecrets.servicebus.{}", std::process::id());
+    let consumer = Sbus::setup(&broker, &q).await;
+
+    // The broker's AMQP 1.0 listener takes SASL PLAIN, so this send goes through (`dedup` puts
+    // a recognizable id on the wire, which is how the test sees its own messages).
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, vars, timeout_ms) \
+         VALUES ('sb', 'servicebus', ?, 'off', ?, 8000)",
+        (
+            format!("sb://{broker}/queues/{q}"),
+            json!({"username": "env:LWF_LOGSB_USER", "password": "env:LWF_LOGSB_PW",
+                   "dedup": true})
+            .to_string(),
+        ),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'sb', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty FROM orders WHERE id IN (:keys)",
+            SB_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    // And a send that cannot: a SAS target puts its token to `$cbs`, which this broker has no
+    // node for. The failure is what must stay clean of the key.
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, vars, timeout_ms) \
+         VALUES ('sbsas', 'servicebus', ?, 'off', ?, 3000)",
+        (
+            format!("sb://{broker}/queues/{q}"),
+            json!({"key_name": "RootManageSharedAccessKey", "key": "env:LWF_LOGSB_KEY"})
+                .to_string(),
+        ),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('items', 'sbsas', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, name FROM items WHERE id IN (:keys)",
+            SB_PUT,
+        ),
+    )
+    .await;
+    db.trigger("items", "items", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    db.exec("INSERT INTO items VALUES (7, 'widget')").await;
+
+    let mut ids = consumer.ids(2).await;
+    ids.sort();
+    assert_eq!(ids.len(), 2, "one message per key: {ids:?}");
+    for id in &ids {
+        assert_eq!(id.len(), 64, "the dedup id of {id}");
+    }
+    assert_ne!(ids[0], ids[1], "the two keys differ: {ids:?}");
+    // The SAS target's own failing attempt is the line the key could leak into. This broker has
+    // no `$cbs` node and does not complete a SASL ANONYMOUS handshake either (Service Bus allows
+    // CBS on ANONYMOUS only), so the attempt ends in the target's time limit and the engine
+    // retries it as the transient failure it is — the log line and the rule's `last_error` are
+    // the evidence that it was made. (CBS against a real namespace is therefore unproven here;
+    // the report says so, and `cbs_put_token_request_has_the_shape_the_node_wants` covers the
+    // request's shape.)
+    wait_for(
+        Duration::from_secs(90),
+        "the SAS target's failing attempt",
+        || async {
+            let url = format!("sb://{broker}/queues/{q}");
+            let out = captured();
+            let attempted =
+                out.contains("flush failed") && out.contains(&url) && out.contains("rule=items");
+            let reported = db
+                .status("items")
+                .await
+                .and_then(|s| s.3)
+                .is_some_and(|e| e.contains(&url));
+            (attempted || reported).then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+    rabbitmqctl(&["delete_user", SB_USER]);
+
+    // The token the kind builds for that key and audience: as secret as the key itself.
+    let now = lazy_wire_fire::time::unix_now_ms() / 1000;
+    let token = lazy_wire_fire::servicebus::sas_token(
+        &format!("sb://{broker}/queues/{q}"),
+        "RootManageSharedAccessKey",
+        SB_KEY,
+        now,
+        3600,
+    )
+    .unwrap();
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    let leaks = leaks(
+        &out,
+        &[
+            ("SASL user", SB_USER),
+            ("SASL password", SB_PW),
+            ("SAS key", SB_KEY),
+        ],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+    // A token is only secret while its inputs are: the one of this minute must not be there
+    // either (the expiry moves, so its own `se` is not part of the compare).
+    let sig = token
+        .split('&')
+        .find(|p| p.starts_with("sig="))
+        .unwrap_or_default()
+        .to_string();
+    assert!(!sig.is_empty(), "the token carries a signature: {token}");
+    assert!(!out.contains(&sig), "the SAS signature is in the logs");
+    assert!(
+        !out.contains(SB_KEY),
+        "the key is in the log of the CBS attempt"
+    );
 }
 
 /// The Pub/Sub emulator's REST API (project `lwf-test`): topic and subscription, the pull.

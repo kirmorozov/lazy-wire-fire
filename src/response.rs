@@ -134,6 +134,18 @@ impl Row {
         }
     }
 
+    /// The result of one servicebus send as `body`: `{"entity": …, "message_id": …}` (the
+    /// entity the message went to and the document key it carried; `vars.dedup` is what
+    /// puts a real MessageId on the wire).
+    pub fn servicebus(uses: Uses, entity: &str, key: Option<&str>) -> Row {
+        Row {
+            body: uses
+                .body
+                .then(|| serde_json::json!({"entity": entity, "message_id": key}).to_string()),
+            ..Row::default()
+        }
+    }
+
     /// A JSON answer as `body` (the rows of a SQL listing).
     pub fn json(uses: Uses, v: &Value) -> Row {
         Row {

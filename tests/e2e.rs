@@ -5339,6 +5339,501 @@ async fn kafka_restart() {
     k.drop_topic(&topic).await;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The servicebus kind against RabbitMQ 4 speaking AMQP 1.0 (`LAZYWF_TEST_SERVICEBUS=
+// 127.0.0.1:34610`, the compose `amqp` profile's RabbitMQ: its 5672 answers both 0-9-1 and 1.0
+// and picks by itself, and 34610 is that port published for this kind). RabbitMQ has no `$cbs`
+// node, so the SAS path cannot run here: the target connects with SASL PLAIN (`vars.username`,
+// `vars.password`), which is what a broker that is not Service Bus takes. The queue is declared
+// and read over AMQP 0-9-1 with lapin, as the `amqp` tests do: what arrives is the target's own
+// message seen from the other protocol of the same broker.
+
+/// The rendered action: one message per key (message i takes key i), each with its document.
+const SB_PUT: &str = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"value": {{json doc}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+/// The target's `expect`: the send answered with the entity the message went to.
+const SB_EXPECT: &str = "JSON_EXTRACT(body, '$.entity') IS NOT NULL";
+
+/// The broker's `host:port`, when the suite has one.
+fn servicebus_broker() -> Option<String> {
+    std::env::var("LAZYWF_TEST_SERVICEBUS").ok()
+}
+
+macro_rules! need_servicebus {
+    () => {
+        match servicebus_broker() {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "LAZYWF_TEST_SERVICEBUS not set: skipping (make servers with the amqp profile)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// One test at a time on the shared broker (the restart test stops it).
+static SB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The shared RabbitMQ of the suite (the compose project `lazywf-test`).
+const SB_CONTAINER: &str = "lazywf-test-rabbitmq-1";
+
+/// The password of the broker's test user, by reference as the kind demands it.
+const SB_PW_VAR: &str = "LWF_TEST_SB_PW";
+
+/// The container's health as the compose health check sees it (`rabbitmq-diagnostics -q ping`).
+fn sb_container_health() -> String {
+    std::process::Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Health.Status}}",
+            SB_CONTAINER,
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The shared RabbitMQ container, kept up when a test ends between its stop and its start.
+struct SbRestart {
+    down: bool,
+}
+
+impl SbRestart {
+    fn new() -> Self {
+        Self { down: false }
+    }
+    /// Stops the container (graceful: what the broker holds is meant to survive).
+    fn stop(&mut self) {
+        docker(&["stop", "-t", "10", SB_CONTAINER]);
+        self.down = true;
+    }
+    fn start(&mut self) {
+        docker(&["start", SB_CONTAINER]);
+        self.down = false;
+    }
+    /// Waits for the started broker to answer its own health check.
+    async fn healthy(&self) {
+        wait_for(
+            Duration::from_secs(120),
+            "the broker healthy again",
+            || async { (sb_container_health() == "healthy").then_some(()) },
+        )
+        .await;
+    }
+}
+
+impl Drop for SbRestart {
+    fn drop(&mut self) {
+        if self.down {
+            let _ = std::process::Command::new("docker")
+                .args(["start", SB_CONTAINER])
+                .status();
+        }
+    }
+}
+
+/// One message of a queue as the test reads it over AMQP 0-9-1.
+#[derive(Debug, Clone)]
+struct SbMsg {
+    message_id: String,
+    content_type: String,
+    durable: bool,
+    body: Value,
+}
+
+/// The test's view of the broker: declares its queue and reads it back. One connection per call,
+/// so a broker that went away and came back is met with a fresh one.
+struct Sbus {
+    url: String,
+}
+
+impl Sbus {
+    fn new(broker: &str) -> Sbus {
+        Sbus {
+            url: format!("amqp://lwftest:lwftest@{broker}/%2f"),
+        }
+    }
+
+    async fn channel(&self) -> Option<lapin::Channel> {
+        let conn = lapin::Connection::connect(&self.url, lapin::ConnectionProperties::default())
+            .await
+            .ok()?;
+        conn.create_channel().await.ok()
+    }
+
+    /// (Re)creates the durable queue, empty: a rerun does not see an earlier run's messages.
+    async fn declare(&self, queue: &str) {
+        use lapin::options::{QueueDeclareOptions, QueueDeleteOptions};
+        let conn = lapin::Connection::connect(&self.url, lapin::ConnectionProperties::default())
+            .await
+            .unwrap();
+        let chan = conn.create_channel().await.unwrap();
+        chan.queue_delete(queue.into(), QueueDeleteOptions::default())
+            .await
+            .ok();
+        chan.queue_declare(
+            queue.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// How many messages the queue holds now (a passive declare); `None` while the broker is
+    /// down or the queue is gone.
+    async fn depth(&self, queue: &str) -> Option<u32> {
+        use lapin::options::QueueDeclareOptions;
+        let chan = self.channel().await?;
+        chan.queue_declare(
+            queue.into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            lapin::types::FieldTable::default(),
+        )
+        .await
+        .ok()
+        .map(|q| q.message_count())
+    }
+
+    /// Every message waiting on the queue now, taken (acked) from it.
+    async fn take(&self, queue: &str) -> Vec<SbMsg> {
+        use lapin::options::BasicGetOptions;
+        let Some(chan) = self.channel().await else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        loop {
+            let Ok(Some(m)) = chan
+                .basic_get(queue.into(), BasicGetOptions { no_ack: true })
+                .await
+            else {
+                return out;
+            };
+            let d = m.delivery;
+            let p = &d.properties;
+            out.push(SbMsg {
+                message_id: p
+                    .message_id()
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                content_type: p
+                    .content_type()
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                durable: *p.delivery_mode() == Some(2),
+                body: serde_json::from_slice(&d.data).unwrap_or(Value::Null),
+            });
+        }
+    }
+}
+
+/// Reads the queue into `seen` (a `take` acks, so what was read must be kept) and returns
+/// everything seen so far.
+async fn sb_read(sb: &Sbus, queue: &str, seen: &std::sync::Mutex<Vec<SbMsg>>) -> Vec<SbMsg> {
+    let mut new = sb.take(queue).await;
+    let mut all = seen.lock().unwrap();
+    if !new.is_empty() {
+        all.append(&mut new);
+    }
+    all.clone()
+}
+
+/// Waits until `n` messages have arrived on the queue and returns them all.
+async fn sb_arrived(sb: &Sbus, queue: &str, n: usize) -> Vec<SbMsg> {
+    let seen = std::sync::Mutex::new(Vec::new());
+    wait_for(
+        Duration::from_secs(60),
+        &format!("{n} servicebus messages on {queue}"),
+        || async {
+            let all = sb_read(sb, queue, &seen).await;
+            (all.len() >= n).then_some(all)
+        },
+    )
+    .await
+}
+
+/// The target row: one endpoint, plain TLS (a local broker may be plain), SASL PLAIN as the
+/// kind's own vars demand them (`vars.password` by reference only).
+async fn sb_target(db: &Db, broker: &str, queue: &str, extra_vars: Value) {
+    std::env::set_var(SB_PW_VAR, "lwftest");
+    let mut vars = json!({"username": "lwftest", "password": format!("env:{SB_PW_VAR}")});
+    if let Some(extra) = extra_vars.as_object() {
+        vars.as_object_mut().unwrap().extend(extra.clone());
+    }
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, tls, expect, vars, timeout_ms) \
+         VALUES ('sb', 'servicebus', ?, 'off', ?, ?, 8000)",
+        (
+            format!("sb://{broker}/queues/{queue}"),
+            SB_EXPECT,
+            vars.to_string(),
+        ),
+    )
+    .await;
+}
+
+/// The rule that turns every changed order into one message of the action.
+async fn sb_rule(db: &Db, fire_per: &str) {
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'sb', ?, ?, ?, 100)",
+        (
+            fire_per,
+            "SELECT id AS _key, sku, qty FROM orders WHERE id IN (:keys)",
+            SB_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// Every changed key arrives once, as its own message, with its document, the JSON content type
+/// and a durable header; `vars.dedup` puts the key-and-content id on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn servicebus_every_key_arrives_once() {
+    let root = need_db!();
+    let broker = need_servicebus!();
+    let _lock = SB_LOCK.lock().await;
+    let sb = Sbus::new(&broker);
+    let queue = format!("lwf-sb-every-{}", std::process::id());
+    sb.declare(&queue).await;
+    let db = Db::fresh(&root, "sb_every").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    sb_target(&db, &broker, &queue, json!({"dedup": true})).await;
+    sb_rule(&db, "batch").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec(
+        "INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1),(3,'C-3',5),(4,'D-4',2),(5,'E-5',9)",
+    )
+    .await;
+    let got = sb_arrived(&sb, &queue, 5).await;
+    assert_eq!(got.len(), 5, "nothing arrives twice: {got:?}");
+    let docs = [
+        ("1", "A-1", 3),
+        ("2", "B-2", 1),
+        ("3", "C-3", 5),
+        ("4", "D-4", 2),
+        ("5", "E-5", 9),
+    ];
+    let of = |key: &str| -> Vec<SbMsg> {
+        got.iter()
+            .filter(|g| {
+                g.body.get("sku").and_then(Value::as_str)
+                    == Some(docs.iter().find(|d| d.0 == key).unwrap().1)
+            })
+            .cloned()
+            .collect()
+    };
+    for (key, sku, qty) in docs {
+        let m = &of(key);
+        assert_eq!(m.len(), 1, "key {key} arrives once: {got:?}");
+        assert_eq!(m[0].body, json!({"sku": sku, "qty": qty}), "key {key}");
+        assert_eq!(m[0].content_type, "application/json", "key {key}");
+        assert!(m[0].durable, "key {key}: the message is durable");
+    }
+    // `vars.dedup`: the id is the hex sha256 of key + NUL + value, so it is 64 hex characters
+    // and two keys holding the same document still differ (the id is not only the content).
+    for m in &got {
+        // First of all: the document has to be the body a consumer of the entity reads. The
+        // rest of the test is worthless if it is not, and a `Data` section that arrived as
+        // something else would otherwise only show up as a key "not arriving".
+        assert!(
+            m.body.get("sku").and_then(Value::as_str).is_some(),
+            "the document is the body of the message: {m:?}"
+        );
+        assert_eq!(m.message_id.len(), 64, "dedup id: {m:?}");
+        assert!(
+            m.message_id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "dedup id is hex: {m:?}"
+        );
+    }
+    assert_eq!(
+        got.iter()
+            .map(|m| m.message_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        5,
+        "the ids are distinct per key: {got:?}"
+    );
+    inst.quiet().await;
+    // The status row appears when the engine next saves its position, which is its own cadence
+    // — so it is waited for, not assumed. And nothing failed on the way.
+    let (f, p, _, err) = wait_for(
+        Duration::from_secs(30),
+        "the status row of the rule",
+        || async { db.status("orders").await },
+    )
+    .await;
+    let shown = format!("{f}:{p} {}", err.as_deref().unwrap_or("no error"));
+    assert!(
+        (f, p) > start,
+        "the position has moved past the insert: {shown}"
+    );
+    assert!(err.is_none(), "nothing failed: {shown}");
+    inst.stop().await;
+}
+
+/// One message the entity will not take is refused alone: its own strike, while its neighbours
+/// of the same action go through. Here the refusal is the target's own size check — a value over
+/// the entity's `vars.max_message_size` never goes on the wire, because the broker would only
+/// refuse it with a this-message condition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn servicebus_refusal() {
+    let root = need_db!();
+    let broker = need_servicebus!();
+    let _lock = SB_LOCK.lock().await;
+    let sb = Sbus::new(&broker);
+    let queue = format!("lwf-sb-refusal-{}", std::process::id());
+    sb.declare(&queue).await;
+    let db = Db::fresh(&root, "sb_refusal").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), payload TEXT)")
+        .await;
+    tables(&db).await;
+    // The entity takes 200 bytes a message: keys 1 and 3 fit, key 2 does not.
+    sb_target(&db, &broker, &queue, json!({"max_message_size": 200})).await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'sb', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, payload FROM orders WHERE id IN (:keys)",
+            SB_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec_params(
+        "INSERT INTO orders VALUES (1, 'A-1', 'small'), (2, 'B-2', ?), (3, 'C-3', 'also small')",
+        ("B".repeat(400),),
+    )
+    .await;
+    let err = wait_for(
+        Duration::from_secs(60),
+        "the over-size message refused and the position moved on",
+        || async {
+            let (f, p, _, err) = db.status("orders").await?;
+            let err = err?;
+            (err.contains("`2` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(err.contains("maximum"), "{err}");
+
+    let got = sb_arrived(&sb, &queue, 2).await;
+    let skus: Vec<Option<&str>> = got
+        .iter()
+        .map(|g| g.body.get("sku").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        skus,
+        [Some("A-1"), Some("C-3")],
+        "the two small messages arrive: {got:?}"
+    );
+    inst.stop().await;
+}
+
+/// The broker goes down and comes back: the messages already in the entity are still there
+/// (durable queue, durable messages), and a key fired while the broker was down is not lost — it
+/// arrives after the heal, once, with the document of its fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn servicebus_restart() {
+    let root = need_db!();
+    let broker = need_servicebus!();
+    let _lock = SB_LOCK.lock().await;
+    let mut restart = SbRestart::new();
+    let sb = Sbus::new(&broker);
+    let queue = format!("lwf-sb-restart-{}", std::process::id());
+    sb.declare(&queue).await;
+    let db = Db::fresh(&root, "sb_restart").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    sb_target(&db, &broker, &queue, json!({})).await;
+    sb_rule(&db, "batch").await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1),(3,'C-3',5)")
+        .await;
+    wait_for(
+        Duration::from_secs(60),
+        "the first three in the entity",
+        || async { (sb.depth(&queue).await == Some(3)).then_some(()) },
+    )
+    .await;
+    inst.quiet().await;
+
+    restart.stop();
+    db.exec("INSERT INTO orders VALUES (4,'D-4',2),(5,'E-5',9)")
+        .await;
+    // The engine holds keys 4 and 5: their send cannot reach the broker.
+    wait_for(
+        Duration::from_secs(30),
+        "keys 4 and 5 pending while the broker is down",
+        || async {
+            let s = inst.health.status();
+            s["rules"]["orders"]["pending_keys"]
+                .as_u64()
+                .is_some_and(|n| n >= 1)
+                .then_some(())
+        },
+    )
+    .await;
+
+    restart.start();
+    restart.healthy().await;
+    let got = sb_arrived(&sb, &queue, 5).await;
+    inst.quiet().await;
+    for m in &got {
+        assert!(
+            m.body.get("sku").and_then(Value::as_str).is_some(),
+            "the document is the body of the message: {m:?}"
+        );
+    }
+    let by_sku = |sku: &str| -> usize {
+        got.iter()
+            .filter(|g| g.body.get("sku").and_then(Value::as_str) == Some(sku))
+            .count()
+    };
+    for sku in ["A-1", "B-2", "C-3"] {
+        assert_eq!(by_sku(sku), 1, "{sku} survived the restart once: {got:?}");
+    }
+    for sku in ["D-4", "E-5"] {
+        assert_eq!(by_sku(sku), 1, "{sku} arrived after the heal: {got:?}");
+    }
+    assert_eq!(
+        got.iter()
+            .filter(|g| g.body.get("qty").and_then(Value::as_i64) == Some(1))
+            .count(),
+        1,
+        "key 2's document as it was when it fired: {got:?}"
+    );
+    inst.stop().await;
+}
+
 /// Commits the commit fence has written for lazywf (0 before the first one; the table is made by
 /// the first flush).
 async fn fence_count(db: &Db) -> u64 {

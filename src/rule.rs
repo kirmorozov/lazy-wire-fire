@@ -272,6 +272,14 @@ pub fn kind_errors(
             .unwrap_or(crate::kafka::MESSAGE_MAX_BYTES);
         out.extend(crate::kafka::rule_errors(def, limit));
     }
+    if kind == Kind::ServiceBus {
+        // The batch's byte limit: the entity's maximum message size (256 KiB by default,
+        // raised by the target's `vars.max_message_size` — checked at load, so the read
+        // cannot fail here).
+        let limit = crate::servicebus::max_message_bytes(&target.vars)
+            .unwrap_or(crate::servicebus::MAX_MESSAGE_BYTES);
+        out.extend(crate::servicebus::rule_errors(def, limit));
+    }
     if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
         match def.batch_max_keys {
             None => out.push(
