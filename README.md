@@ -13,7 +13,8 @@ action), an Amazon Kinesis stream (one `PutRecords` per action), an AWS Lambda f
 Amazon SNS topic (one `PublishBatch` per action), a Google Cloud Pub/Sub topic (one `publish`
 per action), an AMQP broker (one publish per action),
 an SMTP server (one mail per action), a Kafka-protocol broker (one produce of a batch of records
-per action), an Azure Service Bus queue or topic (one batch of messages per action), Redis (one
+per action), a RabbitMQ stream (one publish batch of records per action), an Azure Service Bus
+queue or topic (one batch of messages per action), Redis (one
 command), or MySQL / PostgreSQL (one SQL statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
@@ -157,8 +158,8 @@ A key is dropped only when the target refuses it for good: it is refused five ti
 keys of the same actions go through (the strikes live in memory only; when a whole flush is
 refused, the template or the target is at fault, and nothing is dropped). Transient failures
 (connection errors, timeouts, 5xx, 408, 429, AWS throttling codes, a Redis error reply, an SMTP
-4xx reply, a retriable Kafka broker error, transient SQL errors) never drop a key: it stays
-pending and the rule retries it with backoff.
+4xx reply, a retriable Kafka broker error, a RabbitMQ stream publish code that says nothing,
+transient SQL errors) never drop a key: it stays pending and the rule retries it with backoff.
 
 A dropped key is named in the rule's `last_error` (`/status`, `lazy_wire_fire_status`). With
 `LAZYWF_LOG_FORMAT=json` it is also one WARN event per key, on the event target
@@ -289,6 +290,7 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 | SMTP server | `smtp` ([SMTP targets](docs/reference.md#smtp-targets)) | `smtp(s)://host[:port]` (587 / 465 by default) | one mail | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | Mailpit 1.33 — CI (release gate) |
 | Google Cloud Pub/Sub | `pubsub` ([Pub/Sub targets](docs/reference.md#pubsub-targets)) | `gc-pubsub://<project>/<topic>` | one `topics.publish` | for the action | refused at load (append-only; publish-only reset steps) | `vars.credentials_ref` (reference only), else Application Default Credentials; never in the URL | the Pub/Sub emulator — CI (release gate) |
 | Kafka-protocol broker (Apache Kafka, Redpanda, MSK, Event Hubs) | `kafka` ([Kafka targets](docs/reference.md#kafka-targets)) | `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` | one produce of a batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.sasl` (`plain`, `scram-sha-256`, `scram-sha-512`) with `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | Redpanda 26.1.20 — CI (release gate) |
+| RabbitMQ stream (native stream protocol, super streams included) | `rabbitmq-stream` ([RabbitMQ stream targets](docs/reference.md#rabbitmq-stream-targets)) | `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>`, or `rabbitmq-stream+tls://…` for TLS (5552 / 5551) | one publish batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | RabbitMQ 4.3 with the stream plugin — CI (release gate) |
 | Azure Service Bus (queues, topics) | `servicebus` ([Service Bus targets](docs/reference.md#service-bus-targets)) | `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (a local broker: `sb://<host>:<port>/<address>`) | one batch of messages over AMQP 1.0, TLS on 5671, a disposition awaited per message | per message, per key | refused at load (append-only; a listing is refused too) | `vars.key_name` with `vars.key` (a reference only) for a SAS token over `$cbs`, or `vars.username` with `vars.password` (a reference only) for SASL PLAIN on a broker without CBS; no Entra ID; never in the URL | RabbitMQ 4.3 answering AMQP 1.0 on its 5672 (SASL PLAIN; no local broker has a `$cbs` node) — CI (release gate) |
 
 The append-only kinds and `lambda` refuse a stray cleanup at load, and `sqs` / `kinesis` /
@@ -304,7 +306,7 @@ make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: M
 make test-matrix               # every other blocking line of "Supported servers", one at a time
 make test-prerelease           # the advisory MariaDB 13.1 RC and 13.2 preview
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
-make test-e2e-queues           # SQS, Kinesis, AMQP, Service Bus, Pub/Sub, SMTP, Kafka, EventBridge and SNS against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka, eventbridge and sns compose profiles; the servicebus flows ride the amqp profile's RabbitMQ, whose listener answers AMQP 1.0 too)
+make test-e2e-queues           # SQS, Kinesis, AMQP, Service Bus, RabbitMQ Streams, Pub/Sub, SMTP, Kafka, EventBridge and SNS against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka, eventbridge and sns compose profiles; the servicebus flows ride the amqp profile's RabbitMQ, whose listener answers AMQP 1.0 too, and the rabbitmq-stream flows its stream plugin on port 5552)
 make coverage                  # unit tests + e2e under cargo-llvm-cov 0.9.1 into tmp/coverage (informational, not a gate)
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
@@ -323,8 +325,8 @@ Docker for the test servers.
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
 lint, unit tests, the integration suite on the default servers (Varnish included), on every other
 server (one runner each, pre-releases advisory), with the search engines, with the queue
-emulators (SQS, Kinesis, AMQP, Service Bus, Pub/Sub, SMTP, Kafka (Redpanda), EventBridge (moto)
-and SNS (moto)), and the image for both platforms. Two jobs run on narrower
+emulators (SQS, Kinesis, AMQP, Service Bus, RabbitMQ Streams, Pub/Sub, SMTP, Kafka (Redpanda),
+EventBridge (moto) and SNS (moto)), and the image for both platforms. Two jobs run on narrower
 triggers: the `coverage (informational)` job (pull requests and pushes to `main`; the table in the
 job summary, the lcov and HTML in the `coverage` artifact for 14 days) and the weekly
 `lazyview drift (advisory)` job (`scripts/sync-lazyview.sh --drift`, a warning per drifted file,

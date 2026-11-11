@@ -25,9 +25,9 @@ object.
 SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
 Lambda function, below), `eventbridge` (SigV4, an Amazon EventBridge event bus, below), `sns`
 (SigV4, an Amazon SNS topic, below), `amqp` (an AMQP 0-9-1
-broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `servicebus` (an Azure Service Bus queue or topic over AMQP 1.0, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path), or, for the four plain http kinds only, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](#secret-http-endpoints)). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `sns`: exactly one: `aws-sns://[<region>/]<account-id>/<topic-name>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). `servicebus`: exactly one: `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (no credentials in the URL, TLS on port 5671, the local-broker form: below). An action goes to every endpoint |
-| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets); `servicebus` takes them all but refuses `disabled` on a `servicebus.windows.net` endpoint and any `tls.server_name`: [below](#service-bus-targets)) |
+broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `rabbitmq-stream` (a RabbitMQ stream or super stream over the native stream protocol, below), `servicebus` (an Azure Service Bus queue or topic over AMQP 1.0, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path), or, for the four plain http kinds only, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](#secret-http-endpoints)). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `sns`: exactly one: `aws-sns://[<region>/]<account-id>/<topic-name>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). `rabbitmq-stream`: exactly one: `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>` or `rabbitmq-stream+tls://…` (ports 5552 / 5551; no credentials in the URL: below). `servicebus`: exactly one: `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (no credentials in the URL, TLS on port 5671, the local-broker form: below). An action goes to every endpoint |
+| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets); `rabbitmq-stream` takes only `verify-full` with exactly one `tls.ca` file: [below](#rabbitmq-stream-targets); `servicebus` takes them all but refuses `disabled` on a `servicebus.windows.net` endpoint and any `tls.server_name`: [below](#service-bus-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
@@ -111,6 +111,13 @@ is TLS), without credentials: `vars.sasl` (`plain`, `scram-sha-256` or `scram-sh
 `vars.username` (a reference or a literal) and `vars.password` (a reference, never a literal),
 or no SASL at all for an anonymous connection. One action is one produce of a batch of records,
 record *i* answered by key *i*: [below](#kafka-targets).
+
+**`rabbitmq-stream`**: the endpoint is the RabbitMQ stream or super stream its batches go to,
+as `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>` or `rabbitmq-stream+tls://…` for TLS
+(default ports 5552 / 5551), without credentials: `vars.username` (a reference or a literal,
+as `amqp` takes it) and `vars.password` (a reference, never a literal) are the SASL PLAIN
+account the stream protocol always asks for. One action is one publish batch of records,
+record *i* answered by key *i*: [below](#rabbitmq-stream-targets).
 
 **`servicebus`**: the endpoint is the queue or topic, as
 `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (exactly one, AMQP 1.0 over TLS on
@@ -277,6 +284,10 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 * For `kafka`, the produce answer maps per partition onto that partition's records, so `expect`
   runs once per record: `body` is the record's `{"topic": …, "partition": …, "offset": …}`
   object, the other columns NULL. A record whose `expect` is not met is refused on its own.
+* For `rabbitmq-stream`, the publish answer of the batch is per record, so `expect` runs once
+  per record: `body` is the record's `{"stream": …, "publishing_id": …}` object (the partition
+  stream of a super stream), `status` 200, the other columns NULL. A record whose `expect` is
+  not met is refused on its own.
 * For `eventbridge`, the answer of one `PutEvents` gives its entries in request order, so
   `expect` runs once per entry: `status` is the request's HTTP status and `body` is the entry's
   own JSON (its `EventId`, or its `ErrorCode` and `ErrorMessage`). An entry whose `expect` is
@@ -315,6 +326,7 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | a Lambda invoke (the result names the stored id) | `JSON_EXTRACT(body, '$.id') IS NOT NULL` |
 | a Pub/Sub publish (at least one message id) | `JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0` |
 | a Kafka produce (per record, the offset answered) | `JSON_EXTRACT(body, '$.offset') IS NOT NULL` |
+| a RabbitMQ stream publish (per record, the publish stored) | `JSON_EXTRACT(body, '$.publishing_id') IS NOT NULL` |
 | an EventBridge entry (per entry, the event stored) | `JSON_EXTRACT(body, '$.EventId') IS NOT NULL` |
 | an SNS entry (per entry, the message stored) | `JSON_EXTRACT(body, '$.MessageId') IS NOT NULL` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
@@ -354,7 +366,8 @@ receiver reads (a stray-cleanup listing of these kinds is signed too):
   header name, an encoding that is neither `hex` nor `base64`, a `sign_prefix` that is not a
   string, and the three `hmac`-only settings on `standard` (that scheme fixes its headers).
 * A signing setting on any other kind — `http.s3`, `sqs`, `kinesis`, `lambda`, `eventbridge`,
-  `sns`, `pubsub`, `kafka`, `amqp`, `smtp`, `redis`, `mysql`, `pgsql` — is a load error too:
+  `sns`, `pubsub`, `kafka`, `rabbitmq-stream`, `amqp`, `smtp`, `redis`, `mysql`, `pgsql` — is a
+  load error too:
   `http.s3` signs SigV4 and the queue kinds their own protocols, so the setting would point at
   nothing.
 * The secret is a credential of the kind: it stays out of the template context (`target.vars`
@@ -666,6 +679,17 @@ and a nack or a lost confirm is transient.
   the key, and the body carries the key's current state (here `op` and `doc`), so a consumer
   keeps the newest message per key. Several changes of one key within the debounce window arrive
   as one message, and a delete is the key's last state. Across keys no order is guaranteed.
+* **Into a stream queue.** A queue declared with `x-queue-type: stream` and bound to the
+  exchange and routing key the target publishes to takes this kind's messages as they are —
+  the same envelope, the same publisher confirms, the same outcomes — onto RabbitMQ's
+  append-only log. The integration suite does exactly this: the target is such a queue, every
+  key arrives with its document (insert, update, delete), and after the broker is cut off and
+  lazywf restarts over it the log holds every key again — at-least-once, since a re-send can
+  store a message twice. A stream is read by consuming it, not with `basic.get`: a consumer
+  with the `x-stream-offset` argument (`first` starts at the beginning of the log), a prefetch
+  and acknowledgements (the acks are the credit that advances the consumer's offset) reads the
+  log without removing anything from it. For the native stream protocol — throughput, super
+  streams — the kind is another one: [RabbitMQ stream targets](#rabbitmq-stream-targets).
 
 ### SMTP targets
 
@@ -865,6 +889,111 @@ so the image grows no native Kafka dependency.
   last state. One key's records keep their order (one key, one partition); across keys no order
   is guaranteed.
 
+### RabbitMQ stream targets
+
+`rabbitmq-stream` writes to a RabbitMQ stream — or to the partitions of a super stream — over
+RabbitMQ's native stream protocol, port 5552 (5551 over TLS): one action is one publish batch
+of records, one record per key, and the broker's publish confirm answers each record, so the
+kind's answer is per item and not per action. The client is `rabbitmq-stream-client`, the
+official pure-Rust one, used through its raw `Client`: the kind owns its connection and waits
+for the confirms of a publish itself, exactly the kafka "kind owns its connection" shape. For a
+stream queue on the AMQP 0-9-1 port the kind is `amqp` ([AMQP targets](#amqp-targets)); this
+one is for throughput and super streams.
+
+* **The endpoint.** `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>`, or
+  `rabbitmq-stream+tls://` for TLS (default ports 5552 / 5551 — RabbitMQ's own stream ports);
+  exactly one endpoint per target: one node and the stream its batches go to (a batch is
+  answered per item, which the engine sends to a single endpoint, as `kafka` and `servicebus`
+  take one too). The path is `<stream>` (the default vhost) or `<vhost>/<stream>`; `%2F`
+  names the default vhost. The stream name is 1 to 255 letters, digits, `-`, `.`, `_` or `:`
+  (as the broker names queues); the target never creates one, and neither creates the
+  partitions of a super stream. No credentials in the URL (a `@` is a load error: they belong
+  in `vars`), no query string and no fragment (TLS is the target's `tls`), and a
+  `rabbitmq-stream://` or `rabbitmq-stream+tls://` URL belongs to `kind rabbitmq-stream` only.
+  The endpoint context names the vhost and the stream (`endpoint.vhost`, `endpoint.stream`)
+  next to `host`, `port` and `url`, and [LAZYWF_ALLOWED_HOSTS](#security) matches the host.
+* **Credentials.** The stream protocol always asks for a SASL PLAIN account: `vars.username`
+  (a reference or a literal, as `amqp` takes it) and `vars.password` (a reference, `env:` or
+  `file:`, never a literal; a secret of the kind), and both are required — without them the
+  target does not load. They are resolved on every connect, so a rotated secret file applies
+  at the next connection, and neither reaches a log at any level.
+* **The rendered action.** One action, one publish batch: the template renders `POST /` with a
+  body of
+
+  ```text
+  POST / HTTP/1.1
+  Content-Type: application/json
+
+  {"records": [{"value": …, "routing_key": "order-1"}, {"value": …, "routing_key": null}]}
+  ```
+
+  Record *i* takes the document key `keys[i]` — it travels on the broker's message as the
+  application property `lazywf_key` (the counterpart of `amqp`'s `Message-Id`; a `once` step
+  has no keys and its records carry none) — its rendered `value` (one JSON value, serialized
+  compactly; null is refused — render an empty object for a delete) and its optional
+  `routing_key` (a string or null). A record carries `value` and `routing_key` only, and the
+  records' count must match the keys'. A blank render sends nothing; a body that is not that
+  JSON is refused.
+* **Super streams and the partition choice.** A plain stream takes every record of the batch.
+  The first batch asks the broker whether the named stream is a super stream (its partition
+  list, cached per connection); if it is, each record's `routing_key` chooses the partition
+  stream it goes to: **murmur3 of the routing key (seed 104729) modulo the length of the
+  broker's partition list** — the rule `rabbitmq-stream-client`'s own super-stream producer
+  uses, so the same key lands on the same partition either way — and one publisher is declared
+  per partition stream, all of it on the connection to the endpoint's host. A super stream
+  record without a routing key is refused on its own (nothing to route by); on a plain stream
+  the routing key is carried and unused. A partition whose leader is another node answers
+  `StreamNotAvailable`, which is transient here: front the cluster with a stream load
+  balancer, or name the node that hosts the partitions.
+* **Size.** The largest batch a target takes is one stream frame: 1 MiB (the client sends a
+  publish batch as one frame and does not split it; there is no var to raise the limit). With
+  `fire_per = batch`, a `batch_max_bytes` above it does not load, and a batch is split to it
+  when unset; a batch that still goes over the frame limit is refused whole before anything
+  goes on the wire, and the error names the template or the setting.
+* **Outcomes.** A publish confirm for the record is **sent**: `expect` then sees, per record,
+  `body` `{"stream": …, "publishing_id": …}` and status 200 (no `expect`: met), and a record
+  whose condition is not met is refused on its own. Of the broker's publish-error codes only
+  `FrameTooLarge` speaks positively about this one record and nothing else: it refuses that
+  record **alone**, so its neighbours of the batch still arrive and only that key is struck.
+  `AccessRefused` — the account may not publish to this stream — refuses the **whole call**
+  and strikes no key: a super stream's partitions are separate streams with separate rights,
+  and a per-record verdict would let a permissions mistake quietly drop the keys of the
+  forbidden partition after five strikes while the others went through. A stream the broker
+  does not know (refused at the publisher's declare — the target never creates one) and a
+  refused SASL or vhost account (at the connect) are likewise a **refusal of the whole call**,
+  found at link level once — never a per-message strike: with nothing confirmed in the batch
+  the answer says nothing about one key on its own, so the keys stay pending and the rule
+  retries until someone creates the stream or fixes the target — exactly `kafka`'s unknown
+  topic at the metadata check. Everything that does not positively refuse this record is
+  transient — a lost connection, no confirm within the target's `timeout_ms`, and every code
+  that says "not now" or nothing (`StreamNotAvailable`, `InternalError`, a publisher gone
+  stale, an unknown code): the connection drops and the next action reconnects; a retry cannot
+  drop a key.
+* **One batch at a time.** One publish batch at a time per endpoint: the endpoint's lock is
+  held over all of an action's publishes; different targets and rules run in parallel (as
+  `kafka` and `amqp` hold theirs).
+* **TLS.** `rabbitmq-stream+tls://` is TLS, and this client verifies one way only:
+  `verify-full` with `tls.ca` naming exactly one PEM file — the client trusts that file and
+  nothing else (no Mozilla roots, no OS store) and checks the endpoint host's name itself, so
+  a `+tls://` target without `tls.ca` is a load error: name the CA. The modes the client
+  cannot express are refused at load, naming the mode: `required`, `verify-ca` (no host name
+  check), `tls.server_name` (the endpoint's own host is always the one checked) and `disabled`
+  on `rabbitmq-stream+tls://`; the crate's no-verification mode is never reachable.
+  Handshakes run on the ring rustls provider, which the tool installs as the process default
+  at startup.
+* **Reset steps.** The kind only appends: a published record cannot be recalled and the target
+  cannot list keys, so a `for_each: stray` step does not load. Still allowed: `once` (one
+  publish of keyless records, an announcement for example), `for_each: snapshot` (every key
+  published again, as new records) and `reset_requested`.
+* **Contract.** The stream receives the latest state of each key, not a log of every change.
+  Delivery is **at-least-once, with no broker-side deduplication yet**: the producer is
+  unnamed and the publishing ids are the client's own per connection, so after a lost confirm
+  or a restart re-send a consumer may see the same record twice (a record is never lost by
+  that). A consumer reads the log and keeps the newest record per key — the document key
+  travels as the `lazywf_key` application property. Several changes of one key within the
+  debounce window arrive as one record, and a delete is the key's last state. Across keys no
+  order is guaranteed.
+
 ### Service Bus targets
 
 `servicebus` writes to an Azure Service Bus queue or topic over AMQP 1.0: one action is one batch
@@ -965,7 +1094,7 @@ grows no native AMQP dependency.
 | `selects` | zero or more queries: SQL separated by `;`, or a JSON array of strings or `{"name", "sql"}`. Each returns `_key` plus [path-named columns](#documents-from-path-named-columns) and uses `:keys` for the changed keys (`WHERE id IN (:keys)`). They run concurrently, each on its own connection |
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
-| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge`, `sns`, `kafka` and `servicebus` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [SNS targets](#sns-targets), [Kafka targets](#kafka-targets), [Service Bus targets](#service-bus-targets)) |
+| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge`, `sns`, `kafka`, `rabbitmq-stream` and `servicebus` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [SNS targets](#sns-targets), [Kafka targets](#kafka-targets), [RabbitMQ stream targets](#rabbitmq-stream-targets), [Service Bus targets](#service-bus-targets)) |
 | `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
 is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
 5242880 ([Kinesis targets](#kinesis-targets)). `eventbridge`: `batch_max_keys` is required with
@@ -977,7 +1106,9 @@ is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` ca
 `fire_per = batch` and holds 1 to 1000, and `batch_max_bytes` cannot exceed 10000000
 ([Pub/Sub targets](#pubsub-targets)). `kafka`: `batch_max_bytes` cannot exceed the target's
 produce limit, the broker's `message.max.bytes` (1 MiB by default) raised by its
-`vars.message_max_bytes` ([Kafka targets](#kafka-targets)). `servicebus`: `batch_max_bytes`
+`vars.message_max_bytes` ([Kafka targets](#kafka-targets)). `rabbitmq-stream`: `batch_max_bytes`
+cannot exceed the one stream frame a publish is, 1048576 (1 MiB; there is no var to raise it:
+[RabbitMQ stream targets](#rabbitmq-stream-targets)). `servicebus`: `batch_max_bytes`
 cannot exceed the target's entity message size, 262144 (256 KiB) by default, raised by its
 `vars.max_message_size` up to 104857600 ([Service Bus targets](#service-bus-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
@@ -1096,7 +1227,7 @@ Handlebars, never HTML-escaped. Context:
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `sns` also `topic`, `topic_arn`, `region` and `fifo`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker); `servicebus` also `entity`) of the endpoint the action goes to. For an endpoint whose URL is a reference these three are the origin only — `url` is `https://hooks.example.test/…` and nothing below the origin reaches a template ([secret http endpoints](#secret-http-endpoints)) |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `sns` also `topic`, `topic_arn`, `region` and `fifo`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker); `rabbitmq-stream` also `vhost` and `stream`; `servicebus` also `entity`) of the endpoint the action goes to. For an endpoint whose URL is a reference these three are the origin only — `url` is `https://hooks.example.test/…` and nothing below the origin reaches a template ([secret http endpoints](#secret-http-endpoints)) |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -1154,6 +1285,10 @@ What a template renders:
 * **kafka**: `POST /` with the `{"records": […]}` produce body (record *i* takes key *i*); the
   tool groups the records by partition and produces them
   ([Kafka targets](#kafka-targets)). Blank output sends nothing.
+* **rabbitmq-stream**: `POST /` with the `{"records": […]}` publish body (record *i* takes key
+  *i*, with its `routing_key` for a super stream); the tool publishes the batch — a super
+  stream's records grouped per partition stream — and awaits the publish confirm of every
+  record ([RabbitMQ stream targets](#rabbitmq-stream-targets)). Blank output sends nothing.
 * **eventbridge**: the raw request as for `http` — the `PutEvents` call — whose `Entries` are
   checked before the request is signed and sent
   ([EventBridge targets](#eventbridge-targets)). Blank output sends nothing.
@@ -1201,7 +1336,7 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
 * An append-only kind (`sqs`, `kinesis`, `eventbridge`, `sns`, `amqp`, `smtp`, `pubsub`, `kafka`,
-  `servicebus`)
+  `rabbitmq-stream`, `servicebus`)
   refuses a `for_each: stray` step at load (a sent message cannot be recalled), `lambda` refuses
   one too (a function cannot list what it was invoked with), `sqs`, `kinesis`, `eventbridge` and
   `sns` refuse a `once` step that purges what it has sent (a queue's `PurgeQueue`, a stream's
@@ -1209,7 +1344,7 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
   that does anything but publish — [SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets),
   [Lambda targets](#lambda-targets), [EventBridge targets](#eventbridge-targets),
   [SNS targets](#sns-targets), [AMQP targets](#amqp-targets), [Pub/Sub targets](#pubsub-targets),
-  [Service Bus targets](#service-bus-targets).
+  [RabbitMQ stream targets](#rabbitmq-stream-targets), [Service Bus targets](#service-bus-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
