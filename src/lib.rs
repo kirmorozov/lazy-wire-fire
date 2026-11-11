@@ -12,6 +12,7 @@ pub mod analyze;
 pub mod analyzer;
 pub mod aws;
 pub mod binlog;
+pub mod cascade;
 pub mod catalog;
 pub mod config;
 pub mod datum;
