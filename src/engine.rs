@@ -176,7 +176,9 @@ impl Buffer {
 impl Default for Buffer {
     fn default() -> Self {
         Self {
-            core: buffer::Buffer::new(KeySpaces::SPACES),
+            // `false`: the facts flag stays off (lazyview decision 3), which is what the
+            // vendored buffer did before the flag existed — nothing per-id is tracked.
+            core: buffer::Buffer::new(KeySpaces::SPACES, false),
             keys: KeySpaces::default(),
             queries: IndexMap::new(),
             since_ts: 0,
@@ -1748,6 +1750,12 @@ impl Engine {
                 self.txn_foreign = true;
                 self.end_txn(pos);
                 self.on_statement(&schema, &query);
+            }
+            // The vendored reader surfaces an INCIDENT event as its own item and logs nothing
+            // itself; warn here, at the one place that saw it before, and change no state —
+            // the reader used to fold INCIDENT into `Other` after this very warning.
+            Item::Incident { pos } => {
+                warn!(at = %pos, "INCIDENT event in the binlog: the source reports possibly lost changes");
             }
             Item::Heartbeat | Item::Other => {}
         }
