@@ -4259,6 +4259,289 @@ async fn amqp_restart() {
     inst.stop().await;
 }
 
+/// The `amqp` kind into a **stream queue** (`x-queue-type: stream`): the same publisher
+/// confirms and the same envelope over AMQP 0-9-1, onto RabbitMQ's append-only log. A stream
+/// is read with a consumer, not `basic.get`: it starts at the first offset and acks every
+/// delivery (the acks are the credit that advances the consumer's offset), so the test reads
+/// the log back without removing anything from it.
+struct StreamQueue {
+    _conn: lapin::Connection,
+    drain: tokio::task::JoinHandle<()>,
+    got: Arc<std::sync::Mutex<Vec<Got>>>,
+}
+
+impl StreamQueue {
+    /// A fresh stream queue `queue` bound to `exchange` on `order.changed`, with a reader
+    /// from its first offset. The queue is deleted first: a rerun sees no earlier messages.
+    async fn setup(broker: &str, exchange: &str, queue: &str) -> StreamQueue {
+        use futures_util::StreamExt;
+        use lapin::options::*;
+        use lapin::types::{AMQPValue, FieldTable};
+        use lapin::{ConnectionProperties, ExchangeKind};
+        let url = format!("amqp://lwftest:lwftest@{broker}/%2f");
+        let conn = lapin::Connection::connect(&url, ConnectionProperties::default())
+            .await
+            .unwrap();
+        let chan = conn.create_channel().await.unwrap();
+        chan.queue_delete(queue.into(), QueueDeleteOptions::default())
+            .await
+            .ok();
+        chan.exchange_declare(
+            exchange.into(),
+            ExchangeKind::Direct,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        let mut args = FieldTable::default();
+        args.insert(
+            "x-queue-type".into(),
+            AMQPValue::LongString("stream".into()),
+        );
+        chan.queue_declare(
+            queue.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            args,
+        )
+        .await
+        .unwrap();
+        chan.queue_bind(
+            queue.into(),
+            exchange.into(),
+            "order.changed".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        // A stream demands a prefetch and acknowledgements.
+        chan.basic_qos(200, BasicQosOptions::default())
+            .await
+            .unwrap();
+        let mut copts = FieldTable::default();
+        copts.insert(
+            "x-stream-offset".into(),
+            AMQPValue::LongString("first".into()),
+        );
+        let mut consumer = chan
+            .basic_consume(
+                queue.into(),
+                "lwf-reader".into(),
+                BasicConsumeOptions::default(),
+                copts,
+            )
+            .await
+            .unwrap();
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let drain = tokio::spawn(async move {
+            while let Some(delivery) = consumer.next().await {
+                let Ok(d) = delivery else { break };
+                let p = &d.properties;
+                sink.lock().unwrap().push(Got {
+                    routing_key: d.routing_key.to_string(),
+                    message_id: p
+                        .message_id()
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    content_type: p
+                        .content_type()
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    persistent: *p.delivery_mode() == Some(2),
+                    body: serde_json::from_slice(&d.data).unwrap_or(Value::Null),
+                });
+                let _ = d.ack(BasicAckOptions::default()).await;
+            }
+        });
+        StreamQueue {
+            _conn: conn,
+            drain,
+            got,
+        }
+    }
+
+    /// Waits until at least `n` messages have been read from the log, and returns them all.
+    async fn at_least(&self, n: usize) -> Vec<Got> {
+        wait_for(
+            Duration::from_secs(30),
+            &format!("{n} stream messages"),
+            || async {
+                let all = self.got.lock().unwrap().clone();
+                (all.len() >= n).then_some(all)
+            },
+        )
+        .await
+    }
+}
+
+impl Drop for StreamQueue {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+/// The `amqp` kind publishing into a stream queue: every key arrives once with its document
+/// (insert, update, delete), the confirm path unchanged from a classic queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn amqp_stream_queue_target() {
+    let root = need_db!();
+    let Some(broker) = amqp_broker() else {
+        return eprintln!("LAZYWF_TEST_AMQP not set: skipping");
+    };
+    let db = Db::fresh(&root, "amqp_stream_queue_target").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let (ex, q) = (
+        "lwf.amqp_stream_queue_target",
+        "lwf.amqp_stream_queue_target.q",
+    );
+    let admin = StreamQueue::setup(&broker, ex, q).await;
+
+    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    db.target(
+        "bus",
+        "amqp",
+        &format!("amqp://{broker}/"),
+        None,
+        &vars.to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            amqp_envelope(ex),
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    let got = admin.at_least(2).await;
+    assert_eq!(got.len(), 2, "one message per key, no duplicates: {got:?}");
+    let by_id = |id: &str| got.iter().find(|g| g.message_id == id).unwrap().clone();
+    for (id, sku, qty) in [("1", "A-1", 3), ("2", "B-2", 1)] {
+        let g = by_id(id);
+        assert_eq!(g.routing_key, "order.changed");
+        assert_eq!(g.content_type, "application/json");
+        assert_eq!(
+            g.body,
+            json!({"key": id, "op": "upsert", "doc": {"sku": sku, "qty": qty}})
+        );
+    }
+
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    let got = admin.at_least(3).await;
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got[2].body,
+        json!({"key": "1", "op": "upsert", "doc": {"sku": "A-1", "qty": 4}})
+    );
+
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    let got = admin.at_least(4).await;
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[3].message_id, "2");
+    assert_eq!(got[3].body["op"], "delete", "{:?}", got[3]);
+    inst.stop().await;
+}
+
+/// The broker is cut off and comes back, and lazywf itself restarts over it: the keys changed
+/// meanwhile are re-sent and the stream holds every one of them (read back from its first
+/// offset), none lost. A re-send may store a message twice (at-least-once); keys are checked
+/// deduplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn amqp_stream_queue_restart() {
+    let root = need_db!();
+    let Some(broker) = amqp_broker() else {
+        return eprintln!("LAZYWF_TEST_AMQP not set: skipping");
+    };
+    let db = Db::fresh(&root, "amqp_stream_queue_restart").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let (ex, q) = (
+        "lwf.amqp_stream_queue_restart",
+        "lwf.amqp_stream_queue_restart.q",
+    );
+    let admin = StreamQueue::setup(&broker, ex, q).await;
+
+    let upstream: &'static str = Box::leak(broker.clone().into_boxed_str());
+    let proxy = Flaky::start(upstream).await;
+    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    let cfg = config(&db, &[]);
+    db.target(
+        "bus",
+        "amqp",
+        &format!("amqp://127.0.0.1:{}/", proxy.port),
+        None,
+        &vars.to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            amqp_envelope(ex),
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(cfg.clone()).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    assert_eq!(admin.at_least(2).await.len(), 2);
+
+    // The broker goes away; a key changes meanwhile and cannot be confirmed. The instance is
+    // then stopped: its position did not pass key 3, so the new instance re-sends it.
+    proxy.cut();
+    db.exec("INSERT INTO orders VALUES (3, 'C-3', 7)").await;
+    wait_for(Duration::from_secs(30), "a refused connection", || async {
+        (proxy.refused() >= 1).then_some(())
+    })
+    .await;
+    assert!(
+        !admin
+            .got
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|g| g.message_id == "3"),
+        "key 3 arrived while the broker was cut off"
+    );
+    inst.stop().await;
+    proxy.heal();
+
+    let inst = Instance::ready(cfg).await;
+    let got = admin.at_least(3).await;
+    let mut keys: Vec<&str> = got.iter().map(|g| g.message_id.as_str()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys, vec!["1", "2", "3"], "every key arrives: {got:?}");
+    let g3 = got.iter().find(|g| g.message_id == "3").unwrap();
+    assert_eq!(
+        g3.body,
+        json!({"key": "3", "op": "upsert", "doc": {"sku": "C-3", "qty": 7}})
+    );
+    inst.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The smtp kind against Mailpit (`LAZYWF_TEST_SMTP=127.0.0.1:34565`, compose profile `smtp`;
 // Mailpit's HTTP API is on the next port, 34566). The server is configured to refuse every
