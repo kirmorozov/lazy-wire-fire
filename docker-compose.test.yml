@@ -75,13 +75,19 @@ services:
     profiles: ["kinesis"]
     ports: ["127.0.0.1:34562:4568"]
 
-  # The AMQP broker for the `amqp` target tests (RabbitMQ 4.x, AMQP 0-9-1). Not started by `make
-  # servers`: `docker compose -f docker-compose.test.yml --profile amqp up -d --wait rabbitmq`.
+  # The AMQP broker for the `amqp` target tests (RabbitMQ 4.x, AMQP 0-9-1) and for the
+  # `servicebus` ones (the same listener answers AMQP 1.0: RabbitMQ 4 speaks it natively and
+  # picks the protocol by itself). Not started by `make servers`: `docker compose -f
+  # docker-compose.test.yml --profile amqp up -d --wait rabbitmq`.
+  # 34560 is the `amqp` tests' port; 34610 is the same listener published again for the
+  # `servicebus` tests (`LAZYWF_TEST_SERVICEBUS`), so the two kinds can be told apart and the
+  # 1.0 suite has a port of its own in the reserved range, outside the 34560-34570 block the
+  # queue emulators hold.
   rabbitmq:
-    image: rabbitmq:4.3.7
+    image: rabbitmq:4.3.7@sha256:2afee120d039c78a16c930036ac47568ed7fc45dabdc56fc3d890d2d9273ac49
     profiles: ["amqp"]
     environment: { RABBITMQ_DEFAULT_USER: lwftest, RABBITMQ_DEFAULT_PASS: lwftest }
-    ports: ["127.0.0.1:34560:5672"]
+    ports: ["127.0.0.1:34560:5672", "127.0.0.1:34610:5672"]
     healthcheck: { test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"], interval: 3s, retries: 60 }
 
   # Mailpit for the `smtp` target tests (SMTP on 1025, its HTTP API on 8025). Not started by

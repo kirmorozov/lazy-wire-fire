@@ -67,6 +67,12 @@ prost-reflect = "0.16"
 # The xxh3-64 content hash of each item, echoed by its ack (src/grpc/). Pure Rust; already
 # in the tree through rskafka.
 twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_64"] }
+# AMQP 1.0 client for the `servicebus` kind (src/servicebus.rs). Pure Rust; the 0.14 line, whose
+# rustls feature wires rustls/tokio-rustls with default-features off and the ring provider, as the
+# rest of the TLS here (the newer 0.18 line enables rustls' default features, which pull
+# aws-lc-rs and cmake). The `rustls` feature is the TLS; CBS (claims-based security) is built on
+# the bare link primitives here, in src/servicebus.rs.
+fe2o3-amqp = { version = "0.14", default-features = false, features = ["rustls"] }
 # AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
 # aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }

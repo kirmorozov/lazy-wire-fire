@@ -61,6 +61,9 @@ enum Transport {
     /// One gRPC endpoint (`src/grpc/`): the rule's documents as protobuf messages on one
     /// long-lived bidirectional stream, acknowledged item by item.
     Grpc(Box<crate::grpc::Client>),
+    /// One Azure Service Bus endpoint (`src/servicebus.rs`): one batch of messages per
+    /// action to a queue or topic, a disposition per message.
+    ServiceBus(Box<crate::servicebus::Client>),
 }
 
 pub struct Target {
@@ -82,6 +85,9 @@ pub struct Target {
     /// The effective batch limit of a `grpc` target, when `vars.max_message_bytes` raises the
     /// kind's default (the server's own maximum message size).
     grpc: Option<usize>,
+    /// The effective batch limit of a `servicebus` target, when `vars.max_message_size`
+    /// raises the kind's default (the entity's maximum message size).
+    servicebus: Option<usize>,
     /// The `aws-sns://` endpoint of an `sns` target and its batch byte limit.
     sns: Option<Sns>,
     /// `LAZYWF_ALLOWED_HOSTS`, kept for the endpoints that are resolved per request: a rotated
@@ -694,6 +700,17 @@ impl Target {
                     });
                 }
             }
+            Kind::ServiceBus => {
+                // from_row: exactly one endpoint, `sb://<namespace>.servicebus.windows.net/
+                // <queue-or-topic>` (or a plain host with a port for a local broker).
+                for e in &def.endpoints {
+                    let (ctx, client) = crate::servicebus::Client::new(&def, e)?;
+                    endpoints.push(Endpoint {
+                        ctx,
+                        transport: Transport::ServiceBus(Box::new(client)),
+                    });
+                }
+            }
             _ => {
                 // The plain http kinds. An endpoint is an address, or a reference whose value is
                 // the full URL — for an incoming webhook the URL *is* the credential, so it
@@ -745,6 +762,9 @@ impl Target {
         let grpc = (def.kind == Kind::Grpc)
             .then(|| crate::grpc::options(&def.vars).map(|o| o.max_message_bytes))
             .and_then(|r| r.ok());
+        let servicebus = (def.kind == Kind::ServiceBus)
+            .then(|| crate::servicebus::max_message_bytes(&def.vars))
+            .and_then(|r| r.ok());
         Ok(Arc::new(Target {
             def,
             ctx,
@@ -755,6 +775,7 @@ impl Target {
             lambda: lambda_url,
             kafka,
             grpc,
+            servicebus,
             sns,
             allowed: allowed.cloned(),
             pool,
@@ -775,6 +796,9 @@ impl Target {
             return Some(n);
         }
         if let Some(n) = self.grpc {
+            return Some(n);
+        }
+        if let Some(n) = self.servicebus {
             return Some(n);
         }
         if let Some(s) = &self.sns {
@@ -969,6 +993,10 @@ impl Target {
             Transport::Grpc(client) => {
                 crate::grpc::send(client, rendered, &self.expect, &self.pool).await
             }
+            Transport::ServiceBus(client) => {
+                // A `once` reset step: no keys, the messages carry no key (see `servicebus.rs`).
+                crate::servicebus::send(client, rendered, &self.expect, &self.pool).await
+            }
             Transport::MySql(_) | Transport::Pg(_) => {
                 let sql = match crate::sqlwire::single_statement(rendered) {
                     Ok(Some(s)) => s,
@@ -1040,6 +1068,7 @@ impl Target {
             }
             Transport::Kafka(_) => bail!("kind kafka appends: it cannot list keys"),
             Transport::Grpc(_) => bail!("kind grpc pushes: it cannot list keys"),
+            Transport::ServiceBus(_) => bail!("kind servicebus appends: it cannot list keys"),
             Transport::MySql(c) => {
                 let sql = crate::sqlwire::single_statement(rendered)?
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
@@ -1089,6 +1118,16 @@ impl Target {
                 bail!("target `{}` is not a grpc target", self.def.name);
             };
             return crate::grpc::send_items(client, rendered, keys, &self.expect, &self.pool).await;
+        }
+        if self.def.kind == Kind::ServiceBus {
+            let Some(endpoint) = self.endpoints.get(ep) else {
+                bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+            };
+            let Transport::ServiceBus(client) = &endpoint.transport else {
+                bail!("target `{}` is not a servicebus target", self.def.name);
+            };
+            return crate::servicebus::send_items(client, rendered, keys, &self.expect, &self.pool)
+                .await;
         }
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);

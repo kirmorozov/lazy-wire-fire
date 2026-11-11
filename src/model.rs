@@ -142,6 +142,9 @@ pub enum Kind {
     /// gRPC: the rule's documents as protobuf messages, pushed onto one long-lived
     /// bidirectional stream per endpoint and acknowledged item by item (see `grpc.rs`).
     Grpc,
+    /// Azure Service Bus: one batch of messages per action to a queue or topic, a
+    /// disposition per message (see `servicebus.rs`).
+    ServiceBus,
     Redis,
     MySql,
     PgSql,
@@ -165,11 +168,12 @@ impl Kind {
             "pubsub" => Kind::PubSub,
             "kafka" => Kind::Kafka,
             "grpc" => Kind::Grpc,
+            "servicebus" => Kind::ServiceBus,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, grpc, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, grpc, servicebus, redis, mysql or pgsql)"
             ),
         })
     }
@@ -184,6 +188,7 @@ impl Kind {
                 | Kind::PgSql
                 | Kind::Kafka
                 | Kind::Grpc
+                | Kind::ServiceBus
         )
     }
 
@@ -205,6 +210,7 @@ impl Kind {
             Kind::PubSub => "pubsub",
             Kind::Kafka => "kafka",
             Kind::Grpc => "grpc",
+            Kind::ServiceBus => "servicebus",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
             Kind::PgSql => "pgsql",
@@ -223,6 +229,7 @@ impl Kind {
                 | Kind::Grpc
                 | Kind::EventBridge
                 | Kind::Sns
+                | Kind::ServiceBus
         )
     }
 
@@ -240,6 +247,7 @@ impl Kind {
                 | Kind::PubSub
                 | Kind::Kafka
                 | Kind::Grpc
+                | Kind::ServiceBus
         )
     }
 
@@ -265,6 +273,9 @@ impl Kind {
             // The server's own maximum message size, 4 MiB in the usual implementations;
             // `vars.max_message_bytes` raises it (see `Target::batch_bytes_limit`).
             Kind::Grpc => Some(crate::grpc::MAX_MESSAGE_BYTES),
+            // The entity's maximum message size, 256 KiB by default; `vars.max_message_size`
+            // raises it to the entity's (see `servicebus.rs`).
+            Kind::ServiceBus => Some(crate::servicebus::MAX_MESSAGE_BYTES),
             _ => None,
         }
     }
@@ -298,6 +309,7 @@ impl Kind {
             }
             // `token` is a reference, not a value, but a path in a template is one leak too far.
             Kind::Grpc => &["token", "descriptor_set"],
+            Kind::ServiceBus => &["key", "password"],
         }
     }
 }
@@ -530,6 +542,7 @@ impl TargetDef {
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Kafka => crate::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Grpc => crate::grpc::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::ServiceBus => crate::servicebus::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         // Webhook signing is an option of the plain http kinds; on the others the settings
@@ -562,6 +575,7 @@ impl TargetDef {
         crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
         crate::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
         crate::grpc::refuse_scheme(kind == Kind::Grpc, &endpoints)?;
+        crate::servicebus::refuse_scheme(kind == Kind::ServiceBus, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }

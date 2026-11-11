@@ -92,6 +92,7 @@ test-e2e-queues:
 	  $(E2E_DB) LAZYWF_TEST_SQS=http://127.0.0.1:34561 $(CARGO) test --test e2e sqs_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 $(CARGO) test --test e2e kinesis_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_AMQP=127.0.0.1:34560 $(CARGO) test --test e2e amqp_ || rc=1; \
+	  $(E2E_DB) LAZYWF_TEST_SERVICEBUS=127.0.0.1:34610 $(CARGO) test --test e2e servicebus_ -- --test-threads=1 || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_PUBSUB=http://127.0.0.1:34563 $(CARGO) test --test e2e pubsub_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_SMTP=127.0.0.1:34565 $(CARGO) test --test e2e smtp_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_KAFKA=127.0.0.1:34564 $(CARGO) test --test e2e kafka_ -- --test-threads=1 || rc=1; \
@@ -102,6 +103,7 @@ test-e2e-queues:
 	    LAZYWF_TEST_SMTP=127.0.0.1:34565 LAZYWF_TEST_EVENTBRIDGE=http://127.0.0.1:34569 \
 	    LAZYWF_TEST_SNS=http://127.0.0.1:34569 \
 	    LAZYWF_TEST_KAFKA=127.0.0.1:34564 LAZYWF_TEST_KAFKA_ADMIN=http://127.0.0.1:34567 \
+	    LAZYWF_TEST_SERVICEBUS=127.0.0.1:34610 \
 	    $(CARGO) test --test log_secrets -- --test-threads=$(E2E_THREADS) || rc=1; \
 	fi; \
 	$(COMPOSE) $(QUEUE_PROFILES) stop $(QUEUE_SERVICES); exit $$rc
