@@ -146,8 +146,14 @@ impl RawRequest {
     /// Wire bytes. `Content-Length` and `Transfer-Encoding` from the template are replaced by
     /// the body's length.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.to_bytes_with(&self.target)
+    }
+
+    /// The same with the request line's target written as `target` (the way a secret endpoint's
+    /// own path and query join it, see [`SecretUrl::target`]).
+    pub fn to_bytes_with(&self, target: &str) -> Vec<u8> {
         let mut out = Vec::with_capacity(256 + self.body.len());
-        out.extend_from_slice(format!("{} {} HTTP/1.1\r\n", self.method, self.target).as_bytes());
+        out.extend_from_slice(format!("{} {target} HTTP/1.1\r\n", self.method).as_bytes());
         for (n, v) in &self.headers {
             if n.eq_ignore_ascii_case("content-length")
                 || n.eq_ignore_ascii_case("transfer-encoding")
@@ -258,6 +264,119 @@ impl BaseUrl {
             self.base
         )
     }
+
+    /// How an endpoint whose URL is a secret is shown: the scheme, the host, the port, and an
+    /// ellipsis for everything below the origin. Every message that names such an endpoint —
+    /// a log line at any `RUST_LOG` level, `/status`, `last_error`, a refused `expect` — goes
+    /// through this one display, so the secret part of the URL has no way out.
+    pub fn origin(&self) -> String {
+        format!(
+            "{}://{}/…",
+            if self.secure { "https" } else { "http" },
+            self.host_header()
+        )
+    }
+}
+
+/// The URL of a secret http endpoint: a full http(s) URL that lives behind an `env:` / `file:`
+/// reference (see [`crate::secrets`]) because its path or query *is* the credential — the
+/// incoming webhook of Slack, Microsoft Teams Workflows, Google Chat or Discord.
+///
+/// Everything below the origin is a secret: the value is resolved on every request, is never
+/// handed to a template, never reaches a `{:?}` and is never named in a message. Only the origin
+/// is shown, through [`BaseUrl::origin`]; the path and the query are joined to the request line
+/// as the bytes are written ([`Client::send_to`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretUrl {
+    /// The origin: scheme, host and port. Nothing below the origin is kept.
+    pub base: BaseUrl,
+    /// The path, without a trailing `/` (empty when the URL has none).
+    pub path: String,
+    /// The query, without its `?` (empty when the URL has none).
+    pub query: String,
+}
+
+/// The origin and an ellipsis, the way [`BaseUrl::origin`] shows it: the derived `Debug`
+/// would print the path and the query, and those *are* the secret, so a future
+/// `debug!("{url:?}")` could carry it into a log line.
+impl std::fmt::Debug for SecretUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretUrl({})", self.base.origin())
+    }
+}
+
+impl SecretUrl {
+    /// Parses the value a reference holds. It must be a full http(s) URL, without userinfo (a
+    /// credential belongs in the target's `vars`, and here it would be a second secret) and
+    /// without a fragment. A message says what is wrong with the shape and never quotes the
+    /// URL: the whole of it below the origin is the secret. A broken authority gets one fixed
+    /// message, because `BaseUrl::parse` would quote what it was given, and the cut at the
+    /// first `/` can leave a piece of the secret in its place: for `https://user:pa/ss@host/x`
+    /// the authority becomes `user:pa` and its answer is `invalid port `pa``.
+    pub fn parse(s: &str) -> Result<SecretUrl> {
+        let s = s.trim();
+        let (scheme, rest) = match s.strip_prefix("https://") {
+            Some(r) => ("https", r),
+            None => match s.strip_prefix("http://") {
+                Some(r) => ("http", r),
+                None => bail!(
+                    "a secret endpoint is a full http(s) URL: `http://host/…` or `https://host/…`"
+                ),
+            },
+        };
+        let cut = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(cut);
+        // Only the origin goes to `BaseUrl::parse` — and not even its message: it quotes the
+        // authority it was given, which can be a piece of the secret. One fixed message says
+        // what is wrong and names nothing.
+        let base = BaseUrl::parse(&format!("{scheme}://{authority}"))
+            .map_err(|_| anyhow!("the host or port of a secret endpoint is not valid"))?;
+        if tail.contains('#') {
+            bail!("a secret endpoint has no fragment: nothing after `#` is ever sent");
+        }
+        if tail.bytes().any(|c| c <= b' ' || c == 0x7f) {
+            bail!("a secret endpoint has a space or a control character in its path or query");
+        }
+        let (path, query) = match tail.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (tail, ""),
+        };
+        Ok(SecretUrl {
+            base,
+            path: path.trim_end_matches('/').to_string(),
+            query: query.to_string(),
+        })
+    }
+
+    /// The request line's target for a template that wrote `request_target`: what the endpoint's
+    /// own path and query make of it, so a webhook URL is called exactly as given.
+    ///
+    /// * `POST /` asks for the endpoint itself: the result is the endpoint's path and query, with
+    ///   no stray trailing slash (`https://host/services/T0/B0/SECRET` and nothing else);
+    /// * any other target goes below the endpoint's path: `/media/1.png` on
+    ///   `https://host/hooks/a` is requested as `/hooks/a/media/1.png`;
+    /// * the endpoint's query comes last, joined to a query the template wrote with `&`;
+    /// * `*` stays `*` (a request line that asks for no path at all).
+    pub fn target(&self, request_target: &str) -> String {
+        if request_target == "*" {
+            return "*".to_string();
+        }
+        let joined = if self.path.is_empty() {
+            request_target.to_string()
+        } else if request_target == "/" {
+            self.path.clone()
+        } else {
+            format!("{}{}", self.path, request_target)
+        };
+        if self.query.is_empty() {
+            return joined;
+        }
+        match joined.split_once('?') {
+            Some((head, q)) if !q.is_empty() => format!("{head}?{q}&{}", self.query),
+            Some((head, _)) => format!("{head}?{}", self.query),
+            None => format!("{joined}?{}", self.query),
+        }
+    }
 }
 
 /// `host`, `host:port`, `[v6]`, `[v6]:port`.
@@ -366,7 +485,20 @@ impl Client {
     /// within `timeout`. A pooled connection that turns out to be closed is retried once on a
     /// new one.
     pub async fn send(&self, req: &RawRequest, timeout: Duration) -> Result<Response> {
-        let bytes = req.to_bytes();
+        self.send_to(req, &req.target, timeout).await
+    }
+
+    /// Sends `req` with the request line's target written as `target` instead of the one the
+    /// template rendered: how a secret endpoint's own path and query reach the wire (see
+    /// [`SecretUrl::target`]). `target` is the secret, so it is used for these bytes and
+    /// dropped: nothing here keeps it, and no error names it.
+    pub async fn send_to(
+        &self,
+        req: &RawRequest,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<Response> {
+        let bytes = req.to_bytes_with(target);
         let head_only = req.method.eq_ignore_ascii_case("HEAD");
         let work = async {
             if let Some(conn) = self.pooled() {
@@ -661,6 +793,149 @@ mod tests {
         assert_eq!(BaseUrl::parse("https://h").unwrap().url(), "https://h");
         assert!(BaseUrl::parse("ftp://h").is_err());
         assert!(BaseUrl::parse("http://u:p@h").is_err());
+    }
+}
+
+#[cfg(test)]
+mod secret_url_tests {
+    use super::*;
+
+    const MARKER: &str = "SECMARK-6f1a";
+
+    /// The whole URL of a webhook, with a path that is the secret.
+    const WEBHOOK: &str = "https://hooks.example.test/services/T0000/B0000/SECMARK-6f1a";
+
+    fn parse(s: &str) -> SecretUrl {
+        SecretUrl::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_full_https_url_keeps_its_origin_and_holds_its_path_and_query() {
+        let u = parse(WEBHOOK);
+        assert_eq!(
+            (u.base.secure, u.base.host.as_str(), u.base.port),
+            (true, "hooks.example.test", 443)
+        );
+        assert_eq!(u.path, "/services/T0000/B0000/SECMARK-6f1a");
+        assert_eq!(u.query, "");
+        // What the rest of the program is allowed to show.
+        assert_eq!(u.base.origin(), "https://hooks.example.test/…");
+
+        let u = parse("http://127.0.0.1:34599/hooks/a/?team=42&key=SECMARK-6f1a");
+        assert_eq!((u.base.host.as_str(), u.base.port), ("127.0.0.1", 34599));
+        assert_eq!(u.path, "/hooks/a");
+        assert_eq!(u.query, "team=42&key=SECMARK-6f1a");
+        assert_eq!(u.base.origin(), "http://127.0.0.1:34599/…");
+
+        // An origin with nothing below it, and a bracketed IPv6.
+        let u = parse("https://[::1]");
+        assert_eq!((u.path.as_str(), u.query.as_str()), ("", ""));
+        assert_eq!(u.base.origin(), "https://[::1]/…");
+        // Surrounding whitespace a secret file may hold.
+        assert_eq!(parse("  https://h/a  ").path, "/a");
+    }
+
+    #[test]
+    fn a_url_that_is_not_a_plain_http_one_is_refused_without_naming_it() {
+        // The whole chain: a load error is shown that way too, in the log and in `last_error`.
+        let err = |s: &str| format!("{:#}", SecretUrl::parse(s).unwrap_err());
+        // Not a full http(s) URL.
+        assert!(err("hooks.example.test/services/T/B/x").contains("full http(s) URL"));
+        assert!(err("ftp://h/SECMARK-6f1a").contains("full http(s) URL"));
+        assert!(err("").contains("full http(s) URL"));
+        // A credential in the URL is a load error, and the message names neither it nor
+        // the host: every `BaseUrl::parse` error becomes one fixed message.
+        let e = err("https://u:SECMARK-6f1a@h/x");
+        assert!(e.contains("not valid"), "{e}");
+        assert!(!e.contains(MARKER), "{e}");
+        // A fragment is never sent, so it cannot be part of the endpoint.
+        assert!(err("https://h/x#SECMARK-6f1a").contains("fragment"));
+        // A space or a control character is how a second header smuggles itself in.
+        for bad in ["https://h/a b", "https://h/a\u{1}b", "https://h/a\tb"] {
+            assert!(err(bad).contains("control character"), "{bad}");
+        }
+        // A broken address: one fixed message, whatever `BaseUrl::parse` would have said.
+        for bad in ["https://", "https://h:notaport/x"] {
+            assert!(err(bad).contains("not valid"), "{bad}");
+        }
+
+        // Nothing that is refused carries the secret out in the message. The userinfo with a
+        // `/` in it is the sharp case: the cut at the first `/` leaves `user:SECMARK-6f1a` as
+        // the authority, and `BaseUrl::parse` would answer `invalid port `SECMARK-6f1a``.
+        for bad in [
+            "ftp://h/SECMARK-6f1a",
+            "https://u:SECMARK-6f1a@h/x",
+            "https://user:SECMARK-6f1a/ss@h/x",
+            "https://h/x#SECMARK-6f1a",
+            "https://h/a SECMARK-6f1a",
+        ] {
+            let e = err(bad);
+            assert!(!e.contains(MARKER), "`{bad}` is shown as `{e}`");
+        }
+    }
+
+    #[test]
+    fn a_debug_shows_the_origin_and_an_ellipsis_and_nothing_else() {
+        // Path and query both hold the marker; neither may reach the `{:?}`.
+        let u = parse("https://hooks.example.test/services/T0000/SECMARK-6f1a?key=SECMARK-6f1a");
+        let d = format!("{u:?}");
+        assert_eq!(d, "SecretUrl(https://hooks.example.test/…)");
+        assert!(!d.contains(MARKER), "{d}");
+    }
+
+    #[test]
+    fn the_endpoint_s_path_and_query_join_the_request_line() {
+        let u = parse(WEBHOOK);
+        // `POST /` calls the webhook exactly as given: no trailing slash, nothing appended.
+        assert_eq!(u.target("/"), "/services/T0000/B0000/SECMARK-6f1a");
+        // Any other target goes below the endpoint's path.
+        assert_eq!(
+            u.target("/media/1.png"),
+            "/services/T0000/B0000/SECMARK-6f1a/media/1.png"
+        );
+        // `*` asks for no path.
+        assert_eq!(u.target("*"), "*");
+
+        // The query comes last, whatever the template's target carried.
+        let u =
+            parse("https://chat.example.test/v1/spaces/AAA/messages?key=SECMARK-6f1a&token=BBB");
+        assert_eq!(
+            u.target("/"),
+            "/v1/spaces/AAA/messages?key=SECMARK-6f1a&token=BBB"
+        );
+        assert_eq!(
+            u.target("/x?a=1"),
+            "/v1/spaces/AAA/messages/x?a=1&key=SECMARK-6f1a&token=BBB"
+        );
+        assert_eq!(
+            u.target("/x?"),
+            "/v1/spaces/AAA/messages/x?key=SECMARK-6f1a&token=BBB"
+        );
+        // An origin with no path leaves the request line as the template wrote it.
+        let u = parse("http://localhost:9/");
+        assert_eq!(u.target("/"), "/");
+        assert_eq!(u.target("/a?b=1"), "/a?b=1");
+        // A trailing slash on the endpoint never reaches the wire twice.
+        let u = parse("https://h/hooks/a///");
+        assert_eq!(u.target("/"), "/hooks/a");
+    }
+
+    #[test]
+    fn the_joined_target_is_the_only_place_the_secret_path_appears() {
+        // `send_to` writes it into the request line; `to_bytes` on its own keeps what the
+        // template rendered, which holds no secret.
+        let u = parse(WEBHOOK);
+        let req = RawRequest::parse("POST / HTTP/1.1\n\nok").unwrap().unwrap();
+        assert_eq!(req.target, "/");
+        let wire = String::from_utf8(req.to_bytes_with(&u.target(&req.target))).unwrap();
+        assert!(
+            wire.starts_with("POST /services/T0000/B0000/SECMARK-6f1a HTTP/1.1\r\n"),
+            "{wire}"
+        );
+        assert!(String::from_utf8(req.to_bytes())
+            .unwrap()
+            .starts_with("POST / HTTP/1.1\r\n"));
+        assert!(!format!("{req:?}").contains(MARKER));
     }
 }
 

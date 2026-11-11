@@ -62,6 +62,12 @@ const KAFKA_PW: &str = "LWFSECRET-kafka-pw-9d3e";
 /// The bearer token of the `grpc` flow (`vars.token`, an `env:` reference): its value is the
 /// `authorization` metadata of every call, so a leak would be a credential, not a path.
 const GRPC_TOKEN: &str = "LWFSECRET-grpc-token-4b1a";
+/// The path and the query of the webhook URL an endpoint reference holds. For these targets the
+/// URL below the host *is* the credential (the incoming webhook of Slack, Microsoft Teams
+/// Workflows, Google Chat or Discord), so neither may appear in a log, a `/status` or
+/// `last_error`.
+const WEBHOOK_PATH: &str = "LWFSECRET-webhook-path-9f2c";
+const WEBHOOK_QUERY: &str = "LWFSECRET-webhook-query-4b71";
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -2198,4 +2204,140 @@ async fn no_secret_in_the_logs_grpc() {
         dump(&out);
     }
     assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// An `http` target whose endpoint is itself a reference (`file:/path`, `env:NAME`): the incoming
+/// webhook of a business app, where everything below the host is the credential. The flow
+/// delivers to a stand-in at the exact secret path, while a third target whose reference names a
+/// port nothing listens on keeps failing — which is what fills the log at `trace`. The captured
+/// output, `/status` and every `last_error` are searched for the path and the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_webhook_endpoint() {
+    let root = need_db!();
+    install();
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    let db = Db::fresh(&root, "logweb").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("tmp/out/secrets-logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+    let hook = dir.join("webhook");
+    std::fs::write(
+        &hook,
+        format!(
+            "http://{}/services/T0000/B0000/{WEBHOOK_PATH}?token={WEBHOOK_QUERY}\n",
+            mock.addr
+        ),
+    )
+    .unwrap();
+    std::env::set_var(
+        "LWF_LOGWEB_TEAMS",
+        format!("http://{}/hooks/b4b0/{WEBHOOK_PATH}", mock.addr),
+    );
+    // A reference that names a port nothing listens on: its failed connection is what the log has
+    // to show, at every level.
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let broken = dir.join("webhook-dead");
+    std::fs::write(
+        &broken,
+        format!("http://{dead}/services/T0000/B0000/{WEBHOOK_PATH}?token={WEBHOOK_QUERY}"),
+    )
+    .unwrap();
+
+    for (name, endpoint) in [
+        ("hook", format!("file:{}", hook.display())),
+        ("teams", "env:LWF_LOGWEB_TEAMS".to_string()),
+        ("dead", format!("file:{}", broken.display())),
+    ] {
+        db.target(name, "http", &endpoint, None, "{}").await;
+        db.exec_params(
+            "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, ?, 100)",
+            (
+                name,
+                name,
+                r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"text":"out of stock","at":{{json endpoint.url}}}"#,
+            ),
+        )
+        .await;
+        db.trigger(name, "customers", Some("{{new.id}}"), None)
+            .await;
+    }
+
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann'), (2, 'Bob')")
+        .await;
+    // The two reachable targets are called, each at its own secret path, with the origin (and
+    // nothing below it) in the document the template built.
+    wait_for(
+        Duration::from_secs(30),
+        "both webhooks are called",
+        || async {
+            let got = mock.requests();
+            (got.iter().any(|r| {
+                r.path == format!("/services/T0000/B0000/{WEBHOOK_PATH}?token={WEBHOOK_QUERY}")
+            }) && got
+                .iter()
+                .any(|r| r.path == format!("/hooks/b4b0/{WEBHOOK_PATH}"))
+                && got.iter().all(|r| r.body.contains("\"at\":\"http://")))
+            .then_some(())
+        },
+    )
+    .await;
+    // The third is still failing: the engine has tried it, and said why.
+    wait_for(
+        Duration::from_secs(30),
+        "the unreachable target has complained",
+        || async {
+            db.status("dead")
+                .await
+                .and_then(|(_, _, _, e)| e)
+                .map(|_| ())
+        },
+    )
+    .await;
+    let status = serde_json::to_string(&inst.health.status()).unwrap();
+    let mut errors: Vec<String> = Vec::new();
+    for name in ["hook", "teams", "dead"] {
+        if let Some((_, _, _, Some(e))) = db.status(name).await {
+            errors.push(e);
+        }
+    }
+    inst.stop().await;
+
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    // The failing endpoint is still identifiable: its origin, with everything below it an
+    // ellipsis.
+    assert!(
+        out.contains(&format!("POST http://{dead}/…")),
+        "the unreachable endpoint is not named by its origin in the log"
+    );
+    // Everything that could carry the secret: the log, `/status` and every `last_error`.
+    let everything = format!("{out}\n{status}\n{errors:#?}");
+    let leaks = leaks(
+        &everything,
+        &[
+            ("webhook path", WEBHOOK_PATH),
+            ("webhook query", WEBHOOK_QUERY),
+        ],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(
+        leaks.is_empty(),
+        "the webhook URL is in the output: {leaks:#?}"
+    );
 }

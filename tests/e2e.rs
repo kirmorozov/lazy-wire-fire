@@ -6119,6 +6119,136 @@ async fn allowed_hosts_refuse_unlisted_endpoints() {
     inst.stop().await;
 }
 
+/// An http endpoint whose URL is a secret (`env:NAME` / `file:/path`): the incoming webhook of a
+/// business app, where everything below the host *is* the credential. The URL is resolved on every
+/// request, so a rotated file applies without a reload; the template context, the log and
+/// `last_error` see the origin only; the request line calls the webhook exactly as the file gives
+/// it, with no trailing slash added; and `LAZYWF_ALLOWED_HOSTS` is checked against the host the
+/// reference holds at that moment, not the one the target was loaded with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_endpoint_calls_the_webhook_exactly_as_given() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "secretep").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    // The same secret directory the other reference tests use (it is one process-wide setting).
+    let dir = std::env::current_dir().unwrap().join("tmp/out/secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hook = dir.join("incoming-webhook");
+    std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+    // Everything after the host is the credential.
+    std::fs::write(
+        &hook,
+        format!(
+            "http://{}/services/T0000/B0000/WEbhook5ecret?token=Qz9x\n",
+            mock.addr
+        ),
+    )
+    .unwrap();
+
+    db.target(
+        "hook",
+        "http",
+        &format!("file:{}", hook.display()),
+        None,
+        "{}",
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, ?, 100)",
+        (
+            "hook",
+            "hook",
+            r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"keys":{{join keys ","}},"url":{{json endpoint.url}}}"#,
+        ),
+    )
+    .await;
+    db.trigger("hook", "orders", Some("{{new.id}}"), None).await;
+
+    let inst = Instance::ready(config(&db, &[("LAZYWF_ALLOWED_HOSTS", "127.0.0.1")])).await;
+    db.exec("INSERT INTO orders VALUES (7, 1, 'new', 1)").await;
+    db.tick().await;
+    let got = wait_for(Duration::from_secs(30), "the webhook is called", || async {
+        mock.requests()
+            .into_iter()
+            .find(|r| r.path == "/services/T0000/B0000/WEbhook5ecret?token=Qz9x")
+    })
+    .await;
+    // Called exactly as the file gives it: the endpoint's own path and query, nothing appended,
+    // and the `Host` of the resolved URL.
+    assert_eq!(got.method, "POST");
+    assert_eq!(got.header("host"), Some(mock.addr.to_string().as_str()));
+    // What the template sees of the endpoint: the origin, and nothing below it.
+    assert_eq!(
+        got.body,
+        format!("{{\"keys\":7,\"url\":\"http://{}/…\"}}", mock.addr)
+    );
+
+    // Rotated to a host the operator did not allow: refused before anything is sent, and the
+    // rule's `last_error` names the host and the setting — never the path it stands for.
+    mock.clear();
+    std::fs::write(
+        &hook,
+        format!(
+            "http://localhost:{}/services/T0000/B0000/ROTATED-path-9f2?token=Qz9x\n",
+            mock.addr.port()
+        ),
+    )
+    .unwrap();
+    db.exec("INSERT INTO orders VALUES (8, 1, 'paid', 2)").await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(30),
+        "the unlisted host is refused",
+        || async {
+            let (_, _, _, err) = db.status("hook").await?;
+            err.filter(|e| e.contains("localhost") && e.contains("LAZYWF_ALLOWED_HOSTS"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    assert!(
+        mock.requests().iter().all(|r| !r.path.contains("ROTATED")),
+        "an unlisted host was called: {:?}",
+        mock.requests()
+            .iter()
+            .map(|r| r.path.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Rotated back, to another path: the next request uses it without a reload, still exactly as
+    // the file gives it.
+    mock.clear();
+    std::fs::write(&hook, format!("http://{}/hooks/rotated-4c1\n", mock.addr)).unwrap();
+    db.exec("INSERT INTO orders VALUES (9, 1, 'sent', 3)").await;
+    db.tick().await;
+    let got = wait_for(
+        Duration::from_secs(30),
+        "the rotated secret delivers",
+        || async {
+            mock.requests()
+                .into_iter()
+                .find(|r| r.path == "/hooks/rotated-4c1")
+        },
+    )
+    .await;
+    assert_eq!(got.path, "/hooks/rotated-4c1");
+    // The document the template built names the origin, and nothing below it. (Which keys it
+    // carries is the engine's business: a key the flush lost waits in the buffer and rides out
+    // with the next one.)
+    assert!(
+        got.body
+            .contains(&format!("\"url\":\"http://{}/…\"", mock.addr)),
+        "{}",
+        got.body
+    );
+    assert!(!got.body.contains("rotated-4c1"), "{}", got.body);
+    inst.stop().await;
+}
+
 // `eventbridge` targets, against moto (`LAZYWF_TEST_EVENTBRIDGE`, e.g. http://127.0.0.1:34569;
 // the `eventbridge` compose profile). The bus is read back the way AWS delivers: a rule on the
 // bus with an SQS queue as its target, the queue drained through the SQS API. An entry's
