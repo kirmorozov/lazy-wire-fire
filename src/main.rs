@@ -115,6 +115,10 @@ async fn run() -> ExitCode {
         None => {}
     }
     init_logging();
+    // The rustls provider of the process, before anything connects: ring, so every handshake
+    // — including the rabbitmq-stream client's, whose tokio-rustls pulls aws-lc-rs into the
+    // tree — runs on ring (the first install wins; `gcp::Auth` keeps its own call).
+    lazy_wire_fire::gcp::install_crypto_provider();
     // Before the configuration: its DSN checks already use the binlog reader's messages.
     lazy_wire_fire::binlog::set_product("lazywf", "LAZYWF_");
     lazy_wire_fire::fence::set_table(lazy_wire_fire::model::FENCE);

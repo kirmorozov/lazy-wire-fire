@@ -146,6 +146,18 @@ impl Row {
         }
     }
 
+    /// A publish the broker confirmed on a stream: the answer `expect` sees for a record of
+    /// the `rabbitmq-stream` kind (see `rabbitmq_stream.rs`).
+    pub fn rabbitmq_stream(uses: Uses, stream: &str, publishing_id: u64) -> Row {
+        Row {
+            status: uses.status.then_some(200),
+            body: uses.body.then(|| {
+                serde_json::json!({"stream": stream, "publishing_id": publishing_id}).to_string()
+            }),
+            ..Row::default()
+        }
+    }
+
     /// A JSON answer as `body` (the rows of a SQL listing).
     pub fn json(uses: Uses, v: &Value) -> Row {
         Row {

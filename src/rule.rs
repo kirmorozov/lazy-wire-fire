@@ -280,6 +280,14 @@ pub fn kind_errors(
             .unwrap_or(crate::servicebus::MAX_MESSAGE_BYTES);
         out.extend(crate::servicebus::rule_errors(def, limit));
     }
+    if kind == Kind::RabbitMqStream {
+        // One publish is one stream frame: 1 MiB, with no var to raise it (the crate sends
+        // the batch as a single frame).
+        out.extend(crate::rabbitmq_stream::rule_errors(
+            def,
+            crate::rabbitmq_stream::MESSAGE_MAX_BYTES,
+        ));
+    }
     if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
         match def.batch_max_keys {
             None => out.push(

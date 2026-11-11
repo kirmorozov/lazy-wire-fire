@@ -48,6 +48,19 @@ const SB_USER: &str = "lwf_ls_sb";
 const SB_PW: &str = "LWFSECRET-sb-pw-7b13";
 const SB_KEY: &str = "c2VjcmV0LXNlcnZpY2VidXMta2V5LTExLTAx";
 
+/// The `rabbitmq-stream` flow's own account on the broker's stream endpoint (by reference
+/// only), and the wrong password of the send that must fail: the broker's refusal is where a
+/// credential could surface.
+const RMQS_USER: &str = "lwf_ls_rmq_stream";
+const RMQS_PW: &str = "LWFSECRET-rmq-stream-pw-4d7f";
+const RMQS_BAD_PW: &str = "LWFSECRET-rmq-stream-bad-pw-9a12";
+
+/// The rendered action of the `rabbitmq-stream` flow: one record per key with its document.
+const RMQS_PUT: &str = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"records": [{{#each docs}}{"value": {{json doc}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
 /// The rendered action of the servicebus flow: one message per key with its document (the
 /// template renders the document whole, so it serves either table).
 const SB_PUT: &str = r#"POST / HTTP/1.1
@@ -1129,6 +1142,273 @@ async fn no_secret_in_the_logs_amqp() {
     let leaks = leaks(
         &out,
         &[("AMQP username", AMQP_USER), ("AMQP password", AMQP_PW)],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}
+
+/// A reader over a stream, from its first offset: a stream is an append-only log, so reading
+/// it costs nothing and removes nothing. Collects the `lazywf_key` of every record.
+struct StreamReader {
+    _conn: lapin::Connection,
+    drain: tokio::task::JoinHandle<()>,
+    got: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl StreamReader {
+    /// Attaches the test's consumer of the stream over the broker's **AMQP 0-9-1** endpoint
+    /// (`LAZYWF_TEST_AMQP`, the port the `amqp` flow uses): reading a stream is an AMQP consumer
+    /// with `x-stream-offset`, and the stream port itself speaks another protocol and would abort
+    /// this handshake. Attaching is retried: the RabbitMQ of the shared compose file belongs to the
+    /// host too and another agent can restart it while the suite runs.
+    async fn setup(stream: &str) -> StreamReader {
+        use futures_util::StreamExt;
+        let broker = std::env::var("LAZYWF_TEST_AMQP")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .expect("LAZYWF_TEST_AMQP: a stream is read back by an AMQP 0-9-1 consumer, this port");
+        let url = format!("amqp://lwftest:lwftest@{broker}/%2f");
+        let (conn, mut consumer) = {
+            let mut last = "never attempted".to_string();
+            let mut out = None;
+            for _ in 0..30 {
+                match StreamReader::attach(&url, stream).await {
+                    Ok(v) => {
+                        out = Some(v);
+                        break;
+                    }
+                    Err(e) => {
+                        last = e.to_string();
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    }
+                }
+            }
+            out.unwrap_or_else(|| panic!("the reader could not attach to {broker}: {last}"))
+        };
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let drain = tokio::spawn(async move {
+            use lapin::options::BasicAckOptions;
+            use lapin::types::AMQPValue;
+            while let Some(delivery) = consumer.next().await {
+                let Ok(d) = delivery else { break };
+                // The key as the kind carries it: the `lazywf_key` application property (the
+                // counterpart of `Message-Id` in the amqp flow above).
+                let key = d
+                    .properties
+                    .headers()
+                    .as_ref()
+                    .and_then(|h| {
+                        h.into_iter().find(|(k, _)| k.as_str() == "lazywf_key").map(
+                            |(_, v)| match v {
+                                AMQPValue::LongString(s) => s.to_string(),
+                                _ => String::new(),
+                            },
+                        )
+                    })
+                    .filter(|k| !k.is_empty());
+                if let Some(key) = key {
+                    sink.lock().unwrap().push(key);
+                }
+                let _ = d.ack(BasicAckOptions::default()).await;
+            }
+        });
+        StreamReader {
+            _conn: conn,
+            drain,
+            got,
+        }
+    }
+
+    /// One attempt: the connection, the channel with its prefetch, and the consumer of the whole
+    /// stream from its first record.
+    async fn attach(
+        url: &str,
+        stream: &str,
+    ) -> anyhow::Result<(lapin::Connection, lapin::Consumer)> {
+        use lapin::options::*;
+        use lapin::types::AMQPValue;
+        use lapin::ConnectionProperties;
+        let conn = lapin::Connection::connect(url, ConnectionProperties::default()).await?;
+        let chan = conn.create_channel().await?;
+        // A stream demands a prefetch and acknowledgements (the acks are the credit that
+        // advances this consumer's own offset, nothing is removed from the log).
+        chan.basic_qos(200, BasicQosOptions::default()).await?;
+        let mut copts = lapin::types::FieldTable::default();
+        copts.insert(
+            "x-stream-offset".into(),
+            AMQPValue::LongString("first".into()),
+        );
+        let consumer = chan
+            .basic_consume(
+                stream.into(),
+                "lwf-logsecrets".into(),
+                BasicConsumeOptions::default(),
+                copts,
+            )
+            .await?;
+        Ok((conn, consumer))
+    }
+
+    /// Waits until at least `n` records have been read, and returns the ids collected so far.
+    async fn at_least(&self, n: usize) -> Vec<String> {
+        wait_for(
+            Duration::from_secs(60),
+            &format!("{n} stream records"),
+            || async {
+                let all = self.got.lock().unwrap().clone();
+                (all.len() >= n).then_some(all)
+            },
+        )
+        .await
+    }
+}
+
+impl Drop for StreamReader {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+/// The `rabbitmq-stream` kind against the broker's stream endpoint
+/// (`LAZYWF_TEST_RABBITMQ_STREAM`): the flow's own account, its password a fake secret taken by
+/// `env:` reference only. Both the send that goes through and the send that cannot (a wrong
+/// password, so the broker refuses the login: the path a credential could ride out on) must
+/// leave nothing in the logs at any level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_rabbitmq_stream() {
+    let root = need_db!();
+    let Some(broker) = std::env::var("LAZYWF_TEST_RABBITMQ_STREAM")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        return eprintln!(
+            "LAZYWF_TEST_RABBITMQ_STREAM not set: skipping the stream flow (make test-e2e-queues)"
+        );
+    };
+    install();
+    let db = Db::fresh(&root, "logrmqs").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20))")
+        .await;
+    tables(&db).await;
+    // The flow's own account (dropped at its end; its absence is not an error) and the flow's
+    // own stream, created over the suite's `lwftest` account with the official client.
+    let _ = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "lazywf-test-rabbitmq-1",
+            "rabbitmqctl",
+            "delete_user",
+            RMQS_USER,
+        ])
+        .output();
+    rabbitmqctl(&["add_user", RMQS_USER, RMQS_PW]);
+    rabbitmqctl(&["set_permissions", "-p", "/", RMQS_USER, ".*", ".*", ".*"]);
+    let (host, port) = match broker.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().expect("stream port")),
+        None => (broker.clone(), 5552),
+    };
+    let stream = format!("lwf.logsecrets.rmqstream.{}", std::process::id());
+    let env = rabbitmq_stream_client::Environment::builder()
+        .host(&host)
+        .port(port)
+        .username("lwftest")
+        .password("lwftest")
+        .build()
+        .await
+        .unwrap();
+    env.delete_stream(&stream).await.ok();
+    env.stream_creator().create(&stream).await.unwrap();
+    let reader = StreamReader::setup(&stream).await;
+    std::env::set_var("LWF_LOGRMQS_USER", RMQS_USER);
+    std::env::set_var("LWF_LOGRMQS_PW", RMQS_PW);
+    std::env::set_var("LWF_LOGRMQS_BAD", RMQS_BAD_PW);
+    // The send that goes through: the account by reference, `expect` on the broker's confirm.
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{stream}"),
+        Some("JSON_EXTRACT(body, '$.publishing_id') IS NOT NULL"),
+        &json!({"username": "env:LWF_LOGRMQS_USER", "password": "env:LWF_LOGRMQS_PW"}).to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty FROM orders WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    // And the send that cannot: the same stream, an account whose password is wrong.
+    db.target(
+        "bad",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{stream}"),
+        None,
+        &json!({"username": "env:LWF_LOGRMQS_USER", "password": "env:LWF_LOGRMQS_BAD"}).to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('items', 'bad', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, name FROM items WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("items", "items", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    db.exec("INSERT INTO items VALUES (7, 'widget')").await;
+    let mut ids = reader.at_least(2).await;
+    ids.sort();
+    assert_eq!(ids, vec!["1", "2"], "one record per key: {ids:?}");
+    // Not `inst.quiet()`: the wrong password is refused while connecting, so nothing of that
+    // batch is confirmed, and a refusal that says nothing about one key on its own is retried
+    // rather than struck (`engine.rs judge_strikes`) — `pending_keys` of that rule stays 1 while
+    // the instance runs, as it does for the servicebus flow below. What the test needs is that
+    // the failing path really ran, so it waits for the attempt itself: the flush failure in the
+    // log (of rule `items`, the failing target's rule) or the same refusal as the rule's
+    // `last_error`. Then the instance stops and the capture is read.
+    wait_for(
+        Duration::from_secs(90),
+        "the wrong-password attempt",
+        || async {
+            let url = format!("rabbitmq-stream://{broker}/{stream}");
+            let out = captured();
+            let attempted =
+                out.contains("flush failed") && out.contains(&url) && out.contains("rule=items");
+            let reported = db
+                .status("items")
+                .await
+                .and_then(|s| s.3)
+                .is_some_and(|e| e.contains(&url));
+            (attempted || reported).then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+    rabbitmqctl(&["delete_user", RMQS_USER]);
+    env.delete_stream(&stream).await.ok();
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    let leaks = leaks(
+        &out,
+        &[
+            ("stream username", RMQS_USER),
+            ("stream password", RMQS_PW),
+            ("stream wrong password", RMQS_BAD_PW),
+        ],
     );
     if !leaks.is_empty() {
         dump(&out);

@@ -378,7 +378,8 @@ mod tests {
     use rcgen::{
         date_time_ymd, BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair,
     };
-    use rustls::CertificateError;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{CertificateError, ServerConfig};
 
     /// A test certificate authority, generated at run time: nothing is written to disk.
     struct Ca {
@@ -536,6 +537,82 @@ mod tests {
         };
         let cert = self_signed(&["other.example.test"]);
         assert!(check(&v, &cert, "db.example.test").is_ok());
+    }
+
+    /// Condition 1 of the `rabbitmq-stream` dependency (owner, 2026-11-11): with **both** crypto
+    /// libraries compiled in — `rabbitmq-stream-client`'s tokio-rustls brings aws-lc-rs, which
+    /// cannot be turned off from here — the provider the process runs on is still lazywf's ring,
+    /// and an existing kind's TLS connection still works. `ClientConfig::builder()` is exactly
+    /// the call a dependency makes when it takes the process default (the stream client's own
+    /// config does, `client/options.rs`): with two providers compiled in it panics unless one is
+    /// installed as the default, so this asserts the installed default is ring, that the
+    /// dependency-style builder takes ring, and that a `Connector` handshake — the path the
+    /// http, amqp, smtp, redis … kinds take — completes against a server of the test's own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_existing_kind_handshakes_on_ring_with_aws_lc_in_the_tree() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        crate::gcp::install_crypto_provider();
+        let installed = CryptoProvider::get_default().expect("a process default provider");
+        let ring = rustls::crypto::ring::default_provider();
+        // The provider of the process is ring's, not the aws-lc one that is compiled in too:
+        // the two carry a different randomness source, which is what their `Debug` prints.
+        assert_eq!(
+            format!("{:?}", installed.secure_random),
+            format!("{:?}", ring.secure_random),
+            "the process default provider must be ring, not the aws-lc one in the tree"
+        );
+        // The dependency-style builder — what the stream client calls (`ClientConfig::builder()`,
+        // no provider passed, `client/options.rs`): with two providers compiled in that panics
+        // unless one is installed as the process default, and it takes that default. Building it
+        // is the check; the handshake below runs on it through the kind's own `Connector`.
+        let dep_style = ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(dep_style.enable_sni, "the built configuration is usable");
+
+        // A server of the test's own (`required` verifies nothing, so the CA needs no file).
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "test leaf");
+        let cert = params.self_signed(&key).unwrap();
+        let server = ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.expect("the server side");
+            let mut buf = [0u8; 8];
+            let n = tls.read(&mut buf).await.expect("a read");
+            assert_eq!(&buf[..n], b"ping", "what the client sent");
+            tls.write_all(b"pong").await.expect("a write");
+            tls.flush().await.expect("a flush");
+        });
+
+        let spec = TlsSpec::parse(Some("required")).unwrap();
+        let mut stream = Connector::new("localhost", port, &spec, true, &[])
+            .unwrap()
+            .connect(Duration::from_secs(10))
+            .await
+            .expect("a TLS handshake on the installed provider");
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+        server_task.await.unwrap();
     }
 
     #[test]

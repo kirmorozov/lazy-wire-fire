@@ -59,6 +59,18 @@ rskafka = { version = "0.6", default-features = false, features = [
     "compression-zstd",
     "transport-tls",
 ] }
+# RabbitMQ Streams for the `rabbitmq-stream` kind (src/rabbitmq_stream.rs): the official
+# RabbitMQ stream client, used through its raw `Client` only (its high-level Producer has a
+# hardcoded 1 s confirm timeout and `todo!()`s on answers it does not expect). Its tokio-rustls
+# comes with the crate's default features, so aws-lc-rs / aws-lc-sys are in the tree (the owner
+# accepted both crypto libraries on 2026-11-11; openssl stays out). lazywf installs the ring
+# provider as the process default (src/main.rs), so every handshake, this client's included,
+# runs on ring: aws-lc is compiled, never used.
+rabbitmq-stream-client = "0.11"
+# The super stream partition hash of the `rabbitmq-stream` kind (src/rabbitmq_stream.rs): the
+# same crate the stream client itself hashes with (`superstream.rs`, seed 104729), so the two
+# place a key on the same partition stream. Already in the tree through that client.
+murmur3 = "0.5"
 # gRPC (src/grpc/): dynamic protobuf messages from a descriptor set, so a schema is
 # configuration: no codegen and no protoc at build time. prost-reflect brings prost and
 # prost-types (the same prost 0.14 both use).
