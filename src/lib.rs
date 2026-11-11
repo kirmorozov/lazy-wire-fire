@@ -32,6 +32,7 @@ pub mod logging;
 pub mod model;
 pub mod path;
 pub mod pubsub;
+pub mod rabbitmq_stream;
 pub mod redis;
 pub mod response;
 pub mod rows;

@@ -58,6 +58,9 @@ enum Transport {
     PubSub(Box<crate::pubsub::Client>),
     /// One Kafka endpoint (`src/kafka.rs`): one produce of a batch of records per action.
     Kafka(Box<crate::kafka::Client>),
+    /// One RabbitMQ Stream endpoint (`src/rabbitmq_stream.rs`): one publish batch of records
+    /// per action, on the stream protocol.
+    RabbitMqStream(Box<crate::rabbitmq_stream::Client>),
     /// One gRPC endpoint (`src/grpc/`): the rule's documents as protobuf messages on one
     /// long-lived bidirectional stream, acknowledged item by item.
     Grpc(Box<crate::grpc::Client>),
@@ -687,6 +690,18 @@ impl Target {
                     });
                 }
             }
+            Kind::RabbitMqStream => {
+                // from_row: exactly one endpoint, `rabbitmq-stream(+tls)://<host>[:port]/
+                // [vhost/]stream` — one node and the stream (or super stream) the records of
+                // an action go to.
+                for e in &def.endpoints {
+                    let (ctx, client) = crate::rabbitmq_stream::Client::new(&def, e)?;
+                    endpoints.push(Endpoint {
+                        ctx,
+                        transport: Transport::RabbitMqStream(Box::new(client)),
+                    });
+                }
+            }
             Kind::Grpc => {
                 // from_row: exactly one endpoint, `grpc(s)://<host>[:port]/<Service>/<Method>`.
                 // The descriptor set, the item type and the method's shape are all read here,
@@ -990,6 +1005,11 @@ impl Target {
                 // A `once` reset step: no keys, the records take partition 0 (see `kafka.rs`).
                 crate::kafka::send(client, rendered, &self.expect, &self.pool).await
             }
+            Transport::RabbitMqStream(client) => {
+                // A `once` reset step: no keys, no `lazywf_key` property (see
+                // `rabbitmq_stream.rs`).
+                crate::rabbitmq_stream::send(client, rendered, &self.expect, &self.pool).await
+            }
             Transport::Grpc(client) => {
                 crate::grpc::send(client, rendered, &self.expect, &self.pool).await
             }
@@ -1067,6 +1087,9 @@ impl Target {
                 bail!("pubsub targets only publish: a listing is refused")
             }
             Transport::Kafka(_) => bail!("kind kafka appends: it cannot list keys"),
+            Transport::RabbitMqStream(_) => {
+                bail!("kind rabbitmq-stream appends: it cannot list keys")
+            }
             Transport::Grpc(_) => bail!("kind grpc pushes: it cannot list keys"),
             Transport::ServiceBus(_) => bail!("kind servicebus appends: it cannot list keys"),
             Transport::MySql(c) => {
@@ -1109,6 +1132,22 @@ impl Target {
             };
             return crate::kafka::send_items(client, rendered, keys, &self.expect, &self.pool)
                 .await;
+        }
+        if self.def.kind == Kind::RabbitMqStream {
+            let Some(endpoint) = self.endpoints.get(ep) else {
+                bail!("endpoint {ep} of target `{}` is gone", self.def.name);
+            };
+            let Transport::RabbitMqStream(client) = &endpoint.transport else {
+                bail!("target `{}` is not a rabbitmq-stream target", self.def.name);
+            };
+            return crate::rabbitmq_stream::send_items(
+                client,
+                rendered,
+                keys,
+                &self.expect,
+                &self.pool,
+            )
+            .await;
         }
         if self.def.kind == Kind::Grpc {
             let Some(endpoint) = self.endpoints.get(ep) else {

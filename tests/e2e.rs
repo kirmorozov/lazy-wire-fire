@@ -6278,6 +6278,594 @@ async fn commit_fence_writes_per_flush_and_moves_no_position() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The rabbitmq-stream kind against RabbitMQ's stream protocol (`LAZYWF_TEST_RABBITMQ_STREAM`,
+// e.g. 127.0.0.1:34572; the `amqp` compose profile, which enables the stream plugin on the
+// broker). Streams are managed through the official client's environment and read back with an
+// AMQP 0-9-1 consumer: a stream is an append-only log, not `basic.get`-able, so the reader
+// starts at its first offset and its acks are the credit that advances it.
+
+/// The rendered action: one record per key, its value the `{key, op, doc}` document (the
+/// shape the amqp tests assert). Plain streams ignore `routing_key`; the super stream tests
+/// render it.
+const RMQS_PUT: &str = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"records": [{{#each docs}}{"value": {"key": {{json key}}, "op": {{json op}}, "doc": {{json doc}}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+
+/// The target's `expect`: a publish the broker confirmed (see `Row::rabbitmq_stream`).
+const RMQS_EXPECT: &str = "JSON_EXTRACT(body, '$.publishing_id') IS NOT NULL";
+
+/// The broker's stream endpoint `host:port`, when the suite has one.
+fn rabbitmq_stream_broker() -> Option<String> {
+    std::env::var("LAZYWF_TEST_RABBITMQ_STREAM")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// The stream account of the compose broker (same user as the amqp tests).
+fn rabbitmq_stream_vars() -> String {
+    std::env::set_var("LWF_TEST_RMQS_PW", "lwftest");
+    json!({"username": "lwftest", "password": "env:LWF_TEST_RMQS_PW"}).to_string()
+}
+
+/// The (host, port) of the stream endpoint (the default port when the value has none).
+fn rabbitmq_stream_addr(broker: &str) -> (String, u16) {
+    match broker.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().expect("stream port")),
+        None => (broker.to_string(), 5552),
+    }
+}
+
+/// The test's own administration connection (the official client's environment).
+async fn stream_env(broker: &str) -> rabbitmq_stream_client::Environment {
+    let (host, port) = rabbitmq_stream_addr(broker);
+    rabbitmq_stream_client::Environment::builder()
+        .host(&host)
+        .port(port)
+        .username("lwftest")
+        .password("lwftest")
+        .build()
+        .await
+        .unwrap()
+}
+
+/// A fresh stream: deleted when one survives from an earlier run, then created.
+async fn make_stream(broker: &str, stream: &str) {
+    let env = stream_env(broker).await;
+    env.delete_stream(stream).await.ok();
+    env.stream_creator().create(stream).await.unwrap();
+}
+
+/// A fresh super stream of `n` partitions (`{name}-0` … `{name}-{n-1}`), leftover partitions
+/// deleted with it.
+async fn make_super_stream(broker: &str, name: &str, n: usize) {
+    let env = stream_env(broker).await;
+    env.delete_super_stream(name).await.ok();
+    for i in 0..n {
+        env.delete_stream(&format!("{name}-{i}")).await.ok();
+    }
+    env.stream_creator()
+        .create_super_stream(name, n, None)
+        .await
+        .unwrap();
+}
+
+/// The partition stream a routing key goes to: the broker's own partition list
+/// (`super_stream_partitions`) with murmur3 (seed 104729) modulo its length — the rule of the
+/// client library's own super-stream producer, and the rule the kind uses. The broker's
+/// `super_stream_route` command is not asked: this client decodes its answer (publisher items)
+/// as a string list, so it reads back empty for every key.
+async fn expected_partition(broker: &str, key: &str, super_stream: &str) -> String {
+    use rabbitmq_stream_client::{Client, ClientOptions};
+    let (host, port) = rabbitmq_stream_addr(broker);
+    let opts = ClientOptions::builder()
+        .host(&host)
+        .port(port)
+        .user("lwftest")
+        .password("lwftest")
+        .build();
+    let client = Client::connect(opts).await.unwrap();
+    let r = client.partitions(super_stream.to_string()).await.unwrap();
+    client.close().await.ok();
+    assert!(
+        r.is_ok() && !r.streams.is_empty(),
+        "the broker lists no partitions of {super_stream}"
+    );
+    let h = murmur3::murmur3_32(&mut std::io::Cursor::new(key), 104729).unwrap();
+    r.streams[(h % r.streams.len() as u32) as usize].clone()
+}
+
+/// One record of a stream as the test consumer reads it: the key carried as the application
+/// property `lazywf_key`, and the value.
+#[derive(Debug, Clone, PartialEq)]
+struct SRec {
+    key: Option<String>,
+    value: Value,
+}
+
+/// A reader over one stream: a consumer from its first offset with a prefetch and an ack per
+/// delivery, collecting everything without removing anything from the log.
+struct StreamRead {
+    _conn: lapin::Connection,
+    drain: tokio::task::JoinHandle<()>,
+    got: Arc<std::sync::Mutex<Vec<SRec>>>,
+}
+
+impl StreamRead {
+    /// One attempt at the AMQP 0-9-1 consumer of the stream, from the fresh connection to the
+    /// subscribed consumer. A stream is read this way because the point is what a consumer of the
+    /// stream sees: the `lazywf_key` of each record and the document, as appended by the kind.
+    async fn attach(
+        url: &str,
+        stream: &str,
+    ) -> anyhow::Result<(lapin::Connection, lapin::Consumer)> {
+        use lapin::options::*;
+        use lapin::types::AMQPValue;
+        use lapin::ConnectionProperties;
+        let conn = lapin::Connection::connect(url, ConnectionProperties::default()).await?;
+        let chan = conn.create_channel().await?;
+        chan.basic_qos(200, BasicQosOptions::default()).await?;
+        let mut copts = lapin::types::FieldTable::default();
+        copts.insert(
+            "x-stream-offset".into(),
+            AMQPValue::LongString("first".into()),
+        );
+        let consumer = chan
+            .basic_consume(
+                stream.into(),
+                "lwf-reader".into(),
+                BasicConsumeOptions::default(),
+                copts,
+            )
+            .await?;
+        Ok((conn, consumer))
+    }
+
+    /// Attaches a consumer of the whole stream — over the broker's **AMQP 0-9-1** endpoint, the way
+    /// a stream is read: a consumer with `x-stream-offset: first` (the stream port itself speaks
+    /// another protocol and would abort this handshake). The RabbitMQ of the shared compose file
+    /// belongs to the host too and another agent can restart it while a suite runs, so attaching is
+    /// retried for a while: what the test asserts is what the reader sees, not that the broker
+    /// never restarts. A broker that stays gone is still a failure.
+    async fn setup(stream: &str) -> StreamRead {
+        use futures_util::StreamExt;
+        let broker = amqp_broker()
+            .filter(|v| !v.is_empty())
+            .expect("LAZYWF_TEST_AMQP: a stream is read back by an AMQP 0-9-1 consumer, this port");
+        let url = format!("amqp://lwftest:lwftest@{broker}/%2f");
+        let (conn, mut consumer) = {
+            let mut last = "never attempted".to_string();
+            let mut out = None;
+            for _ in 0..30 {
+                match StreamRead::attach(&url, stream).await {
+                    Ok(v) => {
+                        out = Some(v);
+                        break;
+                    }
+                    Err(e) => {
+                        last = e.to_string();
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    }
+                }
+            }
+            out.unwrap_or_else(|| panic!("the reader could not attach to {broker}: {last}"))
+        };
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let drain = tokio::spawn(async move {
+            while let Some(delivery) = consumer.next().await {
+                let Ok(d) = delivery else { break };
+                let key = d
+                    .properties
+                    .headers()
+                    .as_ref()
+                    .and_then(|h| {
+                        h.into_iter().find(|(k, _)| k.as_str() == "lazywf_key").map(
+                            |(_, v)| match v {
+                                lapin::types::AMQPValue::LongString(s) => s.to_string(),
+                                _ => String::new(),
+                            },
+                        )
+                    })
+                    .filter(|k| !k.is_empty());
+                sink.lock().unwrap().push(SRec {
+                    key,
+                    value: serde_json::from_slice(&d.data).unwrap_or(Value::Null),
+                });
+                let _ = d.ack(lapin::options::BasicAckOptions::default()).await;
+            }
+        });
+        StreamRead {
+            _conn: conn,
+            drain,
+            got,
+        }
+    }
+
+    /// Waits until at least `n` records have been read from the log, and returns them all.
+    async fn at_least(&self, n: usize) -> Vec<SRec> {
+        wait_for(
+            Duration::from_secs(30),
+            &format!("{n} stream records"),
+            || async {
+                let all = self.got.lock().unwrap().clone();
+                (all.len() >= n).then_some(all)
+            },
+        )
+        .await
+    }
+}
+
+impl Drop for StreamRead {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+/// The `rabbitmq-stream` kind into a plain stream: every key arrives with its document
+/// (insert, update, delete), the key also carried as the `lazywf_key` application property,
+/// the target's `expect` met on every confirm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_target() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_target").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let stream = "lwf.rabbitmq_stream_target";
+    make_stream(&broker, stream).await;
+    let read = StreamRead::setup(stream).await;
+
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{stream}"),
+        Some(RMQS_EXPECT),
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    let got = read.at_least(2).await;
+    assert_eq!(got.len(), 2, "one record per key, no duplicates: {got:?}");
+    for (key, sku, qty) in [("1", "A-1", 3), ("2", "B-2", 1)] {
+        let r = got.iter().find(|r| r.key.as_deref() == Some(key)).unwrap();
+        assert_eq!(
+            r.value,
+            json!({"key": key, "op": "upsert", "doc": {"sku": sku, "qty": qty}})
+        );
+    }
+
+    db.exec("UPDATE orders SET qty = 4 WHERE id = 1").await;
+    let got = read.at_least(3).await;
+    assert_eq!(
+        got[2].value,
+        json!({"key": "1", "op": "upsert", "doc": {"sku": "A-1", "qty": 4}})
+    );
+
+    db.exec("DELETE FROM orders WHERE id = 2").await;
+    let got = read.at_least(4).await;
+    assert_eq!(got[3].key.as_deref(), Some("2"));
+    assert_eq!(got[3].value["op"], "delete", "{:?}", got[3]);
+    // The `expect` held: an unmet expectation would have refused every record and the rule
+    // would be striking keys.
+    inst.quiet().await;
+    inst.stop().await;
+}
+
+/// A stream the broker does not know: every action is refused at the declare (the target
+/// never creates streams), the keys are struck until they are dropped, `last_error` names the
+/// stream — and nothing is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_unknown_stream() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_unknown_stream").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let stream = "lwf.rabbitmq_stream_no_such_stream";
+    let env = stream_env(&broker).await;
+    env.delete_stream(stream).await.ok();
+    std::mem::forget(env);
+
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{stream}"),
+        None,
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3)").await;
+    // The refusal is a link-level one (the declare), so it is the rule's last error and the key
+    // is **not** struck: nothing of the batch arrived, so the answer says nothing about this key
+    // on its own — the engine keeps the key pending and retries, as it does for kafka's unknown
+    // topic, until the operator creates the stream or fixes the target.
+    let err = wait_for(
+        Duration::from_secs(90),
+        "the unknown stream refused at link level",
+        || async {
+            let (_, _, _, last) = db.status("orders").await?;
+            let err = last?;
+            (err.contains(stream) && err.contains("unknown to the broker")).then_some(err)
+        },
+    )
+    .await;
+    assert!(err.contains("the target does not create it"), "{err}");
+    inst.stop().await;
+}
+
+/// The connection is cut and the instance restarts over the broker: the keys changed meanwhile
+/// are re-sent and the stream holds every one of them (read back from its first offset), none
+/// lost. A re-send may store a record twice (at-least-once); keys are checked deduplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_restart() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_restart").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let stream = "lwf.rabbitmq_stream_restart";
+    make_stream(&broker, stream).await;
+    let read = StreamRead::setup(stream).await;
+
+    let upstream: &'static str = Box::leak(broker.clone().into_boxed_str());
+    let proxy = Flaky::start(upstream).await;
+    let cfg = config(&db, &[]);
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://127.0.0.1:{}/{stream}", proxy.port),
+        None,
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(cfg.clone()).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    assert_eq!(read.at_least(2).await.len(), 2);
+
+    // The broker goes away; a key changes meanwhile and cannot be confirmed. The instance is
+    // then stopped: its position did not pass key 3, so the new instance re-sends it.
+    proxy.cut();
+    db.exec("INSERT INTO orders VALUES (3, 'C-3', 7)").await;
+    wait_for(Duration::from_secs(30), "a refused connection", || async {
+        (proxy.refused() >= 1).then_some(())
+    })
+    .await;
+    assert!(
+        !read
+            .got
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.key.as_deref() == Some("3")),
+        "key 3 arrived while the broker was cut off"
+    );
+    inst.stop().await;
+    proxy.heal();
+
+    let inst = Instance::ready(cfg).await;
+    let got = read.at_least(3).await;
+    let mut keys: Vec<String> = got.iter().filter_map(|r| r.key.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys, ["1", "2", "3"], "every key arrives: {got:?}");
+    let r3 = got.iter().find(|r| r.key.as_deref() == Some("3")).unwrap();
+    assert_eq!(
+        r3.value,
+        json!({"key": "3", "op": "upsert", "doc": {"sku": "C-3", "qty": 7}})
+    );
+    inst.stop().await;
+}
+
+/// A super stream routed by key: records with a `routing_key` land on the partition the broker's
+/// partition list and the hash rule give (checked per key against the partition they were read
+/// from), every key exactly once across the three partitions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_super_stream() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_super_stream").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let super_name = "lwf.rabbitmq_stream_super_stream";
+    make_super_stream(&broker, super_name, 3).await;
+    let parts = [
+        "lwf.rabbitmq_stream_super_stream-0",
+        "lwf.rabbitmq_stream_super_stream-1",
+        "lwf.rabbitmq_stream_super_stream-2",
+    ];
+    let mut reads = Vec::new();
+    for p in parts {
+        reads.push(StreamRead::setup(p).await);
+    }
+
+    let template = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"records": [{{#each docs}}{"value": {"key": {{json key}}, "op": {{json op}}, "doc": {{json doc}}}, "routing_key": {{json key}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{super_name}"),
+        Some(RMQS_EXPECT),
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            template,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1), (3, 'C-3', 7), (4, 'D-4', 2)")
+        .await;
+    // (key, partition) of every record read so far, taken fresh on each look.
+    let seen: Vec<(String, String)> =
+        wait_for(Duration::from_secs(60), "the four records", || async {
+            let mut got: Vec<(String, String)> = Vec::new();
+            for (i, r) in reads.iter().enumerate() {
+                for rec in r.got.lock().unwrap().iter() {
+                    if let Some(k) = &rec.key {
+                        got.push((k.clone(), parts[i].to_string()));
+                    }
+                }
+            }
+            (got.len() >= 4).then_some(got)
+        })
+        .await;
+    let mut uniq: Vec<&String> = seen.iter().map(|(k, _)| k).collect();
+    uniq.sort();
+    let before = uniq.len();
+    uniq.dedup();
+    assert_eq!(before, uniq.len(), "a key arrived twice: {seen:?}");
+    assert_eq!(uniq, ["1", "2", "3", "4"], "every key once: {seen:?}");
+    // The partition of each key is the one the broker's partition list and the hash rule give.
+    for key in ["1", "2", "3", "4"] {
+        let want = expected_partition(&broker, key, super_name).await;
+        let got = seen
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, p)| p.as_str())
+            .unwrap();
+        assert_eq!(got, want.as_str(), "key {key} on the wrong partition");
+    }
+    inst.stop().await;
+}
+
+/// One record the target refuses alone (a super stream record with no routing key: nothing to
+/// route by): its neighbours of the same batch go through, only it is struck, and the position
+/// moves on — `last_error` says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_refused_alone() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_refused_alone").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let super_name = "lwf.rabbitmq_stream_refused_alone";
+    make_super_stream(&broker, super_name, 3).await;
+    let parts: Vec<String> = (0..3).map(|i| format!("{super_name}-{i}")).collect();
+    let mut reads = Vec::new();
+    for p in &parts {
+        reads.push(StreamRead::setup(p).await);
+    }
+
+    // Key 2 renders a null routing_key: the broker cannot place it, and no retry changes that.
+    let template = r#"POST / HTTP/1.1
+Content-Type: application/json
+
+{"records": [{{#each docs}}{"value": {"key": {{json key}}, "op": {{json op}}, "doc": {{json doc}}}, "routing_key": {{#if (eq key "2")}}null{{else}}{{json key}}{{/if}}}{{#unless @last}}, {{/unless}}{{/each}}]}"#;
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{super_name}"),
+        None,
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            template,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1), (3, 'C-3', 7)")
+        .await;
+    // Keys 1 and 3 arrive; key 2 never does: its neighbours of the batch went through, so the
+    // answer is about that record alone, it is struck five times and dropped, and the position
+    // moves on (`last_error` is the engine's drop line, engine.rs `judge_strikes`).
+    let err = wait_for(
+        Duration::from_secs(60),
+        "key 2 refused alone and the position moved on",
+        || async {
+            let (f, p, _, last) = db.status("orders").await?;
+            let err = last?;
+            (err.contains("`2` refused") && (f, p) >= start).then_some(err)
+        },
+    )
+    .await;
+    assert!(err.contains("routing_key"), "{err}");
+    let mut keys: Vec<String> = Vec::new();
+    for r in &reads {
+        keys.extend(r.got.lock().unwrap().iter().filter_map(|x| x.key.clone()));
+    }
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys, ["1", "3"], "the neighbours went through: {keys:?}");
+    inst.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // `pubsub` targets, against Google's Pub/Sub emulator (`LAZYWF_TEST_PUBSUB`, e.g.
 // http://127.0.0.1:34563; the `pubsub` compose profile). The tests read the messages back
 // through a subscription on the emulator (its REST API, project `lwf-test`).

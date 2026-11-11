@@ -139,6 +139,9 @@ pub enum Kind {
     /// Kafka: one produce of a batch of records per action, an answer per partition (see
     /// `kafka.rs`).
     Kafka,
+    /// RabbitMQ Streams: one publish batch per action to a stream or a super stream over the
+    /// stream protocol, an answer per record (see `rabbitmq_stream.rs`).
+    RabbitMqStream,
     /// gRPC: the rule's documents as protobuf messages, pushed onto one long-lived
     /// bidirectional stream per endpoint and acknowledged item by item (see `grpc.rs`).
     Grpc,
@@ -167,13 +170,14 @@ impl Kind {
             "smtp" => Kind::Smtp,
             "pubsub" => Kind::PubSub,
             "kafka" => Kind::Kafka,
+            "rabbitmq-stream" => Kind::RabbitMqStream,
             "grpc" => Kind::Grpc,
             "servicebus" => Kind::ServiceBus,
             "redis" => Kind::Redis,
             "mysql" | "mariadb" => Kind::MySql,
             "pgsql" | "postgres" | "postgresql" => Kind::PgSql,
             other => bail!(
-                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, grpc, servicebus, redis, mysql or pgsql)"
+                "kind `{other}` (use http, http.basic, http.bearer, http.header, http.s3, sqs, kinesis, lambda, eventbridge, sns, amqp, smtp, pubsub, kafka, rabbitmq-stream, grpc, servicebus, redis, mysql or pgsql)"
             ),
         })
     }
@@ -187,6 +191,7 @@ impl Kind {
                 | Kind::MySql
                 | Kind::PgSql
                 | Kind::Kafka
+                | Kind::RabbitMqStream
                 | Kind::Grpc
                 | Kind::ServiceBus
         )
@@ -209,6 +214,7 @@ impl Kind {
             Kind::Smtp => "smtp",
             Kind::PubSub => "pubsub",
             Kind::Kafka => "kafka",
+            Kind::RabbitMqStream => "rabbitmq-stream",
             Kind::Grpc => "grpc",
             Kind::ServiceBus => "servicebus",
             Kind::Redis => "redis",
@@ -226,6 +232,7 @@ impl Kind {
                 | Kind::Kinesis
                 | Kind::Lambda
                 | Kind::Kafka
+                | Kind::RabbitMqStream
                 | Kind::Grpc
                 | Kind::EventBridge
                 | Kind::Sns
@@ -246,6 +253,7 @@ impl Kind {
                 | Kind::Smtp
                 | Kind::PubSub
                 | Kind::Kafka
+                | Kind::RabbitMqStream
                 | Kind::Grpc
                 | Kind::ServiceBus
         )
@@ -270,6 +278,9 @@ impl Kind {
             // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
             // (see `Target::batch_bytes_limit`).
             Kind::Kafka => Some(crate::kafka::MESSAGE_MAX_BYTES),
+            // One stream frame, 1 MiB (the crate sends a batch as a single frame; see
+            // `rabbitmq_stream.rs`).
+            Kind::RabbitMqStream => Some(crate::rabbitmq_stream::MESSAGE_MAX_BYTES),
             // The server's own maximum message size, 4 MiB in the usual implementations;
             // `vars.max_message_bytes` raises it (see `Target::batch_bytes_limit`).
             Kind::Grpc => Some(crate::grpc::MAX_MESSAGE_BYTES),
@@ -304,9 +315,13 @@ impl Kind {
             | Kind::EventBridge
             | Kind::Sns => &["access_key_ref", "secret_key_ref", "session_token_ref"],
             Kind::PubSub => &["credentials_ref"],
-            Kind::Amqp | Kind::Smtp | Kind::Redis | Kind::MySql | Kind::PgSql | Kind::Kafka => {
-                &["password"]
-            }
+            Kind::Amqp
+            | Kind::Smtp
+            | Kind::Redis
+            | Kind::MySql
+            | Kind::PgSql
+            | Kind::Kafka
+            | Kind::RabbitMqStream => &["password"],
             // `token` is a reference, not a value, but a path in a template is one leak too far.
             Kind::Grpc => &["token", "descriptor_set"],
             Kind::ServiceBus => &["key", "password"],
@@ -541,6 +556,9 @@ impl TargetDef {
             Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
             Kind::Kafka => crate::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::RabbitMqStream => {
+                crate::rabbitmq_stream::check(&endpoints, &vars, r.tls.as_deref())?
+            }
             Kind::Grpc => crate::grpc::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::ServiceBus => crate::servicebus::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
@@ -574,6 +592,7 @@ impl TargetDef {
         }
         crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
         crate::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
+        crate::rabbitmq_stream::refuse_scheme(kind == Kind::RabbitMqStream, &endpoints)?;
         crate::grpc::refuse_scheme(kind == Kind::Grpc, &endpoints)?;
         crate::servicebus::refuse_scheme(kind == Kind::ServiceBus, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
@@ -1650,6 +1669,7 @@ mod load_refusals_tests {
             Kind::Smtp,
             Kind::PubSub,
             Kind::Kafka,
+            Kind::RabbitMqStream,
             Kind::Redis,
             Kind::MySql,
             Kind::PgSql,
@@ -1686,6 +1706,10 @@ mod load_refusals_tests {
             Kind::Kafka.batch_bytes_limit(),
             Some(crate::kafka::MESSAGE_MAX_BYTES)
         );
+        assert_eq!(
+            Kind::RabbitMqStream.batch_bytes_limit(),
+            Some(crate::rabbitmq_stream::MESSAGE_MAX_BYTES)
+        );
         for k in [Kind::Http, Kind::Redis, Kind::MySql, Kind::Smtp] {
             assert_eq!(k.batch_bytes_limit(), None, "{}", k.name());
         }
@@ -1695,6 +1719,7 @@ mod load_refusals_tests {
             Kind::Kinesis,
             Kind::Lambda,
             Kind::Kafka,
+            Kind::RabbitMqStream,
             Kind::EventBridge,
         ] {
             assert!(k.reports_items(), "{}", k.name());
