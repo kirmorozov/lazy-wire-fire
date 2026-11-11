@@ -35,10 +35,24 @@ House rules for commits, branches and pull requests on this repository.
   mergeable, in a merge pass over the open pull requests. Squash merging
   does not need the branch to be up to date, so nobody rebases for the
   merge.
-- A pull request that conflicts with `main` goes back to its author:
-  "needs refresh." The author rebases onto the new `main`, force-pushes its
-  own branch, and gets its CI green again. The keeper never rebases another
-  author's branch and never resolves a conflict.
+- The merge pass is also gated by review: it merges a pull request only
+  when lwf-super has approved its current head commit — one approval file
+  per reviewed commit (`tmp/out/lwf-super/approvals/<pr>-<sha>`, written by
+  `tmp/lwf-super/approve.sh`, the team's coordination tooling under `tmp/`).
+  A push after the review moves the head, so the pull request waits for a
+  new approval; authors do not treat "ready" as approved.
+- A pull request that conflicts with `main` may be refreshed by the keeper
+  itself when the conflict is simple: both sides' changes stay exactly as
+  written and the resolution only puts them together — entries both sides
+  added to the same list, enum, match, dependency section or import block,
+  or edits on neighbouring lines (`tmp/git-keeper/refresh-pr.sh <n>`, the
+  keeper's tooling under `tmp/`). Anything else goes back to its author as
+  "needs refresh": the same lines changed differently, logic or a test that
+  would have to change, a vendored file, or any doubt. The author then
+  rebases onto the new `main`, force-pushes its own branch and gets its CI
+  green again. A refresh changes the head, so the author fetches and resets
+  its worktree to the new head before more work, and lwf-super reviews the
+  resolution.
 
 ## Checks before a commit
 
