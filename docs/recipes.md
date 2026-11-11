@@ -52,13 +52,16 @@ query ([reference → security](reference.md#security)).
 Each credential is a literal, `env:NAME` or `file:/path`; a file's trailing newline is dropped and
 a reference is resolved on every request, so a rotated secret applies without a restart. `file:`
 must resolve inside `LAZYWF_SECRET_DIRS` (default `/run/secrets:/var/run/secrets`) and `env:`
-cannot name lazywf's own `LAZYWF_*` settings. **References are resolved only there**: nothing is
-resolved in `endpoints`, `template` or `expect`, so a token written into a template is a literal
-that everyone who can read the table can see (`target.vars` in a template also holds no
-credentials). One consequence worth remembering: `http.header` carries exactly one header, so a
-service that wants two custom headers gets one from `vars` and the other written by the template —
-and a template header is *rendered*, while `vars.value` is *resolved as a credential* and never
-rendered, so data belongs in a template header and secrets in `vars`.
+cannot name lazywf's own `LAZYWF_*` settings. **References are resolved in `vars` and, for these
+four kinds, in `endpoints`** — there an entry may be a whole webhook URL, the case where the URL
+below the host *is* the credential
+([reference → secret http endpoints](reference.md#secret-http-endpoints)). Nothing is resolved in
+`template` or `expect`, so a token written into a template is a literal that everyone who can read
+the table can see (`target.vars` in a template also holds no credentials). One consequence worth
+remembering: `http.header` carries exactly one header, so a service that wants two custom headers
+gets one from `vars` and the other written by the template — and a template header is *rendered*,
+while `vars.value` is *resolved as a credential* and never rendered, so data belongs in a template
+header and secrets in `vars`.
 
 **`expect` is a column of the target, not of the rule.** It is one MySQL / MariaDB condition over
 the answer as the row `r` of a derived table, which the source database evaluates:
@@ -499,21 +502,24 @@ Content-Length: 40
 
 | | |
 |---|---|
-| **Endpoint** | `POST` to the incoming-webhook URL: `https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX` |
-| **Auth** | **None — leave `vars` empty for this target.** The URL is the credential: it contains a secret, and Slack revokes a leaked one |
+| **Endpoint** | the incoming-webhook URL whole: `https://hooks.slack.com/services/T00000000/B00000000/PLACEHOLDER-TOKEN`. `endpoints` holds a `file:` reference to it and the template's request line is `POST /` |
+| **Auth** | **None — leave `vars` empty for this target.** The URL is the credential: it contains a secret, and Slack revokes a leaked one — which is exactly why it belongs in a file outside the tables rather than in a column |
 | **Renders** | `{"text":"…"}`, optionally with `blocks`, as `Content-Type: application/json` |
 | **`expect`** | `status = 200 AND text = 'ok'` — a posted message answers 200 with the plain string `ok`, which is not JSON, so `body` is NULL and only `text` can confirm it |
 | **Batch limit** | One message per request and about one message per second per channel → `fire_per = 'key'`, no batching |
 | **Deletes** | Incoming webhooks cannot delete a message once posted; deleting means the Web API (`chat.delete`) with a bot token, i.e. a different target with real auth |
 
 ```sql
+-- /run/secrets/slack_webhook, one line, no trailing slash (the path below is a placeholder):
+-- https://hooks.slack.com/services/T00000000/B00000000/PLACEHOLDER-TOKEN
+
 INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms) VALUES
- ('slack', 'http', 'https://hooks.slack.com', 'status = 200 AND text = ''ok''', 10000);
+ ('slack', 'http', 'file:/run/secrets/slack_webhook', 'status = 200 AND text = ''ok''', 10000);
 
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms, max_delay_ms) VALUES
  ('stock_alerts', 'slack', 'key',
   'SELECT id AS _key, note FROM alerts WHERE id IN (:keys)',
-  'POST /services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX HTTP/1.1
+  'POST / HTTP/1.1
 Content-Type: application/json
 
 {{#each docs}}{"text": {{json doc.note}}}{{/each}}',
@@ -524,7 +530,7 @@ INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, `key`) VALUES
 ```
 
 ```text
-POST /services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX HTTP/1.1
+POST /services/T00000000/B00000000/PLACEHOLDER-TOKEN HTTP/1.1
 Content-Type: application/json
 User-Agent: lazywf/<version>
 Host: hooks.slack.com
@@ -533,14 +539,32 @@ Content-Length: 32
 {"text": "Bowl is out of stock"}
 ```
 
-* **The URL is a credential sitting in a plain column.** Values in `endpoints` are text, not
-  references, so anyone who can read `lazy_wire_fire_target` can post to that channel, and a
-  configuration snapshot copies it. Keep the tables admin-only, give each channel its own webhook
-  rather than sharing one, and remember rotation means editing this row — Slack's own guidance is
-  that it hunts for and revokes leaked webhook URLs.
-* **The whole path is in the request line**, not in `endpoints`: `endpoints` is the origin and the
-  template's request line carries `/services/…`, which avoids the trailing slash a prefix plus
-  `POST /` would produce.
+The request line above is what goes on the wire: the endpoint's own path and query are joined to
+it as the bytes are written, so `POST /` calls the URL exactly as given, and nothing below the
+origin reaches a template.
+
+* **The URL is a credential, so it lives outside the tables.** `endpoints` holds the reference and
+  the file holds the URL: it must sit inside `LAZYWF_SECRET_DIRS` (default
+  `/run/secrets:/var/run/secrets`) and an `env:` reference may not name a `LAZYWF_*` variable.
+  Rewriting the file **is** the rotation — the next request uses the new URL, with no reload and
+  no restart, and the value is not held between requests. The log at every `RUST_LOG` level,
+  `/status`, `last_error` and `endpoint.url` show `https://hooks.slack.com/…` and nothing below
+  the origin, and with `LAZYWF_ALLOWED_HOSTS=hooks.slack.com` a rewritten file cannot move the
+  target to a host the operator did not allow
+  ([reference → secret http endpoints](reference.md#secret-http-endpoints)).
+  Slack's own guidance is that it hunts for and revokes leaked webhook URLs; give each channel its
+  own webhook rather than sharing one, and keep the tables admin-only all the same.
+* **The fallback is weaker.** Putting the origin in `endpoints` (`https://hooks.slack.com`) and the
+  secret path in the template's request line works, and is what this recipe taught before endpoint
+  references existed. It is weaker in three ways: the credential then sits in
+  `lazy_wire_fire_rule.template`, so anyone who can read that table can post to the channel; a
+  configuration snapshot copies it; and rotation means editing the rule row instead of rewriting
+  one file. (It still keeps the path out of `endpoints`, because a prefix there is put in front of
+  every path and `POST /` would gain a trailing slash.)
+* **Copy the URL into the file; do not rebuild it.** Its host and path depend on the workspace and
+  the channel. One line, no trailing slash: `POST /` asks for the endpoint itself, so the URL is
+  called exactly as given, with no slash added; any other target in the request line goes *below*
+  the endpoint's path.
 * **`fire_per = 'key'` and one lane** put the limiter on the sender's side. Exceeding about one
   message per second answers **HTTP 429 with a `Retry-After` header**, which is transient: the
   action waits and retries rather than dead-lettering, so a fast source drains slowly instead of
@@ -568,5 +592,7 @@ steps, not instructions:
   NULL, and no purge rate-limit figures are given for a service.
 * **Automation hub**: no third-party workflow tool is claimed here to verify an HMAC natively. The
   signing contract is this tool's and the Standard Webhooks convention.
-* **Slack**: a webhook URL cannot be rotated from the configuration tables, and an incoming webhook
-  cannot delete or edit what it posted.
+* **Slack**: the `ok` answer, the 429-with-`Retry-After` band and the hunt for leaked webhook URLs
+  are the vendor's own pages; nothing was replayed against a live workspace. Rotating by rewriting
+  the file the endpoint reference names is this tool's side of it, not a Slack contract. What an
+  incoming webhook cannot do — delete or edit what it posted — holds either way.

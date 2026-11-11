@@ -15,12 +15,17 @@ much a 2xx is actually worth.
 
 Three things are the same in every recipe here:
 
-* **`endpoints` is the origin** and the template's request line carries the path and the query.
-  A prefix in `endpoints` is put in front of every path, so a prefix plus `POST /` would gain a
-  trailing slash; the services below all take their path in the template instead.
-* **The credential is a reference in `vars`** (`env:NAME` or `file:/path`), resolved on every
-  request, never rendered by a template. The two webhook recipes are the exception, and they are
-  spelled out: there the secret is inside the URL, which is a plain column.
+* **`endpoints` is the origin** and the template's request line carries the path and the query —
+  for every recipe here except the two incoming webhooks, where `endpoints` is a `file:` reference
+  whose value is the whole URL and the request line is `POST /`
+  ([reference → secret http endpoints](reference.md#secret-http-endpoints)). A prefix in
+  `endpoints` is put in front of every path, so a prefix plus `POST /` would gain a trailing
+  slash; the services that give their address in plain text take their path in the template
+  instead.
+* **The credential is a reference** (`env:NAME` or `file:/path`), resolved on every request, never
+  rendered by a template: in `vars` for the six API recipes, and in `endpoints` for the two
+  webhook recipes, whose secret is the URL below the origin (a reference endpoint is for the four
+  plain http kinds, and only their `endpoints` column resolves one).
 * **`expect` is a target column**, evaluated as a SQL condition over the response row
   (`status`, `headers`, `body`, `text`). Left empty it means "any 2xx". A condition that names
   `status` replaces the 2xx band, so write `status BETWEEN 200 AND 299 AND …` when you want both
@@ -78,8 +83,8 @@ drains a burst instead of losing it. Five strikes on the same key drops that key
 
 | | |
 |---|---|
-| **Endpoint** | the callback URL the Workflows app prints when the flow is saved. `endpoints` is its origin; the request line is the rest of that URL, copied verbatim |
-| **Auth** | **None — leave `vars` empty.** The URL is the credential, and it sits in the configuration as plain text: whoever can read the row can post to that channel |
+| **Endpoint** | the callback URL the Workflows app prints when the flow is saved, whole: `endpoints` holds a `file:` reference to it and the template's request line is `POST /` |
+| **Auth** | **None — leave `vars` empty.** The URL is the credential, so it stays out of the configuration: the file the reference names holds it, no column does, and a reader of `lazy_wire_fire_target` sees the reference and nothing of the URL |
 | **Renders** | one of the two shapes the page shows: `{"text":"…"}`, or an Adaptive Card envelope `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":{…}}]}`, as `Content-Type: application/json` |
 | **`expect`** | NULL — every 2xx passes. The page documents the request and not the answer, so there is no status or body to assert |
 | **Batch and rate limit** | 28 KB per message; beyond four requests in a second the connection is throttled until the fixed window refreshes → `fire_per = 'key'`, one message per request, one lane, `debounce_ms` / `max_delay_ms` widened for bursts |
@@ -90,13 +95,17 @@ retired in May 2026, and the trigger to build the flow around is `When a Teams w
 is received`.
 
 ```sql
+-- /run/secrets/teams_webhook, one line, no trailing slash: the callback URL the flow prints,
+-- verbatim (its host and path depend on the flow; nothing below the origin is in a column):
+-- https://workflow-host.example/<the rest of the callback URL>
+
 INSERT INTO lazy_wire_fire_target (name, kind, endpoints, timeout_ms) VALUES
- ('teams', 'http', 'https://workflow-host.example', 10000);
+ ('teams', 'http', 'file:/run/secrets/teams_webhook', 10000);
 
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms, max_delay_ms) VALUES
  ('teams_order_updates', 'teams', 'key',
   'SELECT id AS _key, CONCAT(''Order '', id, '' is '', status) AS line FROM orders WHERE id IN (:keys)',
-  'POST /<the rest of the callback URL> HTTP/1.1
+  'POST / HTTP/1.1
 Content-Type: application/json
 
 {{#each docs}}{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":{"type":"AdaptiveCard","version":"1.2","body":[{"type":"TextBlock","text":{{json doc.line}}}]}}]}{{/each}}',
@@ -116,13 +125,18 @@ Content-Length: 221
 {"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":{"type":"AdaptiveCard","version":"1.2","body":[{"type":"TextBlock","text":"Order 4213 is shipped"}]}}]}
 ```
 
-* **Copy the callback URL; do not rebuild it.** Its host and path depend on the flow, and only
-  the origin belongs in `endpoints` — the whole path and query go in the request line, which is
-  also how the Slack recipe in [the http recipes](recipes.md#slack-post-to-a-channel) avoids the
-  trailing slash a prefix plus `POST /` produces. The URL is stored as plain text in the
-  configuration, like the Slack webhook: values in `endpoints` are text and not references, so
-  anyone who can read `lazy_wire_fire_target` can post to this channel, and a configuration
-  snapshot copies it; keep the tables admin-only. When the endpoint can be a reference, use it.
+* **Copy the callback URL into the file; do not rebuild it.** Its host and path depend on the
+  flow. One line, no trailing slash: `POST /` asks for the endpoint itself, so the URL is called
+  exactly as given. The file must sit inside `LAZYWF_SECRET_DIRS` (default
+  `/run/secrets:/var/run/secrets`) and an `env:` reference may not name a `LAZYWF_*` variable;
+  rewriting it **is** the rotation, applied on the next request with no reload and no restart.
+  The log, `/status` and `last_error` name the request `POST https://workflow-host.example/…`, and
+  a template's `endpoint.url` is that same origin ([reference → secret http endpoints](reference.md#secret-http-endpoints)).
+* **The fallback is weaker.** Keeping the origin in `endpoints` and the callback path in the
+  template's request line is what this recipe taught before endpoint references existed, and it is
+  what to fall back to only if the URL must stay in a row: the credential then sits in
+  `lazy_wire_fire_rule.template`, where anyone who can read that table can post to the channel, a
+  configuration snapshot copies it, and rotation means editing the rule.
 * **The flow, not the request, decides what the message says.** The trigger hands the payload to
   the flow, which posts it after the response has already gone back, so a 2xx means the trigger
   accepted the body. Text fields in a card take basic Markdown; HTML in them is ignored.
@@ -138,22 +152,26 @@ Content-Length: 221
 
 | | |
 |---|---|
-| **Endpoint** | `POST /v1/spaces/<space>/messages?key=<key>&token=<token>` on `https://chat.googleapis.com` — the URL the space's webhook gives you, split at the origin |
-| **Auth** | **None — leave `vars` empty.** The `token` in the query is the secret; `key` is a value shared by all webhooks. Both travel in the URL |
+| **Endpoint** | the space's webhook URL whole — `https://chat.googleapis.com/v1/spaces/<space>/messages?key=<key>&token=<token>`: `endpoints` holds a `file:` reference to it and the template's request line is `POST /` |
+| **Auth** | **None — leave `vars` empty.** The `token` in the query is the secret; `key` is a value shared by all webhooks. Both travel in the URL, so both live in the file the reference names and in no column |
 | **Renders** | `{"text":"…"}` as `Content-Type: application/json`; `threadKey` in the body replies into a thread instead of starting one |
 | **`expect`** | `json_extract(body, '$.name') IS NOT NULL` — deliberately without `status`, so the 2xx band stays and no success code is asserted |
 | **Batch and rate limit** | One message per request, and the per-space quota for `spaces.messages.create` is 1 request per second shared among all webhooks in that space → `fire_per = 'key'`, one lane, wide `debounce_ms` |
 | **Deletes** | None from a webhook. Removing a message is `spaces.messages.delete`, an OAuth call with a bot's credentials: a different target kind of problem |
 
 ```sql
+-- /run/secrets/gchat_webhook, one line, no trailing slash. The credential is the query, so the
+-- file holds it whole (`<key>` and `<token>` are placeholders, never values to publish):
+-- https://chat.googleapis.com/v1/spaces/<space>/messages?key=<key>&token=<token>
+
 INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms) VALUES
- ('gchat', 'http', 'https://chat.googleapis.com',
+ ('gchat', 'http', 'file:/run/secrets/gchat_webhook',
   'json_extract(body, ''$.name'') IS NOT NULL', 10000);
 
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms, max_delay_ms) VALUES
  ('gchat_order_updates', 'gchat', 'key',
   'SELECT id AS _key, CONCAT(''Order '', id, '' is '', status) AS line FROM orders WHERE id IN (:keys)',
-  'POST /v1/spaces/<space>/messages?key=<key>&token=<token> HTTP/1.1
+  'POST / HTTP/1.1
 Content-Type: application/json
 
 {{#each docs}}{"text": {{json doc.line}}}{{/each}}',
@@ -173,12 +191,22 @@ Content-Length: 33
 {"text": "Order 4213 is shipped"}
 ```
 
-* **The URL is a credential sitting in a plain column**, exactly as with the Slack webhook:
-  values in `endpoints` are text and not references, so anyone who can read
-  `lazy_wire_fire_target` can post to that space, and a configuration snapshot copies it. Keep
-  the tables admin-only, one webhook per space, and treat rotation as an edit to this row.
-  `key` and `token` above are placeholders, never values to publish. When the endpoint can be a
-  reference, use it.
+* **The URL is the credential, so it lives outside the tables** — and here the credential is the
+  **query**, which makes it the clearest case for a reference endpoint: the file holds
+  `?key=<key>&token=<token>` and the template's request line is simply `POST /`, the endpoint's own
+  query being joined to it last, with `&` after any query the template wrote. `endpoints` holds the
+  `file:` reference; the file must sit inside `LAZYWF_SECRET_DIRS` (default
+  `/run/secrets:/var/run/secrets`) and an `env:` reference may not name a `LAZYWF_*` variable.
+  Rewriting the file **is** the rotation, applied on the next request with no reload and no
+  restart, and the log, `/status`, `last_error` and a template's `endpoint.url` name only
+  `https://chat.googleapis.com/…`
+  ([reference → secret http endpoints](reference.md#secret-http-endpoints)). Keep one webhook per
+  space, and keep the tables admin-only all the same.
+* **The fallback is weaker.** Keeping `https://chat.googleapis.com` in `endpoints` and writing
+  `/v1/spaces/<space>/messages?key=…&token=…` in the template's request line is what this recipe
+  taught before endpoint references existed: the secret then sits in
+  `lazy_wire_fire_rule.template`, so anyone who can read that table can post to the space, a
+  configuration snapshot copies it, and rotation means editing the rule.
 * **The answer is a stub of a message.** The response populates only `name` and `thread.name`, so
   `expect` checks that a name came back and nothing more: reading `$.text` out of it would fail a
   message that was posted perfectly well. A non-JSON answer leaves `body` NULL, which the same
