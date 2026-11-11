@@ -579,15 +579,17 @@ fn parse_sql<T>(sql: &str, f: impl FnOnce(&mut Parser) -> Result<T, ParserError>
 }
 
 /// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted
-/// identifier is one character of the name.
-fn unquote(value: &str, quote: Option<char>) -> String {
+/// identifier is one character of the name. The owner of both readings of a name, shared with
+/// `crate::analyzer` (see [`ident_name`]).
+pub(crate) fn unquote(value: &str, quote: Option<char>) -> String {
     match quote {
         Some(q) => value.replace(&format!("{q}{q}"), &q.to_string()),
         None => value.to_string(),
     }
 }
 
-fn ident_name(i: &Ident) -> String {
+/// The name an identifier of a parsed AST stands for.
+pub(crate) fn ident_name(i: &Ident) -> String {
     unquote(&i.value, i.quote_style)
 }
 
@@ -1087,6 +1089,12 @@ pub struct ViewPlan {
     pub edges: Vec<Edge>,
     /// Per reduced unit expression: the alias columns it reads.
     pub unit_refs: Vec<Vec<(usize, usize)>>,
+    /// Whether the definition spells a `COLLATE` of its own anywhere ([`has_collate`], the
+    /// statement as written and as the lookups see it). The lookup of an incremental view then
+    /// binds its string parameters without one: a `COLLATE` clause is EXPLICIT, and the view's own
+    /// would meet the parameter's in an error ("Illegal mix of collations", 1267). See the lookup
+    /// in `engine`.
+    pub has_explicit_collate: bool,
 }
 
 impl ViewPlan {
@@ -2454,12 +2462,27 @@ fn chosen_id(
     Ok(chosen)
 }
 
-fn quote(id: &str) -> String {
-    format!("`{}`", id.replace('`', "``"))
+/// A backtick-quoted identifier for the AST. The stored value keeps the doubled backticks a name
+/// needs inside quotes, exactly as the tokenizer leaves them, so a generated identifier and a
+/// parsed one of the same name hold the same value (see [`unquote`], [`expr_key`]).
+pub(crate) fn qident(id: &str) -> Ident {
+    Ident::with_quote('`', id.replace('`', "``"))
 }
 
-fn qident(id: &str) -> Ident {
-    Ident::with_quote('`', id)
+/// Whether anything in `t` carries a `COLLATE` of its own: a `COLLATE` clause anywhere in the
+/// definition (projection, WHERE, joins, GROUP BY, HAVING, ORDER BY, subqueries) makes the server
+/// compare with an EXPLICIT collation, which an equally EXPLICIT parameter collation cannot meet.
+fn has_collate(t: &impl Visit) -> bool {
+    let mut found = false;
+    let mut find = |e: &Expr| {
+        if matches!(e, Expr::Collate { .. }) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    };
+    let _ = visit_expressions(t, &mut find);
+    found
 }
 
 /// Plans a definition: the query analyzer resolves CTEs, derived tables and subqueries and
@@ -2508,6 +2531,9 @@ pub fn plan_block(
         }
     }
     let output_names = (!def.columns.is_empty()).then(|| def.columns.clone());
+    // The definition as written; the incremental plans below add what the inlined VIRTUAL columns
+    // carry. Never a reason to reject, only to bind string parameters the other way.
+    let has_explicit_collate = has_collate(&def.query);
     // Full rebuilds run the statement exactly as written (ORDER BY matters with LIMIT).
     let full_select = full_select_sql(def, default_schema, tables)?;
     let full_with = |reason: &str, watched: Vec<TableRef>, columns| ViewPlan {
@@ -2545,6 +2571,7 @@ pub fn plan_block(
         output_names: output_names.clone(),
         edges: Vec::new(),
         unit_refs: Vec::new(),
+        has_explicit_collate,
     };
     let full = |reason: &str| {
         let columns = read_columns(&def.query, &all_tables, tables);
@@ -3511,6 +3538,11 @@ pub fn plan_block(
                 .join(", ")
         ))
     };
+    // The statement as the lookups see it: a VIRTUAL column's inlined form carries a `COLLATE` of
+    // its own too, so this only adds to what the definition as written already had.
+    let has_explicit_collate = has_explicit_collate
+        || has_collate(&*select)
+        || order_usage.as_ref().is_some_and(has_collate);
     Ok(ViewPlan {
         schema,
         name: def.name.clone(),
@@ -3566,6 +3598,7 @@ pub fn plan_block(
         output_names,
         edges,
         unit_refs: unit_refs_cols,
+        has_explicit_collate,
     })
 }
 
@@ -4274,7 +4307,7 @@ fn full_select_sql(
             );
         }
     }
-    let names: Vec<String> = def.columns.iter().map(|c| quote(c)).collect();
+    let names: Vec<String> = def.columns.iter().map(|c| quote_ident(c)).collect();
     Ok(format!(
         "WITH `_lv_cols` ({}) AS ({}) SELECT * FROM `_lv_cols`",
         names.join(", "),
@@ -4633,7 +4666,9 @@ fn read_columns(
         .collect()
 }
 
-fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+/// The `JoinConstraint` of a join operator, `None` for the operators that carry none. One owner,
+/// also read by `crate::analyzer` (its `ast` module re-exports it).
+pub(crate) fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     match op {
         JoinOperator::Join(c)
         | JoinOperator::Inner(c)
@@ -4711,42 +4746,16 @@ fn substitute_factor(
     }
 }
 
+/// A backtick-quoted identifier: the name `` a`b `` renders as `` `a``b` ``.
 pub fn quote_ident(id: &str) -> String {
-    quote(id)
+    format!("`{}`", id.replace('`', "``"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::test_catalog::{catalog, table, typed, VIEW_CORPUS};
     use crate::catalog::Column;
-
-    fn table(name: &str, cols: &[(&str, &str)], pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-        let t = TableInfo {
-            schema: "db".into(),
-            name: name.into(),
-            columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
-            pk: pk.to_vec(),
-            unique_keys: vec![],
-            cascades: vec![],
-            is_view: false,
-            view_bases: vec![],
-        };
-        (("db".into(), name.into()), Arc::new(t))
-    }
-
-    fn typed(name: &str, cols: Vec<Column>, pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-        let t = TableInfo {
-            schema: "db".into(),
-            name: name.into(),
-            columns: cols,
-            pk: pk.to_vec(),
-            unique_keys: vec![],
-            cascades: vec![],
-            is_view: false,
-            view_bases: vec![],
-        };
-        (("db".into(), name.into()), Arc::new(t))
-    }
 
     fn full_reason(sql: &str) -> String {
         match p(sql).mode {
@@ -4755,44 +4764,150 @@ mod tests {
         }
     }
 
-    fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
-        [
-            table(
-                "orders",
-                &[
-                    ("id", "int"),
-                    ("customer_id", "int"),
-                    ("status", "varchar"),
-                    ("total", "decimal"),
-                    ("note", "text"),
-                ],
-                &[0],
-            ),
-            table(
-                "customers",
-                &[("id", "int"), ("name", "varchar"), ("region_id", "int")],
-                &[0],
-            ),
-            table("regions", &[("id", "int"), ("name", "varchar")], &[0]),
-            table(
-                "order_items",
-                &[
-                    ("order_id", "int"),
-                    ("line", "int"),
-                    ("qty", "int"),
-                    ("price", "decimal"),
-                ],
-                &[0, 1],
-            ),
-            table("logs", &[("msg", "varchar")], &[]),
-        ]
-        .into_iter()
-        .collect()
-    }
-
     fn p(sql: &str) -> ViewPlan {
         let d = parse_definition(sql).unwrap();
         plan_block(&d, "db", &catalog()).unwrap()
+    }
+
+    /// The shared corpus is these tests' own statements, so they are checked here too: the
+    /// analyzer's differential test compares its plans against the block planner's, and a
+    /// statement that stopped reaching this planner would otherwise go unnoticed. Refusing one
+    /// is an outcome (some name tables this catalog has no entry for); panicking is not.
+    #[test]
+    fn every_statement_of_the_shared_corpus_is_planned() {
+        let cat = catalog();
+        for sql in VIEW_CORPUS {
+            let Ok(d) = parse_definition(sql) else {
+                continue;
+            };
+            if let Err(e) = plan_block(&d, "db", &cat) {
+                assert!(!e.to_string().is_empty(), "{sql}: refused without a reason");
+            }
+        }
+    }
+
+    /// The flag that makes a lookup bind its strings without a `COLLATE` (see `engine`): the
+    /// definition's own `COLLATE`, wherever it sits.
+    #[test]
+    fn a_definition_with_an_explicit_collate_is_marked() {
+        let cat: HashMap<_, _> = [
+            table("c", &[("id", "int"), ("name", "varchar")], &[0]),
+            table("s_bin", &[("code", "varchar")], &[0]),
+        ]
+        .into_iter()
+        .collect();
+        let marked = |cat: &HashMap<TableRef, Arc<TableInfo>>, sql: &str| {
+            crate::analyzer::plan(
+                &parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap(),
+                "db",
+                cat,
+            )
+            .unwrap()
+            .has_explicit_collate
+        };
+        assert!(
+            marked(&cat, "SELECT c.id FROM c WHERE c.name COLLATE utf8mb4_general_ci IN (SELECT b.code FROM s_bin b)"),
+            "a COLLATE of its own in the WHERE"
+        );
+        assert!(
+            !marked(
+                &cat,
+                "SELECT c.id FROM c WHERE c.name IN (SELECT b.code FROM s_bin b)"
+            ),
+            "the same view without it"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id FROM c ORDER BY c.name COLLATE utf8mb4_general_ci"
+            ),
+            "the ORDER BY counts as much as the WHERE"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id, b.code COLLATE utf8mb4_general_ci AS cd FROM c \
+                 JOIN s_bin b ON b.code COLLATE utf8mb4_general_ci = c.name"
+            ),
+            "a COLLATE in a JOIN ... ON"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id, c.name COLLATE utf8mb4_general_ci AS nm FROM c"
+            ),
+            "a COLLATE in the projection"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.name COLLATE utf8mb4_general_ci AS nm, COUNT(*) AS n FROM c \
+                 GROUP BY c.name COLLATE utf8mb4_general_ci"
+            ),
+            "a COLLATE in the GROUP BY"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id FROM c GROUP BY c.id \
+                 HAVING MAX(c.name COLLATE utf8mb4_general_ci) = 'x'"
+            ),
+            "a COLLATE in the HAVING"
+        );
+        assert!(
+            marked(
+                &cat,
+                "SELECT c.id, (SELECT b.code COLLATE utf8mb4_general_ci FROM s_bin b LIMIT 1) AS x FROM c"
+            ),
+            "a COLLATE in a standalone subquery"
+        );
+        assert!(
+            marked(
+                &cat,
+                "WITH s AS (SELECT b.code COLLATE utf8mb4_general_ci AS cd FROM s_bin b) \
+                 SELECT t.cd FROM s AS t JOIN c ON c.name = t.cd"
+            ),
+            "a COLLATE in a view wrapped in a CTE / derived table with renamed aliases"
+        );
+        // The only COLLATE comes from an inlined VIRTUAL column: its inlined string form carries
+        // an EXPLICIT collation the definition as written never shows (inline_virtual_columns).
+        let mut gn = Column::new(
+            "gn",
+            "varchar",
+            "varchar(64)",
+            Some("utf8mb4"),
+            Some("utf8mb4_bin"),
+            None,
+            true,
+        );
+        gn.generated = Some(crate::catalog::Generated {
+            expr: "(CAST(`code` AS CHAR))".into(),
+            stored: false,
+            deps: Some(vec![0]),
+        });
+        let vcat: HashMap<TableRef, Arc<TableInfo>> = [(
+            ("db".to_string(), "skus".to_string()),
+            Arc::new(TableInfo {
+                schema: "db".into(),
+                name: "skus".into(),
+                columns: vec![Column::simple("code", "varchar"), gn],
+                pk: vec![0],
+                unique_keys: vec![],
+                cascades: vec![],
+                is_view: false,
+                view_bases: vec![],
+            }),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            marked(&vcat, "SELECT gn FROM skus"),
+            "the inlined form of a VIRTUAL column carries a COLLATE of its own"
+        );
+        assert!(
+            !marked(&vcat, "SELECT code FROM skus"),
+            "the same table read without the VIRTUAL column"
+        );
     }
 
     /// Constant filters per FROM alias: `col = lit`, `lit = col`, `col <=> lit` and IN lists of

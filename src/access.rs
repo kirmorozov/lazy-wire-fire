@@ -10,7 +10,7 @@ use crate::analyze::{
     definition_hash, int_sql, is_create_statement, parse_definition, parse_select, quote_ident,
     referenced_tables, ConstFilter, Edge, Mode, ParsedDef, ViewPlan,
 };
-use crate::catalog::{FkAction, TableInfo, TableRef};
+use crate::catalog::{ColKind, Column, FkAction, TableInfo, TableRef};
 use crate::datum::Datum;
 
 /// The view's unit, by expression.
@@ -81,14 +81,18 @@ pub enum Path {
     Whole,
 }
 
-/// The id through the occurrence's link tables: its columns on the chain's edges, the matching
-/// chain columns as `alias`.`col`, the id positions the chain reaches (all: the full id), the
-/// chain's aliases (not including the occurrence) and the parameterized SELECT mapping the
-/// partner values to the id values; the key filter on the partners is appended by the executor.
+/// The SELECT reads the chain's tables only, not the occurrence's: the executor appends
+/// `AND (<partner>) IN (<link values from the occurrence's images>)`, so a link row deleted or
+/// moved in the same window still finds the ids its old value reached (the chain rows exist
+/// unless their own, traced, events removed them).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hop {
     pub link_cols: Vec<usize>,
     pub partner: Vec<String>,
+    /// The partner columns as (alias, column) ordinals, in `link_cols` order. The executor
+    /// appends `AND (<partner>) IN (<link values>)`, single- or multi-column, built and
+    /// checked against the server rules in 6R/6T.
+    pub partner_cols: Vec<(usize, usize)>,
     pub positions: Vec<usize>,
     pub aliases: Vec<usize>,
     pub select: String,
@@ -475,10 +479,19 @@ fn chain(
     Ok((c.aliases, c.links, c.positions))
 }
 
-/// The id of the occurrence through its link tables: the hop SQL maps the partner values to
-/// the id values and drops the view's other conditions (a superset of the ids, sound).
+/// The SELECT reads the chain's tables only, not the occurrence's: the executor appends
+/// `AND (<partner>) IN (<link values from the occurrence's images>)`, so a link row deleted or
+/// moved in the same window still finds the ids its old value reached (the chain rows exist
+/// unless their own, traced, events removed them).
 fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
     let c = search(p, y)?;
+    // Executor (a) refreshes the full id or the ids of one partial set (`ViewPlan::partial`).
+    if c.positions.len() != p.unit_exprs.len() && !p.partial.sets.contains(&c.positions) {
+        return Err(format!(
+            "the hop reaches id[{}], which no partial id has",
+            ordinals(&c.positions)
+        ));
+    }
     // Both sides of every edge of the chain carry binlog values that compare as their SQL
     // values do; a collation-compared link would make the step-6 cache inexact.
     for &ei in &c.edges {
@@ -487,6 +500,14 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
             || !p.aliases[e.b.0].table.columns[e.b.1].exact_key()
         {
             return Err("link compared by collation".into());
+        }
+        if (e.a.0 == y || e.b.0 == y)
+            && !same_link_type(
+                &p.aliases[e.a.0].table.columns[e.a.1],
+                &p.aliases[e.b.0].table.columns[e.b.1],
+            )
+        {
+            return Err("link columns of different types".into());
         }
     }
     let qcol = |al: usize, col: usize| {
@@ -503,8 +524,10 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
         .collect();
     let mut sel = partner.clone();
     sel.extend(c.positions.iter().map(|&i| p.unit_exprs[i].clone()));
-    let from: Vec<String> = std::iter::once(y)
-        .chain(c.aliases.iter().copied())
+    let from: Vec<String> = c
+        .aliases
+        .iter()
+        .copied()
         .map(|al| {
             let a = &p.aliases[al];
             format!(
@@ -518,6 +541,7 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
     let mut where_parts: Vec<String> = c
         .edges
         .iter()
+        .filter(|&&ei| p.edges[ei].a.0 != y && p.edges[ei].b.0 != y)
         .map(|&ei| {
             let e = &p.edges[ei];
             format!("{} = {}", qcol(e.a.0, e.a.1), qcol(e.b.0, e.b.1))
@@ -535,15 +559,52 @@ fn hop(p: &ViewPlan, y: usize) -> Result<Hop, String> {
     Ok(Hop {
         link_cols: c.links.iter().map(|&(col, _)| col).collect(),
         partner,
+        partner_cols: c.links.iter().map(|&(_, pc)| pc).collect(),
         positions: c.positions,
         aliases: c.aliases,
         select: format!(
             "SELECT DISTINCT {} FROM {} WHERE {}",
             sel.join(", "),
             from.join(", "),
-            where_parts.join(" AND ")
+            if where_parts.is_empty() {
+                "TRUE".to_string()
+            } else {
+                where_parts.join(" AND ")
+            }
         ),
     })
+}
+
+/// Whether a link column and its partner decode to equal datums for equal SQL values (the hop
+/// cache keys answers by the partner's query values and looks them up by the link's binlog
+/// values): the same decoded kind (the binlog decoder's [`ColKind`], `unsigned` included),
+/// never JSON, the BLOB family or the spatial / opaque types.
+fn same_link_type(a: &Column, b: &Column) -> bool {
+    const INTS: [&str; 6] = [
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "int",
+        "integer",
+        "bigint",
+    ];
+    // The decoded kind decides: a signed and an unsigned integer are different kinds, so an
+    // `int` vs `int unsigned` pair is not one type class.
+    if a.kind != b.kind {
+        return false;
+    }
+    // JSON, BLOB-family and spatial / opaque columns never key the hop cache: their binlog and
+    // query representations differ (or cannot be bound back at all), so such a link keeps the
+    // viewplan route and the JSON key-part rule cannot arise.
+    if matches!(a.kind, ColKind::Json | ColKind::Binary | ColKind::Opaque) {
+        return false;
+    }
+    let int = |c: &Column| match &c.kind {
+        ColKind::Plain => INTS.iter().any(|t| c.data_type.eq_ignore_ascii_case(t)),
+        ColKind::Unsigned(_) => true,
+        _ => false,
+    };
+    (int(a) && int(b)) || a.data_type.eq_ignore_ascii_case(&b.data_type)
 }
 
 /// One access per cascading foreign key of the plan, in `ViewPlan.cascades` order; the
@@ -845,51 +906,13 @@ impl std::fmt::Display for AccessPlan {
 mod tests {
     use super::*;
     use crate::analyze::{parse_definition, plan_block};
-    use crate::catalog::{Column, TableInfo};
-    use std::collections::HashMap;
+    use crate::catalog::test_catalog::linked_catalog;
+    use crate::catalog::Column;
     use std::sync::Arc;
-
-    fn table(name: &str, cols: &[(&str, &str)], pk: &[usize]) -> (TableRef, Arc<TableInfo>) {
-        let t = TableInfo {
-            schema: "db".into(),
-            name: name.into(),
-            columns: cols.iter().map(|(n, ty)| Column::simple(n, ty)).collect(),
-            pk: pk.to_vec(),
-            unique_keys: vec![],
-            cascades: vec![],
-            is_view: false,
-            view_bases: vec![],
-        };
-        (("db".into(), name.into()), Arc::new(t))
-    }
-
-    fn catalog() -> HashMap<TableRef, Arc<TableInfo>> {
-        [
-            table(
-                "items",
-                &[("id", "int"), ("kind_id", "int"), ("owner_id", "int")],
-                &[0],
-            ),
-            table("kinds", &[("id", "int"), ("name", "varchar")], &[0]),
-            table(
-                "item_values",
-                &[("item_id", "int"), ("key_id", "int"), ("val", "int")],
-                &[0, 1],
-            ),
-            table("owners", &[("id", "int"), ("name", "varchar")], &[0]),
-            table(
-                "item_links",
-                &[("child_id", "int"), ("parent_id", "int")],
-                &[0, 1],
-            ),
-        ]
-        .into_iter()
-        .collect()
-    }
 
     fn plan(sql: &str) -> ViewPlan {
         let d = parse_definition(&format!("CREATE VIEW v AS {sql}")).unwrap();
-        plan_block(&d, "db", &catalog()).unwrap()
+        plan_block(&d, "db", &linked_catalog()).unwrap()
     }
 
     #[test]
@@ -1060,15 +1083,12 @@ mod tests {
                     h.select
                 );
                 assert!(
-                    h.select.ends_with("WHERE `l`.`parent_id` = `i`.`kind_id`"),
+                    h.select.ends_with("FROM `db`.`items` AS `i` WHERE TRUE"),
                     "{}",
                     h.select
                 );
-                assert!(
-                    h.select.contains("AS `l`, `db`.`items` AS `i`"),
-                    "{}",
-                    h.select
-                );
+                assert!(!h.select.contains("`item_links`"), "{}", h.select);
+                assert_eq!(h.partner_cols, vec![(0, 1)]);
             }
             other => panic!("expected a hop, got {other:?}"),
         }
@@ -1089,10 +1109,11 @@ mod tests {
                 assert_eq!(h.partner, vec![r#"`l`.`child_id`"#.to_string()]);
                 assert_eq!(h.positions, vec![0]);
                 assert!(
-                    h.select.contains("`o`.`id` = `l`.`child_id`"),
+                    !h.select.contains("`o`.`id` = `l`.`child_id`"),
                     "{}",
                     h.select
                 );
+                assert!(!h.select.contains("`owners`"), "{}", h.select);
                 assert!(
                     h.select.contains("`l`.`parent_id` = `i`.`kind_id`"),
                     "{}",
@@ -1122,7 +1143,7 @@ mod tests {
                 lookup_where: false,
             }
         };
-        let cat = catalog();
+        let cat = linked_catalog();
         let i = cat[&("db".into(), "items".into())].clone();
         let l = cat[&("db".into(), "item_links".into())].clone();
         let o = cat[&("db".into(), "owners".into())].clone();
@@ -1151,7 +1172,10 @@ mod tests {
             window_sql: None,
             lookup_where_sql: None,
             alias_filters: vec![vec![], vec![], vec![]],
-            partial: crate::analyze::PartialUnits::default(),
+            partial: crate::analyze::PartialUnits {
+                sets: vec![vec![0]],
+                aliases: vec![Some((0, vec![0])), None, None],
+            },
             presence: vec![],
             edges: vec![
                 // `l` joins to `i` (usable for every occurrence).
@@ -1168,6 +1192,7 @@ mod tests {
                 },
             ],
             unit_refs: vec![vec![(0, 0)], vec![(2, 0)]],
+            has_explicit_collate: false,
         }
     }
 
@@ -1188,6 +1213,97 @@ mod tests {
             }
             other => panic!("expected a hop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hop_positions_need_a_partial_set() {
+        // The chain of `l` reaches one of the two id parts and no partial id has that set:
+        // executor (a) could not refresh it, so the hop is refused and the view keeps the
+        // viewplan route.
+        let mut v = partial_plan();
+        v.partial = crate::analyze::PartialUnits::default();
+        let ap = AccessPlan::of(&v);
+        match &ap.occurrences[1].path {
+            Path::Untraced { reason } => {
+                assert!(reason.contains("which no partial id has"), "{reason}");
+            }
+            other => panic!("expected an untraced occurrence, got {other:?}"),
+        }
+        assert!(matches!(ap.route, Route::ViewPlan { .. }), "{ap}");
+    }
+
+    #[test]
+    fn hop_select_leaves_out_the_occurrence() {
+        // The SELECT reads the chain's tables only: it never names the occurrence's own
+        // `AS <alias>` and its partner columns parallel `partner`.
+        let views = [
+            "SELECT i.id, l.child_id FROM items i JOIN item_links l ON l.parent_id = i.kind_id",
+            "SELECT i.id, MAX(o.name) n FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = l.child_id GROUP BY i.id",
+            "SELECT i.id, MAX(o.name) n FROM items i JOIN item_values v ON v.item_id = i.id \
+             JOIN item_links l ON l.child_id = v.key_id JOIN owners o ON o.id = l.parent_id \
+             GROUP BY i.id",
+            "SELECT i.id, l.child_id, o.name FROM items i JOIN item_links l ON l.parent_id = i.kind_id \
+             JOIN owners o ON o.id = i.owner_id",
+        ];
+        let mut hops = 0usize;
+        for sql in views {
+            let ap = AccessPlan::of(&plan(sql));
+            for o in &ap.occurrences {
+                if let Path::Hop(h) = &o.path {
+                    hops += 1;
+                    assert!(
+                        !h.select.contains(&format!("AS `{}`", o.alias)),
+                        "the SELECT of {} names the occurrence `{}`: {}",
+                        sql,
+                        o.alias,
+                        h.select
+                    );
+                    assert_eq!(h.partner_cols.len(), h.partner.len(), "{:?}", h.select);
+                }
+            }
+        }
+        assert!(hops >= 4, "expected hops on these views, got {hops}");
+    }
+
+    #[test]
+    fn link_types() {
+        // The hop cache keys answers by the partner's query values and looks them up by the
+        // link's binlog values: the pair must decode equal datums, i.e. the same decoded kind
+        // (unsigned included) and both integers or the same data type.
+        assert!(same_link_type(
+            &Column::simple("a", "int"),
+            &Column::simple("b", "bigint")
+        ));
+        assert!(same_link_type(
+            &Column::simple("a", "varchar"),
+            &Column::simple("b", "varchar")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "int"),
+            &Column::simple("b", "decimal")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "int"),
+            &Column::simple("b", "varchar")
+        ));
+        // The binlog decodes a signed and an unsigned integer into different kinds.
+        let unsigned = |n: &str| Column::new(n, "int", "int(11) unsigned", None, None, None, false);
+        assert!(!same_link_type(&Column::simple("a", "int"), &unsigned("b")));
+        assert!(same_link_type(&unsigned("a"), &unsigned("b")));
+        // JSON, BLOB-family and spatial columns never key the hop cache.
+        assert!(!same_link_type(
+            &Column::simple("a", "json"),
+            &Column::simple("b", "json")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "blob"),
+            &Column::simple("b", "blob")
+        ));
+        assert!(!same_link_type(
+            &Column::simple("a", "point"),
+            &Column::simple("b", "point")
+        ));
     }
 
     /// Three aliases `i` (0), occurrence `l` (1) and `o` (2), with the given id parts and
@@ -1243,6 +1359,7 @@ mod tests {
             presence: vec![],
             edges,
             unit_refs,
+            has_explicit_collate: false,
         }
     }
 
@@ -1250,7 +1367,7 @@ mod tests {
     fn search_keeps_two_links_on_one_id_column() {
         // Both edges sit on `l.child_id` (col 0) with different partners: the link dedup must
         // keep both; only a true duplicate of the pair would be dropped.
-        let c = catalog();
+        let c = linked_catalog();
         let pick = |t: &str| c[&("db".into(), t.into())].clone();
         let p = three_alias_plan(
             pick("items"),
@@ -1280,7 +1397,7 @@ mod tests {
     fn search_rejects_a_chain_that_covers_no_id_part() {
         // `l` reaches `i` (one link), but every id part also reads the unreachable `o`:
         // no position survives, so the chain cannot stand for the id.
-        let c = catalog();
+        let c = linked_catalog();
         let pick = |t: &str| c[&("db".into(), t.into())].clone();
         let p = three_alias_plan(
             pick("items"),
@@ -1303,7 +1420,7 @@ mod tests {
     fn hop_rejects_a_link_compared_by_collation() {
         // `o.ts` (timestamp) is not an exact key: a link whose one side is inexact must fail
         // even when the other side is exact.
-        let c = catalog();
+        let c = linked_catalog();
         let pick = |t: &str| c[&("db".into(), t.into())].clone();
         let o = Arc::new(TableInfo {
             schema: "db".into(),
@@ -1359,7 +1476,7 @@ mod tests {
             "CREATE VIEW v AS SELECT i.id FROM items i WHERE i.id NOT IN (SELECT id FROM kinds k)",
         )
         .unwrap();
-        let v = crate::analyze::plan(&d, "db", &catalog()).unwrap();
+        let v = crate::analyze::plan(&d, "db", &linked_catalog()).unwrap();
         let ap = AccessPlan::of(&v);
         let semi = ap
             .occurrences
@@ -1508,7 +1625,7 @@ mod tests {
                     h.select
                 );
                 assert!(
-                    h.select.contains("`o`.`id` = `l`.`parent_id`"),
+                    !h.select.contains("`o`.`id` = `l`.`parent_id`"),
                     "{}",
                     h.select
                 );
@@ -1546,7 +1663,7 @@ mod tests {
     #[test]
     fn explain_pins_cascade_traced_directly() {
         use crate::catalog::{FkAction, ForeignKey};
-        let cat = catalog();
+        let cat = linked_catalog();
         let mut i = (*cat[&("db".into(), "item_values".into())]).clone();
         let fk = |parent: &str, cols: Vec<usize>, pcols: &[&str]| ForeignKey {
             parent: ("db".into(), parent.into()),
@@ -1592,7 +1709,7 @@ mod tests {
     #[test]
     fn explain_pins_traced_cascade() {
         use crate::catalog::{FkAction, ForeignKey};
-        let cat = catalog();
+        let cat = linked_catalog();
         let mut i = (*cat[&("db".into(), "items".into())]).clone();
         i.cascades = vec![ForeignKey {
             parent: ("db".into(), "kinds".into()),
@@ -1657,7 +1774,7 @@ mod tests {
                 keys_marker: None,
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap();
         assert!(
@@ -1688,12 +1805,12 @@ mod tests {
             names: &["_key"],
             keys_marker: m,
         };
-        let plain = plan_access(base, id(None), "db", &catalog()).unwrap();
+        let plain = plan_access(base, id(None), "db", &linked_catalog()).unwrap();
         let with = plan_access(
             &format!("{base} WHERE i.id IN (:keys)"),
             id(Some(":keys")),
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap();
         assert_eq!(with.plan.where_sql, None);
@@ -1718,7 +1835,7 @@ mod tests {
                 keys_marker: Some(":keys"),
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         );
         assert!(p.is_ok(), "{:?}", p.err());
     }
@@ -1734,7 +1851,7 @@ mod tests {
                 keys_marker: Some(":keys"),
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap_err()
         .to_string();
@@ -1746,7 +1863,7 @@ mod tests {
                 keys_marker: Some(":keys"),
             },
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap_err()
         .to_string();
@@ -1781,7 +1898,7 @@ mod tests {
             "CREATE VIEW v AS SELECT i.id FROM items i",
             IdSpec::Unit,
             "db",
-            &catalog(),
+            &linked_catalog(),
         )
         .unwrap();
         let want = AccessPlan::of(&plan("SELECT i.id FROM items i"));
