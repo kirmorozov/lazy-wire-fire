@@ -85,6 +85,37 @@ twox-hash = { version = "2.1", default-features = false, features = ["std", "xxh
 # aws-lc-rs and cmake). The `rustls` feature is the TLS; CBS (claims-based security) is built on
 # the bare link primitives here, in src/servicebus.rs.
 fe2o3-amqp = { version = "0.14", default-features = false, features = ["rustls"] }
+# The gRPC call itself (src/grpc/stream.rs): tonic's generic client over the hyper/rustls
+# transport. Default features off; `channel` is the client half of the transport. TLS goes
+# through a connector on src/tls.rs (so lazywf's CA, verify mode and server name apply, and
+# ring stays the only libcrypto here): tonic's own tls-* stay unneeded. `gzip` and `zstd`
+# are for reading a server that compresses its answers; lazywf's own compression is applied
+# per message above the size threshold (see stream.rs).
+tonic = { version = "0.14", default-features = false, features = [
+    "channel",
+    "gzip",
+    "zstd",
+] }
+# The prost codec for the static contract types (Envelope out, Acks in).
+tonic-prost = { version = "0.14", default-features = false }
+# The wire pieces the compression service between the gRPC layer and the channel speaks:
+# the framed bodies, the two codecs, and the hyper glue for the connector on src/tls.rs.
+# Same versions the rest of the tree builds on (hyper, lapin, rskafka).
+bytes = "1"
+http = "1"
+http-body = "1"
+# The body combinators: the compression service collects response excerpts and
+# the tests read framed bodies back.
+http-body-util = "0.1"
+tower-service = "0.3"
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tokio-stream = "0.1"
+flate2 = "1"
+zstd = { version = "0.14", default-features = false }
+# Tests only: the gRPC e2e (tests/grpc_stream.rs) answers with a hand-rolled h2
+# server, so it can reply plain HTTP statuses, drop trailers and reset streams
+# mid-call, none of which a real gRPC framework server lets you do.
+h2 = "0.4"
 # AWS credentials and SigV4 (src/aws.rs). Default features off: aws-config's defaults bring
 # aws-lc and cmake; the HTTP client is the rustls-ring one, passed in.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }

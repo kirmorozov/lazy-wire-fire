@@ -1,5 +1,8 @@
-//! Test harness: a schema per test, the engine running in-process, a scriptable HTTP target.
+//! Test harness: a schema per test, the engine running in-process, a scriptable HTTP target, and
+//! the in-process gRPC server of [`grpc_server`].
 #![allow(dead_code)]
+
+pub mod grpc_server;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
