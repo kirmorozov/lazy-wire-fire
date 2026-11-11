@@ -13,7 +13,8 @@ action), an Amazon Kinesis stream (one `PutRecords` per action), an AWS Lambda f
 Amazon SNS topic (one `PublishBatch` per action), a Google Cloud Pub/Sub topic (one `publish`
 per action), an AMQP broker (one publish per action),
 an SMTP server (one mail per action), a Kafka-protocol broker (one produce of a batch of records
-per action), Redis (one command), or MySQL / PostgreSQL (one SQL statement).
+per action), an Azure Service Bus queue or topic (one batch of messages per action), Redis (one
+command), or MySQL / PostgreSQL (one SQL statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
 knows nothing about any application: everything it does is rows in four tables. It reads the
@@ -274,7 +275,7 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 
 | target | `kind` | endpoint | one action is | per-key answer | stray cleanup | credentials | tested against |
 |---|---|---|---|---|---|---|---|
-| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]` | one HTTP request, optionally signed ([webhook signing](docs/reference.md#webhook-signing)) | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference; the signing secret `vars.sign_secret_ref`: a reference only | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
+| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]`, or, for these four kinds, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](docs/reference.md#secret-http-endpoints)) | one HTTP request, optionally signed ([webhook signing](docs/reference.md#webhook-signing)) | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference; the signing secret `vars.sign_secret_ref`: a reference only | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
 | S3 API | `http.s3` ([targets](docs/reference.md#targets)) | the service URL, optional (derived from `vars` when empty) | one signed S3 request | for the action | allowed | `access_key_ref` / `secret_key_ref` (references only; optional `session_token_ref`), else the [AWS default chain](docs/reference.md#aws-credentials) | versitygw 1.10 — CI |
 | Redis / Valkey, Streams included | `redis` ([targets](docs/reference.md#targets)) | `host:port/db` (or `redis://` / `rediss://`) | one Redis command | for the action | allowed | `vars.password`, optional `vars.username` for ACLs: a literal or a reference | Redis 7.4, Valkey 8.1 — CI |
 | MySQL / MariaDB | `mysql` (also `mariadb`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | MySQL 8.4 — CI |
@@ -288,6 +289,7 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 | SMTP server | `smtp` ([SMTP targets](docs/reference.md#smtp-targets)) | `smtp(s)://host[:port]` (587 / 465 by default) | one mail | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | Mailpit 1.33 — CI (release gate) |
 | Google Cloud Pub/Sub | `pubsub` ([Pub/Sub targets](docs/reference.md#pubsub-targets)) | `gc-pubsub://<project>/<topic>` | one `topics.publish` | for the action | refused at load (append-only; publish-only reset steps) | `vars.credentials_ref` (reference only), else Application Default Credentials; never in the URL | the Pub/Sub emulator — CI (release gate) |
 | Kafka-protocol broker (Apache Kafka, Redpanda, MSK, Event Hubs) | `kafka` ([Kafka targets](docs/reference.md#kafka-targets)) | `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` | one produce of a batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.sasl` (`plain`, `scram-sha-256`, `scram-sha-512`) with `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | Redpanda 26.1.20 — CI (release gate) |
+| Azure Service Bus (queues, topics) | `servicebus` ([Service Bus targets](docs/reference.md#service-bus-targets)) | `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (a local broker: `sb://<host>:<port>/<address>`) | one batch of messages over AMQP 1.0, TLS on 5671, a disposition awaited per message | per message, per key | refused at load (append-only; a listing is refused too) | `vars.key_name` with `vars.key` (a reference only) for a SAS token over `$cbs`, or `vars.username` with `vars.password` (a reference only) for SASL PLAIN on a broker without CBS; no Entra ID; never in the URL | RabbitMQ 4.3 answering AMQP 1.0 on its 5672 (SASL PLAIN; no local broker has a `$cbs` node) — CI (release gate) |
 
 The append-only kinds and `lambda` refuse a stray cleanup at load, and `sqs` / `kinesis` /
 `eventbridge` / `sns` / `pubsub` refuse purge-like or non-publishing reset steps; no other kind
@@ -302,7 +304,7 @@ make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: M
 make test-matrix               # every other blocking line of "Supported servers", one at a time
 make test-prerelease           # the advisory MariaDB 13.1 RC and 13.2 preview
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
-make test-e2e-queues           # SQS, Kinesis, AMQP, Pub/Sub, SMTP, Kafka, EventBridge and SNS against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka, eventbridge and sns compose profiles)
+make test-e2e-queues           # SQS, Kinesis, AMQP, Service Bus, Pub/Sub, SMTP, Kafka, EventBridge and SNS against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka, eventbridge and sns compose profiles; the servicebus flows ride the amqp profile's RabbitMQ, whose listener answers AMQP 1.0 too)
 make coverage                  # unit tests + e2e under cargo-llvm-cov 0.9.1 into tmp/coverage (informational, not a gate)
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
@@ -321,8 +323,8 @@ Docker for the test servers.
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
 lint, unit tests, the integration suite on the default servers (Varnish included), on every other
 server (one runner each, pre-releases advisory), with the search engines, with the queue
-emulators (SQS, Kinesis, AMQP, Pub/Sub, SMTP, Kafka (Redpanda), EventBridge (moto) and SNS
-(moto)), and the image for both platforms. Two jobs run on narrower
+emulators (SQS, Kinesis, AMQP, Service Bus, Pub/Sub, SMTP, Kafka (Redpanda), EventBridge (moto)
+and SNS (moto)), and the image for both platforms. Two jobs run on narrower
 triggers: the `coverage (informational)` job (pull requests and pushes to `main`; the table in the
 job summary, the lcov and HTML in the `coverage` artifact for 14 days) and the weekly
 `lazyview drift (advisory)` job (`scripts/sync-lazyview.sh --drift`, a warning per drifted file,

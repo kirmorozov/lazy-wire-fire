@@ -25,16 +25,19 @@ object.
 SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
 Lambda function, below), `eventbridge` (SigV4, an Amazon EventBridge event bus, below), `sns`
 (SigV4, an Amazon SNS topic, below), `amqp` (an AMQP 0-9-1
-broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `sns`: exactly one: `aws-sns://[<region>/]<account-id>/<topic-name>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). An action goes to every endpoint |
-| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets)) |
+broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `servicebus` (an Azure Service Bus queue or topic over AMQP 1.0, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path), or, for the four plain http kinds only, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](#secret-http-endpoints)). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `sns`: exactly one: `aws-sns://[<region>/]<account-id>/<topic-name>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). `servicebus`: exactly one: `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (no credentials in the URL, TLS on port 5671, the local-broker form: below). An action goes to every endpoint |
+| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets); `servicebus` takes them all but refuses `disabled` on a `servicebus.windows.net` endpoint and any `tls.server_name`: [below](#service-bus-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
 
 A credential in `vars` is a literal or a reference: `env:NAME`, or `file:/path` (trailing newline
 dropped, read on every use so rotated secrets apply). References are recommended when other users
-can read the database.
+can read the database. For the four plain http kinds an `endpoints` entry may be a reference too,
+and there it is the **whole** URL — for an incoming webhook the URL below the host *is* the
+credential: [secret http endpoints](#secret-http-endpoints). Every other kind refuses a reference
+endpoint at load: it takes its address in plain text and keeps its credentials in `vars`.
 
 **`http.s3`**: `vars.bucket`, `vars.region`, optional `vars.endpoint` (MinIO, R2, …),
 `vars.path_style` (default false: virtual-hosted, `bucket.host`), `vars.access_key_ref`,
@@ -109,6 +112,13 @@ is TLS), without credentials: `vars.sasl` (`plain`, `scram-sha-256` or `scram-sh
 or no SASL at all for an anonymous connection. One action is one produce of a batch of records,
 record *i* answered by key *i*: [below](#kafka-targets).
 
+**`servicebus`**: the endpoint is the queue or topic, as
+`sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (exactly one, AMQP 1.0 over TLS on
+port 5671, no credentials in the URL). Credentials are one SAS rule: `vars.key_name` with
+`vars.key` (a reference, never a literal), put to the connection's `$cbs` node; Microsoft Entra
+ID is not supported. One action is one batch of messages, a disposition awaited for every
+message, message *i* answered by key *i*: [below](#service-bus-targets).
+
 **The `aws-sqs://`, `aws-kinesis://`, `aws-lambda://`, `aws-eventbridge://` and `aws-sns://` URL
 form** (the `endpoints` of the kinds `sqs`, `kinesis`, `lambda`, `eventbridge` and `sns`, and of
 no other kind):
@@ -148,6 +158,52 @@ no other kind):
 The same rules, minus the region in the URL, hold for `pubsub`'s `gc-pubsub://` endpoint: no
 userinfo, and a `gc-pubsub://` URL is for `kind pubsub` only (and `pubsub` takes only that
 scheme); `?endpoint=` there is the only query parameter.
+
+`servicebus`'s `sb://` endpoint follows the same rules with no query parameter at all: no
+userinfo, no query string and no fragment, and a `sb://` URL is for `kind servicebus` only (and
+`servicebus` takes only that scheme).
+
+### Secret http endpoints
+
+For the four plain http kinds (`http`, `http.basic`, `http.bearer`, `http.header`) an entry of
+`endpoints` may itself be a reference — `env:NAME` or `file:/path` — whose value is the **whole**
+http(s) URL. It is for an incoming webhook whose path or query *is* the credential (Slack,
+Microsoft Teams Workflows, Google Chat, Discord), where keeping the origin in `endpoints` and
+putting the secret path in the template leaves the credential in a plain column that anyone who
+can read the rule table can see. No other kind takes a reference endpoint: it names its address
+in plain text and keeps its secrets in `vars`, so a reference there would only hide the address.
+
+* **The value is a full URL**: `http://host/…` or `https://host/…`. Userinfo
+  (`https://user:pass@host/x`) is a load error — a credential belongs in the target's `vars`, and
+  here it would be a second secret; so are a fragment, a space or a control character in the path
+  or query, and a host or port that does not parse. A refusal names the reference and never the
+  value it holds.
+* **Confined like any other secret reference**: the file must resolve (symlinks followed) inside
+  `LAZYWF_SECRET_DIRS` (default `/run/secrets:/var/run/secrets`) and `env:` may not name a
+  `LAZYWF_*` variable ([Security](#security)).
+* **Resolved on every request**, so rewriting the file *is* the rotation: the next request uses
+  the new URL, with no reload and no restart, and the value is not kept between requests (the
+  keep-alive pool is keyed by the origin, never by the URL).
+* **Nothing below the origin gets out**: the log at every `RUST_LOG` level, `/status`, a rule's
+  `last_error` and the template's `endpoint.*` show the scheme, the host, the port and an
+  ellipsis — `https://hooks.example.test/…`. `endpoint.url` is that string; `endpoint.host` and
+  `endpoint.port` are the origin's. The path and the query reach only the bytes of the request
+  line, written as they are sent.
+* **`LAZYWF_ALLOWED_HOSTS` checks the resolved host** of every request, not the reference
+  ([Security](#security)): a rewritten file cannot move a target to a host the operator did not
+  allow, and such a host is refused, not waited out.
+* **How the request line is made**: `POST /` asks for the endpoint itself, so the URL is called
+  exactly as given, with no stray trailing slash; any other target goes *below* the endpoint's
+  path (`/media/1.png` on `https://hooks.example.test/hooks/a` is requested as
+  `/hooks/a/media/1.png`); the endpoint's query comes last, joined with `&` to a query the
+  template wrote; `*` stays `*`. The endpoint's path is no prefix: a base URL's `/prefix` is put
+  in front of every path, whereas here the path belongs to the request line.
+
+So the recommended form of an incoming webhook is `endpoints = 'file:/run/secrets/slack_webhook'`,
+the file holding `https://hooks.example.test/services/T00000000/B00000000/PLACEHOLDER-TOKEN`, and
+`POST / HTTP/1.1` in the template ([the Slack recipe](recipes.md#slack-post-to-a-channel),
+[Teams](recipes-apps.md#microsoft-teams-post-to-a-channel) and
+[Google Chat](recipes-apps.md#google-chat-post-to-a-space)).
 
 ### AWS credentials
 
@@ -809,6 +865,95 @@ so the image grows no native Kafka dependency.
   last state. One key's records keep their order (one key, one partition); across keys no order
   is guaranteed.
 
+### Service Bus targets
+
+`servicebus` writes to an Azure Service Bus queue or topic over AMQP 1.0: one action is one batch
+of messages sent over one sender link, with a disposition awaited for every transfer, so the
+kind's answer is per item and not per action. The client is `fe2o3-amqp`, pure Rust, so the image
+grows no native AMQP dependency.
+
+* **The endpoint.** `sb://<namespace>.servicebus.windows.net/<queue-or-topic>`: exactly one per
+  target (a batch is answered per item, which the engine sends to a single endpoint, as `kafka`,
+  `sqs` and `sns` do), AMQP 1.0 over TLS on port 5671, always. No credentials in the URL (a `@`
+  is a load error: they belong in `vars`), no query string, no fragment, and no
+  `tls.server_name` (the endpoint's own host is the one checked). The entity is 1 to 260 letters,
+  digits, `-`, `.` or `_`, does not start with `$` (the system nodes) and carries no
+  `/subscriptions/` segment: a sender writes to the topic and the namespace fans the copy out.
+  The target creates nothing: a queue or topic that is not there refuses the target (below).
+  The endpoint context names the entity (`endpoint.entity`) next to `host`, `port` and `url`, and
+  [LAZYWF_ALLOWED_HOSTS](#security) matches the host.
+* **The local broker.** Any host that is not `<namespace>.servicebus.windows.net` is the override
+  for tests and self-hosted brokers — `sb://<host>:<port>/<address>`, the integration suite
+  pointing it at its own RabbitMQ — where the path is the AMQP 1.0 address the broker is
+  given verbatim (its leading `/` kept, `%` allowed for a percent-encoded segment: RabbitMQ's own
+  form is `/queues/<name>`) and `tls: disabled` is allowed. The `$` and subscription refusals
+  stand there too, so a typo cannot reach a system node.
+* **Credentials: a SAS rule.** `vars.key_name` (the authorization rule name) together with
+  `vars.key` (the key: a reference, `env:` or `file:`, never a literal; one without the other is
+  a load error). The token is put to the connection's `$cbs` node and refreshed before it
+  expires, and the key is resolved on every put, so a rotated secret file applies at the next
+  refresh. **Microsoft Entra ID is not supported** by this kind. For a broker that speaks
+  AMQP 1.0 but not CBS, `vars.username` (a reference or a literal) with `vars.password` (a
+  reference, never a literal) select SASL PLAIN instead; the two forms cannot be combined (Service
+  Bus accepts CBS only on a SASL ANONYMOUS handshake) and neither at all means an anonymous
+  connection, which only the local override may use.
+* **The rendered action.** One action, one batch: the template renders `POST /` with a body of
+
+  ```text
+  POST / HTTP/1.1
+  Content-Type: application/json
+
+  {"messages": [{"value": …, "session": "orders-7", "properties": {"op": "upsert"}}, {"value": …}]}
+  ```
+
+  Message *i* takes the document key `keys[i]`: its `value` (one JSON value, serialized compactly
+  into an AMQP Data section with `content_type: application/json` and a durable header; null is
+  refused — render an empty object for a delete), its optional `session` and its optional
+  `properties` (string to string: the application properties). A message carries `value`,
+  `session` and `properties` only, and the messages' count must match the keys'. A `once` reset
+  step has no keys, so its messages are keyless. A blank render sends nothing; a body that is not
+  that JSON is refused.
+* **Sessions.** `vars.session` states that the entity takes sessions; then every message must
+  render its `session` — the AMQP group id, what the entity groups by — or that one message is
+  refused while its neighbours go through.
+* **Size.** The most one message takes is the entity's maximum message size, 256 KiB by default,
+  raised per target by `vars.max_message_size` to the entity's own limit (1 to 104857600 bytes:
+  100 MiB, the biggest tier's). A `value` over it is refused on its own, before anything goes on
+  the wire. The same number bounds the batch: with `fire_per = batch`, a `batch_max_bytes` above
+  the target's limit does not load, and a batch the link's own limits will not take is halved and
+  sent again, as for `kafka`.
+* **Duplicate detection.** `vars.dedup` (off by default) gives every message the `MessageId`
+  `hex(sha256(key + NUL + value))`, which is what the entity's own duplicate-detection window
+  filters on. It is opt-in: a document that legitimately returns to an earlier value inside that
+  window would otherwise be dropped as a duplicate.
+* **Outcomes.** An `Accepted` disposition is the only answer that counts as sent: `expect` then
+  sees, per message, `body` `{"entity": …, "message_id": …}` (no `expect`: met), and a message
+  whose condition is not met is refused on its own. A `Rejected` whose condition is a verdict on
+  that message — `amqp:link:message-size-exceeded`, `amqp:decode-error`, `amqp:invalid-field` —
+  refuses that message alone. Everything else is transient, because nothing there says the message
+  did not arrive: `Released`, `Modified`, a server-busy or throttling condition, a condition this
+  kind does not know, a timeout with no disposition, a missing ack, a lost link. Only a positive
+  verdict about a message costs that key a strike. A missing entity or an attach refused for lack
+  of the Send right (`amqp:not-found`, `amqp:unauthorized-access`) refuses the **whole target**
+  once per attempt — the target creates no entities and holds no rights — and so does a CBS reply
+  that refuses the token (400, 401, 403 or 404: a malformed token, a wrong key or rule name, no
+  right, an unknown audience, none of which a retry can fix) and a failed SASL PLAIN handshake;
+  any other CBS reply (5xx, a malformed answer, 408 or 429) says nothing about the token and stays
+  transient.
+* **One send at a time.** One connection and one sender link per endpoint, held across actions
+  behind the endpoint's lock, so one action at a time per endpoint (as `kafka` and `amqp` hold
+  theirs) while different targets and rules run in parallel. Any failure that leaves the state
+  unknown drops the connection: the next action reconnects, re-puts the token and re-attaches.
+  Every step of an action is bounded by the target's `timeout_ms`.
+* **Reset steps.** The kind only appends: a message sent cannot be recalled and the target cannot
+  list keys, so a `for_each: stray` step does not load. Still allowed: `once` (one batch of
+  keyless messages, an announcement for example), `for_each: snapshot` (every key sent again, as
+  new messages) and `reset_requested`.
+* **Contract.** The entity receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: a message can arrive twice (a retry after an answer that never came,
+  a snapshot reset), so a reader keeps the newest message per key. Several changes of one key
+  within the debounce window arrive as one message, and a delete is the key's last state.
+
 ## Rules
 
 `lazy_wire_fire_rule`
@@ -820,7 +965,7 @@ so the image grows no native Kafka dependency.
 | `selects` | zero or more queries: SQL separated by `;`, or a JSON array of strings or `{"name", "sql"}`. Each returns `_key` plus [path-named columns](#documents-from-path-named-columns) and uses `:keys` for the changed keys (`WHERE id IN (:keys)`). They run concurrently, each on its own connection |
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
-| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge`, `sns` and `kafka` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [SNS targets](#sns-targets), [Kafka targets](#kafka-targets)) |
+| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge`, `sns`, `kafka` and `servicebus` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [SNS targets](#sns-targets), [Kafka targets](#kafka-targets), [Service Bus targets](#service-bus-targets)) |
 | `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
 is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
 5242880 ([Kinesis targets](#kinesis-targets)). `eventbridge`: `batch_max_keys` is required with
@@ -832,7 +977,9 @@ is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` ca
 `fire_per = batch` and holds 1 to 1000, and `batch_max_bytes` cannot exceed 10000000
 ([Pub/Sub targets](#pubsub-targets)). `kafka`: `batch_max_bytes` cannot exceed the target's
 produce limit, the broker's `message.max.bytes` (1 MiB by default) raised by its
-`vars.message_max_bytes` ([Kafka targets](#kafka-targets)) |
+`vars.message_max_bytes` ([Kafka targets](#kafka-targets)). `servicebus`: `batch_max_bytes`
+cannot exceed the target's entity message size, 262144 (256 KiB) by default, raised by its
+`vars.max_message_size` up to 104857600 ([Service Bus targets](#service-bus-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
 | `reset_steps` | JSON array, [below](#reset-steps) |
 | `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded |
@@ -949,7 +1096,7 @@ Handlebars, never HTML-escaped. Context:
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `sns` also `topic`, `topic_arn`, `region` and `fifo`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker)) of the endpoint the action goes to |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `sns` also `topic`, `topic_arn`, `region` and `fifo`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker); `servicebus` also `entity`) of the endpoint the action goes to. For an endpoint whose URL is a reference these three are the origin only — `url` is `https://hooks.example.test/…` and nothing below the origin reaches a template ([secret http endpoints](#secret-http-endpoints)) |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -1013,6 +1160,10 @@ What a template renders:
 * **sns**: the raw request as for `http` — the form-encoded `PublishBatch` call — whose
   entries are checked before the request is signed and sent
   ([SNS targets](#sns-targets)). Blank output sends nothing.
+* **servicebus**: `POST /` (any other request line is refused) with the `{"messages": […]}` batch
+  body (message *i* takes key *i*); the tool opens the connection and the sender link, puts the
+  SAS token to `$cbs` and sends the batch, awaiting a disposition per message
+  ([Service Bus targets](#service-bus-targets)). Blank output sends nothing.
 
 ## Reset steps
 
@@ -1049,14 +1200,16 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
   The keys missing from the snapshot, read after the listing, are rendered with op `delete`
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
-* An append-only kind (`sqs`, `kinesis`, `eventbridge`, `sns`, `amqp`, `smtp`, `pubsub`, `kafka`)
+* An append-only kind (`sqs`, `kinesis`, `eventbridge`, `sns`, `amqp`, `smtp`, `pubsub`, `kafka`,
+  `servicebus`)
   refuses a `for_each: stray` step at load (a sent message cannot be recalled), `lambda` refuses
   one too (a function cannot list what it was invoked with), `sqs`, `kinesis`, `eventbridge` and
   `sns` refuse a `once` step that purges what it has sent (a queue's `PurgeQueue`, a stream's
   `DeleteStream`, an event bus's `DeleteEventBus`, a topic's `DeleteTopic`), and `pubsub` a step
   that does anything but publish — [SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets),
   [Lambda targets](#lambda-targets), [EventBridge targets](#eventbridge-targets),
-  [SNS targets](#sns-targets), [AMQP targets](#amqp-targets), [Pub/Sub targets](#pubsub-targets).
+  [SNS targets](#sns-targets), [AMQP targets](#amqp-targets), [Pub/Sub targets](#pubsub-targets),
+  [Service Bus targets](#service-bus-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
@@ -1071,7 +1224,7 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
 
 | column | meaning |
 |---|---|
-| `binlog_file`, `binlog_pos` | every action for changes before this point met `expect`. `*`: where the stream resumes |
+| `binlog_file`, `binlog_pos` | every action for changes before this point met `expect`. `*`: where the stream resumes. The position is a transaction boundary: the end of the last event that closed a transaction (`Xid`, `XA PREPARE`, `COMMIT` / `ROLLBACK`, a statement on its own), never the position of a statement inside one — the events that open a group differ per server, the ones that close it do not, so the boundary is the same rule whether GTIDs are on or off |
 | `lag_ms` | age of the oldest change not yet confirmed (or how far the stream is behind) |
 | `reset_state` | `none`, `pending: <reason>`, `running: step i/n …`, `done: <time>`, `missing: <reason>` (continuity lost, the rule has no reset steps) |
 | `last_error`, `last_error_at` | the last failure |
@@ -1137,7 +1290,9 @@ What the tool enforces on its own:
   (`/*+ … */`) stay allowed ([SQL targets](#sql-targets)).
 * **Secret references are confined**: `env:` cannot name lazywf's own settings (`LAZYWF_*`), and
   `file:` must resolve (symlinks followed) inside `LAZYWF_SECRET_DIRS` (default
-  `/run/secrets:/var/run/secrets`).
+  `/run/secrets:/var/run/secrets`). An `endpoints` entry of the four plain http kinds is confined
+  the same way and held to the same rule: its value is a whole webhook URL, read on every request
+  and shown only as its origin ([secret http endpoints](#secret-http-endpoints)).
 * **The webhook signing secret is a reference.** `vars.sign_secret_ref` is confined like any
   other secret reference and a literal is a load error; it is a credential of the kind, so it
   stays out of the template context and is read only where the signature is computed: it never
@@ -1397,6 +1552,32 @@ with `"op": "delete"`, the select's `_op` column making keys no select returns d
 `orderingKey` the key (here, `vars.ordering`), so a subscriber with message ordering on receives
 each key's messages in publish order. For the emulator, `?endpoint=` in the endpoint names its
 address (with no `credentials_ref`, no credentials are sent).
+
+**Messages to an Azure Service Bus queue**, one batch per flush (a reader keeps the newest
+message per key):
+
+```sql
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, vars) VALUES
+ ('orders-sb', 'servicebus', 'sb://lwf-test-ns.servicebus.windows.net/orders',
+  'JSON_EXTRACT(body, ''$.entity'') IS NOT NULL',
+  '{"key_name": "send-rule", "key": "env:SB_SEND_KEY"}');
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template, debounce_ms)
+ VALUES ('orders', 'orders-sb', 'batch', 500, 200000,
+  'SELECT c.id AS _key, c.id, c.name, NULL AS _op FROM customers c WHERE c.id IN (:keys)',
+  'POST / HTTP/1.1
+Content-Type: application/json
+
+{"messages": [{{#each docs}}{"value": {{json doc}}}{{#unless @last}}, {{/unless}}{{/each}}]}',
+  100);
+```
+
+A trigger on `customers` marks `{{new.id}}`: one batch per flush, message *i* the document of key
+*i*, and the disposition awaited for that transfer is its answer — `expect` sees
+`{"entity": …, "message_id": …}` per message. `vars.key_name` names the shared access rule that
+holds the Send right and `vars.key` is its key, a reference only; `vars.session` says the entity
+takes sessions (every message then renders its `session`), `vars.dedup` puts a content id on the
+wire for the entity's duplicate detection, and `vars.max_message_size` raises the 256 KiB default
+to the entity's own limit — which is also the ceiling `batch_max_bytes` must stay under.
 
 **Search index re-sync in place** (OpenSearch / Elasticsearch): upsert everything, then delete
 what the index has and the database does not.
