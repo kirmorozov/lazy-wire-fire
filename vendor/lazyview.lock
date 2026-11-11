@@ -2,6 +2,20 @@
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
 commit 06daf3ddce592be364c4eb0ed1caab5810b16f3d
+glob src/access.rs
+glob src/access/**
+glob src/analyze.rs
+glob src/analyze/**
+glob src/analyzer/**
+glob src/binlog.rs
+glob src/binlog/**
+glob src/cascade.rs
+glob src/catalog.rs
+glob src/catalog/**
+glob src/datum.rs
+glob src/dedup/**
+glob src/fence.rs
+glob src/intset.rs
 file src/access.rs 7ef19aeeb4300cc2335be515c763c973b7caca2ed0d0d131ebf35e226535d403
 file src/analyze.rs 75b6cc618c555dc84afd6cd6310295d1127b221723ff354ec9f14e84005ca73f
 file src/analyzer/ast.rs 2796d2ecb544678be94d159b39ea11b496f214d5cb5d5bfa591d3b62e74773fa
