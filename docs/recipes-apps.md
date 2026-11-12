@@ -1,30 +1,34 @@
 # Business app recipes
 
 Copy-ready recipes for the `http` kinds pointed at hosted business applications: two chat
-platforms, an event pipeline, an email platform and three systems of record — Microsoft Teams,
-Google Chat, Segment, Klaviyo, HubSpot, Airtable and Notion. Same kinds and the same three
-tables as [the http recipes](recipes.md). What changes is which vendor limit binds, which
+platforms, an event pipeline, an email platform, three systems of record and four automation
+hubs — Microsoft Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable, Notion, and Zapier,
+Make, n8n and Microsoft Power Automate. Same kinds and the same three tables as
+[the http recipes](recipes.md). What changes is which vendor limit binds, which
 header a service wants besides its auth header, which id a delete has to be keyed by, and how
 much a 2xx is actually worth.
 
 > **These are examples; CI does not run them.** The test suite exercises the built-in sinks and
 > the `http` kinds against OpenSearch, Elasticsearch and Varnish containers, never against
-> Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable or Notion. The endpoint forms, header
-> names and `expect` clauses below come from each vendor's own documentation and from the
-> request-building code. Try one against your own account before production data drives it.
+> Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable, Notion or the four automation hubs.
+> The endpoint forms, header names and `expect` clauses below come from each vendor's own
+> documentation and from the request-building code. Try one against your own account before
+> production data drives it.
 
 Three things are the same in every recipe here:
 
 * **`endpoints` is the origin** and the template's request line carries the path and the query —
-  for every recipe here except the two incoming webhooks, where `endpoints` is a `file:` reference
+  for every recipe here except the incoming webhooks (Teams, Google Chat, Zapier, Power Automate,
+  and n8n with its authentication left at None), where `endpoints` is a `file:` reference
   whose value is the whole URL and the request line is `POST /`
   ([reference → secret http endpoints](reference.md#secret-http-endpoints)). A prefix in
   `endpoints` is put in front of every path, so a prefix plus `POST /` would gain a trailing
   slash; the services that give their address in plain text take their path in the template
   instead.
 * **The credential is a reference** (`env:NAME` or `file:/path`), resolved on every request, never
-  rendered by a template: in `vars` for the six API recipes, and in `endpoints` for the two
-  webhook recipes, whose secret is the URL below the origin (a reference endpoint is for the four
+  rendered by a template: in `vars` for the recipes that send a credential (and for the
+  automation hub that sends an API-key header), and in `endpoints` for the incoming webhooks
+  whose secret is the URL below the origin (a reference endpoint is for the four
   plain http kinds, and only their `endpoints` column resolves one).
 * **`expect` is a target column**, evaluated as a SQL condition over the response row
   (`status`, `headers`, `body`, `text`). Left empty it means "any 2xx". A condition that names
@@ -43,6 +47,10 @@ limits that bind, and how a delete is expressed — or the fact that none exists
 * [HubSpot: upsert contacts and archive them](#hubspot-upsert-contacts-and-archive-them)
 * [Airtable: create, update and delete records](#airtable-create-update-and-delete-records)
 * [Notion: create a page and archive it](#notion-create-a-page-and-archive-it)
+* [Zapier: trigger a Zap from a catch hook](#zapier-trigger-a-zap-from-a-catch-hook)
+* [Make: trigger a scenario from its custom webhook](#make-trigger-a-scenario-from-its-custom-webhook)
+* [n8n: run a workflow from its Webhook node](#n8n-run-a-workflow-from-its-webhook-node)
+* [Microsoft Power Automate: run an instant cloud flow](#microsoft-power-automate-run-an-instant-cloud-flow)
 * [What these recipes do not claim](#what-these-recipes-do-not-claim)
 * [Not covered here](#not-covered-here)
 
@@ -564,6 +572,255 @@ Content-Length: 148
   the burst is allowed and one lane with a sane `debounce_ms` is enough; the transient retry waits
   it out.
 
+## Zapier: trigger a Zap from a catch hook
+
+| | |
+|---|---|
+| **Endpoint** | the hook URL the Zap's Test tab prints, whole — `https://hooks.zapier.com/hooks/catch/<user-id>/<hook>`: `endpoints` holds a `file:` reference to it and the template's request line is `POST /` |
+| **Auth** | **None — leave `vars` empty.** Zapier's article for the catch triggers documents no key and no signature: the URL is the only access control, and it embeds the owner's Zapier ID (a transferred Zap gets a new URL, and every sender has to be told). The `file:` keeps it out of the configuration file and out of `lazy_wire_fire_target` |
+| **Renders** | one JSON array of the rows' documents, `[{…},{…}]`: [Zapier documents](https://help.zapier.com/hc/en-us/articles/8496288690317-Trigger-Zap-workflows-from-webhooks) an array of JSON objects as triggering the Zap **once per object** — one request per batch, one Zap run per row |
+| **`expect`** | `status = 200` — a live Zap's hook answers 200 and a deleted or turned-off one answers 404; the delay between the two is the first bullet |
+| **Batch and rate limit** | 10 MB per request (2 MB for a Catch Raw Hook); 20,000 requests per 5 minutes per user and 1,000 per 5 minutes per Zap on legacy routes → `batch_max_keys = 50`, `batch_max_bytes = 65536`, one lane. Past the limit Zapier answers 429, which is transient |
+| **Deletes** | None. A hook receives; turning the Zap off or deleting it happens in Zapier |
+
+The trigger is **Webhooks by Zapier** with the **Catch Hook** event (the body arrives parsed);
+**Catch Raw Hook** is the variant whose body arrives unparsed, headers included, and it carries
+the 2 MB limit.
+
+```sql
+-- /run/secrets/zapier_hook, one line, no trailing slash: the trigger URL the Zap's Test tab
+-- prints, verbatim (the user id and hook below are placeholders):
+-- https://hooks.zapier.com/hooks/catch/123456/abcdef
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms) VALUES
+ ('zapier', 'http', 'file:/run/secrets/zapier_hook', 'status = 200', 10000);
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
+ ('zapier_order_events', 'zapier', 'batch', 50, 65536,
+  'SELECT id AS _key, id, status, updated_at FROM orders WHERE id IN (:keys)',
+  'POST / HTTP/1.1
+Content-Type: application/json
+
+[{{#each docs}}{{#unless @first}}, {{/unless}}{{json doc}}{{/each}}]');
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('zapier_order_events', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+POST /hooks/catch/123456/abcdef HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: hooks.zapier.com
+Content-Length: 130
+
+[{"id":4213,"status":"shipped","updated_at":"2026-11-11 09:15:02"},{"id":4214,"status":"paid","updated_at":"2026-11-11 09:15:04"}]
+```
+
+* **One array, one run per object.** Zapier's own example posts three objects and runs the Zap
+  three times, which is why the body here is the plain array of documents and nothing wraps it:
+  `batch_max_keys` doubles as the number of Zap runs one flush buys.
+* **The 404 of a dead Zap comes late.** Zapier: with the Zap turned off or deleted, incoming
+  requests get 404 — "however, there is a system update delay of up to several hours before the
+  404 response takes effect, during which the URL will continue to return a 200 response."
+  Through that window lazywf keeps settling rows as though the Zap ran: a retired Zap is an
+  operational fact the rows cannot see.
+* **A 200 is accepted, not run.** "Webhooks may delay passing on data to other steps if there are
+  a lot of requests coming at the same time", and in busy periods Zapier "may return a 200 status
+  code but delay webhook processing by several minutes": nothing in the row says the Zap's actions
+  ran.
+* **The limits are per user and per Zap.** [Zapier's rate-limits
+  article](https://help.zapier.com/hc/en-us/articles/29972220283789-Webhooks-by-Zapier-rate-limits)
+  gives 20,000 requests per 5 minutes per user and 1,000 per 5 minutes per Zap for legacy webhook
+  routes (those without the user id in the URL), answered 429 past the limit — transient here, so
+  one lane and a sane `debounce_ms` ride a burst out. Confirm the current numbers for your plan.
+* **The URL is the bearer credential, so it lives outside the tables** — one line in a file
+  inside `LAZYWF_SECRET_DIRS`, rewriting it is the rotation, and
+  `LAZYWF_ALLOWED_HOSTS=hooks.zapier.com` stops a rewritten file from moving the target
+  ([reference → secret http endpoints](reference.md#secret-http-endpoints)). Zapier documents no
+  signature for the catch triggers, so there is nothing to verify and nothing to set: a receiver
+  that can check an HMAC is what [the signed-webhook
+  recipe](recipes.md#a-signed-webhook-to-an-automation-hub) is for.
+
+## Make: trigger a scenario from its custom webhook
+
+| | |
+|---|---|
+| **Endpoint** | `https://hook.eu2.make.com` (the region host your webhook uses) in `endpoints`, the [Custom webhook](https://apps.make.com/gateway)'s 32-character string in the request line — plain text, because `http.header` is not one of the four plain http kinds and takes no reference endpoint; the API key below is what stops the URL from being the only credential |
+| **Auth** | `kind = 'http.header'`, `vars.header` = `x-make-apikey`, `vars.value` → `file:/run/secrets/make_apikey`. Make documents an optional API key per webhook — "In requests, include API keys in the `x-make-apikey` header" — created in the webhook's settings, at most 512 ASCII characters, shown once |
+| **Renders** | one JSON array of the rows' documents, `[{…},{…}]`. Declare the webhook's data structure (Make recommends it) as an array of objects matching the select: without one "Make accepts all incoming data without validation", with one a request that fails validation is "rejected with HTTP status code 400" |
+| **`expect`** | `status = 200 AND text = 'Accepted'` — Make's documented default answer while the call enters the scenario's queue; its other default answers are in the first bullet |
+| **Batch and rate limit** | 5 MB (5 242 880 bytes) per request "regardless of the subscription tier" → `batch_max_keys = 50`, `batch_max_bytes = 262144`, one lane. A full webhook queue answers 400 — a refusal, so a scenario that cannot drain strikes keys rather than waiting |
+| **Deletes** | None. The webhook receives; deactivating the scenario happens in Make |
+
+```sql
+-- /run/secrets/make_apikey, one line: the value you typed into the webhook's keychain when you
+-- created it (Make shows it once and never again).
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms, vars) VALUES
+ ('make', 'http.header', 'https://hook.eu2.make.com',
+  'status = 200 AND text = ''Accepted''', 10000,
+  '{"header": "x-make-apikey", "value": "file:/run/secrets/make_apikey"}');
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
+ ('make_order_events', 'make', 'batch', 50, 262144,
+  'SELECT id AS _key, id, status, updated_at FROM orders WHERE id IN (:keys)',
+  'POST /<the-32-character-webhook-string> HTTP/1.1
+Content-Type: application/json
+
+[{{#each docs}}{{#unless @first}}, {{/unless}}{{json doc}}{{/each}}]');
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('make_order_events', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+POST /<the-32-character-webhook-string> HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: hook.eu2.make.com
+x-make-apikey: <the key file:/run/secrets/make_apikey holds>
+Content-Length: 130
+
+[{"id":4213,"status":"shipped","updated_at":"2026-11-11 09:15:02"},{"id":4214,"status":"paid","updated_at":"2026-11-11 09:15:04"}]
+```
+
+* **The answer is about the queue, not the scenario.** Make's own table: `200 Accepted` when the
+  call enters the queue, `400 Queue is full.` when it will not fit, and — only when the scenario
+  contains the **Webhook Response** module — `500 Scenario failed to complete.` when the scenario
+  errors, with that module's own status and body answered instead of the defaults and `200
+  Accepted` if the scenario has not answered within 180 seconds. A 500 is transient here, so the
+  whole batch is retried and the scenario runs again for the same rows: make the scenario
+  idempotent per document, or have the Webhook Response module answer a 4xx of your choosing for
+  a failure you do not want replayed.
+* **The data structure is a 400 switch.** With one, a payload that fails validation is refused
+  with 400 — a refusal here, so a drifted template strikes keys instead of waiting — and without
+  one everything is accepted and the error surfaces late, in a module two steps downstream.
+  Declare it as the rendered array, and use Make's **Detect new values** to confirm the shape.
+* **`x-make-apikey` is reserved inside Make.** With request headers exposed to the scenario, that
+  header's value is sanitized away before the scenario can map it: it is a transport credential
+  to Make, not payload content, which is what `vars.value` (resolved per request, never rendered
+  by a template) is for.
+* **The account is rate limited too.** Make's webhook article gives 300 requests per 10 seconds
+  across an account's webhooks and answers 429 past it — transient — and the article, not this
+  recipe, is where the current number for a plan lives.
+
+## n8n: run a workflow from its Webhook node
+
+| | |
+|---|---|
+| **Endpoint** | the node's **Production URL**, `https://<n8n-host>/webhook/<path>` (the path is randomly generated by default), in plain `endpoints` — with the node's Authentication left at None, take the Zapier shape instead: `kind = 'http'` with a `file:` reference holding the whole URL |
+| **Auth** | `kind = 'http.header'`, `vars.header` = `x-api-key` — any name, as long as it equals the **Name** of the [Header Auth credential](https://docs.n8n.io/integrations/builtin/credentials/webhook.html) — `vars.value` → `file:/run/secrets/n8n_webhook_key`. In the node set Authentication to **Header Auth** and create that credential with the same Name and Value |
+| **Renders** | one JSON array of the rows' documents, `[{…},{…}]`; the workflow sees the request as `{ body, headers, params, query }`, so the array arrives at `$json.body` |
+| **`expect`** | `status = 200` — with **Respond: Immediately** the node answers its Response Code (200 by default) and the message `Workflow got started` the moment the execution begins; mirror any Response Code you change here |
+| **Batch and rate limit** | 16 MB per request (`N8N_PAYLOAD_SIZE_MAX`, self-hosted) → `batch_max_keys = 50`, `batch_max_bytes = 262144`. One webhook per path-and-method; on n8n Cloud an answer slower than 100 seconds becomes a Cloudflare 524, which Respond: Immediately avoids by construction |
+| **Deletes** | None. The workflow runs; unpublishing it in n8n stops the production URL |
+
+```sql
+-- /run/secrets/n8n_webhook_key, one line: the Value of the Header Auth credential in n8n.
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms, vars) VALUES
+ ('n8n', 'http.header', 'https://automation.example', 'status = 200', 10000,
+  '{"header": "x-api-key", "value": "file:/run/secrets/n8n_webhook_key"}');
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
+ ('n8n_order_events', 'n8n', 'batch', 50, 262144,
+  'SELECT id AS _key, id, status, updated_at FROM orders WHERE id IN (:keys)',
+  'POST /webhook/6f4d2a9c HTTP/1.1
+Content-Type: application/json
+
+[{{#each docs}}{{#unless @first}}, {{/unless}}{{json doc}}{{/each}}]');
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('n8n_order_events', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+POST /webhook/6f4d2a9c HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: automation.example
+x-api-key: <the value file:/run/secrets/n8n_webhook_key holds>
+Content-Length: 130
+
+[{"id":4213,"status":"shipped","updated_at":"2026-11-11 09:15:02"},{"id":4214,"status":"paid","updated_at":"2026-11-11 09:15:04"}]
+```
+
+* **Production means published.** The test URL answers only after you select **Listen for test
+  event**, and for 120 seconds; the production URL is registered when you publish the workflow and
+  lives until it is unpublished. Point lazywf at the production URL and build against the test
+  URL — and check what your n8n answers for a production URL whose workflow is unpublished before
+  trusting `expect` to catch that mistake.
+* **Only Run If is a 200 that runs nothing.** A request whose expression is false "receive[s] a
+  200 response without creating an execution", and an expression that fails to evaluate lets the
+  request through with a logged warning. A wrong filter therefore settles every row here: test
+  the expression before the rule goes near production data.
+* **The IP allowlist answers 403, which refuses.** Outside the allowlist n8n throws 403 — a
+  refusal here, charging strikes rather than waiting — and behind a reverse proxy even allowed
+  IPs fail until `N8N_PROXY_HOPS` counts the proxies correctly.
+* **The auth options map unevenly.** Header Auth is the one this recipe uses; Basic Auth maps to
+  `http.basic` (`vars.username`, `vars.password`); JWT auth and n8n User Auth (OAuth2) have no
+  counterpart among the four plain http kinds. Left at **None**, the random path *is* the
+  credential — then use `kind = 'http'` with the whole URL in a `file:` reference
+  ([reference → secret http endpoints](reference.md#secret-http-endpoints)) instead of a header.
+
+## Microsoft Power Automate: run an instant cloud flow
+
+| | |
+|---|---|
+| **Endpoint** | the **HTTP POST URL** the trigger prints once the flow is saved, whole: `endpoints` holds a `file:` reference to it and the template's request line is `POST /` |
+| **Auth** | **None — leave `vars` empty.** The trigger has no shared secret: what Microsoft documents is *who can trigger the flow* — Anyone, Any user in my tenant, or Specific users in my tenant — and with **Anyone** (the form [Microsoft's lead-management instructions](https://learn.microsoft.com/en-us/partner-center/marketplace-offers/commercial-marketplace-lead-management-instructions-https) use) the URL is the credential, so it lives in a file and in no column. Check which setting your flow carries |
+| **Renders** | one JSON array of the rows' documents, `[{…},{…}]`; the trigger's **Request Body JSON Schema** is free text you write: declare `"type": "array"` whose `items` object lists the columns the select returns |
+| **`expect`** | `status = 200`, with a `Response` action at the end of the trigger branch answering 200. Without a Response action the same family of request trigger is answered as soon as the trigger fires — Microsoft's Logic Apps documentation of it says 202 Accepted: started, not finished |
+| **Batch and rate limit** | the request-trigger pages consulted print no payload or rate limit for the trigger → `batch_max_keys = 50`, `batch_max_bytes = 65536`, one lane, and check the limits shown for your flow |
+| **Deletes** | None. The flow runs; turning it off or deleting it happens in Power Automate |
+
+```sql
+-- /run/secrets/powerautomate_flow, one line, no trailing slash: the HTTP POST URL the trigger
+-- shows after the flow is saved, verbatim (the host and path below are placeholders):
+-- https://flow-host.example/<the path and query the trigger generated>
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms) VALUES
+ ('powerautomate', 'http', 'file:/run/secrets/powerautomate_flow', 'status = 200', 10000);
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
+ ('powerautomate_order_events', 'powerautomate', 'batch', 50, 65536,
+  'SELECT id AS _key, id, status, updated_at FROM orders WHERE id IN (:keys)',
+  'POST / HTTP/1.1
+Content-Type: application/json
+
+[{{#each docs}}{{#unless @first}}, {{/unless}}{{json doc}}{{/each}}]');
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('powerautomate_order_events', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+POST /<the path and query the trigger generated> HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: flow-host.example
+Content-Length: 130
+
+[{"id":4213,"status":"shipped","updated_at":"2026-11-11 09:15:02"},{"id":4214,"status":"paid","updated_at":"2026-11-11 09:15:04"}]
+```
+
+* **The URL exists only after the first save.** The instant cloud flow's trigger prints its HTTP
+  POST URL when the flow is saved — that is the moment the file gets its content; on the lazywf
+  side rewriting the file is the rotation, as for every secret endpoint.
+* **The answer is yours to define.** Put a `Response` action at the end of the trigger branch and
+  pin `expect` to exactly what it answers; without one, the platform answers for you (Microsoft's
+  Logic Apps documentation of the same request trigger: no Response action means the call is
+  answered 202 Accepted as soon as the trigger fires, and a beyond-timeout request gets 408).
+  Test the flow in the designer and mirror what you see.
+* **Premium is Microsoft's call.** The request trigger appears marked `[PREMIUM]` in Microsoft's
+  documentation; whether an instant flow with an HTTP trigger runs on your licensing is a check in
+  your own tenant, made before the rule goes near production data.
+* **Nothing here is claimed about retries.** The pages consulted say nothing about whether the
+  platform redelivers a request whose answer never arrived; lazywf is at-least-once on its side,
+  so the flow must be idempotent per document — an upsert keyed on the order id, say — or both
+  sides' retries will duplicate.
+
 ## What these recipes do not claim
 
 The vendor pages consulted do not settle everything a recipe would want, so these are
@@ -593,6 +850,20 @@ verification steps against your own account, not instructions:
   property types are written as their own pages write them. What an unknown property name answers
   is not stated, so the names above are the ones the recipe was read from the database's own
   columns; check them against yours.
+* **Zapier**: the 200 answer is documented as a status, not a body, so `expect` pins the status
+  and reads nothing else; and that the catch triggers document no signature is a statement about
+  the article consulted, not about every Zapier product. Confirm both in your Zap's Test tab.
+* **Make**: the 300-requests-per-10-seconds figure is the one printed in Make's webhook article —
+  verify the current number for your plan. The `Accepted` and `Queue is full.` answers are the
+  documented defaults; what your scenario answers once a Webhook Response module is in it is
+  yours, and only you can pin it.
+* **n8n**: what the production URL answers while the workflow is unpublished is not stated in the
+  pages consulted, and neither is how Header Auth answers a wrong value — both are checks to make
+  in your own n8n before trusting `expect` to notice the mistake.
+* **Power Automate**: no claim about retries, duplicates or a trigger timeout — the pages
+  consulted print none; the `[PREMIUM]` marking is quoted from Microsoft's documentation and your
+  licensing is a tenant check; and which of the three "who can trigger" settings your flow carries
+  is not something the rows can show you.
 
 ## Not covered here
 

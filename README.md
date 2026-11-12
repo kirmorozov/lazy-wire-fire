@@ -14,7 +14,8 @@ Amazon SNS topic (one `PublishBatch` per action), a Google Cloud Pub/Sub topic (
 per action), an AMQP broker (one publish per action),
 an SMTP server (one mail per action), a Kafka-protocol broker (one produce of a batch of records
 per action), a RabbitMQ stream (one publish batch of records per action), an Azure Service Bus
-queue or topic (one batch of messages per action), Redis (one
+queue or topic (one batch of messages per action), a gRPC server (one long-lived bidirectional
+stream, items acknowledged one by one), Redis (one
 command), or MySQL / PostgreSQL (one SQL statement).
 
 Search index upserts, cache purges, webhooks and object-store exports are all just rules. The tool
@@ -90,7 +91,8 @@ a chat hook), with the endpoint, credential and `expect` each one wants, in
 [docs/recipes.md](docs/recipes.md).
 
 Business-app http recipes (Microsoft Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable,
-Notion), with the extra header each service wants and what its 2xx is worth, in
+Notion, and the automation hubs Zapier, Make, n8n and Microsoft Power Automate), with the extra
+header each service wants and what its 2xx is worth, in
 [docs/recipes-apps.md](docs/recipes-apps.md).
 
 ## Platforms
@@ -292,6 +294,7 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 | Kafka-protocol broker (Apache Kafka, Redpanda, MSK, Event Hubs) | `kafka` ([Kafka targets](docs/reference.md#kafka-targets)) | `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` | one produce of a batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.sasl` (`plain`, `scram-sha-256`, `scram-sha-512`) with `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | Redpanda 26.1.20 — CI (release gate) |
 | RabbitMQ stream (native stream protocol, super streams included) | `rabbitmq-stream` ([RabbitMQ stream targets](docs/reference.md#rabbitmq-stream-targets)) | `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>`, or `rabbitmq-stream+tls://…` for TLS (5552 / 5551) | one publish batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | RabbitMQ 4.3 with the stream plugin — CI (release gate) |
 | Azure Service Bus (queues, topics) | `servicebus` ([Service Bus targets](docs/reference.md#service-bus-targets)) | `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (a local broker: `sb://<host>:<port>/<address>`) | one batch of messages over AMQP 1.0, TLS on 5671, a disposition awaited per message | per message, per key | refused at load (append-only; a listing is refused too) | `vars.key_name` with `vars.key` (a reference only) for a SAS token over `$cbs`, or `vars.username` with `vars.password` (a reference only) for SASL PLAIN on a broker without CBS; no Entra ID; never in the URL | RabbitMQ 4.3 answering AMQP 1.0 on its 5672 (SASL PLAIN; no local broker has a `$cbs` node) — CI (release gate) |
+| gRPC server (bidirectional streaming, per-item acks) | `grpc` ([gRPC targets](docs/reference.md#grpc-targets)) | `grpc(s)://<host>[:port]/<package.Service>/<Method>` (default ports 80 / 443) | one `Envelope` of items written onto one long-lived bidirectional stream per endpoint | per item, per key: an acknowledgement matched by sequence number and verified by hash | refused at load (append-only; a listing is refused too) | `vars.token` as a bearer credential (a reference only, `env:` / `file:`); the schema is `vars.descriptor_set` (a `file:` reference) with `vars.item_type`; never in the URL | the suite's own in-process gRPC server (`cargo test --test grpc_stream`; not wired into the Makefile or CI — CI exercises the kind only through the `log_secrets` bearer-token flow) |
 
 The append-only kinds and `lambda` refuse a stray cleanup at load, and `sqs` / `kinesis` /
 `eventbridge` / `sns` / `pubsub` refuse purge-like or non-publishing reset steps; no other kind

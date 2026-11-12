@@ -25,9 +25,9 @@ object.
 SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
 Lambda function, below), `eventbridge` (SigV4, an Amazon EventBridge event bus, below), `sns`
 (SigV4, an Amazon SNS topic, below), `amqp` (an AMQP 0-9-1
-broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `rabbitmq-stream` (a RabbitMQ stream or super stream over the native stream protocol, below), `servicebus` (an Azure Service Bus queue or topic over AMQP 1.0, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
-| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path), or, for the four plain http kinds only, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](#secret-http-endpoints)). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `sns`: exactly one: `aws-sns://[<region>/]<account-id>/<topic-name>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). `rabbitmq-stream`: exactly one: `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>` or `rabbitmq-stream+tls://…` (ports 5552 / 5551; no credentials in the URL: below). `servicebus`: exactly one: `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (no credentials in the URL, TLS on port 5671, the local-broker form: below). An action goes to every endpoint |
-| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets); `rabbitmq-stream` takes only `verify-full` with exactly one `tls.ca` file: [below](#rabbitmq-stream-targets); `servicebus` takes them all but refuses `disabled` on a `servicebus.windows.net` endpoint and any `tls.server_name`: [below](#service-bus-targets)) |
+broker with publisher confirms, below), `smtp` (an SMTP server, one mail per action, below), `pubsub` (a Google Cloud Pub/Sub topic, below), `kafka` (a broker of the Kafka protocol — Apache Kafka, Redpanda, MSK, Event Hubs — below), `rabbitmq-stream` (a RabbitMQ stream or super stream over the native stream protocol, below), `grpc` (a server of the gRPC protocol, reached over one long-lived bidirectional stream, below), `servicebus` (an Azure Service Bus queue or topic over AMQP 1.0, below), `redis` (`vars.password`, optional `vars.username` for ACLs), `mysql` (also `mariadb`) / `pgsql` (also `postgres`, `postgresql`) (`vars.username`, `vars.password`; [SQL targets](#sql-targets)) |
+| `endpoints` | list. http: base URLs `http(s)://host:port[/prefix]` (the prefix is put before every path), or, for the four plain http kinds only, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](#secret-http-endpoints)). redis: `host:port/db` (or `redis://…`, `rediss://…` for TLS). mysql / pgsql: `host:port/database` (the scheme, `mysql://` / `postgres://`, … is optional). `http.s3`: optional, the service URL; derived from `vars` when empty. `sqs`: exactly one: `aws-sqs://[<region>/]<account-id>/<queue-name>`. `kinesis`: exactly one: `aws-kinesis://[<region>/]<stream-name>`. `lambda`: exactly one: `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (the `aws-` URL form, `?endpoint=`, `?invocation=` and the region: below). `eventbridge`: exactly one: `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` (the `aws-` URL form and the region: below). `sns`: exactly one: `aws-sns://[<region>/]<account-id>/<topic-name>` (the `aws-` URL form and the region: below). `amqp`: `amqp(s)://host[:port][/vhost]` (no credentials in the URL). `smtp`: `smtp(s)://host[:port]` (no credentials in the URL, no path or query; port 587 for `smtp://`, 465 for `smtps://`). `pubsub`: exactly one: `gc-pubsub://<project>/<topic>` (`?endpoint=` for the emulator: below). `kafka`: exactly one: `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (no credentials in the URL: below). `rabbitmq-stream`: exactly one: `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>` or `rabbitmq-stream+tls://…` (ports 5552 / 5551; no credentials in the URL: below). `servicebus`: exactly one: `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (no credentials in the URL, TLS on port 5671, the local-broker form: below). `grpc`: exactly one: `grpc(s)://<host>[:port]/<package.Service>/<Method>` (default ports 80 / 443; no credentials, no query string, no fragment and no bracketed IPv6 literal: below). An action goes to every endpoint |
+| `tls` | empty (TLS for `https://` / `rediss://` / `amqps://` / `smtps://` / `kafkas://`, verified), `disabled`, `required` (no certificate checks), `verify-ca`, `verify-full`, or `{"mode": "verify-full", "ca": "/path/ca.pem", "server_name": "…"}` (`amqp` takes only `verify-full` / empty / `disabled` on `amqp://`: [below](#amqp-targets); `smtp` takes them all but refuses `disabled` on `smtps://`: [below](#smtp-targets); `kafka` takes them all but refuses `disabled` on `kafkas://` and any `tls.server_name`: [below](#kafka-targets); `rabbitmq-stream` takes only `verify-full` with exactly one `tls.ca` file: [below](#rabbitmq-stream-targets); `servicebus` takes them all but refuses `disabled` on a `servicebus.windows.net` endpoint and any `tls.server_name`: [below](#service-bus-targets); `grpc` takes them all but refuses `disabled` on a `grpcs://` endpoint: [below](#grpc-targets)) |
 | `timeout_ms` | per action and endpoint, default 10000 |
 | `expect` | success criterion: a SQL condition over the response, below |
 | `vars` | JSON object: credentials for `kind` and anything templates need (`target.vars`). Credentials never reach templates |
@@ -126,6 +126,14 @@ port 5671, no credentials in the URL). Credentials are one SAS rule: `vars.key_n
 ID is not supported. One action is one batch of messages, a disposition awaited for every
 message, message *i* answered by key *i*: [below](#service-bus-targets).
 
+**`grpc`**: the endpoint is the method to call, as
+`grpc(s)://<host>[:port]/<package.Service>/<Method>` (exactly one, default ports 80 / 443, no
+credentials in the URL). The schema is a protobuf
+descriptor set the target names: `vars.descriptor_set` (a `file:` reference) with `vars.item_type`
+(the message a document becomes), both required. One action is one `lazywf.v1.Envelope` of items
+written onto the target's one long-lived bidirectional stream, the server's acknowledgements
+answering it item by item: [below](#grpc-targets).
+
 **The `aws-sqs://`, `aws-kinesis://`, `aws-lambda://`, `aws-eventbridge://` and `aws-sns://` URL
 form** (the `endpoints` of the kinds `sqs`, `kinesis`, `lambda`, `eventbridge` and `sns`, and of
 no other kind):
@@ -170,6 +178,10 @@ scheme); `?endpoint=` there is the only query parameter.
 userinfo, no query string and no fragment, and a `sb://` URL is for `kind servicebus` only (and
 `servicebus` takes only that scheme).
 
+`grpc`'s `grpc(s)://` endpoint follows them too — no userinfo, no query string, no fragment, no
+bracketed IPv6 literal — and a `grpc://` or `grpcs://` URL is for `kind grpc` only (and `grpc`
+takes only those two schemes); each refusal names the expected form.
+
 ### Secret http endpoints
 
 For the four plain http kinds (`http`, `http.basic`, `http.bearer`, `http.header`) an entry of
@@ -210,7 +222,9 @@ So the recommended form of an incoming webhook is `endpoints = 'file:/run/secret
 the file holding `https://hooks.example.test/services/T00000000/B00000000/PLACEHOLDER-TOKEN`, and
 `POST / HTTP/1.1` in the template ([the Slack recipe](recipes.md#slack-post-to-a-channel),
 [Teams](recipes-apps.md#microsoft-teams-post-to-a-channel) and
-[Google Chat](recipes-apps.md#google-chat-post-to-a-space)).
+[Google Chat](recipes-apps.md#google-chat-post-to-a-space), and among the automation hubs
+[Zapier](recipes-apps.md#zapier-trigger-a-zap-from-a-catch-hook) and
+[Power Automate](recipes-apps.md#microsoft-power-automate-run-an-instant-cloud-flow)).
 
 ### AWS credentials
 
@@ -288,6 +302,10 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
   per record: `body` is the record's `{"stream": …, "publishing_id": …}` object (the partition
   stream of a super stream), `status` 200, the other columns NULL. A record whose `expect` is
   not met is refused on its own.
+* For `grpc`, `expect` runs over each acknowledged item: `status` 200, `text` `ok` and `body` the
+  acknowledgement's `{"seq", "hash", "status", "reason"}` JSON. An item whose `expect` is not met
+  refuses its own key and only that key; a `REFUSED` or `RETRY` acknowledgement never asks
+  `expect` ([below](#grpc-targets)).
 * For `eventbridge`, the answer of one `PutEvents` gives its entries in request order, so
   `expect` runs once per entry: `status` is the request's HTTP status and `body` is the entry's
   own JSON (its `EventId`, or its `ErrorCode` and `ErrorMessage`). An entry whose `expect` is
@@ -327,6 +345,7 @@ when it returns the row. It is MySQL / MariaDB SQL: operators, `JSON_*` function
 | a Pub/Sub publish (at least one message id) | `JSON_LENGTH(JSON_EXTRACT(body, '$.messageIds')) > 0` |
 | a Kafka produce (per record, the offset answered) | `JSON_EXTRACT(body, '$.offset') IS NOT NULL` |
 | a RabbitMQ stream publish (per record, the publish stored) | `JSON_EXTRACT(body, '$.publishing_id') IS NOT NULL` |
+| a gRPC item (per item, the server took it) | `status = 200 AND JSON_UNQUOTE(JSON_EXTRACT(body, '$.status')) = 'OK'` |
 | an EventBridge entry (per entry, the event stored) | `JSON_EXTRACT(body, '$.EventId') IS NOT NULL` |
 | an SNS entry (per entry, the message stored) | `JSON_EXTRACT(body, '$.MessageId') IS NOT NULL` |
 | a webhook where a 404 is fine | `status BETWEEN 200 AND 299 OR status = 404` |
@@ -366,8 +385,8 @@ receiver reads (a stray-cleanup listing of these kinds is signed too):
   header name, an encoding that is neither `hex` nor `base64`, a `sign_prefix` that is not a
   string, and the three `hmac`-only settings on `standard` (that scheme fixes its headers).
 * A signing setting on any other kind — `http.s3`, `sqs`, `kinesis`, `lambda`, `eventbridge`,
-  `sns`, `pubsub`, `kafka`, `rabbitmq-stream`, `amqp`, `smtp`, `redis`, `mysql`, `pgsql` — is a
-  load error too:
+  `sns`, `pubsub`, `kafka`, `rabbitmq-stream`, `grpc`, `amqp`, `smtp`, `redis`, `mysql`, `pgsql` —
+  is a load error too:
   `http.s3` signs SigV4 and the queue kinds their own protocols, so the setting would point at
   nothing.
 * The secret is a credential of the kind: it stays out of the template context (`target.vars`
@@ -1083,6 +1102,86 @@ grows no native AMQP dependency.
   a snapshot reset), so a reader keeps the newest message per key. Several changes of one key
   within the debounce window arrive as one message, and a delete is the key's last state.
 
+### gRPC targets
+
+`grpc` writes to a server of the gRPC protocol over HTTP/2: one action is one `lazywf.v1.Envelope`
+of items written onto the target's one long-lived bidirectional stream, and the server's
+`lazywf.v1.Acks` answer it item by item — the kind's answer is per item, not per action. The
+contract is lazywf's own (`proto/lazywf/v1/lazywf.proto`: `Item`, `Envelope`, `Ack`, `Acks`, and a
+`Sink` service whose one method takes a stream of envelopes and returns a stream of acks); a server
+implements that signature under a service and method name of its own, which the endpoint's path
+names. The client is `tonic` over lazywf's own TLS connector, so `grpcs://` gets the same CA bundle
+and verify modes as every other kind and the image grows no second libcrypto.
+
+* **The endpoint.** `grpc(s)://<host>[:port]/<package.Service>/<Method>`: exactly one per target
+  (the engine holds one stream per endpoint), default ports 80 / 443. No credentials in the URL (an
+  `@` is a load error: the bearer belongs in `vars.token`), no query string, no fragment, no
+  bracketed IPv6 literal; the service and method are protobuf names. `grpcs://` is TLS: the `tls`
+  column holds the modes as for `http`, and `disabled` on a `grpcs://` endpoint is refused.
+  [LAZYWF_ALLOWED_HOSTS](#security) matches the host and `endpoint.url` holds the endpoint as it
+  should be written.
+* **The schema.** `vars.descriptor_set` is a `file:` reference to a protobuf descriptor set and
+  `vars.item_type` names the message a document becomes — both are required, and a
+  `descriptor_set` written any other way is refused ("a schema is a file, never a value in the
+  database"). The set must hold the endpoint's service and method — whose signature is
+  `rpc (stream lazywf.v1.Envelope) returns (stream lazywf.v1.Acks)` — and the item message, all
+  checked when the rule loads; the rule's payload columns are checked against the item message's
+  fields where they can be, and an item field no column covers is a warning. The vars an owner
+  reaches for when the schema lives elsewhere — `schema`, `message`, `message_type`,
+  `request_type`, `response_type`, `service`, `method` — are refused at load, naming the two this
+  kind reads.
+* **The mapping.** Protobuf's own JSON mapping, restricted to what a document is: a field name or
+  its lowerCamelCase JSON name, a number into any numeric field, a string into a string, `bytes`
+  (base64) or an enum, an object into a message or a map, an array into a repeated field. Anything
+  else is refused with the field named — at rule load where the columns say enough to tell, at
+  send time where they do not.
+* **The rendered action.** One action, one batch: the template renders the `docs` array itself
+  (no request line — anything that is not that JSON is refused as a body that is not the `docs`
+  array), and lazywf reads that JSON back rather than shipping the rendered text — element *i*
+  must be `{"key": "<the key>", "doc": {…}}`, `doc` becomes the item message field by field, and
+  an element count that is not the key count, a `key` that is not the one the engine gave, or a
+  missing `doc` is refused (document *i* is the item of key *i*). A blank render sends nothing.
+* **Credentials.** `vars.token` is a bearer credential — a reference (`env:` or `file:`), never a
+  literal — resolved on every call, so a rotated file applies without a reload, and sent as
+  `authorization: Bearer …` marked sensitive, which keeps it out of the log, a `Debug` and a
+  panic. Without it the call carries no `authorization` metadata.
+* **Size and compression.** The largest message the server takes is `vars.max_message_bytes`
+  (4 194 304 bytes by default, at least 64); with `fire_per = batch`, a `batch_max_bytes` above it
+  does not load. Messages of at least `vars.compress_min_bytes` (1024 by default) are compressed:
+  `vars.compression` is `auto` (the default — zstd, stepping down to gzip and to identity when
+  the server says it lacks the codec), `none`, `gzip` or `zstd`; a pinned codec the server lacks
+  does not step down: the flush is a moment whose message quotes the server's own words, so the
+  target keeps the codec it was told and says who lacks it.
+* **The stream.** One long-lived bidirectional stream per endpoint, opened by the first flush that
+  needs it and kept while it is healthy: nothing waits to fill a batch, sequence numbers restart
+  at 1 with each stream, and up to 512 items / 8 MiB ride unacknowledged at a time (HTTP/2's own
+  flow control beside them). An item is settled by the ack naming its sequence number, and only
+  when its hash — xxh3-64 of the key and the encoded body — matches, so a stale ack from a dead
+  stream confirms nothing. A stream that ends before an item is acknowledged leaves that item
+  transient; the next flush reconnects (backoff from 100 ms, doubling to 30 s) and sends it again.
+* **Outcomes.** An `OK` ack settles its key once the rule's `expect` agrees: the row it reads
+  has `status` 200, `text` `ok` and `body` the acknowledgement's JSON (`seq` and `hash` as
+  strings, `status` `OK` and the server's `reason`), so a rule can hold the server to its own
+  answer. A `REFUSED` ack refuses exactly that key (its row is 400 / `refused`), a `RETRY` ack
+  is that key's own moment, and an ack with no status or an unknown one says nothing —
+  transient, never a strike. The whole call is refused only by a gRPC status that judges the
+  request (`INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`,
+  `FAILED_PRECONDITION`, `OUT_OF_RANGE`, `UNAUTHENTICATED`) or, from a peer that answered plain
+  HTTP rather than gRPC, by the statuses that are their own no (400, 401, 403, 409 and the
+  404-family); everything else — 408, 425, 429, any 5xx, `UNAVAILABLE`, `DEADLINE_EXCEEDED`
+  and the rest — is a moment. Only a positive verdict about an item can cost that key a
+  strike.
+* **Reset steps.** The kind only appends: a sent item cannot be recalled and the target cannot
+  list keys, so a `for_each: stray` step does not load. Still allowed: `once` (whatever the
+  template rendered goes out; its `key` fields are the server's deduplication label, and an item
+  the server will not take fails the step), `for_each: snapshot` (every key sent again) and
+  `reset_requested`.
+* **Contract.** The server receives the latest state of each key, not a log of every change, and
+  delivery is at-least-once: an item can arrive twice (a retry after an answer that never came, a
+  snapshot reset), which is what the `key` and the hash are for — a server that has already
+  stored a key may acknowledge the duplicate without processing it again. Several changes of one
+  key within the debounce window arrive as one item, and a delete is the key's last state.
+
 ## Rules
 
 `lazy_wire_fire_rule`
@@ -1094,7 +1193,7 @@ grows no native AMQP dependency.
 | `selects` | zero or more queries: SQL separated by `;`, or a JSON array of strings or `{"name", "sql"}`. Each returns `_key` plus [path-named columns](#documents-from-path-named-columns) and uses `:keys` for the changed keys (`WHERE id IN (:keys)`). They run concurrently, each on its own connection |
 | `snapshot_keys_sql` | returns every key (`_key`), for `for_each` reset steps |
 | `template` | the action, [below](#templates) |
-| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge`, `sns`, `kafka`, `rabbitmq-stream` and `servicebus` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [SNS targets](#sns-targets), [Kafka targets](#kafka-targets), [RabbitMQ stream targets](#rabbitmq-stream-targets), [Service Bus targets](#service-bus-targets)) |
+| `fire_per` | `batch` (one action per batch of keys) or `key` (one per key; `docs` has one entry). `amqp` and `smtp` take `key` only (one message / one mail per action: [AMQP targets](#amqp-targets), [SMTP targets](#smtp-targets)); `sqs`, `kinesis`, `lambda`, `eventbridge`, `sns`, `kafka`, `rabbitmq-stream`, `grpc` and `servicebus` answer per item ([SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets), [EventBridge targets](#eventbridge-targets), [SNS targets](#sns-targets), [Kafka targets](#kafka-targets), [RabbitMQ stream targets](#rabbitmq-stream-targets), [gRPC targets](#grpc-targets), [Service Bus targets](#service-bus-targets)) |
 | `batch_max_keys`, `batch_max_bytes` | split a flush above these limits. Bytes count the rendered action. Without `batch_max_keys`, a batch holds at most 10000 keys. `sqs`: `batch_max_keys` is required with `fire_per = batch` and holds 1 to 10, and `batch_max_bytes` cannot exceed 262144 ([SQS targets](#sqs-targets)). `kinesis`: `batch_max_keys`
 is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` cannot exceed
 5242880 ([Kinesis targets](#kinesis-targets)). `eventbridge`: `batch_max_keys` is required with
@@ -1108,7 +1207,9 @@ is required with `fire_per = batch` and holds 1 to 500, and `batch_max_bytes` ca
 produce limit, the broker's `message.max.bytes` (1 MiB by default) raised by its
 `vars.message_max_bytes` ([Kafka targets](#kafka-targets)). `rabbitmq-stream`: `batch_max_bytes`
 cannot exceed the one stream frame a publish is, 1048576 (1 MiB; there is no var to raise it:
-[RabbitMQ stream targets](#rabbitmq-stream-targets)). `servicebus`: `batch_max_bytes`
+[RabbitMQ stream targets](#rabbitmq-stream-targets)). `grpc`: `batch_max_bytes` cannot exceed the
+target's `vars.max_message_bytes` (4 194 304 bytes by default: [gRPC targets](#grpc-targets)).
+`servicebus`: `batch_max_bytes`
 cannot exceed the target's entity message size, 262144 (256 KiB) by default, raised by its
 `vars.max_message_size` up to 104857600 ([Service Bus targets](#service-bus-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
@@ -1227,7 +1328,8 @@ Handlebars, never HTML-escaped. Context:
 | `rule` | the rule name |
 | `target` | `{name, vars}` (vars without credentials) |
 | `vars` | the rule's vars |
-| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `sns` also `topic`, `topic_arn`, `region` and `fifo`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker); `rabbitmq-stream` also `vhost` and `stream`; `servicebus` also `entity`) of the endpoint the action goes to. For an endpoint whose URL is a reference these three are the origin only — `url` is `https://hooks.example.test/…` and nothing below the origin reaches a template ([secret http endpoints](#secret-http-endpoints)) |
+| `endpoint` | `{host, port, url}` (redis and the SQL targets also `db`; `amqp` also `vhost`; `sqs` also `queue` and `region`; `kinesis` also `stream` and `region`; `lambda` also `function`, `qualifier`, `invocation` and `region`; `eventbridge` also `bus` and `region`; `sns` also `topic`, `topic_arn`, `region` and `fifo`; `pubsub` also `project` and `topic`; `kafka` also `topic` and `brokers` (one `{host, port}` per broker); `rabbitmq-stream` also `vhost` and `stream`; `servicebus` also `entity`; `grpc` also `service`,
+`method` and `item_type`) of the endpoint the action goes to. For an endpoint whose URL is a reference these three are the origin only — `url` is `https://hooks.example.test/…` and nothing below the origin reaches a template ([secret http endpoints](#secret-http-endpoints)) |
 | `reset` | inside reset steps `{step, keys}` (stray steps: the stray keys; list templates also `next`, `page`); `null` otherwise |
 
 Inside `{{#each}}` / `{{#with}}` the names above still mean the top level (as with Handlebars.js
@@ -1299,6 +1401,11 @@ What a template renders:
   body (message *i* takes key *i*); the tool opens the connection and the sender link, puts the
   SAS token to `$cbs` and sends the batch, awaiting a disposition per message
   ([Service Bus targets](#service-bus-targets)). Blank output sends nothing.
+* **grpc**: the `docs` array itself, and nothing else — element *i* is the `{"key": …, "doc": …}`
+  of key *i*; the tool reads that JSON back, encodes each `doc` onto the target's item message
+  with the descriptor set's own schema, writes the envelope onto the target's stream and lets the
+  server's acknowledgements answer it (a request line or header lines in the render are refused:
+  there is no request to parse — [gRPC targets](#grpc-targets)). Blank output sends nothing.
 
 ## Reset steps
 
@@ -1336,7 +1443,7 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
   (`reset.keys` holds them), per endpoint. Keys marked while the step runs are never treated as
   strays.
 * An append-only kind (`sqs`, `kinesis`, `eventbridge`, `sns`, `amqp`, `smtp`, `pubsub`, `kafka`,
-  `rabbitmq-stream`, `servicebus`)
+  `rabbitmq-stream`, `grpc`, `servicebus`)
   refuses a `for_each: stray` step at load (a sent message cannot be recalled), `lambda` refuses
   one too (a function cannot list what it was invoked with), `sqs`, `kinesis`, `eventbridge` and
   `sns` refuse a `once` step that purges what it has sent (a queue's `PurgeQueue`, a stream's
@@ -1344,7 +1451,8 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
   that does anything but publish — [SQS targets](#sqs-targets), [Kinesis targets](#kinesis-targets),
   [Lambda targets](#lambda-targets), [EventBridge targets](#eventbridge-targets),
   [SNS targets](#sns-targets), [AMQP targets](#amqp-targets), [Pub/Sub targets](#pubsub-targets),
-  [RabbitMQ stream targets](#rabbitmq-stream-targets), [Service Bus targets](#service-bus-targets).
+  [RabbitMQ stream targets](#rabbitmq-stream-targets), [gRPC targets](#grpc-targets),
+  [Service Bus targets](#service-bus-targets).
 
 | listing | `keys` | `next` |
 |---|---|---|
