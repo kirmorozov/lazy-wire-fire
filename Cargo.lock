@@ -2399,6 +2399,7 @@ dependencies = [
  "rabbitmq-stream-client",
  "rcgen",
  "regex",
+ "ring",
  "roaring",
  "rskafka",
  "rustls",
