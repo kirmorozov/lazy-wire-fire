@@ -67,6 +67,18 @@ impl Status {
     pub fn from_wire(number: i32) -> Self {
         Status::try_from(number).unwrap_or(Status::Retry)
     }
+
+    /// The status as the `.proto` names it: what the `body` of an acknowledgement row holds, so
+    /// that a rule's `expect` can say `r.body->>'$.status' = 'REFUSED'` and mean the same word
+    /// the server sent.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Status::Unspecified => "STATUS_UNSPECIFIED",
+            Status::Ok => "OK",
+            Status::Refused => "REFUSED",
+            Status::Retry => "RETRY",
+        }
+    }
 }
 
 /// The answer for one item, named by `seq` and `hash`.

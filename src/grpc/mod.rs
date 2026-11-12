@@ -89,17 +89,23 @@
 //!   `INTERNAL`, `DATA_LOSS`, `UNIMPLEMENTED`, …) is transient, as is anything unknown.
 
 use anyhow::{bail, ensure, Context as _, Result};
+use prost::Message as _;
 use serde_json::{Map, Value};
 
 use crate::docs;
 use crate::model::{FirePer, RuleDef, TargetDef};
-use crate::response::Expect;
+use crate::response::{Expect, Row, Uses};
 use crate::secrets;
-use crate::target::{Item, Sent};
-use crate::tls::{Mode, TlsSpec};
+use crate::target::{rejected, Item, Sent};
+use crate::tls::{self, Mode, TlsSpec};
 
 pub mod contract;
 pub mod schema;
+mod stream;
+mod wire;
+
+use stream::{Call, Endpoint0, Outbound, Shared, Verdict};
+use wire::Codec;
 
 pub use schema::{pool, Method};
 
@@ -360,6 +366,9 @@ pub struct Client {
     pub mode: Option<Mode>,
     pub tls: TlsSpec,
     pub timeout: std::time::Duration,
+    /// The one stream of this endpoint, opened by the first flush and kept after that (see
+    /// [`stream`]).
+    call: Call,
 }
 
 impl Client {
@@ -393,6 +402,30 @@ impl Client {
             "method": addr.method,
             "item_type": item_type,
         });
+        // The connector is built once, at load: a `tls` that names an unreadable CA is the
+        // target's load error, not the first flush's. ALPN asks for HTTP/2, which is all gRPC
+        // speaks.
+        let connector = tls::Connector::new(&addr.host, addr.port, &def.tls, addr.secure, &[b"h2"])
+            .with_context(|| format!("`{}`", addr.url()))?;
+        let opts = options(&def.vars)?;
+        let call = Call::new(std::sync::Arc::new(Shared::new(Endpoint0 {
+            url: addr.url(),
+            path: addr.path(),
+            secure: addr.secure,
+            host: addr.host.clone(),
+            port: addr.port,
+            connector,
+            token: opts.token.clone(),
+            compression: match opts.compression {
+                Compression::Auto => None,
+                Compression::None => Some(Codec::Identity),
+                Compression::Gzip => Some(Codec::Gzip),
+                Compression::Zstd => Some(Codec::Zstd),
+            },
+            min_bytes: opts.compress_min_bytes,
+            max_message_bytes: opts.max_message_bytes,
+            timeout: def.timeout,
+        })));
         Ok((
             ctx,
             Client {
@@ -400,10 +433,11 @@ impl Client {
                 addr,
                 method,
                 pool,
-                opts: options(&def.vars)?,
+                opts,
                 mode,
                 tls: def.tls.clone(),
                 timeout: def.timeout,
+                call,
             },
         ))
     }
@@ -474,35 +508,218 @@ pub fn check(endpoints: &[String], vars: &Map<String, Value>, tls: Option<&str>)
 
 /// Sends a `once` reset action of a `grpc` target (no keys).
 ///
-/// Not until the stream exists: the kind's whole answer comes from the acknowledgement stream,
-/// so there is nothing to answer a `once` step with yet. Transient, never refused: a key that
-/// was never sent must not collect a strike.
+/// A `once` step has no keys, so what it sends is whatever its template rendered: the same
+/// `docs` array as an action's, whose `key` fields are only the server's deduplication label
+/// here. Nothing rendered is [`Sent::Skipped`], as every other kind answers a step that rendered
+/// nothing.
 pub async fn send(
     client: &Client,
-    _rendered: &str,
-    _expect: &Expect,
-    _pool: &mysql_async::Pool,
+    rendered: &str,
+    expect: &Expect,
+    pool: &mysql_async::Pool,
 ) -> Result<Sent> {
-    bail!(
-        "kind grpc is not implemented yet: `{}` would be called once the stream lands",
-        client.url
+    let items = items_of(client, rendered, &[])?;
+    if items.is_empty() {
+        return Ok(Sent::Skipped);
+    }
+    let out = client.call.push(&items).await;
+    if let Some(why) = out.refused {
+        return Err(rejected(format!("`{}`: {why}", client.url)));
+    }
+    // One answer for the whole step: any item the server would not take fails it, and any item it
+    // said nothing about leaves the step to be tried again. A `once` step has no keys to lose.
+    let mut ack = None;
+    for v in &out.verdicts {
+        match v {
+            Verdict::Ack {
+                seq,
+                hash,
+                status,
+                reason,
+            } => match status {
+                contract::Status::Ok => {
+                    if ack.is_none() {
+                        ack = Some((*seq, *hash, *status, reason.clone()));
+                    }
+                }
+                contract::Status::Refused => {
+                    return Err(rejected(format!(
+                        "`{}`: the server refused item {seq}: {reason}",
+                        client.url
+                    )))
+                }
+                contract::Status::Retry => {
+                    bail!(
+                        "`{}`: the server asked for item {seq} again: {reason}",
+                        client.url
+                    )
+                }
+                contract::Status::Unspecified => {
+                    unreachable!("an ack with no status is never a verdict")
+                }
+            },
+            Verdict::Lost(why) => bail!("`{}`: {why}", client.url),
+        }
+    }
+    // The step's row is the acknowledgement of the first item: what `expect` holds a `once` step
+    // to, as for every other kind.
+    let (seq, hash, status, reason) = ack.ok_or_else(|| {
+        rejected(format!(
+            "`{}`: the server acknowledged none of the {} items",
+            client.url,
+            out.verdicts.len()
+        ))
+    })?;
+    expect
+        .row(pool, |u| ack_row(u, seq, hash, status, &reason))
+        .await
+        .with_context(|| format!("`{}`", client.url))?
+        .map_err(|e| rejected(format!("`{}`: {e}", client.url)))?;
+    Ok(Sent::Ok)
+}
+
+/// Sends one action of a `grpc` target (item i is the document of key i).
+///
+/// The items go onto the target's stream as one envelope and the server's acknowledgements decide
+/// the outcome of each key: see the module's outcomes. A verdict of the whole call (a status that
+/// refuses, an HTTP peer that answered a proxy's own no) is the action's error and refuses every
+/// key at once; anything the server left unanswered is that key's own transient, so a reconnect
+/// costs the keys the server had already taken nothing.
+pub async fn send_items(
+    client: &Client,
+    rendered: &str,
+    keys: &[String],
+    expect: &Expect,
+    pool: &mysql_async::Pool,
+) -> Result<Vec<Item>> {
+    let items = items_of(client, rendered, keys)?;
+    if items.is_empty() {
+        return Ok(vec![Item::Ok; keys.len()]);
+    }
+    let out = client.call.push(&items).await;
+    if let Some(why) = out.refused {
+        return Err(rejected(format!("`{}`: {why}", client.url)));
+    }
+    let mut out_items = Vec::with_capacity(out.verdicts.len());
+    for (i, v) in out.verdicts.iter().enumerate() {
+        let at = format!("item {i} (key `{}`) of {}", keys[i], client.url);
+        out_items.push(match v {
+            Verdict::Ack {
+                seq,
+                hash,
+                status,
+                reason,
+            } => match status {
+                contract::Status::Ok => match expect
+                    .row(pool, |u| ack_row(u, *seq, *hash, *status, reason))
+                    .await
+                    .with_context(|| at.clone())?
+                {
+                    Ok(()) => Item::Ok,
+                    Err(why) => Item::Rejected(format!("{at}: {why}")),
+                },
+                contract::Status::Refused => {
+                    Item::Rejected(format!("{at}: the server refused it: {reason}"))
+                }
+                contract::Status::Retry => {
+                    Item::Transient(format!("{at}: the server asked for it again: {reason}"))
+                }
+                contract::Status::Unspecified => {
+                    unreachable!("an ack with no status is never a verdict")
+                }
+            },
+            Verdict::Lost(why) => Item::Transient(format!("{at}: {why}")),
+        });
+    }
+    Ok(out_items)
+}
+
+/// The row `r` of one acknowledgement: `status` 200 and the acknowledgement as JSON for what the
+/// server took, 400 and `refused` for what it would not. The rule's `expect` reads `body`, so the
+/// `seq`, the `hash` and the server's `reason` are what a rule can hold the server to.
+fn ack_row(uses: Uses, seq: u64, hash: u64, status: contract::Status, reason: &str) -> Row {
+    let ok = status == contract::Status::Ok;
+    let body = serde_json::json!({
+        "seq": seq.to_string(),
+        "hash": hash.to_string(),
+        "status": status.wire_name(),
+        "reason": reason,
+    });
+    Row::grpc(
+        uses,
+        if ok { 200 } else { 400 },
+        if ok { "ok" } else { "refused" },
+        &body,
     )
 }
 
-/// Sends one action of a `grpc` target (item i is the document of key i). Transient for every
-/// key until the stream lands, which is the only answer that cannot lose one: the keys stay
-/// queued, and the target's own state says why.
-pub async fn send_items(
-    client: &Client,
-    _rendered: &str,
-    keys: &[String],
-    _expect: &Expect,
-    _pool: &mysql_async::Pool,
-) -> Result<Vec<Item>> {
-    let why = format!("kind grpc is not implemented yet: `{}`", client.url);
-    Ok((0..keys.len())
-        .map(|_| Item::Transient(why.clone()))
-        .collect())
+/// The rendered action's items: element i of the `docs` array becomes item i, its `doc` filled
+/// onto the target's item message field by field. `keys` is empty for a `once` step, which has no
+/// keys to line the items up against.
+///
+/// A body that is not the `docs` array, a document that does not fit the schema, and an item
+/// count that is not the key count are all refused: the template or the schema is wrong, and
+/// sending again would be wrong again.
+fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outbound>> {
+    if rendered.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let body: Value = serde_json::from_str(rendered)
+        .map_err(|e| rejected(format!("the body of `{}` is not JSON: {e}", client.url)))?;
+    let docs = body.as_array().ok_or_else(|| {
+        rejected(format!(
+            "the body of `{}` must be the `docs` array",
+            client.url
+        ))
+    })?;
+    if !keys.is_empty() && docs.len() != keys.len() {
+        return Err(rejected(format!(
+            "the body of `{}` lists {} documents for {} keys (document i is the item of key i)",
+            client.url,
+            docs.len(),
+            keys.len()
+        )));
+    }
+    let body_of = client.method.body.as_ref().ok_or_else(|| {
+        rejected(format!(
+            "`{}` has no `vars.item_type`, so a document has nothing to become",
+            client.url
+        ))
+    })?;
+    let mut out = Vec::with_capacity(docs.len());
+    for (i, d) in docs.iter().enumerate() {
+        let at = format!(
+            "document {} of `{}`",
+            i,
+            keys.get(i).map(String::as_str).unwrap_or("?")
+        );
+        let doc = d
+            .as_object()
+            .ok_or_else(|| rejected(format!("{at} is not an object")))?;
+        let key = doc
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| rejected(format!("{at} has no `key` string")))?;
+        if let Some(want) = keys.get(i) {
+            if key != want {
+                return Err(rejected(format!(
+                    "{at}: its `key` is `{key}`, not the key `{want}` the engine gave"
+                )));
+            }
+        }
+        let doc = doc
+            .get("doc")
+            .and_then(Value::as_object)
+            .ok_or_else(|| rejected(format!("{at} has no `doc` object")))?;
+        let message = schema::build(body_of, doc)
+            .with_context(|| format!("{at}, as a `{}`", body_of.full_name()))
+            .map_err(|e| rejected(format!("{e:#}")))?;
+        out.push(Outbound {
+            key: key.to_string(),
+            body: message.encode_to_vec(),
+        });
+    }
+    Ok(out)
 }
 
 /// Rule-load refusals of a `grpc` rule (called from [`crate::rule::kind_errors`]): the rule's
@@ -868,31 +1085,79 @@ mod tests {
         assert!(format!("{e:#}").contains("grpc://"), "{e:#}");
     }
 
+    /// What the stream answers on its own, without a server to ask: a body that is not the
+    /// `docs` array, a document that does not fit the schema and a key that is not the engine's
+    /// are refused (the template or the schema is wrong, and sending again would be wrong
+    /// again), while a server that cannot be reached is transient for every key — the one
+    /// answer that cannot lose one or burn a strike.
     #[test]
-    fn until_the_stream_lands_every_key_is_transient() {
-        // The one answer that cannot lose a key or burn a strike.
+    fn the_items_are_judged_before_the_wire_and_the_wire_never_loses_one() {
         let (_s, ds) = write_descriptor_set();
         let vars = format!(r#"{{"descriptor_set":"file:{ds}","item_type":"orders.v1.Item"}}"#);
         let d = def(&vars, "grpc://h:9000/catalog.v1.Ingest/Push").unwrap();
         let (_, client) = Client::new(&d, &d.endpoints[0]).unwrap();
-        let keys = ["a".to_string(), "b".to_string()];
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
+        let keys = ["a".to_string(), "b".to_string()];
+        let expect = Expect::new(None).unwrap();
+        let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+        let send = |rendered: &str, keys: &[String]| {
+            rt.block_on(send_items(&client, rendered, keys, &expect, &pool))
+        };
+
+        // Nothing rendered: nothing to send, and no key is kept waiting for a stream that has
+        // no items on it.
+        let items = send("", &keys).unwrap();
+        assert!(
+            matches!(items.as_slice(), [Item::Ok, Item::Ok]),
+            "{items:?}"
+        );
+
+        // Refused before the wire: these say the template or the schema is wrong, and every
+        // retry would say it again.
+        for (body, want) in [
+            (r#"{"not":"docs"}"#, "docs"),
+            (r#"[{"key":"a"}]"#, "doc"),
+            (
+                r#"[{"key":"WRONG","doc":{"id":1}},{"key":"b","doc":{"id":2}}]"#,
+                "WRONG",
+            ),
+            (
+                r#"[{"key":"a","doc":{"id":"seven"}},{"key":"b","doc":{"id":2}}]"#,
+                "id",
+            ),
+            (
+                r#"[{"key":"a","doc":{"id":1}},{"key":"b","doc":{"id":2}},"more"]"#,
+                "for 2 keys",
+            ),
+        ] {
+            let e = send(body, &keys)
+                .err()
+                .unwrap_or_else(|| panic!("accepted `{body}`"));
+            assert!(crate::target::is_rejected(&e), "{body}: {e:#}");
+            assert!(format!("{e:#}").contains(want), "{body}: {e:#}");
+        }
+
+        // A server lazywf cannot even reach: every key waits, no key is refused, and the error
+        // is not a refusal of the action either — the same answer for a server that opens the
+        // stream and never acknowledges, which the e2e covers with a real one.
+        let d = {
+            let mut d = def(&vars, "grpc://127.0.0.1:1/catalog.v1.Ingest/Push").unwrap();
+            d.timeout = std::time::Duration::from_secs(5);
+            d
+        };
+        let (_, client) = Client::new(&d, &d.endpoints[0]).unwrap();
+        let body = r#"[{"key":"a","doc":{"id":1}},{"key":"b","doc":{"id":2}}]"#;
         let items = rt
-            .block_on(send_items(
-                &client,
-                "",
-                &keys,
-                &Expect::new(None).unwrap(),
-                &mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x"),
-            ))
+            .block_on(send_items(&client, body, &keys, &expect, &pool))
             .unwrap();
         assert_eq!(items.len(), 2);
         assert!(
             items
                 .iter()
-                .all(|i| matches!(i, Item::Transient(w) if w.contains("not implemented"))),
+                .all(|i| matches!(i, Item::Transient(w) if !w.is_empty())),
             "{items:?}"
         );
     }

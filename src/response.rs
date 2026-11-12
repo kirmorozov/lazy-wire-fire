@@ -158,6 +158,20 @@ impl Row {
         }
     }
 
+    /// The acknowledgement of one `grpc` item as the row `r`: `status` and `text` as the kind
+    /// reads the server's verdict (200 and `ok` for what it took, 400 and `refused` for what it
+    /// would not take at all), and `body` the acknowledgement itself — `seq`, `hash`, `status`,
+    /// `reason` — so a rule's `expect` can hold the server to what it said rather than only to
+    /// the fact that it said something.
+    pub fn grpc(uses: Uses, status: u16, text: &str, body: &Value) -> Row {
+        Row {
+            status: uses.status.then_some(i64::from(status)),
+            text: uses.text.then(|| text.to_string()),
+            body: uses.body.then(|| body.to_string()),
+            ..Row::default()
+        }
+    }
+
     /// A JSON answer as `body` (the rows of a SQL listing).
     pub fn json(uses: Uses, v: &Value) -> Row {
         Row {

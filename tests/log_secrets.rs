@@ -2607,11 +2607,13 @@ Action=PublishBatch&Version=2010-03-31&TopicArn={{url_encode endpoint.topic_arn}
 }
 
 /// The credential of a `grpc` target: `vars.token` is a reference whose value becomes the
-/// `authorization: Bearer …` metadata of every call. The kind has no server to reach yet (the
-/// stream is the next step of it), so this drives the target as far as it goes today — load,
-/// endpoint context, one action, and the refusals an owner can write — and checks the capture:
-/// neither the value nor the descriptor set's contents may appear in the log, and the
-/// configuration error of a credential in the URL must not repeat the URL either.
+/// `authorization: Bearer …` metadata of every call. The flow drives the kind over every path
+/// where a credential could be repeated — the target's load, an endpoint context and an action's
+/// template variables, the refusals an owner can write, a host that never answers — and then
+/// flushes two keys for real at the in-process gRPC server of `common::grpc_server`, which wants
+/// exactly this token and so proves the call carried it. Neither the value nor the descriptor
+/// set's contents may turn up in the capture: not in lazywf's own lines, and not in what tonic and
+/// h2 log around a call that succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_secret_in_the_logs_grpc() {
     install();
@@ -2623,6 +2625,9 @@ async fn no_secret_in_the_logs_grpc() {
     std::fs::write(dir.join("grpc-token"), format!("{GRPC_TOKEN}\n")).unwrap();
     let desc = dir.join("logsecrets.desc");
     std::fs::write(&desc, lazy_wire_fire::grpc::contract::DESCRIPTOR).unwrap();
+    // The schema a flushing target builds its documents onto: an app's own message, and a service
+    // of the contract's shape to call. This binary compiles it here, once.
+    let schema = common::grpc_server::write_schema(&dir);
     // Not a descriptor set, and its bytes are the token: a refusal that quoted the file would
     // be a leak of the credential.
     let not_desc = dir.join("not-a-desc");
@@ -2651,19 +2656,10 @@ async fn no_secret_in_the_logs_grpc() {
     tracing::trace!(?ctx, ?client.opts, "the endpoint of a grpc target");
 
     let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
-    let target = lazy_wire_fire::target::Target::new(def, pool, None).expect("the target starts");
-    let items = target
-        .send_items(0, r#"{"docs":[]}"#, &["1".into(), "2".into()])
-        .await
-        .expect("the answer is per item");
-    assert!(
-        items
-            .iter()
-            .all(|i| matches!(i, lazy_wire_fire::target::Item::Transient(_))),
-        "{items:?}"
-    );
-    // A `once` step of the same target: refused until the stream lands, in a message that names
-    // the endpoint.
+    let target =
+        lazy_wire_fire::target::Target::new(def, pool.clone(), None).expect("the target starts");
+    // A `once` step whose body is not the `docs` array is refused, in a message that names the
+    // endpoint and nothing else.
     let e = target.send(0, "{}").await.unwrap_err();
     tracing::debug!(error = %e, "a once step of a grpc target");
     assert!(format!("{e:#}").contains("lazywf.v1.Sink/Push"), "{e:#}");
@@ -2720,6 +2716,68 @@ async fn no_secret_in_the_logs_grpc() {
             .unwrap_or_else(|| panic!("accepted {what}"));
         tracing::debug!(error = %e, "a grpc target refused");
     }
+
+    use lazy_wire_fire::target::Item;
+    // What a flush of two keys is: the `docs` array a rule's template renders for them, and the
+    // keys the engine hands the kind beside it.
+    let keys: Vec<String> = vec!["1".into(), "2".into()];
+    let body = common::grpc_server::rendered(&["1", "2"]);
+    let flush_vars = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"{}","token":"env:LWF_LOGGRPC_TOKEN"}}"#,
+        schema,
+        common::grpc_server::ITEM_TYPE,
+    );
+    let flushing = |endpoint: String| {
+        let def = lazy_wire_fire::model::TargetDef::from_row(&row(flush_vars.clone(), &endpoint))
+            .expect("loads");
+        lazy_wire_fire::target::Target::new(def, pool.clone(), None).expect("the target starts")
+    };
+
+    // A host nothing answers: every key waits, and what the log has to say about the failed call
+    // is lazywf's own words about the endpoint, never the credential it was given. The method is
+    // the app schema's own, since this target's descriptor set is the one written above.
+    let dead_ep = format!(
+        "grpcs://ingest.example.test:9000/{}",
+        common::grpc_server::METHOD
+    );
+    let dead = flushing(dead_ep);
+    let items = dead
+        .send_items(0, &body, &keys)
+        .await
+        .expect("the answer is per item");
+    assert!(
+        items.iter().all(|i| matches!(i, Item::Transient(_))),
+        "{items:?}"
+    );
+    assert!(
+        format!("{items:?}").contains("ingest.example.test:9000/catalog.v1.Ingest/Push"),
+        "the failed call is not named by its endpoint: {items:?}"
+    );
+
+    // And the stream itself, at a server of lazywf's own that wants exactly this token: the call
+    // the capture is taken around. The token is the `authorization` metadata of the call, so
+    // everything the kind and its transport have to say about a call that *succeeds* is in the
+    // buffer by now.
+    let server = common::grpc_server::Server::start(common::grpc_server::Policy {
+        token: Some(GRPC_TOKEN.to_string()),
+        ..Default::default()
+    })
+    .await;
+    let live = flushing(server.endpoint());
+    let items = live
+        .send_items(0, &body, &keys)
+        .await
+        .expect("the call itself went through");
+    assert!(items.iter().all(|i| *i == Item::Ok), "{items:?}");
+    // Both halves of this are what makes the check below mean something: the items really
+    // reached the server, and what it authenticated the call with really was the token.
+    assert_eq!(server.seen().len(), 2, "the flush did not reach the server");
+    assert_eq!(
+        server.header("authorization").as_deref(),
+        Some(&format!("Bearer {GRPC_TOKEN}")[..]),
+        "the token did not go as the call's bearer metadata"
+    );
+    server.stop();
 
     let out = captured();
     let leaks = leaks(&out, &[("grpc bearer token", GRPC_TOKEN)]);
