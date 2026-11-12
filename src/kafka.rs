@@ -82,7 +82,7 @@ use tokio::sync::Mutex;
 
 use crate::model::{FirePer, RuleDef, TargetDef};
 use crate::response::{Expect, Row};
-use crate::target::{rejected, Item, Sent};
+use crate::target::{rejected, var, Item, Sent};
 use crate::tls::{Mode, TlsSpec};
 
 /// The broker's default `message.max.bytes`: 1 MiB.
@@ -261,12 +261,6 @@ pub fn message_max_bytes(vars: &Map<String, Value>) -> Result<usize> {
             Ok(n as usize)
         }
     }
-}
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 /// The target's SASL settings, when `vars.sasl` selects one. The password is a reference, never

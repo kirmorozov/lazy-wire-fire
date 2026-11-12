@@ -99,7 +99,7 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::model::{FirePer, RuleDef, TargetDef};
 use crate::response::{Expect, Row};
-use crate::target::{rejected, Item, Sent};
+use crate::target::{rejected, var, Item, Sent};
 use crate::tls::{Mode, TlsSpec};
 
 /// The frame limit both sides tune to by default: 1 MiB. The crate sends a publish batch as
@@ -271,12 +271,6 @@ pub fn tls_config(spec: &TlsSpec, secure: bool) -> Result<Option<TlsConfiguratio
         },
         Mode::Auto => bail!("tls mode `auto` was not resolved"),
     }
-}
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 /// The account of the SASL PLAIN handshake the protocol always makes: `vars.username` (a
