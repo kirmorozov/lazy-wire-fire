@@ -283,10 +283,6 @@ impl Instance {
             other => panic!("engine did not stop cleanly: the engine answered {other:?}"),
         }
     }
-
-    pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
-    }
 }
 
 #[derive(Debug, Clone)]

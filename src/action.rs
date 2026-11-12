@@ -1106,8 +1106,6 @@ pub async fn fire_strays(
     f
 }
 
-pub type SharedRule = Arc<Rule>;
-
 #[cfg(test)]
 mod tests {
     use super::*;

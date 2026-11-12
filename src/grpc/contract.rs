@@ -144,19 +144,6 @@ pub const FULL_METHOD: &str = "lazywf.v1.Sink/Push";
 #[cfg(test)]
 pub const PROTO_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/proto");
 
-/// Compiles `proto/lazywf/v1/lazywf.proto` the way the committed descriptor was made:
-/// `protox`, pure Rust, no source info, no protoc.
-#[cfg(test)]
-pub fn compile_proto() -> Vec<u8> {
-    protox::Compiler::new([PROTO_DIR])
-        .expect("the proto directory opens")
-        .include_source_info(false)
-        .include_imports(true)
-        .open_files(["lazywf/v1/lazywf.proto"])
-        .expect("the shipped .proto compiles")
-        .encode_file_descriptor_set()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

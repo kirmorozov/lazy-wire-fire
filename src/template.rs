@@ -867,11 +867,6 @@ pub fn valid_key(k: &str) -> bool {
     !k.is_empty() && !k.bytes().any(|c| c < b' ' || c == 0x7f)
 }
 
-/// Keys from rendered key-template output: one per non-empty line, trimmed.
-pub fn split_keys(rendered: &str) -> impl Iterator<Item = &str> {
-    rendered.lines().map(str::trim).filter(|l| !l.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,9 +1478,5 @@ mod tests {
         assert_eq!(simple_key_template("{{#if new.a}}x{{/if}}"), None);
         assert_eq!(simple_key_template("{{{new.a}}}"), None);
         assert_eq!(simple_key_template("{{vars.a}}"), None);
-        assert_eq!(
-            split_keys(" a \n\n b\n").collect::<Vec<_>>(),
-            vec!["a", "b"]
-        );
     }
 }

@@ -143,7 +143,7 @@ pub enum Kind {
     /// stream protocol, an answer per record (see `rabbitmq_stream.rs`).
     RabbitMqStream,
     /// gRPC: the rule's documents as protobuf messages, pushed onto one long-lived
-    /// bidirectional stream per endpoint and acknowledged item by item (see `grpc.rs`).
+    /// bidirectional stream per endpoint and acknowledged item by item (see `grpc/mod.rs`).
     Grpc,
     /// Azure Service Bus: one batch of messages per action to a queue or topic, a
     /// disposition per message (see `servicebus.rs`).
