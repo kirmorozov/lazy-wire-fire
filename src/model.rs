@@ -304,10 +304,25 @@ impl Kind {
     /// `vars` entries that hold credentials and never reach templates.
     pub fn secret_vars(self) -> &'static [&'static str] {
         match self {
-            Kind::Http => &["sign_secret_ref"],
-            Kind::HttpBasic => &["password", "sign_secret_ref"],
-            Kind::HttpBearer => &["token", "sign_secret_ref"],
-            Kind::HttpHeader => &["value", "sign_secret_ref"],
+            Kind::Http => &["sign_secret_ref", "client_secret_ref", "credentials_ref"],
+            Kind::HttpBasic => &[
+                "password",
+                "sign_secret_ref",
+                "client_secret_ref",
+                "credentials_ref",
+            ],
+            Kind::HttpBearer => &[
+                "token",
+                "sign_secret_ref",
+                "client_secret_ref",
+                "credentials_ref",
+            ],
+            Kind::HttpHeader => &[
+                "value",
+                "sign_secret_ref",
+                "client_secret_ref",
+                "credentials_ref",
+            ],
             Kind::HttpS3
             | Kind::Sqs
             | Kind::Kinesis
@@ -573,6 +588,19 @@ impl TargetDef {
         } else if let Some(k) = crate::sign::first_var(&vars) {
             bail!(
                 "`vars.{k}` is not used by kind {} (signing is an option of http, http.basic, http.bearer and http.header)",
+                kind.name()
+            );
+        }
+        // An OAuth 2.0 access token is an option of the same plain http kinds; on the others
+        // the settings would go unused (each queue kind authenticates in its own way).
+        if matches!(
+            kind,
+            Kind::Http | Kind::HttpBasic | Kind::HttpBearer | Kind::HttpHeader
+        ) {
+            crate::oauth::check(kind, &vars)?;
+        } else if let Some(k) = crate::oauth::first_var(&vars, kind) {
+            bail!(
+                "`vars.{k}` is not used by kind {} (vars.oauth is an option of http, http.basic, http.bearer and http.header)",
                 kind.name()
             );
         }
