@@ -21,7 +21,7 @@ object.
 | column | meaning |
 |---|---|
 | `name` | referenced by rules |
-| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`) (these four can sign their requests: [Webhook signing](#webhook-signing)), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
+| `kind` | `http` (also `https`), `http.basic` (`vars.username`, `vars.password`), `http.bearer` (`vars.token`), `http.header` (`vars.header`, `vars.value`) (these four can sign their requests: [Webhook signing](#webhook-signing), and put an OAuth 2.0 access token on every action: [OAuth access tokens](#oauth-access-tokens)), `http.s3` (SigV4, below), `sqs` (SigV4, an Amazon
 SQS queue, below), `kinesis` (SigV4, an Amazon Kinesis stream, below), `lambda` (SigV4, an Amazon
 Lambda function, below), `eventbridge` (SigV4, an Amazon EventBridge event bus, below), `sns`
 (SigV4, an Amazon SNS topic, below), `amqp` (an AMQP 0-9-1
@@ -392,6 +392,80 @@ receiver reads (a stray-cleanup listing of these kinds is signed too):
 * The secret is a credential of the kind: it stays out of the template context (`target.vars`
   holds the scheme and the header form, not the secret) and out of the logs
   ([security](#security)).
+
+### OAuth access tokens
+
+The four plain http kinds (`http`, `http.basic`, `http.bearer`, `http.header`) can send an
+OAuth 2.0 access token: `vars.oauth` selects the grant and the tool puts
+`Authorization: Bearer <token>` on every action of the target (a stray-cleanup listing of these
+kinds carries it too). Signing and tokens combine: signing proves the payload's origin to the
+receiver and the token authorises lazywf at the endpoint — the token header goes on where the
+kind's credential header goes, and the signature is still written last, over the exact body.
+
+| `vars` | meaning |
+|---|---|
+| `vars.oauth` | `google`, `client_credentials` or `jwt_bearer`: the grant. The setting that turns tokens on; an oauth setting without it is a load error naming the setting, and an unknown grant names itself |
+| `vars.credentials_ref` | `google` only: the service-account key JSON: a reference only (`env:NAME` or `file:/path`), never a literal, read on every use; when the target names none, Application Default Credentials |
+| `vars.token_url` | `client_credentials` and `jwt_bearer`: the token endpoint: https, plain http only on loopback, no userinfo, and its host must pass the operator's allow-list |
+| `vars.client_id` | `client_credentials`: the client identifier (a literal or a reference, as `http.basic` takes its username); `jwt_bearer`: the assertion's `iss` |
+| `vars.client_secret_ref` | `client_credentials` only: the client secret: a reference only, never a literal |
+| `vars.subject` | `jwt_bearer` only: the assertion's `sub`: the user the token acts for (an identifier: literal or reference) |
+| `vars.audience` | `jwt_bearer` only: the assertion's `aud`: required (the login host for Salesforce) |
+| `vars.signing_key_ref` | `jwt_bearer` only: the RSA private key that signs the assertion: a reference only, PEM, PKCS#8 or PKCS#1 |
+| `vars.scope` | any grant, optional: the scope to request at the token endpoint (split on spaces for `google`, sent as one `scope=` form field otherwise) |
+
+* **`google`** — a Google service-account token through the same path `pubsub` uses: the key
+  reference is re-read on every use, Application Default Credentials serve when the target names
+  none, and `vars.scope` asks for the scopes (without it the library's own default, as `pubsub`
+  uses today). The library reports Google no lifetime to the tool, so the tool assumes the usual
+  hour and replaces the token five minutes before that.
+* **`client_credentials`** — RFC 6749 §4.4 over the target's own http client: the tool POSTs
+  `grant_type=client_credentials` (plus `scope=` when set, percent-encoded locally) to
+  `vars.token_url`, authenticating the client with HTTP Basic — RFC 6749 §2.3.1, which every
+  server is required to support: the id and the secret are each form-encoded before the colon and
+  the whole, so the secret never sits in the body.
+* **`jwt_bearer`** — RFC 7523 §2.1 (the flow Salesforce documents for server-to-server auth):
+  the tool signs `{"iss": client_id, "sub": subject, "aud": audience, "iat": now, "exp":
+  now + 180 s}` RS256 with the key behind `vars.signing_key_ref` and POSTs it to `vars.token_url`
+  as `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=…` (plus `scope=` when
+  set). The assertion identifies the client, so the token request carries no client
+  authentication — no `Authorization` header goes to the token endpoint.
+* **Everything else is checked at load and every refusal names its setting**: a literal where a
+  reference belongs (`credentials_ref`, `client_secret_ref`, `signing_key_ref`), a `token_url`
+  that is not https off loopback, carries userinfo, or names a host the allow-list refuses, the
+  settings of one grant on another grant (and any oauth setting without `vars.oauth`), and an
+  oauth setting on any other kind — `http.s3`, the AWS kinds and the queue kinds authenticate
+  their own way (`pubsub` keeps its own `credentials_ref`, which stays legal on that kind). A
+  second source of `Authorization` is refused too, naming both: `http.basic` (its Basic header),
+  `http.bearer` (its Bearer header), `http.header` whose `vars.header` names `Authorization`, and
+  a rule template whose header block writes an `Authorization:` line (the once, snapshot and
+  stray step templates are checked the same way). A header name only the rendering produces is
+  refused at the bind — transient, and the rendered value is never quoted.
+* **The token is cached per target**: reused until a minute before its lifetime ends (half the
+  lifetime when the endpoint reports two minutes or less, so a very short one is not cached at
+  all), one hour when the answer names no `expires_in` (Google's and Entra's usual hour), a
+  claimed lifetime trusted no further than 24 h and read as a number or a numeric string. One
+  token request is in flight at a time — concurrent sends of one target cost one token and share
+  it — and the cache is dropped at once by new bytes behind any secret reference (a rotation
+  applies without a reload), by changed `iss`/`sub`/`aud` for `jwt_bearer`, and by a 401 from the
+  endpoint.
+* **Outcomes**: a token-endpoint failure of any kind — transport, any 4xx (including
+  `invalid_client`), any 5xx, a body that is not JSON, an answer with no `access_token`, a
+  non-bearer `token_type`, an unusable `expires_in` — says nothing about the message, so it is
+  **transient for every key** and names its cause; it is never a refusal. With `vars.oauth` set
+  an endpoint 401 is transient whatever `expect` says (it speaks about the credential, not about
+  this message) and drops the cached token, so the next attempt presents a new one; every other
+  status keeps the http rules ([above](#targets)).
+* **Nothing secret gets out**: the access token, the client secret, the service-account key and
+  the signed assertion never reach a log line at any `RUST_LOG` level, an error text, `/status`
+  or a URL. Each secret exists only as a reference resolved on use and dropped, `target.vars` and
+  `/status` hold the reference alone, an answer that echoes a credential or a token it handed out
+  is scrubbed and clipped to one short line, and messages name the token endpoint by its origin —
+  scheme, host, port — never its path.
+* **The token host's TLS** is verified on the built-in roots, never on the target's `vars.tls`:
+  a `server_name` pinned for the API host must not be reused to verify the token host (a private
+  CA for a token host is not supported yet; a broker on `http://127.0.0.1` — plain http is
+  accepted on loopback — is today's workaround).
 
 ### SQL targets
 
