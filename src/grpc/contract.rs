@@ -145,4 +145,5 @@ pub const FULL_METHOD: &str = "lazywf.v1.Sink/Push";
 pub const PROTO_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/proto");
 
 #[cfg(test)]
+#[path = "../tests/grpc_contract.rs"]
 mod tests;

@@ -541,4 +541,5 @@ fn short(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "tests/response.rs"]
 mod tests;

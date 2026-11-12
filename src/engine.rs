@@ -2917,10 +2917,13 @@ async fn flush_job(
 }
 
 #[cfg(test)]
+#[path = "tests/engine.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/engine_batch_tests.rs"]
 mod batch_tests;
 
 #[cfg(test)]
+#[path = "tests/engine_stream_verdict_tests.rs"]
 mod stream_verdict_tests;

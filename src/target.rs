@@ -1633,19 +1633,24 @@ mod kinesis_verdict_tests {
 }
 
 #[cfg(test)]
+#[path = "tests/target_eventbridge_verdict_tests.rs"]
 mod eventbridge_verdict_tests;
 
 #[cfg(test)]
+#[path = "tests/target_allow_tests.rs"]
 mod allow_tests;
 
 #[cfg(test)]
+#[path = "tests/target_dispatch_tests.rs"]
 mod dispatch_tests;
 
 #[cfg(test)]
+#[path = "tests/target_secret_endpoint_tests.rs"]
 mod secret_endpoint_tests;
 
 // ---------------------------------------------------------------------------------------------
 // oauth: the plain http kinds carry `Authorization: Bearer <token>` (see `src/oauth.rs`).
 
 #[cfg(test)]
+#[path = "tests/target_oauth_tests.rs"]
 mod oauth_tests;

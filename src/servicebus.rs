@@ -1360,4 +1360,5 @@ pub fn refuse_scheme(kind_is_servicebus: bool, endpoints: &[String]) -> Result<(
 }
 
 #[cfg(test)]
+#[path = "tests/servicebus.rs"]
 mod tests;

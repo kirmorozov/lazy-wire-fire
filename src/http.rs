@@ -661,9 +661,11 @@ async fn read_chunked(c: &mut Conn) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[path = "tests/http.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/http_secret_url_tests.rs"]
 mod secret_url_tests;
 
 #[cfg(test)]
@@ -695,4 +697,5 @@ mod debug_tests {
 /// What a rendered template is allowed to put on the wire: a request line that smuggles a
 /// second header, or a body length that lies, must be refused before it is sent.
 #[cfg(test)]
+#[path = "tests/http_request_tests.rs"]
 mod request_tests;

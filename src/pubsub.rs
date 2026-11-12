@@ -412,6 +412,7 @@ async fn publish_once(
 }
 
 #[cfg(test)]
+#[path = "tests/pubsub.rs"]
 mod tests;
 
 #[cfg(test)]
@@ -512,4 +513,5 @@ mod ordering_tests {
 }
 
 #[cfg(test)]
+#[path = "tests/pubsub_body_and_rule_limits_tests.rs"]
 mod body_and_rule_limits_tests;

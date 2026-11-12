@@ -745,7 +745,7 @@ fn the_rule_template_refusals_name_the_template_and_the_grant() {
 // ---------------------------------------------------------------------------------
 // vars.oauth=jwt_bearer (RFC 7523 §2.1, Salesforce)
 
-/// The test-only RSA key of `src/testdata`, both encodings (see its README).
+/// The test-only RSA key of `src/tests/testdata`, both encodings (see its README).
 fn key_pkcs8() -> Vec<u8> {
     jwt_check::fixture("rsa-test-key-pkcs8.pem")
 }

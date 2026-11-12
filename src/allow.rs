@@ -180,4 +180,5 @@ fn in_cidr(ip: IpAddr, net: IpAddr, len: u8) -> bool {
 }
 
 #[cfg(test)]
+#[path = "tests/allow.rs"]
 mod tests;

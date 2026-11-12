@@ -868,4 +868,5 @@ pub fn valid_key(k: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "tests/template.rs"]
 mod tests;

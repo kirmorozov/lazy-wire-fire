@@ -1271,4 +1271,5 @@ impl TowerService<http::Uri> for Pipe {
 }
 
 #[cfg(test)]
+#[path = "../tests/grpc_stream.rs"]
 mod tests;

@@ -590,6 +590,7 @@ fn test_target(kind: &str, endpoint: &str, vars: &str) -> crate::model::TargetDe
 }
 
 #[cfg(test)]
+#[path = "tests/rule_kind_tests.rs"]
 mod kind_tests;
 
 #[cfg(test)]

@@ -902,6 +902,7 @@ pub fn lambda_failed_items(body: &[u8]) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+#[path = "tests/aws_lambda_tests.rs"]
 mod lambda_tests;
 
 /// The region of an AWS endpoint: the URL's, else `AWS_REGION`, else `AWS_DEFAULT_REGION`, else
@@ -1030,6 +1031,7 @@ pub fn transient_code(code: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "tests/aws_provider_tests.rs"]
 mod provider_tests;
 
 #[cfg(test)]
@@ -1210,6 +1212,7 @@ mod classify_tests {
 }
 
 #[cfg(test)]
+#[path = "tests/aws_url_tests.rs"]
 mod url_tests;
 
 #[cfg(test)]

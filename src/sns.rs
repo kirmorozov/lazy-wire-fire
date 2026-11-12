@@ -339,4 +339,5 @@ fn bool_text(text: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+#[path = "tests/sns.rs"]
 mod tests;

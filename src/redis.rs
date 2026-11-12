@@ -416,6 +416,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[path = "tests/redis.rs"]
 mod tests;
 
 #[cfg(test)]

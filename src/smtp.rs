@@ -645,6 +645,7 @@ pub async fn send(client: &Client, rendered: &str, expect: &Expect, pool: &Pool)
 }
 
 #[cfg(test)]
+#[path = "tests/smtp.rs"]
 mod tests;
 
 #[cfg(test)]

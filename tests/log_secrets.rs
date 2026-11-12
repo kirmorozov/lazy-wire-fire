@@ -3135,7 +3135,7 @@ async fn no_secret_in_the_logs_oauth() {
 // ---- The JWT bearer grant of `vars.oauth` (RFC 7523 §2.1, src/oauth.rs).
 
 /// The access token the token endpoint hands out (the hit's number appended). The private
-/// key comes from the test fixture under `src/testdata` (a throwaway key, see its README);
+/// key comes from the test fixture under `src/tests/testdata` (a throwaway key, see its README);
 /// a distinctive run of its base64 body is the marker below. None of these may reach a log
 /// line at `trace`, an error text or `last_error` — the token endpoint of this flow echoes
 /// the whole request it was sent (its assertion included), and the API echoes the
@@ -3159,7 +3159,7 @@ async fn no_secret_in_the_logs_oauth_jwt() {
         .unwrap()
         .join("tmp/out/secrets-logs");
     std::fs::create_dir_all(&dir).unwrap();
-    let key_pem = std::fs::read_to_string("src/testdata/rsa-test-key-pkcs8.pem").unwrap();
+    let key_pem = std::fs::read_to_string("src/tests/testdata/rsa-test-key-pkcs8.pem").unwrap();
     let key_file = dir.join("oauth-jwt-key");
     std::fs::write(&key_file, &key_pem).unwrap();
     std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());

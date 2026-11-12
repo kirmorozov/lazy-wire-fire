@@ -204,4 +204,5 @@ pub(crate) fn ensure_frame_len(len: usize, max: usize) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../tests/grpc_wire.rs"]
 mod tests;
