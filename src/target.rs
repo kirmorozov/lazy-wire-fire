@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use mysql_async::Pool;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::allow::HostList;
 use crate::aws;
@@ -254,11 +254,14 @@ pub fn lambda_items(failed: &[String], keys: &[String]) -> Result<Vec<Item>> {
 
 /// The AWS credentials of a target's `vars`, when it gives any.
 fn aws_refs(def: &TargetDef) -> Option<aws::Refs> {
-    match (var(def, "access_key_ref"), var(def, "secret_key_ref")) {
+    match (
+        def_var(def, "access_key_ref"),
+        def_var(def, "secret_key_ref"),
+    ) {
         (Some(a), Some(s)) => Some(aws::Refs {
             access_key: a.to_string(),
             secret_key: s.to_string(),
-            session_token: var(def, "session_token_ref").map(str::to_string),
+            session_token: def_var(def, "session_token_ref").map(str::to_string),
         }),
         _ => None,
     }
@@ -285,11 +288,16 @@ pub enum Sent {
     Ok,
 }
 
-fn var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
-    def.vars
-        .get(k)
+/// The string a target's `vars` holds under `k`: empty is unset. The kind modules read their
+/// own `vars` through this one.
+pub(crate) fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
+    vars.get(k)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
+}
+
+fn def_var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
+    var(&def.vars, k)
 }
 
 /// One http request with its endpoint resolved: the client that owns the connection, the
@@ -420,8 +428,8 @@ impl Target {
                     let addr = SqlAddr::parse(e, d)?;
                     let ctx = addr.ctx(d);
                     let creds = Credentials {
-                        user: var(&def, "username").map(str::to_string),
-                        password: var(&def, "password").map(str::to_string),
+                        user: def_var(&def, "username").map(str::to_string),
+                        password: def_var(&def, "password").map(str::to_string),
                     };
                     let transport = if def.kind == Kind::MySql {
                         Transport::MySql(MySqlClient::new(addr, &def.tls, creds))
@@ -456,8 +464,8 @@ impl Target {
                     let client = RedisClient::new(
                         addr,
                         &def.tls,
-                        var(&def, "username").map(str::to_string),
-                        var(&def, "password").map(str::to_string),
+                        def_var(&def, "username").map(str::to_string),
+                        def_var(&def, "password").map(str::to_string),
                     )?;
                     endpoints.push(Endpoint {
                         ctx,
@@ -475,8 +483,8 @@ impl Target {
                     _ => false,
                 };
                 let spec = S3Spec {
-                    bucket: var(&def, "bucket").unwrap_or_default().to_string(),
-                    region: var(&def, "region").unwrap_or_default().to_string(),
+                    bucket: def_var(&def, "bucket").unwrap_or_default().to_string(),
+                    region: def_var(&def, "region").unwrap_or_default().to_string(),
                     path_style,
                 };
                 let mut services: Vec<BaseUrl> = def
@@ -485,7 +493,7 @@ impl Target {
                     .map(|e| BaseUrl::parse(e))
                     .collect::<Result<_>>()?;
                 if services.is_empty() {
-                    services.push(match var(&def, "endpoint") {
+                    services.push(match def_var(&def, "endpoint") {
                         Some(e) => BaseUrl::parse(e).context("`vars.endpoint`")?,
                         None => spec.aws_endpoint(),
                     });
@@ -1417,7 +1425,7 @@ impl Target {
             req.set_header("Host", host_header.to_string());
         }
         let get = |k: &str| -> Result<String> {
-            secrets::resolve(var(&self.def, k).ok_or_else(|| anyhow!("vars.{k} is missing"))?)
+            secrets::resolve(def_var(&self.def, k).ok_or_else(|| anyhow!("vars.{k} is missing"))?)
                 .with_context(|| format!("vars.{k}"))
         };
         match self.def.kind {
@@ -1433,7 +1441,7 @@ impl Target {
                 req.set_header("Authorization", format!("Bearer {}", get("token")?))
             }
             Kind::HttpHeader => {
-                let name = var(&self.def, "header").unwrap_or_default().to_string();
+                let name = def_var(&self.def, "header").unwrap_or_default().to_string();
                 req.set_header(&name, get("value")?);
             }
             _ => {}

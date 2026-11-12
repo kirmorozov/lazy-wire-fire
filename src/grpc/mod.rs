@@ -96,7 +96,7 @@ use crate::docs;
 use crate::model::{FirePer, RuleDef, TargetDef};
 use crate::response::{Expect, Row, Uses};
 use crate::secrets;
-use crate::target::{rejected, Item, Sent};
+use crate::target::{rejected, var, Item, Sent};
 use crate::tls::{self, Mode, TlsSpec};
 
 pub mod contract;
@@ -279,12 +279,6 @@ impl Compression {
             Compression::Zstd => "zstd",
         }
     }
-}
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 /// A count of bytes from vars: a JSON number or a string of digits, or the default.

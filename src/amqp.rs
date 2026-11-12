@@ -67,7 +67,7 @@ use tokio::sync::Mutex;
 use crate::model::{FirePer, TargetDef};
 use crate::response::{Expect, Row, Uses};
 use crate::secrets;
-use crate::target::{rejected, Sent};
+use crate::target::{rejected, var, Sent};
 use crate::tls::{Mode, TlsSpec};
 
 /// AMQP short strings hold at most 255 octets.
@@ -189,12 +189,6 @@ pub fn tls_config(spec: &TlsSpec, secure: bool) -> Result<Option<OwnedTLSConfig>
         ),
         Mode::Auto => bail!("tls mode `auto` was not resolved"),
     }
-}
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 /// Load checks for a target of kind amqp (`TargetDef::from_row`): the credentials, each
