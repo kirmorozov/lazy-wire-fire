@@ -44,6 +44,7 @@ use crate::gcp;
 use crate::http::{BaseUrl, Client as HttpClient, RawRequest, Response};
 use crate::model::{Kind, RuleDef, StepKind, TargetDef};
 use crate::secrets;
+use crate::target::var;
 use crate::tls::TlsSpec;
 
 /// The lifetime taken when the token endpoint reports no `expires_in` (Google's and Entra's
@@ -67,12 +68,6 @@ const OAUTH_VARS: &[&str] = &[
     "client_id",
     "client_secret_ref",
 ];
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-}
 
 /// The first oauth setting of `vars`, for the load error on a kind that does not take them
 /// (the `sign::first_var` pattern). `credentials_ref` is `pubsub`'s own setting: naming it
@@ -244,8 +239,9 @@ enum Grant {
 }
 
 struct ClientCredentials {
-    /// The full token URL, for the error messages and the log line: the URL is a setting the
-    /// template may see anyway, not a secret.
+    /// The token endpoint's origin (scheme, host, port) — never its path: the full URL stays
+    /// out of error messages, the warn line and the `Debug`, the way a secret endpoint is
+    /// named. It is still a config the template could see, not a secret itself.
     shown: String,
     /// The request line's target: the URL's path, `/` when it has none.
     path: String,
@@ -318,7 +314,7 @@ impl Provider {
                 Provider {
                     name: def.name.clone(),
                     grant: Grant::ClientCredentials(Box::new(ClientCredentials {
-                        shown: base.url(),
+                        shown: base.origin(),
                         path,
                         client,
                         client_id: var(&def.vars, "client_id").unwrap_or_default().to_string(),
@@ -451,7 +447,12 @@ impl ClientCredentials {
         if let Some(scope) = &self.scope {
             body.push_str(&format!("&scope={}", form_encode(scope)));
         }
-        let basic = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"));
+        // RFC 6749 §2.3.1: the two are each form-encoded before the colon and the whole.
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            form_encode(id),
+            form_encode(secret)
+        ));
         let mut req = RawRequest {
             method: "POST".into(),
             target: self.path.clone(),
@@ -665,8 +666,16 @@ mod tests {
     fn assert_carries_no_secret(s: &str) {
         assert!(!s.contains(SECRET), "{s}");
         assert!(!s.contains(&form_encode(SECRET)), "{s}");
+        // both the raw pair and the §2.3.1 form: the encoded pair is what the wire carries
         assert!(
             !s.contains(&base64::engine::general_purpose::STANDARD.encode(format!("cid:{SECRET}"))),
+            "{s}"
+        );
+        assert!(
+            !s.contains(
+                &base64::engine::general_purpose::STANDARD
+                    .encode(format!("cid:{}", form_encode(SECRET)))
+            ),
             "{s}"
         );
     }
@@ -1016,7 +1025,7 @@ mod tests {
         let p = cc_provider(&server, Some("https://graph.microsoft.com/.default"));
         let header = p.authorization().await.unwrap();
         assert_eq!(header, "Bearer tok-0");
-        let want = base64::engine::general_purpose::STANDARD.encode("cid:s3cr/t");
+        let want = base64::engine::general_purpose::STANDARD.encode("cid:s3cr%2Ft");
         let last = server.last();
         assert!(last.starts_with("POST /token HTTP/1.1\r\n"), "{last}");
         assert!(last.contains("Host: 127.0.0.1"), "{last}");
@@ -1038,6 +1047,34 @@ mod tests {
             "{last}"
         );
         assert_eq!(server.hits(), 1);
+    }
+
+    /// RFC 6749 §2.3.1: each credential is form-encoded BEFORE the colon joins them and
+    /// Base64 covers the pair. A secret full of the characters that encode (`:`, `+`, `%`,
+    /// a space) must reach the endpoint as `Basic base64("cid:s3%3A%2B+%25cr")`, never as the
+    /// literal bytes (a literal `:` would split the pair) and never double-encoded.
+    #[tokio::test]
+    async fn the_basic_credential_form_encodes_the_secret_first() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let nasty = "s3:+ %cr";
+        std::env::set_var("LWF_OAUTH_TEST_SECRET", nasty);
+        let server = TokenServer::start().await;
+        let p = cc_provider(&server, None);
+        assert_eq!(p.authorization().await.unwrap(), "Bearer tok-0");
+        let want = base64::engine::general_purpose::STANDARD.encode("cid:s3%3A%2B+%25cr");
+        let last = server.last();
+        assert!(
+            last.contains(&format!("Authorization: Basic {want}\r\n")),
+            "{last}"
+        );
+        // the literal secret appears nowhere on the wire, its Base64 included
+        assert!(!last.contains(nasty), "{last}");
+        assert!(
+            !last.contains(
+                &base64::engine::general_purpose::STANDARD.encode(format!("cid:{nasty}"))
+            ),
+            "the un-encoded pair went out: {last}"
+        );
     }
 
     #[tokio::test]
