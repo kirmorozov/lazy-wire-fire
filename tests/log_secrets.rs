@@ -5,8 +5,10 @@
 //! inside an endpoint, a separate binlog account, the webhook signing secrets, and, for the
 //! queue targets: AWS access / secret / session references, an AMQP account, a service-account
 //! key by reference and a SCRAM account of the Kafka broker, and for a `grpc` target the bearer
-//! token of `vars.token` by reference), and the captured output must contain none of them, nor
-//! the DSN password (when it is long enough to tell apart from ordinary text).
+//! token of `vars.token` by reference, and for a `vars.oauth` flow the OAuth 2.0 client secret
+//! behind `vars.client_secret_ref` and the access token that target's endpoint hands out (both
+//! echoed back by the servers the flow talks to), and the captured output must contain none of
+//! them, nor the DSN password (when it is long enough to tell apart from ordinary text).
 //! `make servers test-e2e`; the sqs, kinesis, amqp, pubsub, smtp and kafka flows are
 //! `make test-e2e-queues` (their emulators; skipped when absent).
 
@@ -2921,4 +2923,211 @@ Content-Type: application/json
         leaks.is_empty(),
         "the webhook URL is in the output: {leaks:#?}"
     );
+}
+
+// ---- OAuth 2.0 access tokens of the plain http kinds (`vars.oauth`).
+
+/// The oauth flow's own credentials: the client secret behind `vars.client_secret_ref` (a
+/// `file:` reference) and the access token the token endpoint hands out. The endpoint and the
+/// API below both echo them back — an endpoint that repeats what it was sent is exactly where a
+/// credential would surface, in the error it produces and in what the engine logs of it.
+const OAUTH_SECRET: &str = "LWFSECRET-oauth-client-secret-8d41";
+const OAUTH_TOKEN: &str = "LWFSECRET-oauth-access-token-2e9";
+
+/// What the stand-in of the oauth flow answers next: a token endpoint that echoes the request
+/// it was sent, an API that refuses the credential (401), and the acceptance that follows.
+#[derive(Clone, Copy, PartialEq)]
+enum OauthPhase {
+    TokenEchoes,
+    Unauthorized,
+    Accepted,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_oauth() {
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = need_db!();
+    install();
+    let db = Db::fresh(&root, "logoauth").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+
+    // The client secret, behind a `file:` reference in the directory the flows of this binary
+    // share. `client_id` is an identifier and goes in literally.
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("tmp/out/secrets-logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret_file = dir.join("oauth-client-secret");
+    std::fs::write(&secret_file, format!("{OAUTH_SECRET}\n")).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+
+    let mock = Mock::start().await;
+    let phase = Arc::new(Mutex::new(OauthPhase::TokenEchoes));
+    let tokens = Arc::new(AtomicUsize::new(0));
+    {
+        let (phase, tokens) = (phase.clone(), tokens.clone());
+        mock.respond(move |r| match r.path.as_str() {
+            "/token" => {
+                let n = tokens.fetch_add(1, Ordering::SeqCst) + 1;
+                if *phase.lock().unwrap() == OauthPhase::TokenEchoes {
+                    // the echo of the request it was sent: the Basic credential of that request
+                    // is the client secret in Base64, so a message quoting the echo carries it
+                    (
+                        400,
+                        format!(
+                            r#"{{"error": "invalid_client", "got": "{}"}}"#,
+                            r.header("authorization").unwrap_or_default()
+                        ),
+                    )
+                } else {
+                    (
+                        200,
+                        format!(
+                            r#"{{"access_token": "{OAUTH_TOKEN}-{n}", "token_type": "Bearer", "expires_in": 3600}}"#
+                        ),
+                    )
+                }
+            }
+            "/hook" => match *phase.lock().unwrap() {
+                OauthPhase::TokenEchoes => (200, "ok".into()),
+                OauthPhase::Unauthorized => (
+                    401,
+                    format!(
+                        r#"{{"error": "invalid_token", "authorization": "{}"}}"#,
+                        r.header("authorization").unwrap_or_default()
+                    ),
+                ),
+                OauthPhase::Accepted => (200, "ok".into()),
+            },
+            _ => (404, "{}".into()),
+        });
+    }
+
+    db.target(
+        "wh",
+        "http",
+        &mock.url(),
+        None,
+        &json!({
+            "oauth": "client_credentials",
+            "token_url": format!("{}/token", mock.url()),
+            "client_id": "lwf-client",
+            "client_secret_ref": format!("file:{}", secret_file.display()),
+        })
+        .to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, ?, 50)",
+        ("wh", "wh", "POST /hook HTTP/1.1\n\nok"),
+    )
+    .await;
+    db.trigger("wh", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+
+    let hits = |path: &str| mock.requests().iter().filter(|r| r.path == path).count();
+
+    // 1. the token endpoint echoes the request it was sent (its Basic credential is the client
+    // secret in Base64). The send fails; the key waits, and what the failure logs must not
+    // carry the secret in any of its forms.
+    wait_for(Duration::from_secs(30), "a token request", || async {
+        (hits("/token") >= 1).then_some(())
+    })
+    .await;
+    let err = wait_for(
+        Duration::from_secs(30),
+        "the token failure on the rule",
+        || async {
+            db.status("wh")
+                .await
+                .and_then(|(_, _, _, e)| e)
+                .filter(|e| e.contains("token endpoint"))
+        },
+    )
+    .await;
+    assert!(!err.contains(OAUTH_SECRET), "the secret escaped: {err}");
+    *phase.lock().unwrap() = OauthPhase::Unauthorized;
+
+    // 2. the API refuses the credential: a 401 speaks about the token, so the key is kept and
+    // the token is dropped; the message the endpoint produced echoes the token back, and that
+    // message is what `last_error` and the log show.
+    wait_for(
+        Duration::from_secs(30),
+        "the action to reach the API",
+        || async { (hits("/hook") >= 1).then_some(()) },
+    )
+    .await;
+    let err = wait_for(Duration::from_secs(30), "the 401 on the rule", || async {
+        db.status("wh")
+            .await
+            .and_then(|(_, _, _, e)| e)
+            .filter(|e| e.contains("oauth access token"))
+    })
+    .await;
+    assert!(
+        !err.contains(OAUTH_TOKEN),
+        "the access token reached last_error: {err}"
+    );
+    *phase.lock().unwrap() = OauthPhase::Accepted;
+
+    // 3. with a fresh token the same action goes through: the quiet engine has nothing left to
+    // retry, which is the proof the 401 never refused the key.
+    inst.quiet().await;
+    inst.stop().await;
+
+    let reqs = mock.requests();
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("lwf-client:{OAUTH_SECRET}"))
+    );
+    let token_reqs: Vec<&Req> = reqs.iter().filter(|r| r.path == "/token").collect();
+    assert!(
+        token_reqs
+            .iter()
+            .all(|r| r.header("authorization") == Some(basic.as_str())),
+        "the client did not authenticate with Basic as RFC 6749 §2.3.1 says"
+    );
+    assert!(
+        token_reqs
+            .iter()
+            .any(|r| r.body.contains("grant_type=client_credentials")),
+        "the grant was not in the form body"
+    );
+    let hooks: Vec<&Req> = reqs.iter().filter(|r| r.path == "/hook").collect();
+    let bearers: Vec<&str> = hooks
+        .iter()
+        .map(|r| r.header("authorization").unwrap_or_default())
+        .collect();
+    assert!(
+        bearers.iter().all(|b| b.starts_with("Bearer ")),
+        "an action without the bearer token: {bearers:?}"
+    );
+    assert!(
+        bearers.windows(2).any(|w| w[0] != w[1]),
+        "the 401 did not drop the cached token: {bearers:?}"
+    );
+
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    assert!(
+        out.contains("oauth token"),
+        "the token endpoint's failure was never logged: it is what the flow ran on"
+    );
+    let leaks = leaks(
+        &out,
+        &[
+            ("oauth client secret", OAUTH_SECRET),
+            ("oauth access token", OAUTH_TOKEN),
+        ],
+    );
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
 }

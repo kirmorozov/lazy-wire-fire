@@ -179,6 +179,9 @@ async fn compile_selects(
 /// - `grpc`: the rule's payload columns are the item message's fields, so they are checked
 ///   against the target's descriptor set, and a batch is held to the target's
 ///   `vars.max_message_bytes` (see [`crate::grpc::rule_errors`]).
+/// - a plain http kind with `vars.oauth`: the token sets the `Authorization` header, so a
+///   template whose own header block carries a literal one is refused (see
+///   [`crate::oauth::rule_errors`]).
 pub fn kind_errors(
     def: &RuleDef,
     target: &crate::model::TargetDef,
@@ -264,6 +267,16 @@ pub fn kind_errors(
     }
     if kind == Kind::PubSub {
         out.extend(crate::pubsub::rule_errors(def));
+    }
+    if matches!(
+        kind,
+        Kind::Http | Kind::HttpBasic | Kind::HttpBearer | Kind::HttpHeader
+    ) && target.vars.contains_key("oauth")
+    {
+        // `vars.oauth` sets the `Authorization` header: a template whose own header block
+        // carries a literal one is a second source of it (a name produced only by rendering
+        // is caught at the bind, in `Target::prepare`).
+        out.extend(crate::oauth::rule_errors(def));
     }
     if kind == Kind::Kafka {
         // The batch's byte limit: the target's own (the broker's `message.max.bytes`, raised

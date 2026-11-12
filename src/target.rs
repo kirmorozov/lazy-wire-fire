@@ -80,6 +80,9 @@ pub struct Target {
     aws: Option<AwsSign>,
     /// Webhook signing for the http kinds (`src/sign.rs`); the secret is resolved on every use.
     sign: Option<crate::sign::Spec>,
+    /// The OAuth 2.0 access token of a plain http target that asks for one (`vars.oauth`,
+    /// `src/oauth.rs`): every action of the target carries it as `Authorization: Bearer`.
+    oauth: Option<crate::oauth::Provider>,
     /// The `aws-lambda://` endpoint of a `lambda` target (its function, qualifier, invocation).
     lambda: Option<aws::LambdaUrl>,
     /// The effective batch limit of a `kafka` target, when `vars.message_max_bytes` raises the
@@ -372,7 +375,9 @@ fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
 /// One host against the allow-list, with the message every refusal of it uses (at load and on
 /// a request): the host and the setting, nothing else — a caller that resolves a secret URL
 /// must be able to say this without naming the URL.
-fn check_host(list: &HostList, host: &str, port: u16) -> Result<()> {
+/// The operator's allow-list applied to one outbound host (also the token host of an oauth
+/// target, see [`crate::oauth`]).
+pub(crate) fn check_host(list: &HostList, host: &str, port: u16) -> Result<()> {
     if !list.allows(host, port) {
         bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
     }
@@ -778,6 +783,9 @@ impl Target {
             check_allowed(list, &endpoints)?;
         }
         let sign = crate::sign::spec(&def.vars)?;
+        // The token source of `vars.oauth`: `TargetDef::from_row` has refused the setting on
+        // any other kind, and refused an unusable shape on these four.
+        let oauth = crate::oauth::Provider::new(&def, allowed)?;
         let ctx = json!({"name": def.name, "vars": def.template_vars()});
         let kafka = (def.kind == Kind::Kafka)
             .then(|| crate::kafka::message_max_bytes(&def.vars))
@@ -795,6 +803,7 @@ impl Target {
             expect,
             aws: aws_rt,
             sign,
+            oauth,
             lambda: lambda_url,
             kafka,
             grpc,
@@ -953,13 +962,27 @@ impl Target {
                     .send(self.def.timeout)
                     .await
                     .with_context(|| h.at.clone())?;
+                // A 401 while `vars.oauth` is set speaks about the access token, not about this
+                // message: whatever `expect` says, no key is refused for it. The cached token is
+                // dropped, so the next attempt presents a new one.
+                if let Some(o) = &self.oauth {
+                    if resp.status == 401 {
+                        o.invalidate();
+                        return Err(anyhow!(
+                            "{}: 401 with the oauth access token: it is dropped and a new one \
+                             will be fetched; the endpoint said: {}",
+                            h.at_target,
+                            self.scrub(&resp.body_snippet())
+                        ));
+                    }
+                }
                 let verdict = self
                     .expect
                     .http(&self.pool, resp.status, &resp.headers, &resp.body)
                     .await
                     .with_context(|| h.at_target.clone())?;
                 if let Err(e) = verdict {
-                    let msg = format!("{}: {e}: {}", h.at_target, resp.body_snippet());
+                    let msg = self.scrub(&format!("{}: {e}: {}", h.at_target, resp.body_snippet()));
                     // 5xx, 408 and 429 say "not now", and so do AWS throttling codes; other
                     // refusals are about this request.
                     let transient = resp.status >= 500
@@ -1065,16 +1088,31 @@ impl Target {
                     .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
                 let h = self.http_bind(endpoint, req).await?;
                 let resp = h.send(self.def.timeout).await?;
+                // As in `send`: a 401 is the credential being refused, never the listing.
+                if let Some(o) = &self.oauth {
+                    if resp.status == 401 {
+                        o.invalidate();
+                        bail!(
+                            "{}: 401 with the oauth access token: it is dropped and a new one \
+                             will be fetched; the endpoint said: {}",
+                            h.at_target,
+                            self.scrub(&resp.body_snippet())
+                        );
+                    }
+                }
                 if !(200..300).contains(&resp.status) {
                     bail!(
                         "{}: status {}: {}",
                         h.at_target,
                         resp.status,
-                        resp.body_snippet()
+                        self.scrub(&resp.body_snippet())
                     );
                 }
                 if uses.body && serde_json::from_slice::<Value>(&resp.body).is_err() {
-                    bail!("the listing response is not JSON: {}", resp.body_snippet());
+                    bail!(
+                        "the listing response is not JSON: {}",
+                        self.scrub(&resp.body_snippet())
+                    );
                 }
                 Ok(Row::http(uses, resp.status, &resp.headers, &resp.body))
             }
@@ -1350,6 +1388,16 @@ impl Target {
     /// every request (so a rotated file applies), its host is checked against the allow-list
     /// again, and the answer names it by its origin only: the path and the query join the request
     /// line as [`HttpRequest::send`] writes the bytes, and reach no message.
+    /// The text of an http error message, with the oauth access token masked out of it: an
+    /// endpoint that echoes the request (or its own answer) cannot carry the token into a log
+    /// line or `last_error`. Without `vars.oauth` there is no token and nothing to mask.
+    fn scrub(&self, s: &str) -> String {
+        match &self.oauth {
+            Some(o) => o.scrub(s),
+            None => s.to_string(),
+        }
+    }
+
     async fn http_bind(&self, endpoint: &Endpoint, req: RawRequest) -> Result<HttpRequest> {
         match &endpoint.transport {
             Transport::Http {
@@ -1445,6 +1493,23 @@ impl Target {
                 req.set_header(&name, get("value")?);
             }
             _ => {}
+        }
+        // The oauth token, after the kind's own credential so that a target can carry only one
+        // claim (`TargetDef::from_row` refuses the two together). A request line that rendered
+        // its own `Authorization:` is a second claim: refused, naming the setting and where the
+        // other claim came from. The literal form is caught when the rule loads
+        // (`crate::oauth::rule_errors`); this catches a header name rendering produced.
+        if let Some(o) = &self.oauth {
+            if req.header("authorization").is_some() {
+                // A configuration mistake of the rule, not a word about the key: transient.
+                // The rendered value is never quoted — it may be a resolved secret.
+                return Err(anyhow!(
+                    "`vars.oauth={}` sets the `Authorization` header, and the rule template \
+                     rendered one too: keep one",
+                    crate::oauth::grant_name(&self.def.vars)
+                ));
+            }
+            req.set_header("Authorization", o.authorization().await?);
         }
         // The signature goes over the exact body the request will send.
         if let Some(s) = &self.sign {
@@ -2659,5 +2724,549 @@ mod secret_endpoint_tests {
                 "{kind}: {e}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// oauth: the plain http kinds carry `Authorization: Bearer <token>` (see `src/oauth.rs`).
+
+#[cfg(test)]
+mod oauth_tests {
+    use super::*;
+    use crate::model::{RawTarget, TargetDef};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The token the token endpoint hands out (the hit's number appended) and the client
+    /// secret. Neither may reach an error message, a log line or `last_error`.
+    const TOKEN: &str = "LWF-TOKEN-6f1a";
+    const SECRET: &str = "LWF-SECRET-2b9c";
+    /// What the token endpoint answers: a token named for the hit, so a reused token and a
+    /// refetched one are distinguishable in what the API server recorded.
+    const TOKEN_JSON: &str =
+        r#"{"access_token": "LWF-TOKEN-6f1a-{n}", "token_type": "Bearer", "expires_in": 3600}"#;
+    /// One action of the target, as a rule's template renders it.
+    const ACTION: &str = "POST /hook HTTP/1.1\nContent-Type: application/json\n\n{\"k\":\"1\"}";
+
+    /// One plain http server of these tests: it keeps the bytes of every request it is sent and
+    /// answers what `answer` holds (`{n}` in it becomes the hit's number). `delay` holds the
+    /// answer back, which is how a single-flight test makes two sends overlap.
+    struct Server {
+        addr: SocketAddr,
+        hits: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<String>>>,
+        answer: Arc<Mutex<(u16, String)>>,
+        delay: Arc<Mutex<Duration>>,
+    }
+
+    impl Server {
+        async fn start(status: u16, answer: &str) -> Server {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let answer = Arc::new(Mutex::new((status, answer.to_string())));
+            let delay = Arc::new(Mutex::new(Duration::ZERO));
+            let (h, r, a, d) = (
+                hits.clone(),
+                requests.clone(),
+                answer.clone(),
+                delay.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (h, r, a, d) = (h.clone(), r.clone(), a.clone(), d.clone());
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let head = loop {
+                            if let Some(e) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break e;
+                            }
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break buf.len(),
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        // The body is read before answering: answering while the client still
+                        // has bytes to send makes its write fail, and the test would see a
+                        // connection error where it wanted the answer.
+                        let want = String::from_utf8_lossy(&buf[..head])
+                            .lines()
+                            .find_map(|l| {
+                                let (n, v) = l.split_once(':')?;
+                                if n.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0usize);
+                        let mut have = buf.len().saturating_sub(head + 4);
+                        while have < want {
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => have += n,
+                            }
+                        }
+                        let n = h.fetch_add(1, Ordering::SeqCst);
+                        r.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf).into_owned());
+                        let delay = *d.lock().unwrap();
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let (status, body) = a.lock().unwrap().clone();
+                        let body = body.replace("{n}", &n.to_string());
+                        let reply = format!(
+                            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = s.write_all(reply.as_bytes()).await;
+                        let _ = s.shutdown().await;
+                    });
+                }
+            });
+            Server {
+                addr,
+                hits,
+                requests,
+                answer,
+                delay,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        /// What to answer from now on.
+        fn answer(&self, status: u16, body: &str) {
+            *self.answer.lock().unwrap() = (status, body.to_string());
+        }
+
+        fn delay(&self, d: Duration) {
+            *self.delay.lock().unwrap() = d;
+        }
+
+        /// The bytes of the most recent request (its request line, headers and body).
+        fn last(&self) -> String {
+            self.requests
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Where a secret file of these tests lives (the `file:` form of `client_secret_ref`).
+    fn secret_dir() -> std::path::PathBuf {
+        std::env::current_dir().unwrap().join("tmp/out/oauth")
+    }
+
+    /// One valid endpoint per kind these refusals are checked on.
+    fn endpoint(kind: &str) -> &'static str {
+        match kind {
+            "pubsub" => "gc-pubsub://p/t",
+            "kafka" => "kafka://127.0.0.1:9092/t",
+            "redis" => "redis://127.0.0.1:6379",
+            _ => "http://api.example.test",
+        }
+    }
+
+    /// The `vars` of a `client_credentials` target whose token endpoint is `token`.
+    fn cc_vars(token: &str) -> String {
+        format!(
+            r#"{{"oauth": "client_credentials", "token_url": "{token}", "client_id": "cid",
+                 "client_secret_ref": "env:LWF_UNIT_OAUTH_SECRET"}}"#
+        )
+    }
+
+    /// A plain http target with one endpoint, loaded the way the engine loads it. The pool is
+    /// the source database, which only `expect` ever asks (an unreachable address, so a target
+    /// with an `expect` says so loudly — which is itself an assertion below).
+    fn target(api: &str, vars: &str, expect: Option<&str>) -> Arc<Target> {
+        let def = TargetDef::from_row(&RawTarget {
+            name: "t-oauth".into(),
+            kind: Some("http".into()),
+            endpoints: Some(api.into()),
+            tls: None,
+            timeout_ms: Some(5000),
+            expect: expect.map(str::to_string),
+            vars: Some(vars.into()),
+        })
+        .unwrap();
+        Target::new(
+            def,
+            mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x"),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The whole message of an error: the chain, as the log and `last_error` show it.
+    fn chain(e: &anyhow::Error) -> String {
+        format!("{e:#}")
+    }
+
+    /// An address nothing listens on.
+    async fn closed_port() -> SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        addr
+    }
+
+    #[tokio::test]
+    async fn every_action_carries_the_token_the_endpoint_issued_and_it_is_reused() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let token = Server::start(200, TOKEN_JSON).await;
+        let api = Server::start(200, "ok").await;
+        let t = target(
+            &api.url(),
+            &cc_vars(&format!("{}/token", token.url())),
+            None,
+        );
+
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        // the action: the rendered request plus the one header `vars.oauth` adds
+        let sent = api.last();
+        assert!(sent.starts_with("POST /hook HTTP/1.1\r\n"), "{sent}");
+        assert!(
+            sent.contains(&format!("Authorization: Bearer {TOKEN}-0\r\n")),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("Content-Type: application/json\r\n"),
+            "{sent}"
+        );
+        assert!(sent.ends_with("{\"k\":\"1\"}"), "{sent}");
+        // the token request: the grant's form, the client authenticated with Basic
+        let tr = token.last();
+        assert!(tr.starts_with("POST /token HTTP/1.1\r\n"), "{tr}");
+        assert!(tr.contains("grant_type=client_credentials"), "{tr}");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("cid:{SECRET}"));
+        assert!(
+            tr.contains(&format!("Authorization: Basic {basic}\r\n")),
+            "{tr}"
+        );
+        assert_eq!(token.hits(), 1);
+
+        // the next action is served from the cache: same token, no second token request
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        assert_eq!(token.hits(), 1);
+        assert!(
+            api.last().contains(&format!("Bearer {TOKEN}-0")),
+            "{}",
+            api.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_actions_at_once_cost_one_token_request() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let token = Server::start(200, TOKEN_JSON).await;
+        token.delay(Duration::from_millis(200));
+        let api = Server::start(200, "ok").await;
+        let t = target(
+            &api.url(),
+            &cc_vars(&format!("{}/token", token.url())),
+            None,
+        );
+
+        let (a, b) = tokio::join!(t.send(0, ACTION), t.send(0, ACTION));
+        assert_eq!(a.unwrap(), Sent::Ok);
+        assert_eq!(b.unwrap(), Sent::Ok);
+        assert_eq!(api.hits(), 2, "both actions went out");
+        assert_eq!(
+            token.hits(),
+            1,
+            "the second sender waited for the first's token"
+        );
+        assert!(api.last().contains(&format!("Bearer {TOKEN}-0")));
+    }
+
+    #[tokio::test]
+    async fn a_failing_token_endpoint_keeps_every_key_and_names_its_cause() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let api = Server::start(200, "ok").await;
+        let token = Server::start(200, TOKEN_JSON).await;
+
+        // every class of failure is transient: the endpoint is unwell or its answer unusable,
+        // which says nothing about the message, so no key is refused for it.
+        let closed = closed_port().await;
+        let cases: Vec<(String, &str)> = vec![
+            (
+                format!("http://{closed}/token"),
+                "the connection is refused",
+            ),
+            (format!("{}/token", token.url()), "the endpoint answers 500"),
+            (format!("{}/token", token.url()), "the answer is not JSON"),
+            (format!("{}/token", token.url()), "the answer has no token"),
+        ];
+        let answers = [
+            (200u16, TOKEN_JSON.to_string()),
+            (500, "server unwell".to_string()),
+            (200, "<html>a login page</html>".to_string()),
+            (200, r#"{"nope": true}"#.to_string()),
+        ];
+        for (i, (url, why)) in cases.into_iter().enumerate() {
+            token.answer(answers[i].0, &answers[i].1);
+            let t = target(&api.url(), &cc_vars(&url), None);
+            let e = t.send(0, ACTION).await.unwrap_err();
+            let msg = chain(&e);
+            assert!(!is_rejected(&e), "{why}: refused a key for {msg}");
+            assert!(msg.contains("token endpoint"), "{why}: {msg}");
+            // the secret and the token stay where they belong
+            assert!(!msg.contains(SECRET), "{msg}");
+            assert!(!msg.contains(TOKEN), "{msg}");
+        }
+        assert_eq!(api.hits(), 0, "no action left the process");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_401_keeps_the_key_drops_the_token_and_is_confirmed_next_time() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let token = Server::start(200, TOKEN_JSON).await;
+        // A 401 that echoes the token it refused: the message the operator sees must not carry
+        // it.
+        let api = Server::start(
+            401,
+            &format!(r#"{{"error": "invalid_token", "token": "{TOKEN}-0"}}"#),
+        )
+        .await;
+        let t = target(
+            &api.url(),
+            &cc_vars(&format!("{}/token", token.url())),
+            None,
+        );
+
+        let e = t.send(0, ACTION).await.unwrap_err();
+        let msg = chain(&e);
+        assert!(!is_rejected(&e), "a key was refused for {msg}");
+        assert!(msg.contains("oauth access token"), "{msg}");
+        assert!(!msg.contains(TOKEN), "the token escaped: {msg}");
+        assert_eq!(token.hits(), 1, "the token the endpoint refused is dropped");
+
+        // with a new token the same action goes through: the key was never in question
+        api.answer(200, "ok");
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        assert_eq!(token.hits(), 2, "one refetch");
+        assert!(
+            api.last().contains(&format!("Bearer {TOKEN}-1")),
+            "{}",
+            api.last()
+        );
+        // and the new token is then reused, as any token is
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        assert_eq!(token.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn expect_is_never_asked_about_an_oauth_401() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let token = Server::start(200, TOKEN_JSON).await;
+        let api = Server::start(401, "the token is not valid").await;
+        // `expect` asks the source database about every answer, and that database is an
+        // unreachable address here. Getting the token's own message instead — and not the
+        // database's — says the 401 was decided about the credential before `expect` was
+        // consulted at all: whatever the condition says, a 401 cannot refuse a key.
+        let t = target(
+            &api.url(),
+            &cc_vars(&format!("{}/token", token.url())),
+            Some("status = 200"),
+        );
+        let e = t.send(0, ACTION).await.unwrap_err();
+        let msg = chain(&e);
+        assert!(!is_rejected(&e), "a key was refused for {msg}");
+        assert!(msg.contains("oauth access token"), "{msg}");
+        assert!(!msg.contains("status 401"), "expect decided: {msg}");
+        assert!(
+            !msg.contains("Connection refused"),
+            "the database was asked: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_is_handed_a_401_is_transient_too() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let token = Server::start(200, TOKEN_JSON).await;
+        let api = Server::start(401, "the token is not valid").await;
+        let t = target(
+            &api.url(),
+            &cc_vars(&format!("{}/token", token.url())),
+            None,
+        );
+        let e = t
+            .fetch(0, "GET /keys HTTP/1.1\n\n", Uses::default())
+            .await
+            .unwrap_err();
+        let msg = chain(&e);
+        assert!(msg.contains("oauth access token"), "{msg}");
+        assert!(!msg.contains("status 401"), "{msg}");
+        // the token is dropped for the next attempt
+        api.answer(200, "[]");
+        t.fetch(0, "GET /keys HTTP/1.1\n\n", Uses::default())
+            .await
+            .unwrap();
+        assert_eq!(token.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_renders_its_own_authorization_is_refused_at_the_bind() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        std::env::set_var("LWF_UNIT_OAUTH_SECRET", SECRET);
+        let token = Server::start(200, TOKEN_JSON).await;
+        let api = Server::start(200, "ok").await;
+        let t = target(
+            &api.url(),
+            &cc_vars(&format!("{}/token", token.url())),
+            None,
+        );
+
+        // the header name a template produced by rendering: the load check cannot see it, so
+        // the bind refuses the request. It is a mistake of the rule, not a word about the
+        // key, so the key stays.
+        let e = t
+            .send(
+                0,
+                "POST /hook HTTP/1.1\nAuthorization: Bearer hand-made\n\nx",
+            )
+            .await
+            .unwrap_err();
+        let msg = chain(&e);
+        assert!(!is_rejected(&e), "a key was refused for {msg}");
+        assert!(msg.contains("`vars.oauth=client_credentials`"), "{msg}");
+        assert!(msg.contains("rule template"), "{msg}");
+        assert_eq!(api.hits(), 0, "nothing was sent");
+        assert_eq!(token.hits(), 0, "not even a token was fetched");
+
+        // a header that is not `Authorization` is none of the grant's business
+        assert_eq!(
+            t.send(
+                0,
+                "POST /hook HTTP/1.1\nAuthorization-Kind: bearer\nX-Trace: 1\n\nx"
+            )
+            .await
+            .unwrap(),
+            Sent::Ok
+        );
+        assert!(api.last().contains("Authorization-Kind: bearer"));
+        assert!(api.last().contains(&format!("Bearer {TOKEN}-0")));
+    }
+
+    #[test]
+    fn a_foreign_kind_refuses_the_oauth_settings_and_pubsub_keeps_its_own() {
+        let err = |kind: &str, vars: &str| {
+            format!(
+                "{:#}",
+                TargetDef::from_row(&RawTarget {
+                    name: "t".into(),
+                    kind: Some(kind.into()),
+                    endpoints: Some(endpoint(kind).into()),
+                    vars: Some(vars.into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+            )
+        };
+        let e = err("redis", r#"{"oauth": "google"}"#);
+        assert!(e.contains("`vars.oauth` is not used by kind redis"), "{e}");
+        let e = err("kafka", r#"{"scope": "s"}"#);
+        assert!(e.contains("`vars.scope` is not used by kind kafka"), "{e}");
+        let e = err(
+            "pubsub",
+            r#"{"oauth": "client_credentials", "token_url": "https://a.test/t", "client_id": "c", "client_secret_ref": "env:S"}"#,
+        );
+        assert!(e.contains("`vars.oauth` is not used by kind pubsub"), "{e}");
+        // the setting without the grant name the grant
+        let e = err("http", r#"{"token_url": "https://a.test/token"}"#);
+        assert!(e.contains("needs `vars.oauth`"), "{e}");
+        // two claims in one request are refused, both named
+        let e = err("http.bearer", r#"{"oauth": "google", "token": "env:T"}"#);
+        assert!(e.contains("`vars.oauth`"), "{e}");
+        assert!(e.contains("`vars.token`"), "{e}");
+
+        // `credentials_ref` is pubsub's own setting: its use of it is not an oauth setting,
+        // and this target must keep loading.
+        TargetDef::from_row(&RawTarget {
+            name: "t".into(),
+            kind: Some("pubsub".into()),
+            endpoints: Some(endpoint("pubsub").into()),
+            vars: Some(r#"{"credentials_ref": "file:/keys/sa.json"}"#.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_secret_and_the_token_never_reach_the_target_definition_or_its_context() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let dir = secret_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("client"), format!("{SECRET}\n")).unwrap();
+        std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+        let token = Server::start(200, TOKEN_JSON).await;
+        let api = Server::start(200, "ok").await;
+        let vars = format!(
+            r#"{{"oauth": "client_credentials", "token_url": "{}/token", "client_id": "cid",
+                 "client_secret_ref": "file:{}/client"}}"#,
+            token.url(),
+            dir.display()
+        );
+        let def = TargetDef::from_row(&RawTarget {
+            name: "t-oauth".into(),
+            kind: Some("http".into()),
+            endpoints: Some(api.url()),
+            timeout_ms: Some(5000),
+            vars: Some(vars),
+            ..Default::default()
+        })
+        .unwrap();
+        // the definition shows the names of its credential settings, never their bytes: the
+        // reference and the value it names are both absent
+        let shown = format!("{def:?}");
+        assert!(shown.contains("client_secret_ref"), "{shown}");
+        assert!(!shown.contains(SECRET), "{shown}");
+        assert!(!shown.contains("file:"), "{shown}");
+        let ctx = json!({"name": def.name, "vars": def.template_vars()});
+        assert!(
+            !serde_json::to_string(&ctx).unwrap().contains(SECRET),
+            "{ctx}"
+        );
+
+        let t = Target::new(
+            def,
+            mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        // the file reference was read: the endpoint saw those bytes as the client secret
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("cid:{SECRET}"));
+        assert!(
+            token
+                .last()
+                .contains(&format!("Authorization: Basic {basic}\r\n")),
+            "{}",
+            token.last()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -31,6 +31,7 @@ pub mod keyspace;
 pub mod lock;
 pub mod logging;
 pub mod model;
+pub mod oauth;
 pub mod path;
 pub mod pubsub;
 pub mod rabbitmq_stream;
