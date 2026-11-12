@@ -309,7 +309,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
+    pub(super) fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
         let m: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -491,16 +491,8 @@ mod query_tests {
 /// discovered halfway through a flush.
 #[cfg(test)]
 mod secret_refusals_tests {
+    use super::tests::cfg;
     use super::*;
-    use std::collections::HashMap;
-
-    fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
-        let m: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        Config::from_lookup(|k| m.get(k).cloned())
-    }
 
     const DSN: (&str, &str) = ("LAZYWF_DSN", "mysql://app:secret@db:3306/shop");
 

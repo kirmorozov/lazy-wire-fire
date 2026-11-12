@@ -114,7 +114,7 @@ use fe2o3_amqp::Connection;
 
 use crate::model::{FirePer, RuleDef, TargetDef};
 use crate::response::{Expect, Row};
-use crate::target::{rejected, Item, Sent};
+use crate::target::{rejected, var, Item, Sent};
 use crate::tls::{Mode, TlsSpec};
 
 /// The entity's default maximum message size: 256 KiB, the smallest option of the Microsoft
@@ -340,12 +340,6 @@ pub enum Auth {
     },
     /// Nothing (the local override: a broker that takes anonymous connections).
     Anonymous,
-}
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 fn flag(vars: &Map<String, Value>, k: &str) -> Result<bool> {

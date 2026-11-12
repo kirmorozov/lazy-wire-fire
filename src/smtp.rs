@@ -72,7 +72,7 @@ use tokio::sync::Mutex;
 use crate::model::{FirePer, TargetDef};
 use crate::response::{Expect, Row, Uses};
 use crate::secrets;
-use crate::target::{rejected, Sent};
+use crate::target::{rejected, var, Sent};
 use crate::tls::{Mode, TlsSpec};
 
 /// The most recipients a message takes when `vars.recipients` is unset.
@@ -158,12 +158,6 @@ pub fn tls_parameters(spec: &TlsSpec, host: &str) -> Result<Option<TlsParameters
             Ok(Some(b.build().context("`tls`")?))
         }
     }
-}
-
-fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 /// `vars.recipients`: the most recipients one message takes (1 or more).
