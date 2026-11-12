@@ -91,8 +91,9 @@ a chat hook), with the endpoint, credential and `expect` each one wants, in
 [docs/recipes.md](docs/recipes.md).
 
 Business-app http recipes (Microsoft Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable,
-Notion, and the automation hubs Zapier, Make, n8n and Microsoft Power Automate), with the extra
-header each service wants and what its 2xx is worth, in
+Notion, the automation hubs Zapier, Make, n8n and Microsoft Power Automate, and Google Sheets and
+Salesforce behind `vars.oauth`, with Microsoft Excel reached through a Power Automate flow), with
+the extra header each service wants, which token the service takes and what its 2xx is worth, in
 [docs/recipes-apps.md](docs/recipes-apps.md).
 
 ## Platforms
@@ -278,7 +279,7 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 
 | target | `kind` | endpoint | one action is | per-key answer | stray cleanup | credentials | tested against |
 |---|---|---|---|---|---|---|---|
-| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]`, or, for these four kinds, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](docs/reference.md#secret-http-endpoints)) | one HTTP request, optionally signed ([webhook signing](docs/reference.md#webhook-signing)) | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference; the signing secret `vars.sign_secret_ref`: a reference only | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
+| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]`, or, for these four kinds, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](docs/reference.md#secret-http-endpoints)) | one HTTP request, optionally signed ([webhook signing](docs/reference.md#webhook-signing)) | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference; the plain four kinds can also carry an OAuth 2.0 access token, `vars.oauth` ([OAuth access tokens](docs/reference.md#oauth-access-tokens)); the signing secret `vars.sign_secret_ref`: a reference only | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
 | S3 API | `http.s3` ([targets](docs/reference.md#targets)) | the service URL, optional (derived from `vars` when empty) | one signed S3 request | for the action | allowed | `access_key_ref` / `secret_key_ref` (references only; optional `session_token_ref`), else the [AWS default chain](docs/reference.md#aws-credentials) | versitygw 1.10 — CI |
 | Redis / Valkey, Streams included | `redis` ([targets](docs/reference.md#targets)) | `host:port/db` (or `redis://` / `rediss://`) | one Redis command | for the action | allowed | `vars.password`, optional `vars.username` for ACLs: a literal or a reference | Redis 7.4, Valkey 8.1 — CI |
 | MySQL / MariaDB | `mysql` (also `mariadb`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | MySQL 8.4 — CI |

@@ -1,19 +1,21 @@
 # Business app recipes
 
 Copy-ready recipes for the `http` kinds pointed at hosted business applications: two chat
-platforms, an event pipeline, an email platform, three systems of record and four automation
-hubs — Microsoft Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable, Notion, and Zapier,
-Make, n8n and Microsoft Power Automate. Same kinds and the same three tables as
-[the http recipes](recipes.md). What changes is which vendor limit binds, which
+platforms, an event pipeline, an email platform, three systems of record, four automation hubs
+and two services reached with an OAuth 2.0 access token (plus a spreadsheet lane that runs
+through one of the hubs) — Microsoft Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable,
+Notion, Zapier, Make, n8n, Microsoft Power Automate, and Google Sheets and Salesforce with
+`vars.oauth`, and Microsoft Excel through a Power Automate flow. Same kinds and the same three
+tables as [the http recipes](recipes.md). What changes is which vendor limit binds, which
 header a service wants besides its auth header, which id a delete has to be keyed by, and how
 much a 2xx is actually worth.
 
 > **These are examples; CI does not run them.** The test suite exercises the built-in sinks and
 > the `http` kinds against OpenSearch, Elasticsearch and Varnish containers, never against
-> Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable, Notion or the four automation hubs.
-> The endpoint forms, header names and `expect` clauses below come from each vendor's own
-> documentation and from the request-building code. Try one against your own account before
-> production data drives it.
+> Teams, Google Chat, Segment, Klaviyo, HubSpot, Airtable, Notion, the four automation hubs,
+> Google Sheets or Salesforce. The endpoint forms, header names and `expect` clauses below come
+> from each vendor's own documentation and from the request-building code. Try one against your
+> own account before production data drives it.
 
 Three things are the same in every recipe here:
 
@@ -51,6 +53,9 @@ limits that bind, and how a delete is expressed — or the fact that none exists
 * [Make: trigger a scenario from its custom webhook](#make-trigger-a-scenario-from-its-custom-webhook)
 * [n8n: run a workflow from its Webhook node](#n8n-run-a-workflow-from-its-webhook-node)
 * [Microsoft Power Automate: run an instant cloud flow](#microsoft-power-automate-run-an-instant-cloud-flow)
+* [Google Sheets: append rows to a spreadsheet](#google-sheets-append-rows-to-a-spreadsheet)
+* [Microsoft Excel: add rows to a workbook table (through Power Automate)](#microsoft-excel-add-rows-to-a-workbook-table-through-power-automate)
+* [Salesforce: create or upsert a record](#salesforce-create-or-upsert-a-record)
 * [What these recipes do not claim](#what-these-recipes-do-not-claim)
 * [Not covered here](#not-covered-here)
 
@@ -63,6 +68,15 @@ one header, so Klaviyo gets `Authorization` from `vars` and `revision` from the 
 Notion gets `Authorization` from `http.bearer` and `Notion-Version` from the template. A template
 header is *rendered*, so it is the right place for a version string and the wrong place for a
 secret.
+
+**A token is the tool's header.** `vars.oauth` (Google Sheets and Salesforce below) fetches and
+refreshes an OAuth 2.0 access token and writes the `Authorization: Bearer` line itself, in the
+slot the kind's credential header would take — so the target cannot also be `http.basic` or
+`http.bearer`, cannot be an `http.header` naming `Authorization`, and the rule template must not
+write its own `Authorization:` line: one claim per header, checked at load and at the bind
+([reference → OAuth access tokens](reference.md#oauth-access-tokens)). Every token secret (the
+service-account key, the client secret, the signing key) is a reference in `vars`, never a
+literal.
 
 **Order on the wire.** The template's own header lines go first, then `User-Agent`, then `Host`,
 then the kind's credential header, then `Content-Length` computed from the body. Nothing else is
@@ -165,7 +179,7 @@ Content-Length: 221
 | **Renders** | `{"text":"…"}` as `Content-Type: application/json`; `threadKey` in the body replies into a thread instead of starting one |
 | **`expect`** | `json_extract(body, '$.name') IS NOT NULL` — deliberately without `status`, so the 2xx band stays and no success code is asserted |
 | **Batch and rate limit** | One message per request, and the per-space quota for `spaces.messages.create` is 1 request per second shared among all webhooks in that space → `fire_per = 'key'`, one lane, wide `debounce_ms` |
-| **Deletes** | None from a webhook. Removing a message is `spaces.messages.delete`, an OAuth call with a bot's credentials: a different target kind of problem |
+| **Deletes** | None from a webhook. Removing a message is `spaces.messages.delete`, an OAuth call with a bot's credentials: the work of a `vars.oauth` target ([reference → OAuth access tokens](reference.md#oauth-access-tokens)), not of this webhook |
 
 ```sql
 -- /run/secrets/gchat_webhook, one line, no trailing slash. The credential is the query, so the
@@ -821,6 +835,224 @@ Content-Length: 130
   so the flow must be idempotent per document — an upsert keyed on the order id, say — or both
   sides' retries will duplicate.
 
+## Google Sheets: append rows to a spreadsheet
+
+| | |
+|---|---|
+| **Endpoint** | `POST /v4/spreadsheets/<spreadsheet-id>/values/<a1-range>:append?valueInputOption=USER_ENTERED` on `https://sheets.googleapis.com` — [spreadsheets.values.append](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/append) |
+| **Auth** | `kind = 'http'`, `vars.oauth = 'google'`: `vars.credentials_ref` → `file:/run/secrets/gsheets_key` (the service-account key JSON), or Application Default Credentials when the target names none; `vars.scope` = `https://www.googleapis.com/auth/spreadsheets`, one of the scopes the append page's *Authorization scopes* lists. The tool writes `Authorization: Bearer <token>` on every action; the template writes no auth header ([reference → OAuth access tokens](reference.md#oauth-access-tokens)) |
+| **Renders** | a `ValueRange` — `{"values":[[…],[…]]}` as `Content-Type: application/json`: the page's request body is one `ValueRange`, so one append request carries every row of the batch |
+| **`expect`** | NULL — any 2xx passes. The page documents the success body as `{spreadsheetId, tableRange, updates}`; `json_unquote(json_extract(body, '$.spreadsheetId')) IS NOT NULL` pins that the answer names the spreadsheet and keeps the 2xx band (it does not name `status`) |
+| **Batch and rate limit** | [Google's usage limits](https://developers.google.com/workspace/sheets/api/limits): write requests are capped at 300 per minute per project and 60 per minute per user per project (the limits page counts a service account as one user: its API calls are considered to be using a single account), over the quota answers 429 — transient here, retried with the engine's own backoff, which is what Google's page recommends — and the page suggests a 2 MB maximum payload → `fire_per = 'batch'`, one append per flush, one lane, a `debounce_ms` wide enough that a burst of order updates becomes one multi-row append |
+| **Deletes** | None from this recipe: `values.append` appends, and the pages consulted write no row delete on the values resource. Removing rows is done outside lazywf |
+
+```sql
+-- /run/secrets/gsheets_key: the service-account key JSON, one file, mode 0400, inside
+-- LAZYWF_SECRET_DIRS (default /run/secrets:/var/run/secrets). The <spreadsheet-id> below is
+-- a placeholder; the sheet's own Share dialog gives the service account's email access.
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, timeout_ms, vars) VALUES
+ ('gsheets', 'http', 'https://sheets.googleapis.com', 15000,
+  '{"oauth": "google", "credentials_ref": "file:/run/secrets/gsheets_key",
+    "spreadsheet": "<spreadsheet-id>",
+    "scope": "https://www.googleapis.com/auth/spreadsheets"}');
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
+ ('gsheets_order_rows', 'gsheets', 'batch', 200, 65536,
+  'SELECT id AS _key, id, status, total FROM orders WHERE id IN (:keys)',
+  'POST /v4/spreadsheets/{{vars.spreadsheet}}/values/Orders!A1:append?valueInputOption=USER_ENTERED HTTP/1.1
+Content-Type: application/json
+
+{"values":[{{#each docs}}{{#unless @first}}, {{/unless}}[{{json doc.id}}, {{json doc.status}}, {{json doc.total}}]{{/each}}]}');
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('gsheets_order_rows', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+POST /v4/spreadsheets/<spreadsheet-id>/values/Orders!A1:append?valueInputOption=USER_ENTERED HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: sheets.googleapis.com
+Authorization: Bearer <the access token the google grant holds>
+Content-Length: 59
+
+{"values":[[4213, "shipped", 149.9], [4214, "paid", 89.0]]}
+```
+
+* **The spreadsheet has to know the service account.** Create the service account and its JSON
+  key, and share the spreadsheet with the service account's email address — Google's
+  [create-credentials page](https://developers.google.com/workspace/guides/create-credentials)
+  is explicit that IAM roles in the console do not grant access to Workspace assets like Sheets
+  and that access to a specific file comes from sharing the file with the service account's own
+  email. The key file is the reference: `/status` and the logs show `file:/run/secrets/gsheets_key`
+  and nothing of its bytes, and rewriting the file is the rotation.
+* **ADC is the no-file form.** With no `credentials_ref` the token comes from Application Default
+  Credentials, which read `GOOGLE_APPLICATION_CREDENTIALS`, then the file written by
+  `gcloud auth application-default login`, then the attached service account
+  ([Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials)).
+  A token that cannot be fetched is transient for every key, whatever `expect` says — the rule's
+  position holds and `last_error` names the cause.
+* **`valueInputOption` is required.** The append page: the caller must specify the spreadsheet
+  id, the range and a `valueInputOption`; the page itself says the option only controls how the
+  input is interpreted, not where writing starts — what each value does to the input is on the
+  enum page it links, so read that before pinning `USER_ENTERED`.
+* **One request per flush, per the quotas.** A single multi-row append is one write request, so
+  one lane with a wide `debounce_ms` sits far inside 60-per-minute-per-user even under a busy
+  order table; a 429 costs a retry, not a key.
+
+## Microsoft Excel: add rows to a workbook table (through Power Automate)
+
+Microsoft Graph has workbook row endpoints, but they are not reachable from lazywf; the lane that
+is goes through [the Power Automate recipe](#microsoft-power-automate-run-an-instant-cloud-flow).
+
+| | |
+|---|---|
+| **Endpoint** | the flow's **HTTP POST URL** whole, as in the hub recipe: `endpoints` holds a `file:` reference to it and the template's request line is `POST /` |
+| **Auth** | **None on the lazywf side.** The trigger's access control is the flow's (Anyone / tenant / specific users, as the hub recipe says); what reaches Excel is the flow's own **Excel Online (Business)** connection — no Excel credential ever enters lazywf's `vars` |
+| **Renders** | one JSON array of the rows' documents, `[{…},{…}]`, as the hub recipe; the flow reads the array in an `Apply to each` and maps each item onto the connector's **Add a row into a table** action, whose [connector page](https://learn.microsoft.com/en-us/connectors/excelonlinebusiness/) lists Location, Document Library, File, Table and Row as required parameters |
+| **`expect`** | `status = 200`, with a `Response` action answering 200 at the end of the branch (hub recipe). Know what it does not prove: the connector's page states that changes committed by *Add a row*, *Update a row* and *Delete a row* "do not always take affect immediately after successful response" and that delays up to 30 seconds are expected |
+| **Batch and rate limit** | the connector page: at most 5 MB per connector request, at most 25 MB per workbook file, a file may be locked for update up to 6 minutes since the connector's last use, and concurrent writers to one workbook are not supported → `batch_max_keys = 50`, `batch_max_bytes = 65536`, one lane — one flow run per flush |
+| **Deletes** | The connector has *Delete a row* and *Update a row*, and its page says a multi-match in those operations touches only the first row — key the delete by what is unique in your table, and the flow (not lazywf) runs the action |
+
+**Why the flow and not Graph directly.** The Graph reference pages for the row endpoints —
+[table: POST rows](https://learn.microsoft.com/en-us/graph/api/table-post-rows?view=graph-rest-1.0),
+[table: addRows](https://learn.microsoft.com/en-us/graph/api/tablerowcollection-add?view=graph-rest-1.0)
+and [workbook: createSession](https://learn.microsoft.com/en-us/graph/api/workbook-createsession?view=graph-rest-1.0)
+— all print `Application | Not supported.` in their permission tables, and every request form
+those pages give starts with `/me`. The workbook endpoints do not accept an application (app-only)
+token, lazywf's `vars.oauth = client_credentials` gets exactly such a token, and lazywf has no
+delegated (signed-in user) flow — so Excel rows cannot go from lazywf straight to Graph. The
+flow's delegated connection is what reaches the workbook; `vars.oauth` stays documented for any
+OAuth 2.0 server's client-credentials grant ([reference → OAuth access tokens](reference.md#oauth-access-tokens)),
+and for Microsoft Graph it fits only the APIs whose permission tables allow Application
+permissions.
+
+```sql
+-- /run/secrets/powerautomate_excel_flow, one line, no trailing slash: the HTTP POST URL the
+-- trigger prints once the flow is saved (the host and path below are placeholders):
+-- https://flow-host.example/<the path and query the trigger generated>
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms) VALUES
+ ('excel_flow', 'http', 'file:/run/secrets/powerautomate_excel_flow', 'status = 200', 10000);
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
+ ('excel_order_rows', 'excel_flow', 'batch', 50, 65536,
+  'SELECT id AS _key, id, status, total FROM orders WHERE id IN (:keys)',
+  'POST / HTTP/1.1
+Content-Type: application/json
+
+[{{#each docs}}{{#unless @first}}, {{/unless}}{{json doc}}{{/each}}]');
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('excel_order_rows', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+POST /<the path and query the trigger generated> HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: flow-host.example
+Content-Length: 87
+
+[{"id":4213,"status":"shipped","total":149.9},{"id":4214,"status":"paid","total":89.0}]
+```
+
+* **The flow is: trigger → `Apply to each` → *Add a row into a table* → `Response`.** The
+  workbook lives where the connector reaches it: its page says the connector works with files in
+  document libraries supported by Microsoft Graph (OneDrive for Business, SharePoint Sites,
+  Office 365 Groups), in the Excel Open XML and Excel Binary Workbook formats it lists. The
+  action's Row is dynamic: in the designer you map the table's columns, and the pages consulted
+  do not pin a JSON shape for it — build that half against your own table.
+* **A 200 is the flow answering, not the cell written.** `expect` proves the `Response` action
+  ran; the connector's own 30-second visibility delay sits behind it, and its retry policy on a
+  recalculation timeout "can insert data multiple times" (the page's warning). lazywf is
+  at-least-once on top of that: give the table a key column the flow can check, or make the
+  flow's step a check-then-add, before volume arrives.
+* **Premium is Microsoft's call**, exactly as the hub recipe says: the request trigger is marked
+  `[PREMIUM]` in Microsoft's documentation and your licensing is a tenant check.
+
+## Salesforce: create or upsert a record
+
+| | |
+|---|---|
+| **Endpoint** | `POST /services/data/v68.0/sobjects/<Object>` to create a record, `PATCH /services/data/v68.0/sobjects/<Object>/<external-id-field>/<external-id-value>` to create-or-update — on the org's **own** host: `endpoints` is `https://<my-domain>.my.salesforce.com` ([create](https://developer.salesforce.com/docs/platform/api-rest/guide/dome-sobject-create.html), [upsert](https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html)) |
+| **Auth** | `kind = 'http'`, `vars.oauth = 'jwt_bearer'`: `vars.token_url` = the org's `/services/oauth2/token`, `vars.client_id` = the connected app's consumer key (the assertion's `iss`), `vars.subject` = the integration user's username (`sub`), `vars.audience` = `https://login.salesforce.com` (`aud`; `https://test.salesforce.com` for a sandbox, or the My Domain), `vars.signing_key_ref` → `file:/run/secrets/salesforce_key` (the RSA private key in PEM). No `vars.scope`: the flow takes none |
+| **Renders** | the record's field values as one flat JSON object (`{"status__c": …, "amount__c": …}`) as `Content-Type: application/json` — the body shape the two guide pages post |
+| **`expect`** | `json_contains(body, 'true', '$.success')` — both pages answer `{"id": …, "errors": [], "success": true, "created": true|false}`; a create answers 201, an update of an existing record 200 (API 46.0+). An external id matching several records answers 300: not a 2xx, so a refusal under the http rules — the fix is a unique external id, not an `expect` edit |
+| **Batch and rate limit** | one record per request → `fire_per = 'key'`, one lane. The REST guide documents a batched upsert ([sObject Collections](https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-upsert.html), up to **200 records** per request, per-item `success` flags) if one request per flush matters more than one row per action. The org's own API request limits are not on the pages consulted — check them for your edition before production volume |
+| **Deletes** | The sObject Rows by External ID resource includes a delete; the pages consulted do not write its answer down, so verify what a delete answers in your own org before keying a delete rule on it |
+
+```sql
+-- /run/secrets/salesforce_key: the RSA private key (PEM, PKCS#8 "PRIVATE KEY" or PKCS#1
+-- "RSA PRIVATE KEY") whose certificate is uploaded to the connected app. A literal key in
+-- vars is refused at load; /status shows only the reference.
+
+INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, timeout_ms, vars) VALUES
+ ('salesforce', 'http', 'https://<my-domain>.my.salesforce.com',
+  'json_contains(body, ''true'', ''$.success'')', 15000,
+  '{"oauth": "jwt_bearer",
+    "token_url": "https://<my-domain>.my.salesforce.com/services/oauth2/token",
+    "client_id": "<consumer-key>",
+    "subject": "<integration-user@example.test>",
+    "audience": "https://login.salesforce.com",
+    "signing_key_ref": "file:/run/secrets/salesforce_key"}');
+
+INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms, max_delay_ms) VALUES
+ ('salesforce_order_upserts', 'salesforce', 'key',
+  'SELECT id AS _key, status, total FROM orders WHERE id IN (:keys)',
+  'PATCH /services/data/v68.0/sobjects/Order__c/order_no__c/{{#each keys}}{{url_encode this}}{{/each}} HTTP/1.1
+Content-Type: application/json
+
+{{#each docs}}{"status__c": {{json doc.status}}, "amount__c": {{json doc.total}}}{{/each}}',
+  5000, 60000);
+
+INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) VALUES
+ ('salesforce_order_upserts', 'orders', 'insert,update', 'status', '{{new.id}}');
+```
+
+```text
+PATCH /services/data/v68.0/sobjects/Order__c/order_no__c/4213 HTTP/1.1
+Content-Type: application/json
+User-Agent: lazywf/<version>
+Host: <my-domain>.my.salesforce.com
+Authorization: Bearer <the access token the jwt_bearer grant holds>
+Content-Length: 44
+
+{"status__c": "shipped", "amount__c": 149.9}
+```
+
+The token request the grant puts in front of the first action (and in front of every refetch) is
+the form Salesforce's own
+[*OAuth 2.0 JWT Bearer Flow for Server-to-Server Integration*](https://help.salesforce.com/s/articleView?id=remoteaccess_oauth_jwt_flow.htm&language=en_US)
+prints — `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=…`, form-encoded, with
+**no** `Authorization` header, because the assertion identifies the client.
+
+* **What you set up on the org** (the same help page): upload the X.509 certificate — the public
+  half of the signing key, the page caps it at 4 KB — to the external client app; take the app's
+  consumer key as `vars.client_id`; point `vars.subject` at the integration user's username; and
+  set the **Permitted Users** policy (admin-approved users pre-authorized with profiles or
+  permission sets, or all users may self-authorize) — the flow grants no consent at run time and
+  the scopes the token carries come from that policy, which is why `vars.scope` stays out.
+* **`instance_url` is ignored.** Salesforce answers the token request with `instance_url` and
+  `id` next to the token; lazywf reads only `access_token`, `token_type` and `expires_in` from a
+  token answer, and every action goes to the target's own `endpoints` — so point the target at
+  the host the REST calls belong on, which the recipe does for both token and actions.
+* **No `expires_in`, no refresh token, one hour.** The answer the help page shows carries neither
+  `expires_in` nor a refresh token (that flow "never issues a refresh token"), so lazywf assumes
+  its default hour; a session Salesforce ends early is covered by the 401 rule — transient for
+  every key, token dropped, a fresh assertion signed on the next attempt (there is nothing to
+  refresh with).
+* **The assertion is 180 seconds and RS256.** Salesforce requires the JWT to be signed RSA
+  SHA256 and allows a three-minute buffer for clock skew around `exp`; lazywf signs
+  `exp = iat + 180 s` and signs a fresh assertion on every refetch. Salesforce does not require a
+  `jti` and lazywf sends none: the short lifetime is the only replay protection claimed here.
+* **Key problems are transient, not refusals.** A key that does not parse, is not PEM or is not
+  RSA names its cause and the keys wait — the reference is resolved on use, so a rotation lands
+  with the next request and is never a word about the message. A wrong consumer key, username,
+  audience or an unuploaded certificate surfaces at the token endpoint as a transient failure
+  naming the cause, not as a refusal: run the flow against a sandbox first.
+
 ## What these recipes do not claim
 
 The vendor pages consulted do not settle everything a recipe would want, so these are
@@ -864,10 +1096,31 @@ verification steps against your own account, not instructions:
   consulted print none; the `[PREMIUM]` marking is quoted from Microsoft's documentation and your
   licensing is a tenant check; and which of the three "who can trigger" settings your flow carries
   is not something the rows can show you.
+* **Google Sheets**: the quota figures are the limits page's for now, and the page counts a
+  service account's calls against one user's quota — whether your project shares its quota with
+  other workloads is a project-level check. The 2 MB payload figure is the page's own suggestion.
+  And "no row delete on the values resource" is what the consulted pages show, not a statement
+  about every version of the API.
+* **Microsoft Excel**: the flow's own shape (`Apply to each`, the column mapping, the `Response`
+  action) is recipe-side — the connector page pins the action's required parameters, not what your
+  table's columns are. The 30-second visibility delay and the retry-can-duplicate warning are the
+  page's own words; a key column the flow can check, or a check-then-add step, is the mitigation
+  this file can suggest and nothing more. Whether your licensing covers the `[PREMIUM]` connector
+  is a tenant check.
+* **Salesforce**: the JWT article renders its text client-side, so what the recipe quotes from it
+  was captured through search results — re-read the live page before relying on a detail. The
+  version segment (`v68.0`) is what the consulted guide pages print; your instance's newest is a
+  URL edit. Whether the **Permitted Users** policy is admin approval or self-authorization is your
+  org's setup, and the org's own API request limits are not on the pages consulted.
 
 ## Not covered here
 
-Google Sheets, Microsoft Excel and Salesforce are left out of this file: they authenticate through
-OAuth flows, and lazywf has no OAuth client — no authorization code exchange, no token refresh.
-Their APIs are reachable only with a static token or a webhook URL, which is what every recipe
-above uses.
+Everything above gets in with an API key, a webhook URL or a token behind `vars.oauth`. Still left
+out: any service that takes only a **delegated** token — one minted through an interactive login
+and a user's consent. The tool has no OAuth client in that sense: no authorization code exchange,
+no user to redirect to a consent screen, no refresh token held anywhere (the three grants it speaks
+get their tokens from a key, from client credentials or from a signed assertion, and drop the token
+on a 401 rather than refreshing it on a schedule). A hosted API whose permission table prints
+*Application: Not supported* belongs to that group — Microsoft Graph's workbook pages are the case
+this file ran into, quoted above — because its tokens are minted for a signed-in user, and there is
+no lazywf recipe for it.
