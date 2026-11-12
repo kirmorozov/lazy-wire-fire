@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
 
@@ -561,11 +561,6 @@ pub async fn compile(
         error: (!errors.is_empty()).then(|| errors.join("; ")),
         trigger_error: (!trigger_errors.is_empty()).then(|| trigger_errors.join("; ")),
     }
-}
-
-/// A trigger definition error for a row that did not even parse.
-pub fn trigger_parse_error(id: u64, e: &anyhow::Error) -> anyhow::Error {
-    anyhow!("trigger {id}: {e:#}")
 }
 
 /// A rule-load target of `kind` with one endpoint and `vars` (the tests' kind targets load).

@@ -5,7 +5,7 @@
 //! its database password), and `file:` must resolve inside a directory of `LAZYWF_SECRET_DIRS`
 //! (`:`-separated, default `/run/secrets:/var/run/secrets`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -72,11 +72,6 @@ pub fn read_bytes(field: &str, v: &str) -> Result<Vec<u8>> {
     std::fs::read(&real).with_context(|| format!("reading file `{path}`"))
 }
 
-/// Whether `dir` is among the secret directories (for messages and tests).
-pub fn is_secret_dir(dir: &Path) -> bool {
-    std::fs::canonicalize(dir).is_ok_and(|d| secret_dirs().contains(&d))
-}
-
 /// Serialises the tests that set environment variables (`LAZYWF_SECRET_DIRS`, `AWS_*`, `HOME`).
 #[cfg(test)]
 pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -103,7 +98,6 @@ mod tests {
         std::fs::write(allowed.join("pw"), "abc\n").unwrap();
         std::fs::write(base.join("outside"), "no").unwrap();
         std::env::set_var("LAZYWF_SECRET_DIRS", allowed.display().to_string());
-        assert!(is_secret_dir(&allowed));
         assert_eq!(
             resolve(&format!("file:{}/pw", allowed.display())).unwrap(),
             "abc"

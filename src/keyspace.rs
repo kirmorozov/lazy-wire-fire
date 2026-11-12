@@ -228,24 +228,10 @@ impl IdSets {
         self.sets.retain(|_, s| !s.is_empty());
         out
     }
-
-    /// The set as the core built it (`Key::from_text`, e.g. from a target listing or the
-    /// snapshot query) in this rule's layout: text is the pivot.
-    pub fn from_text_set(ks: &mut KeySpaces, src: &IdSet) -> IdSets {
-        let mut out = IdSets::default();
-        for k in src.to_keys() {
-            let mut t = String::new();
-            k.to_text(&mut t);
-            let (s, located) = ks.locate(&t);
-            out.insert(s, located);
-        }
-        out
-    }
 }
 
 /// A set of text keys as the core holds them (`Key::from_text`): the keys of one listing or
-/// snapshot page, the seen-keys of one flush. Owners that compare it with rule-held sets
-/// convert it first ([`IdSets::from_text_set`]), with the text as the pivot.
+/// snapshot page, the seen-keys of one flush.
 pub fn text_set<'a>(keys: impl IntoIterator<Item = &'a str>) -> IdSet {
     let mut set = IdSet::default();
     for k in keys {
@@ -442,21 +428,6 @@ mod tests {
             .collect();
         want.sort();
         assert_eq!(got, want);
-    }
-
-    #[test]
-    fn text_sets_pivot_through_text_into_the_rule_layout() {
-        // What a listing returns (the core's from_text) lands on the same members as the
-        // marks of the rule: the same texts, the same spaces.
-        let mut ks = KeySpaces::new();
-        let texts = ["42", "item_42", "007", "sku-ABC", "-5"];
-        let listed = text_set(texts.iter().copied());
-        let sets = IdSets::from_text_set(&mut ks, &listed);
-        for k in texts {
-            let (s, key) = ks.locate(k);
-            assert!(sets.contains(s, &key), "{k}");
-        }
-        assert_eq!(sets.len(), texts.len());
     }
 
     /// The real bytes behind a million marked keys (the hash-set backend): run with

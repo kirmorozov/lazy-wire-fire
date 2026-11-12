@@ -107,7 +107,7 @@ mod wire;
 use stream::{Call, Endpoint0, Outbound, Shared, Verdict};
 use wire::Codec;
 
-pub use schema::{pool, Method};
+use schema::{pool, Method};
 
 /// The default ports (plain / TLS).
 const DEFAULT_PORT: u16 = 80;
