@@ -3131,3 +3131,236 @@ async fn no_secret_in_the_logs_oauth() {
     }
     assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
 }
+
+// ---- The JWT bearer grant of `vars.oauth` (RFC 7523 §2.1, src/oauth.rs).
+
+/// The access token the token endpoint hands out (the hit's number appended). The private
+/// key comes from the test fixture under `src/testdata` (a throwaway key, see its README);
+/// a distinctive run of its base64 body is the marker below. None of these may reach a log
+/// line at `trace`, an error text or `last_error` — the token endpoint of this flow echoes
+/// the whole request it was sent (its assertion included), and the API echoes the
+/// `Authorization` header of the request it refuses.
+const JWT_ACCESS_TOKEN: &str = "LWFSECRET-jwt-access-token";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_the_logs_oauth_jwt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = need_db!();
+    install();
+    let db = Db::fresh(&root, "logoauthjwt").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+
+    // The signing key behind a `file:` reference (the same secret directory the flows of
+    // this binary share); iss/sub/aud are identifiers and go in literally.
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("tmp/out/secrets-logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let key_pem = std::fs::read_to_string("src/testdata/rsa-test-key-pkcs8.pem").unwrap();
+    let key_file = dir.join("oauth-jwt-key");
+    std::fs::write(&key_file, &key_pem).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", dir.display().to_string());
+    // a run of the key's base64 body: the marker that says the key bytes leaked
+    let key_body: String = key_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<String>();
+    let key_marker = key_body[24..88].to_string();
+
+    let mock = Mock::start().await;
+    #[derive(Clone, Copy, PartialEq)]
+    enum Phase {
+        TokenEchoes,
+        Unauthorized,
+        Accepted,
+    }
+    let phase = Arc::new(Mutex::new(Phase::TokenEchoes));
+    let tokens = Arc::new(AtomicUsize::new(0));
+    {
+        let (phase, tokens) = (phase.clone(), tokens.clone());
+        mock.respond(move |r| match r.path.as_str() {
+            "/token" => {
+                let n = tokens.fetch_add(1, Ordering::SeqCst) + 1;
+                if *phase.lock().unwrap() == Phase::TokenEchoes {
+                    // the echo of the whole request: its `assertion=` field is the signed
+                    // assertion — the credential of this grant for its 180 s of life
+                    (
+                        400,
+                        format!(
+                            r#"{{"error": "invalid_request", "error_description": "got {}"}}"#,
+                            r.body
+                        ),
+                    )
+                } else {
+                    // Salesforce says no `expires_in`: the default lifetime applies and a
+                    // shorter session is covered by the 401 drop below
+                    (
+                        200,
+                        format!(
+                            r#"{{"access_token": "{JWT_ACCESS_TOKEN}-{n}", "token_type": "Bearer"}}"#
+                        ),
+                    )
+                }
+            }
+            "/hook" => match *phase.lock().unwrap() {
+                Phase::TokenEchoes => (200, "ok".into()),
+                Phase::Unauthorized => (
+                    401,
+                    format!(
+                        r#"{{"error": "invalid_token", "authorization": "{}"}}"#,
+                        r.header("authorization").unwrap_or_default()
+                    ),
+                ),
+                Phase::Accepted => (200, "ok".into()),
+            },
+            _ => (404, "{}".into()),
+        });
+    }
+
+    db.target(
+        "wh",
+        "http",
+        &mock.url(),
+        None,
+        &json!({
+            "oauth": "jwt_bearer",
+            "token_url": format!("{}/token", mock.url()),
+            "client_id": "3MVG9IssuerKey",
+            "subject": "integration@company.test",
+            "audience": "https://company.my.salesforce.com",
+            "signing_key_ref": format!("file:{}", key_file.display()),
+        })
+        .to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, ?, 50)",
+        ("wh", "wh", "POST /hook HTTP/1.1\n\nok"),
+    )
+    .await;
+    db.trigger("wh", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+
+    let hits = |path: &str| mock.requests().iter().filter(|r| r.path == path).count();
+
+    // 1. the token endpoint echoes the assertion it was sent. The send fails; the key
+    // waits; what the failure logs must carry neither the assertion, the key, nor a token.
+    wait_for(Duration::from_secs(30), "a token request", || async {
+        (hits("/token") >= 1).then_some(())
+    })
+    .await;
+    let err = wait_for(
+        Duration::from_secs(30),
+        "the token failure on the rule",
+        || async {
+            db.status("wh")
+                .await
+                .and_then(|(_, _, _, e)| e)
+                .filter(|e| e.contains("token endpoint"))
+        },
+    )
+    .await;
+    assert!(
+        !err.contains(&key_marker),
+        "the key escaped to last_error: {err}"
+    );
+    *phase.lock().unwrap() = Phase::Unauthorized;
+
+    // 2. the API refuses the credential: the 401 speaks about the token, the key is kept,
+    // the token dropped; the echoed 401 body must not carry the token out.
+    wait_for(
+        Duration::from_secs(30),
+        "the action to reach the API",
+        || async { (hits("/hook") >= 1).then_some(()) },
+    )
+    .await;
+    let err = wait_for(Duration::from_secs(30), "the 401 on the rule", || async {
+        db.status("wh")
+            .await
+            .and_then(|(_, _, _, e)| e)
+            .filter(|e| e.contains("oauth access token"))
+    })
+    .await;
+    assert!(
+        !err.contains(JWT_ACCESS_TOKEN),
+        "the access token reached last_error: {err}"
+    );
+    *phase.lock().unwrap() = Phase::Accepted;
+
+    // 3. with a fresh token the same action goes through: nothing is left to retry, which
+    // is the proof neither failure refused the key.
+    inst.quiet().await;
+    inst.stop().await;
+
+    let reqs = mock.requests();
+    let token_reqs: Vec<&Req> = reqs.iter().filter(|r| r.path == "/token").collect();
+    assert!(
+        token_reqs
+            .iter()
+            .all(|r| r.header("authorization").is_none()),
+        "client authentication rode the assertion grant (RFC 7523 §2.1 needs none)"
+    );
+    let assertions: Vec<String> = token_reqs
+        .iter()
+        .filter_map(|r| {
+            r.body
+                .split("assertion=")
+                .nth(1)
+                .map(|a| a.split('&').next().unwrap_or_default().to_string())
+        })
+        .collect();
+    assert!(
+        token_reqs.iter().all(|r| r.body.starts_with(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="
+        )),
+        "the grant form was not what went out: {:?}",
+        token_reqs.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+    assert!(!assertions.is_empty(), "no assertion was ever sent");
+    for a in &assertions {
+        assert_eq!(a.matches('.').count(), 2, "not an assertion: {a}");
+    }
+    let hooks: Vec<&Req> = reqs.iter().filter(|r| r.path == "/hook").collect();
+    let bearers: Vec<&str> = hooks
+        .iter()
+        .map(|r| r.header("authorization").unwrap_or_default())
+        .collect();
+    assert!(
+        bearers.iter().all(|b| b.starts_with("Bearer ")),
+        "an action without the bearer token: {bearers:?}"
+    );
+    assert!(
+        bearers.windows(2).any(|w| w[0] != w[1]),
+        "the 401 did not drop the cached token: {bearers:?}"
+    );
+
+    let out = captured();
+    assert!(out.contains("starting"), "no engine log in the capture");
+    assert!(
+        out.contains("oauth token"),
+        "the token endpoint's failure was never logged: it is what the flow ran on"
+    );
+    // the assertion is the credential of this grant: every one that was ever sent must be
+    // absent from the capture, along with the key and the access token
+    let mut secrets: Vec<(String, String)> = vec![
+        ("jwt signing key".to_string(), key_marker.clone()),
+        ("jwt access token".to_string(), JWT_ACCESS_TOKEN.to_string()),
+    ];
+    for (n, a) in assertions.into_iter().enumerate() {
+        secrets.push((format!("jwt assertion #{n}"), a));
+    }
+    let refs: Vec<(&str, &str)> = secrets
+        .iter()
+        .map(|(w, s)| (w.as_str(), s.as_str()))
+        .collect();
+    let leaks = leaks(&out, &refs);
+    if !leaks.is_empty() {
+        dump(&out);
+    }
+    assert!(leaks.is_empty(), "secrets in the logs: {leaks:#?}");
+}

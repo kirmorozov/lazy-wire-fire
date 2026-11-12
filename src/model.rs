@@ -304,24 +304,32 @@ impl Kind {
     /// `vars` entries that hold credentials and never reach templates.
     pub fn secret_vars(self) -> &'static [&'static str] {
         match self {
-            Kind::Http => &["sign_secret_ref", "client_secret_ref", "credentials_ref"],
+            Kind::Http => &[
+                "sign_secret_ref",
+                "client_secret_ref",
+                "credentials_ref",
+                "signing_key_ref",
+            ],
             Kind::HttpBasic => &[
                 "password",
                 "sign_secret_ref",
                 "client_secret_ref",
                 "credentials_ref",
+                "signing_key_ref",
             ],
             Kind::HttpBearer => &[
                 "token",
                 "sign_secret_ref",
                 "client_secret_ref",
                 "credentials_ref",
+                "signing_key_ref",
             ],
             Kind::HttpHeader => &[
                 "value",
                 "sign_secret_ref",
                 "client_secret_ref",
                 "credentials_ref",
+                "signing_key_ref",
             ],
             Kind::HttpS3
             | Kind::Sqs

@@ -126,6 +126,10 @@ aws-smithy-runtime-api = "1"
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+# Tests only: verifies the RS256 assertion of `vars.oauth=jwt_bearer` (the oauth tests of
+# `src/oauth.rs` and `src/target.rs`). The same ring the lock already carries through rustls:
+# no new crate enters the tree.
+ring = "0.17"
 # Tests only: a receiver for the `yaml` helper's bodies (the tool itself never parses YAML).
 # The YAML organization's maintained serde_yaml successor; pure Rust (libyaml-rs), no C build.
 yaml_serde = "0.10"

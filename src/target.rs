@@ -2758,6 +2758,9 @@ mod oauth_tests {
         requests: Arc<Mutex<Vec<String>>>,
         answer: Arc<Mutex<(u16, String)>>,
         delay: Arc<Mutex<Duration>>,
+        /// When set, the JWT bearer assertion of the form is verified on the spot (the way
+        /// a real endpoint must): a bad grant, signature or claim answers `invalid_grant`.
+        jwt: Arc<Mutex<Option<crate::oauth::jwt_check::Expect>>>,
     }
 
     impl Server {
@@ -2768,18 +2771,20 @@ mod oauth_tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let answer = Arc::new(Mutex::new((status, answer.to_string())));
             let delay = Arc::new(Mutex::new(Duration::ZERO));
-            let (h, r, a, d) = (
+            let jwt = Arc::new(Mutex::new(None));
+            let (h, r, a, d, j) = (
                 hits.clone(),
                 requests.clone(),
                 answer.clone(),
                 delay.clone(),
+                jwt.clone(),
             );
             tokio::spawn(async move {
                 loop {
                     let Ok((mut s, _)) = listener.accept().await else {
                         return;
                     };
-                    let (h, r, a, d) = (h.clone(), r.clone(), a.clone(), d.clone());
+                    let (h, r, a, d, j) = (h.clone(), r.clone(), a.clone(), d.clone(), j.clone());
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
                         let mut chunk = [0u8; 4096];
@@ -2817,12 +2822,34 @@ mod oauth_tests {
                         r.lock()
                             .unwrap()
                             .push(String::from_utf8_lossy(&buf).into_owned());
+                        // The endpoint reads the assertion the way Salesforce must: a form
+                        // whose grant, signature or claims are wrong is refused.
+                        let refused = match &*j.lock().unwrap() {
+                            Some(want) => {
+                                let body = String::from_utf8_lossy(
+                                    buf.get(head + 4..).unwrap_or_default(),
+                                )
+                                .into_owned();
+                                crate::oauth::jwt_check::check_form(&body, want).err()
+                            }
+                            None => None,
+                        };
                         let delay = *d.lock().unwrap();
                         if !delay.is_zero() {
                             tokio::time::sleep(delay).await;
                         }
-                        let (status, body) = a.lock().unwrap().clone();
-                        let body = body.replace("{n}", &n.to_string());
+                        let (status, body) = match refused {
+                            Some(why) => (
+                                400u16,
+                                format!(
+                                    "{{\"error\": \"invalid_grant\", \"error_description\": \"{why}\"}}"
+                                ),
+                            ),
+                            None => {
+                                let (status, body) = a.lock().unwrap().clone();
+                                (status, body.replace("{n}", &n.to_string()))
+                            }
+                        };
                         let reply = format!(
                             "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
@@ -2838,7 +2865,13 @@ mod oauth_tests {
                 requests,
                 answer,
                 delay,
+                jwt,
             }
+        }
+
+        /// Demand a verified JWT bearer assertion from now on.
+        fn verify(&self, want: crate::oauth::jwt_check::Expect) {
+            *self.jwt.lock().unwrap() = Some(want);
         }
 
         fn url(&self) -> String {
@@ -3268,5 +3301,127 @@ mod oauth_tests {
             token.last()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- vars.oauth=jwt_bearer (RFC 7523 §2.1, Salesforce) --------------------------
+
+    /// The JWT claims of these tests: `iss` is Salesforce's consumer key, `sub` the user
+    /// the token acts for, `aud` the org's login host.
+    const JWT_ISS: &str = "issuer@company.test";
+    const JWT_SUB: &str = "integration@company.test";
+    const JWT_AUD: &str = "https://company.my.salesforce.com";
+
+    /// The `vars` of a jwt_bearer target whose token endpoint is `token` (the key behind
+    /// an `env:` reference; the unit tests of `src/oauth.rs` walk both reference forms).
+    fn jwt_vars(token: &str) -> String {
+        format!(
+            r#"{{"oauth": "jwt_bearer", "token_url": "{token}", "client_id": "{JWT_ISS}",
+                 "subject": "{JWT_SUB}", "audience": "{JWT_AUD}",
+                 "signing_key_ref": "env:LWF_UNIT_OAUTH_JWT_KEY"}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn the_jwt_bearer_action_carries_the_token_and_the_endpoint_verifies_the_assertion() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let key = include_bytes!("testdata/rsa-test-key-pkcs8.pem");
+        std::env::set_var(
+            "LWF_UNIT_OAUTH_JWT_KEY",
+            String::from_utf8_lossy(key).into_owned(),
+        );
+        // the token endpoint verifies every assertion it is sent (grant, RS256 signature
+        // with the public key, claims): a wrong one answers `invalid_grant` and this test
+        // fails on the send.
+        let token = Server::start(200, TOKEN_JSON).await;
+        token.verify(crate::oauth::jwt_check::Expect {
+            public_key: crate::oauth::jwt_check::test_public_key(key),
+            iss: JWT_ISS.into(),
+            sub: JWT_SUB.into(),
+            aud: JWT_AUD.into(),
+            scope: None,
+        });
+        let api = Server::start(200, "ok").await;
+        let t = target(
+            &api.url(),
+            &jwt_vars(&format!("{}/token", token.url())),
+            None,
+        );
+
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        let sent = api.last();
+        assert!(
+            sent.contains(&format!("Authorization: Bearer {TOKEN}-0\r\n")),
+            "{sent}"
+        );
+        // the token request: the §2.1 form, and no client authentication header
+        let tr = token.last();
+        assert!(tr.starts_with("POST /token HTTP/1.1\r\n"), "{tr}");
+        assert!(
+            tr.contains(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="
+            ),
+            "{tr}"
+        );
+        assert!(
+            !tr.contains("Authorization:"),
+            "a client-auth header rides an assertion grant: {tr}"
+        );
+        assert_eq!(token.hits(), 1);
+        // the next action is served from the cache: same token, no second token request
+        assert_eq!(t.send(0, ACTION).await.unwrap(), Sent::Ok);
+        assert_eq!(token.hits(), 1);
+        assert!(
+            api.last().contains(&format!("Bearer {TOKEN}-0")),
+            "{}",
+            api.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_jwt_token_endpoint_failure_keeps_the_key_and_names_the_cause() {
+        let _env = crate::secrets::ENV_LOCK.lock().await;
+        let key = include_bytes!("testdata/rsa-test-key-pkcs8.pem");
+        std::env::set_var(
+            "LWF_UNIT_OAUTH_JWT_KEY",
+            String::from_utf8_lossy(key).into_owned(),
+        );
+        let api = Server::start(200, "ok").await;
+
+        // the token endpoint is a closed port: a transport cause, and the key waits
+        let closed = closed_port().await;
+        let t = target(
+            &api.url(),
+            &jwt_vars(&format!("http://{closed}/token")),
+            None,
+        );
+        let e = t.send(0, ACTION).await.unwrap_err();
+        assert!(!is_rejected(&e), "the token failure refused the key: {e:#}");
+        let msg = chain(&e);
+        assert!(msg.contains("token endpoint POST"), "{msg}");
+        assert!(msg.contains("refused"), "{msg}");
+        assert_eq!(api.hits(), 0, "an action left the process without a token");
+
+        // an endpoint that refuses the assertion: transient, its cause named
+        let bad = Server::start(
+            400,
+            r#"{"error": "invalid_grant", "error_description": "assertion expired"}"#,
+        )
+        .await;
+        let t = target(&api.url(), &jwt_vars(&format!("{}/token", bad.url())), None);
+        let e = t.send(0, ACTION).await.unwrap_err();
+        assert!(!is_rejected(&e), "the endpoint refused the key: {e:#}");
+        let msg = chain(&e);
+        assert!(msg.contains("status 400"), "{msg}");
+        assert!(msg.contains("invalid_grant"), "{msg}");
+        assert!(msg.contains("assertion expired"), "{msg}");
+        assert_eq!(api.hits(), 0);
+
+        // a key that cannot sign: transient too, naming the key's cause
+        std::env::set_var("LWF_UNIT_OAUTH_JWT_KEY", "not a key at all");
+        let t = target(&api.url(), &jwt_vars(&format!("{}/token", bad.url())), None);
+        let e = t.send(0, ACTION).await.unwrap_err();
+        assert!(!is_rejected(&e), "the key error refused the key: {e:#}");
+        assert!(chain(&e).contains("not a PEM private key"), "{}", chain(&e));
+        assert_eq!(api.hits(), 0);
     }
 }
