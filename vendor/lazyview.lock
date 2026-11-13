@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 0d1fdead61afcb1af9f54dd680a2161de05ccda4
+commit 3e748b43da363c17eefb85742030d1069af06701
 glob src/access.rs
 glob src/access/**
 glob src/analyze.rs
@@ -14,6 +14,7 @@ glob src/catalog.rs
 glob src/catalog/**
 glob src/datum.rs
 glob src/dedup/**
+glob src/dialect/**
 glob src/fence.rs
 glob src/intset.rs
 glob src/pgoutput.rs
@@ -29,7 +30,7 @@ file src/analyze/parse.rs 400426634725d1bc054d75b305aa23a6ff0e3563d9c69fa777e1a4
 file src/analyze/plan.rs b595c9f2b78a2ceb8f5b3f529f2c92403aa64afea8b4d7c1ae19c1f3708580b6
 file src/analyze/routes.rs 0bfc8d354c2dfe4792c224b847268c21e18f5b95420286cdb467ba2ece338e9d
 file src/analyze/tests.rs 734958fcfdecd9373cd083270490d5c23d6bf391f4db1c9aa4149c5b75335b1f
-file src/analyze/vocab.rs 7af5e8235cb1d463580e96e7b0ab4fc7bd2f3d09db3fff74465c27a34afd512f
+file src/analyze/vocab.rs 47bc86693496215fbd5b38c2e60020bfc6a7aaf343e312e7d6f86fb4c6b48f56
 file src/analyzer/ast.rs 2796d2ecb544678be94d159b39ea11b496f214d5cb5d5bfa591d3b62e74773fa
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
 file src/analyzer/internal.rs 9b226a82771b875808fbee30c7ef3738ffa90965316182db23781d18c0401bfd
@@ -75,6 +76,8 @@ file src/dedup/lane.rs 8167ae46129ea6c687178723f21f6fceb73e2f63b34a90436ed575aaf
 file src/dedup/mod.rs c6ffe5b186b01cadefbab64a11ccdfd380d0619343cf9dbdc8a033f37d063ce8
 file src/dedup/stage.rs 6c977ad6a7ea962e8fb7681e93acba86a9fde03239cfc2ce8f0b08c8b4a9dd33
 file src/dedup/testkit.rs 213185e2506521a3f2094cf6500f2a76bca368dcc0764919dc6f586a02b7b35e
+file src/dialect/mod.rs efca63af92b39a0ce1ac75b7cb580ec62729e3346e90531d0f98f2558e057443
+file src/dialect/mysql.rs 76d1a962aebaf12503717ea46d163087080607539a7056731b606a3d35932904
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
 file src/intset.rs 74132f56dd0e628df8be2f3b31430702f58a4cd4b90405aee5714037b9193bb1
 file src/pgoutput.rs 3ba4b836391ddf5dcc1d364e53aa633a9aa2d4ac8b6bc8e4b78371c600109ebd
