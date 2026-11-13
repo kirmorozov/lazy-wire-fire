@@ -275,7 +275,7 @@ impl Kind {
             // PublishBatch: 256 KiB is the default for one message and for the sum of the
             // batch; `vars.maximum_message_size` raises it to the topic's
             // `MaximumMessageSize` (see `Target::batch_bytes_limit`).
-            Kind::Sns => Some(crate::aws::SNS_MAX_BYTES),
+            Kind::Sns => Some(crate::targets::sns::SNS_MAX_BYTES),
             // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
             // (see `Target::batch_bytes_limit`).
             Kind::Kafka => Some(crate::targets::kafka::MESSAGE_MAX_BYTES),
@@ -481,41 +481,9 @@ impl TargetDef {
             }
             Kind::Kinesis => crate::targets::kinesis::check(&endpoints, &vars, kind)?,
             Kind::Sqs => crate::targets::sqs::check(&endpoints, &vars, kind)?,
-            Kind::Lambda => {
-                // `aws-lambda://[<region>/]<function>[:<qualifier>][?invocation=…]`: the function,
-                // the region and the invocation are in the URL.
-                match endpoints.as_slice() {
-                    [url] => {
-                        aws::LambdaUrl::parse(url)?;
-                    }
-                    _ => bail!(
-                        "kind lambda takes exactly one endpoint: aws-lambda://[<region>/]<function-name>[:<qualifier>]"
-                    ),
-                }
-                refuse_vars(
-                    &vars,
-                    &["region"],
-                    kind,
-                    "the region goes in the endpoint: aws-lambda://<region>/<function-name>",
-                )?;
-                aws::check_refs(&vars)?;
-            }
+            Kind::Lambda => crate::targets::lambda::check(&endpoints, &vars, kind)?,
             Kind::EventBridge => crate::targets::eventbridge::check(&endpoints, &vars, kind)?,
-            Kind::Sns => {
-                // `aws-sns://[<region>/]<account-id>/<topic-name>`: account, topic and region are
-                // in the URL; the ARN is built from them (as SqsUrl builds the queue URL).
-                match endpoints.as_slice() {
-                    [url] => {
-                        aws::SnsUrl::parse(url)?;
-                    }
-                    _ => bail!(
-                        "kind sns takes exactly one endpoint: aws-sns://[<region>/]<account-id>/<topic-name>"
-                    ),
-                }
-                refuse_vars(&vars, &["region", "account_id", "topic_name", "topic_arn"], kind, "the region, the account and the topic go in the endpoint: aws-sns://[<region>/]<account-id>/<topic-name>")?;
-                crate::sns::check_vars(&vars)?;
-                aws::check_refs(&vars)?;
-            }
+            Kind::Sns => crate::targets::sns::check(&endpoints, &vars, kind)?,
             Kind::Amqp => crate::targets::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Smtp => crate::targets::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::PubSub => crate::targets::pubsub::check(&vars, &endpoints)?,

@@ -28,7 +28,7 @@ const USER_AGENT: &str = concat!("lazywf/", env!("CARGO_PKG_VERSION"));
 pub struct Endpoint {
     /// `endpoint` in the template context.
     pub ctx: Value,
-    transport: Transport,
+    pub(crate) transport: Transport,
 }
 
 pub(crate) enum Transport {
@@ -86,7 +86,7 @@ pub struct Target {
     /// `src/oauth.rs`): every action of the target carries it as `Authorization: Bearer`.
     oauth: Option<crate::oauth::Provider>,
     /// The `aws-lambda://` endpoint of a `lambda` target (its function, qualifier, invocation).
-    lambda: Option<aws::LambdaUrl>,
+    lambda: Option<crate::targets::lambda::LambdaUrl>,
     /// The effective batch limit of a `kafka` target, when `vars.message_max_bytes` raises the
     /// kind's default (the broker's `message.max.bytes`).
     kafka: Option<usize>,
@@ -97,20 +97,12 @@ pub struct Target {
     /// raises the kind's default (the entity's maximum message size).
     servicebus: Option<usize>,
     /// The `aws-sns://` endpoint of an `sns` target and its batch byte limit.
-    sns: Option<Sns>,
+    sns: Option<crate::targets::sns::Sns>,
     /// `LAZYWF_ALLOWED_HOSTS`, kept for the endpoints that are resolved per request: a rotated
     /// secret file must not be able to move a target to a host the operator did not allow.
     allowed: Option<HostList>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
-}
-
-/// What an `sns` target knows about its topic beyond the endpoint: whether it is FIFO (every
-/// entry then needs a `MessageGroupId`) and its `MaximumMessageSize`, which is the batch's byte
-/// limit (`vars.maximum_message_size` states it; see [`crate::sns::maximum_message_size`]).
-struct Sns {
-    url: aws::SnsUrl,
-    max_bytes: usize,
 }
 
 /// The outcome of one item of a batch request (see [`Target::send_items`]).
@@ -137,20 +129,6 @@ pub enum RecordVerdict {
     Rejected(String),
     /// The answer has no entry for this record: it is not known to be stored, so it waits.
     Missing,
-}
-
-/// The items of a Lambda answer: the keys the function listed in `batchItemFailures` retry
-/// (transient); every other key is met. An identifier that is not a key of the batch is a wrong
-/// answer, so it is an error and nothing is trusted.
-pub fn lambda_items(failed: &[String], keys: &[String]) -> Result<Vec<Item>> {
-    let mut out = vec![Item::Ok; keys.len()];
-    for id in failed {
-        let i = keys.iter().position(|k| k == id).ok_or_else(|| {
-            anyhow!("batchItemFailures lists `{id}`, which is not a key of the batch")
-        })?;
-        out[i] = Item::Transient(format!("key `{id}`: listed in batchItemFailures"));
-    }
-    Ok(out)
 }
 
 /// The AWS credentials of a target's `vars`, when it gives any.
@@ -209,7 +187,7 @@ pub(crate) fn def_var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
 /// origin alone ([`BaseUrl::origin`]), so a log line at any level, `/status` and `last_error`
 /// see `POST https://hooks.example.test/…` and nothing more. Every place that names an http
 /// request goes through these two fields: that is the one redacting display.
-struct HttpRequest {
+pub(crate) struct HttpRequest {
     client: Arc<HttpClient>,
     req: RawRequest,
     /// The endpoint's own path and query, for an endpoint whose URL is a secret.
@@ -221,11 +199,11 @@ struct HttpRequest {
     at: String,
     /// `<METHOD> <url><target>`: what a status or an unmet `expect` names. For a secret endpoint
     /// this is `at` — the target is the secret.
-    at_target: String,
+    pub(crate) at_target: String,
 }
 
 impl HttpRequest {
-    async fn send(&self, timeout: Duration) -> Result<Response> {
+    pub(crate) async fn send(&self, timeout: Duration) -> Result<Response> {
         match &self.secret {
             // The secret path and query exist for these bytes and for nowhere else.
             Some(url) => {
@@ -422,36 +400,9 @@ impl Target {
                 aws_rt = Some(sign);
             }
             Kind::Lambda => {
-                // from_row: exactly one `aws-lambda://[<region>/]<function>[:<qualifier>]` endpoint.
-                // The request goes to the service root; its path names the function.
-                let url = aws::LambdaUrl::parse(
-                    def.endpoints
-                        .first()
-                        .ok_or_else(|| anyhow!("kind lambda needs its aws-lambda:// endpoint"))?,
-                )?;
-                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
-                let mut base = aws::address("lambda", url.endpoint.as_deref(), &region)?;
-                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
-                                 "region": region, "function": url.function,
-                                 "qualifier": url.qualifier,
-                                 "invocation": if url.invocation == aws::Invocation::Event { "event" } else { "sync" }});
-                base.base = String::new();
-                let host_header = base.host_header();
-                let client = Arc::new(HttpClient::new(base, &def.tls)?);
-                endpoints.push(Endpoint {
-                    ctx,
-                    transport: Transport::Http {
-                        client,
-                        prefix: String::new(),
-                        host_header,
-                    },
-                });
-                let provider = aws::Provider::new(aws_refs(&def), &region);
-                aws_rt = Some(AwsSign {
-                    service: "lambda",
-                    region,
-                    provider,
-                });
+                let (ctx, transport, sign, url) = crate::targets::lambda::build(&def)?;
+                endpoints.push(Endpoint { ctx, transport });
+                aws_rt = Some(sign);
                 lambda_url = Some(url);
             }
             Kind::EventBridge => {
@@ -460,42 +411,10 @@ impl Target {
                 aws_rt = Some(sign);
             }
             Kind::Sns => {
-                // from_row: exactly one `aws-sns://[<region>/]<account-id>/<topic-name>` endpoint.
-                // The request goes to the service root (`/`); the topic is named by its ARN in
-                // the body, as `sqs` names its queue by `endpoint.url`.
-                let url = aws::SnsUrl::parse(
-                    def.endpoints
-                        .first()
-                        .ok_or_else(|| anyhow!("kind sns needs its aws-sns:// endpoint"))?,
-                )?;
-                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
-                let mut base = aws::address("sns", url.endpoint.as_deref(), &region)?;
-                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
-                                 "region": region, "topic": url.topic,
-                                 "topic_arn": url.arn(&region), "fifo": url.fifo()});
-                base.base = String::new();
-                let host_header = base.host_header();
-                let client = Arc::new(HttpClient::new(base, &def.tls)?);
-                endpoints.push(Endpoint {
-                    ctx,
-                    transport: Transport::Http {
-                        client,
-                        prefix: String::new(),
-                        host_header,
-                    },
-                });
-                let provider = aws::Provider::new(aws_refs(&def), &region);
-                aws_rt = Some(AwsSign {
-                    service: "sns",
-                    region,
-                    provider,
-                });
-                // The topic's MaximumMessageSize is the batch's byte limit; a var that does not
-                // state it is refused here as at load (`TargetDef::from_row` checks it too).
-                sns = Some(Sns {
-                    url,
-                    max_bytes: crate::sns::maximum_message_size(&def.vars)?,
-                });
+                let (ctx, transport, sign, topic) = crate::targets::sns::build(&def)?;
+                endpoints.push(Endpoint { ctx, transport });
+                aws_rt = Some(sign);
+                sns = Some(topic);
             }
             Kind::Kafka => {
                 // from_row: exactly one endpoint, `kafka(s)://<broker>[:port][,…]/<topic>` —
@@ -647,88 +566,9 @@ impl Target {
         }
     }
 
-    /// One Invoke of a `lambda` target with the rendered payload (the template's body), signed
-    /// through the AWS path of `prepare`. `Ok(None)`: nothing rendered. `Ok(Some(failed))`: the
-    /// answer is met, and `failed` lists the identifiers the function left out (`batchItemFailures`;
-    /// always empty for an event). `Err`: refused ([`Rejected`]) or transient, as for `send`: a
-    /// non-2xx status (5xx, 408, 429 and AWS throttling codes are transient), an
-    /// `X-Amz-Function-Error` (refused), or a refused `expect` (sync only; an event is met on 202).
-    async fn lambda_invoke(&self, ep: usize, rendered: &str) -> Result<Option<Vec<String>>> {
-        let (Some(endpoint), Some(url)) = (self.endpoints.get(ep), self.lambda.as_ref()) else {
-            bail!("endpoint {ep} of target `{}` is gone", self.def.name);
-        };
-        if !matches!(endpoint.transport, Transport::Http { .. }) {
-            bail!("target `{}` is not a lambda target", self.def.name);
-        }
-        if rendered.trim().is_empty() {
-            return Ok(None);
-        }
-        if rendered.len() > url.payload_limit() {
-            return Err(rejected(format!(
-                "the payload is {} bytes, over the {} bytes an Invoke takes",
-                rendered.len(),
-                url.payload_limit()
-            )));
-        }
-        let invocation = match url.invocation {
-            aws::Invocation::Sync => "RequestResponse",
-            aws::Invocation::Event => "Event",
-        };
-        let req = RawRequest {
-            method: "POST".into(),
-            target: url.path(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-                ("X-Amz-Invocation-Type".into(), invocation.into()),
-            ],
-            body: rendered.as_bytes().to_vec(),
-        };
-        let h = self.http_bind(endpoint, req).await?;
-        let at = h.at_target.clone();
-        let resp = h.send(self.def.timeout).await.with_context(|| at.clone())?;
-        if !(200..300).contains(&resp.status) {
-            let msg = format!("{at}: status {}: {}", resp.status, resp.body_snippet());
-            let transient = resp.status >= 500
-                || matches!(resp.status, 408 | 429)
-                || self.aws_throttled(&resp.headers, &resp.body);
-            return Err(if transient {
-                anyhow!(msg)
-            } else {
-                rejected(msg)
-            });
-        }
-        if let Some(err) = aws::function_error(&resp.headers) {
-            return Err(rejected(format!(
-                "{at}: the function raised an error ({err}): {}",
-                resp.body_snippet()
-            )));
-        }
-        match url.invocation {
-            aws::Invocation::Event => {
-                if resp.status != 202 {
-                    bail!("{at}: an event invocation answers 202, not {}", resp.status);
-                }
-                Ok(Some(Vec::new()))
-            }
-            aws::Invocation::Sync => {
-                let verdict = self
-                    .expect
-                    .http(&self.pool, resp.status, &resp.headers, &resp.body)
-                    .await
-                    .with_context(|| at.clone())?;
-                if let Err(e) = verdict {
-                    return Err(rejected(format!("{at}: {e}: {}", resp.body_snippet())));
-                }
-                Ok(Some(
-                    aws::lambda_failed_items(&resp.body).with_context(|| at)?,
-                ))
-            }
-        }
-    }
-
     /// A non-2xx answer of an AWS kind whose error code says "not now" (throttling,
     /// unavailable), whatever the status (AWS JSON errors come as HTTP 400).
-    fn aws_throttled(&self, headers: &[(String, String)], body: &[u8]) -> bool {
+    pub(crate) fn aws_throttled(&self, headers: &[(String, String)], body: &[u8]) -> bool {
         self.aws.is_some()
             && aws::error_code(headers, body).is_some_and(|c| aws::transient_code(&c))
     }
@@ -747,7 +587,15 @@ impl Target {
         if self.def.kind == Kind::Lambda {
             // A lambda answers per item (see `send_items`); one action on its own cannot name
             // the items it lists, so any listed item is a transient failure here.
-            return match self.lambda_invoke(ep, rendered).await? {
+            return match crate::targets::lambda::lambda_invoke(
+                self,
+                &self.pool,
+                ep,
+                self.lambda.as_ref(),
+                rendered,
+            )
+            .await?
+            {
                 None => Ok(Sent::Skipped),
                 Some(failed) if failed.is_empty() => Ok(Sent::Ok),
                 Some(failed) => Err(anyhow!(
@@ -932,9 +780,17 @@ impl Target {
     ) -> Result<Vec<Item>> {
         let n = keys.len();
         if self.def.kind == Kind::Lambda {
-            return match self.lambda_invoke(ep, rendered).await? {
+            return match crate::targets::lambda::lambda_invoke(
+                self,
+                &self.pool,
+                ep,
+                self.lambda.as_ref(),
+                rendered,
+            )
+            .await?
+            {
                 None => Ok(vec![Item::Ok; n]),
-                Some(failed) => lambda_items(&failed, keys),
+                Some(failed) => crate::targets::lambda::lambda_items(&failed, keys),
             };
         }
         if self.def.kind == Kind::Kafka {
@@ -1020,12 +876,7 @@ impl Target {
             }
         }
         if self.def.kind == Kind::Sns {
-            // The batch is answered per entry, by its `Id`: check the rendered form body before
-            // the request goes out (see [`crate::sns::entries_ok`]).
-            let fifo = self.sns.as_ref().is_some_and(|s| s.url.fifo());
-            if let Err(why) = crate::sns::entries_ok(&req.body, n, fifo) {
-                return Err(rejected(format!("the rendered request: {why}")));
-            }
+            crate::targets::sns::pre_check(&self.sns, &req.body, n)?;
         }
         let h = self.http_bind(endpoint, req).await?;
         let resp = h
@@ -1051,8 +902,8 @@ impl Target {
         let answer: Value = if self.def.kind == Kind::Sns {
             // `PublishBatch` is the query protocol, whose answer is XML: read into the same
             // `Successful`/`Failed` shape the mapping below reads (see
-            // [`crate::sns::batch_answer`]).
-            crate::sns::batch_answer(&resp.body).with_context(|| {
+            // [`crate::targets::sns::batch_answer`]).
+            crate::targets::sns::batch_answer(&resp.body).with_context(|| {
                 format!(
                     "{}: the answer is not a PublishBatchResult: {}",
                     h.at,
@@ -1115,7 +966,11 @@ impl Target {
         }
     }
 
-    async fn http_bind(&self, endpoint: &Endpoint, req: RawRequest) -> Result<HttpRequest> {
+    pub(crate) async fn http_bind(
+        &self,
+        endpoint: &Endpoint,
+        req: RawRequest,
+    ) -> Result<HttpRequest> {
         match &endpoint.transport {
             Transport::Http {
                 client,
@@ -1222,6 +1077,7 @@ impl Target {
 #[cfg(test)]
 mod lambda_items_tests {
     use super::*;
+    use crate::targets::lambda::lambda_items;
 
     fn keys(ks: &[&str]) -> Vec<String> {
         ks.iter().map(|k| k.to_string()).collect()

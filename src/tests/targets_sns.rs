@@ -54,11 +54,11 @@ fn every_key_needs_its_own_entry() {
     let twice = body(&[("0", "a")]) + "&PublishBatchRequestEntries.member.1.Id=1";
     assert!(entries_ok(twice.as_bytes(), 2, false).is_err());
     // And not one entry too many: that is what the batch limits are for.
-    let many: Vec<(String, String)> = (0..=aws::SNS_MAX_ENTRIES)
+    let many: Vec<(String, String)> = (0..=SNS_MAX_ENTRIES)
         .map(|i| (i.to_string(), "m".to_string()))
         .collect();
     assert_eq!(
-        entries_ok(body(&many).as_bytes(), aws::SNS_MAX_ENTRIES + 1, false).unwrap_err(),
+        entries_ok(body(&many).as_bytes(), SNS_MAX_ENTRIES + 1, false).unwrap_err(),
         "11 entries is over 10, the most a PublishBatch takes"
     );
 }
@@ -186,10 +186,7 @@ fn the_largest_message_is_the_topics_and_can_be_raised() {
     let vars = |v: &str| -> Map<String, Value> {
         serde_json::from_str(&format!("{{\"maximum_message_size\": {v}}}")).unwrap()
     };
-    assert_eq!(
-        maximum_message_size(&Map::new()).unwrap(),
-        aws::SNS_MAX_BYTES
-    );
+    assert_eq!(maximum_message_size(&Map::new()).unwrap(), SNS_MAX_BYTES);
     assert_eq!(maximum_message_size(&vars("262144")).unwrap(), 262_144);
     assert_eq!(maximum_message_size(&vars("1048576")).unwrap(), 1_048_576);
     // Tighter is the author's own business; beyond what AWS takes is refused.

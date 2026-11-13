@@ -1,4 +1,24 @@
-//! Amazon SNS `PublishBatch`: the wire details of the `sns` target kind.
+//! `sns`: an AWS SNS topic — `aws-sns://[<region>/]<account-id>/<topic-name>`, with the usual
+//! optional `?endpoint=` (emulators), one `PublishBatch` per action over http, signed with SigV4
+//! for service `sns`. Nothing in the endpoint URL is a path: the topic is named by its ARN, as
+//! [`crate::targets::sqs::SqsUrl`] names the queue URL, and the host is
+//! `sns.<region>.amazonaws.com`.
+//!
+//! What the kind decides is here: the endpoint and `vars` checks at load ([`check`]), the rule
+//! checks ([`rule_errors`]), the endpoint and the signer of a loaded target ([`build`]), what
+//! the target knows of its topic ([`Sns`]) with the pre-check of a rendered batch
+//! ([`pre_check`]), and the URL its endpoint is written in ([`SnsUrl`] with its constants). The
+//! purge-like `once` step is the one rule check that is not: it is refused for the four AWS
+//! kinds that can purge (a queue, a stream, an event bus, a topic) by the one segment in
+//! [`crate::rule::kind_errors`] that names them all, as the guards naming several kinds stay in
+//! [`crate::model`] — `sqs`, `kinesis` and `eventbridge` share it and keep it there.
+//!
+//! The rest of the send path is not here either, and that is deliberate: a rendered action goes
+//! out through the shared http-batch front of [`crate::target::Target::send_items`], whose XML
+//! branch reads the answer with [`batch_answer`] and falls through to [`crate::aws::batch_items`]
+//! — the AWS `Successful`/`Failed`/`Id`/`SenderFault` protocol it shares with `sqs`. The plain
+//! `send` of one action is the generic http path of [`crate::target`] too, as it is for the
+//! other kinds that speak http.
 //!
 //! One action is one `PublishBatch`: a POST to the service root in the query protocol's form
 //! encoding (`Action=PublishBatch&Version=2010-03-31&TopicArn=…`, the entries as
@@ -17,10 +37,144 @@
 //! operation (docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html) and the query protocol
 //! (docs.aws.amazon.com/general/latest/gr/query-protocols.html).
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{Map, Value};
+use std::sync::Arc;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Map, Value};
 
 use crate::aws;
+use crate::aws::{split_aws_url, valid_region};
+use crate::docs;
+use crate::http::Client as HttpClient;
+use crate::model::{refuse_vars, FirePer, Kind, RuleDef, TargetDef};
+use crate::target::{aws_refs, rejected, Transport};
+
+/// Load checks for `sns` (from `TargetDef::from_row`): the account, the topic and the region
+/// are in the URL, so `vars` takes none of them, and the credentials are references. `kind` is
+/// the caller's `Kind`, which `refuse_vars` names in its message.
+pub fn check(endpoints: &[String], vars: &Map<String, Value>, kind: Kind) -> Result<()> {
+    // `aws-sns://[<region>/]<account-id>/<topic-name>`: account, topic and region are
+    // in the URL; the ARN is built from them (as SqsUrl builds the queue URL).
+    match endpoints {
+        [url] => {
+            SnsUrl::parse(url)?;
+        }
+        _ => bail!(
+            "kind sns takes exactly one endpoint: aws-sns://[<region>/]<account-id>/<topic-name>"
+        ),
+    }
+    refuse_vars(vars, &["region", "account_id", "topic_name", "topic_arn"], kind, "the region, the account and the topic go in the endpoint: aws-sns://[<region>/]<account-id>/<topic-name>")?;
+    check_vars(vars)?;
+    aws::check_refs(vars)?;
+    Ok(())
+}
+
+/// The `sns` checks of a rule (from `kind_errors`): one action is one `PublishBatch` (10
+/// entries; the same byte limit bounds one message and the batch, the topic's
+/// `MaximumMessageSize` raised by `vars.maximum_message_size`), and a FIFO topic needs a
+/// `version` column to deduplicate by. The purge-like `once` step of these kinds is checked in
+/// [`crate::rule::kind_errors`], shared by the four AWS kinds that can purge (the tuple naming
+/// `DeleteTopic` lives there, as the shared guards that name several kinds live in
+/// [`crate::model`]).
+pub fn rule_errors(
+    def: &RuleDef,
+    fields: &[docs::Field],
+    endpoints: &[String],
+    vars: &Map<String, Value>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // One action is one PublishBatch: the same number bounds one message and the whole batch,
+    // the topic's MaximumMessageSize (256 KiB by default, at most 1 MiB), which
+    // `vars.maximum_message_size` states for the target (checked at load, so it cannot fail
+    // here). The engine splits by bytes, never by count, so the count is a load-time
+    // requirement as for sqs and eventbridge.
+    let limit = maximum_message_size(vars).unwrap_or(SNS_MAX_BYTES);
+    if def.fire_per == FirePer::Batch {
+        match def.batch_max_keys {
+            None => out
+                .push("kind sns needs `batch_max_keys` (1 to 10: entries per PublishBatch)".into()),
+            Some(n) if n > SNS_MAX_ENTRIES => out.push(format!(
+                "`batch_max_keys` {n} is over {}, the most entries a PublishBatch takes",
+                SNS_MAX_ENTRIES
+            )),
+            Some(_) => {}
+        }
+    }
+    if def.batch_max_bytes.is_some_and(|n| n > limit) {
+        out.push(format!(
+            "`batch_max_bytes` is over {limit} bytes, the largest message and the largest batch the topic takes (its MaximumMessageSize, 262144 by default and at most 1048576; `vars.maximum_message_size` states it)"
+        ));
+    }
+    let fifo = endpoints
+        .iter()
+        .any(|e| SnsUrl::parse(e).is_ok_and(|u| u.fifo()));
+    if fifo && !fields.iter().any(|f| f.column == "version") {
+        out.push(
+            "a FIFO topic (a topic name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
+                .into(),
+        );
+    }
+    out
+}
+
+/// The endpoint of a loaded `sns` target: its template context, its http transport, how it
+/// signs and what the target knows of its topic (from `Target::new`).
+pub(crate) fn build(def: &TargetDef) -> Result<(Value, Transport, aws::Sign, Sns)> {
+    // from_row: exactly one `aws-sns://[<region>/]<account-id>/<topic-name>` endpoint.
+    // The request goes to the service root (`/`); the topic is named by its ARN in
+    // the body, as `sqs` names its queue by `endpoint.url`.
+    let url = SnsUrl::parse(
+        def.endpoints
+            .first()
+            .ok_or_else(|| anyhow!("kind sns needs its aws-sns:// endpoint"))?,
+    )?;
+    let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
+    let mut base = aws::address("sns", url.endpoint.as_deref(), &region)?;
+    let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
+                     "region": region, "topic": url.topic,
+                     "topic_arn": url.arn(&region), "fifo": url.fifo()});
+    base.base = String::new();
+    let host_header = base.host_header();
+    let client = Arc::new(HttpClient::new(base, &def.tls)?);
+    let transport = Transport::Http {
+        client,
+        prefix: String::new(),
+        host_header,
+    };
+    let provider = aws::Provider::new(aws_refs(def), &region);
+    let sign = aws::Sign {
+        service: "sns",
+        region,
+        provider,
+    };
+    // The topic's MaximumMessageSize is the batch's byte limit; a var that does not
+    // state it is refused here as at load (`TargetDef::from_row` checks it too).
+    let sns = Sns {
+        url,
+        max_bytes: maximum_message_size(&def.vars)?,
+    };
+    Ok((ctx, transport, sign, sns))
+}
+
+/// What an `sns` target knows about its topic beyond the endpoint: whether it is FIFO (every
+/// entry then needs a `MessageGroupId`) and its `MaximumMessageSize`, which is the batch's byte
+/// limit (`vars.maximum_message_size` states it; see [`maximum_message_size`]).
+pub(crate) struct Sns {
+    pub(crate) url: SnsUrl,
+    pub(crate) max_bytes: usize,
+}
+
+/// The pre-check of a rendered `PublishBatch` (from `Target::send_items`). An error is a
+/// refusal of the whole action: the batch is not sent, the keys stay waiting.
+pub(crate) fn pre_check(sns: &Option<Sns>, body: &[u8], n: usize) -> Result<()> {
+    // The batch is answered per entry, by its `Id`: check the rendered form body before
+    // the request goes out (see [`entries_ok`]).
+    let fifo = sns.as_ref().is_some_and(|s| s.url.fifo());
+    if let Err(why) = entries_ok(body, n, fifo) {
+        return Err(rejected(format!("the rendered request: {why}")));
+    }
+    Ok(())
+}
 
 /// Checks what a `sns` target's `vars` must hold (called by `TargetDef::from_row`).
 pub fn check_vars(vars: &Map<String, Value>) -> Result<()> {
@@ -39,15 +193,15 @@ pub fn check_vars(vars: &Map<String, Value>) -> Result<()> {
 /// and `MaximumMessageSize` (API_SetTopicAttributes.html).
 pub fn maximum_message_size(vars: &Map<String, Value>) -> Result<usize> {
     match vars.get("maximum_message_size") {
-        None => Ok(aws::SNS_MAX_BYTES),
+        None => Ok(SNS_MAX_BYTES),
         Some(v) => {
             let n = v
                 .as_u64()
                 .ok_or_else(|| anyhow!("`vars.maximum_message_size` is not a number"))?;
-            if n == 0 || n as usize > aws::SNS_MAX_MESSAGE_SIZE {
+            if n == 0 || n as usize > SNS_MAX_MESSAGE_SIZE {
                 bail!(
                     "`vars.maximum_message_size` is {n} (1 to {} bytes: the topic's MaximumMessageSize, which is 256 KiB by default and at most 1 MiB)",
-                    aws::SNS_MAX_MESSAGE_SIZE
+                    SNS_MAX_MESSAGE_SIZE
                 );
             }
             Ok(n as usize)
@@ -67,10 +221,10 @@ pub fn entries_ok(body: &[u8], n: usize, fifo: bool) -> Result<(), String> {
     if n == 0 {
         return Err("no keys: a batch sends no PublishBatch".to_string());
     }
-    if n > aws::SNS_MAX_ENTRIES {
+    if n > SNS_MAX_ENTRIES {
         return Err(format!(
             "{n} entries is over {}, the most a PublishBatch takes",
-            aws::SNS_MAX_ENTRIES
+            SNS_MAX_ENTRIES
         ));
     }
     let mut groups: std::collections::BTreeMap<usize, std::collections::BTreeMap<String, String>> =
@@ -338,6 +492,87 @@ fn bool_text(text: &str) -> Option<bool> {
     }
 }
 
+// ---- `aws-sns://` endpoints ----
+
+/// The most entries a PublishBatch request takes: 10 ("Publishes up to 10 messages to the
+/// specified topic in a single batch"; more is `TooManyEntriesInBatchRequest`). Source:
+/// docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html
+pub const SNS_MAX_ENTRIES: usize = 10;
+
+/// The default largest individual message and the default largest total payload of one
+/// PublishBatch (the sum of the lengths of the batched messages): 256 KiB. Source: the same
+/// page: "By default, the maximum allowed individual message size and the maximum total payload
+/// size … are both 256 KiB (262,144 bytes)".
+pub const SNS_MAX_BYTES: usize = 262_144;
+
+/// The most a topic's `MaximumMessageSize` raises those two: 1 MiB (the same page). A topic
+/// attribute, so `vars.maximum_message_size` states it for the target and raises the load-time
+/// check with it, as kafka's `vars.message_max_bytes` does.
+pub const SNS_MAX_MESSAGE_SIZE: usize = 1_048_576;
+
+/// An `aws-sns://` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnsUrl {
+    pub region: Option<String>,
+    pub account: String,
+    pub topic: String,
+    /// `?endpoint=`, as written (a validated http(s) URL).
+    pub endpoint: Option<String>,
+}
+
+impl SnsUrl {
+    /// `aws-sns://<account-id>/<topic-name>` or
+    /// `aws-sns://<region>/<account-id>/<topic-name>`.
+    pub fn parse(url: &str) -> Result<SnsUrl> {
+        let shown = crate::secrets::redact_url(url);
+        let (segs, endpoint) = split_aws_url(url, "sns")?;
+        let (region, account, topic) = match segs.as_slice() {
+            [a, t] => (None, a, t),
+            [r, a, t] => (Some(r), a, t),
+            _ => bail!(
+                "`{shown}`: kind sns takes `aws-sns://<account-id>/<topic-name>` or `aws-sns://<region>/<account-id>/<topic-name>`"
+            ),
+        };
+        if let Some(r) = region {
+            if !valid_region(r) {
+                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
+            }
+        }
+        if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("`{shown}`: the account id is twelve digits");
+        }
+        // A topic name is 1 to 256 letters, digits, `_` or `-`; a FIFO topic's name ends in
+        // `.fifo` (CreateTopic, Name; docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html).
+        let stem = topic.strip_suffix(".fifo").unwrap_or(topic);
+        let name_ok = !stem.is_empty()
+            && topic.len() <= 256
+            && stem
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+        if !name_ok {
+            bail!("`{shown}`: the topic name is 1 to 256 letters, digits, `-` or `_`, optionally ending in `.fifo`");
+        }
+        Ok(SnsUrl {
+            region: region.cloned(),
+            account: account.clone(),
+            topic: topic.clone(),
+            endpoint,
+        })
+    }
+
+    /// A FIFO topic: its name ends in `.fifo`.
+    pub fn fifo(&self) -> bool {
+        self.topic.ends_with(".fifo")
+    }
+
+    /// The topic's ARN, as `PublishBatch`'s `TopicArn` takes it:
+    /// `arn:aws:sns:<region>:<account-id>:<topic-name>` (CreateTopic returns exactly this form,
+    /// with no `topic/` resource prefix before the name).
+    pub fn arn(&self, region: &str) -> String {
+        format!("arn:aws:sns:{region}:{}:{}", self.account, self.topic)
+    }
+}
+
 #[cfg(test)]
-#[path = "tests/sns.rs"]
+#[path = "../tests/targets_sns.rs"]
 mod tests;
