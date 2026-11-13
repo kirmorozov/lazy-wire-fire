@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 6a0db35c870d4a1313c843a4863337c3f3e7b5fb
+commit 0d1fdead61afcb1af9f54dd680a2161de05ccda4
 glob src/access.rs
 glob src/access/**
 glob src/analyze.rs
@@ -16,6 +16,9 @@ glob src/datum.rs
 glob src/dedup/**
 glob src/fence.rs
 glob src/intset.rs
+glob src/pgoutput.rs
+glob src/pgoutput/**
+glob src/source/**
 file src/access.rs 341d32d4dd32b6ff99aa5461f7dbbcf8fe7bc7271fb0b20621dc515431a07ce0
 file src/access/tests.rs 1bb3b9537ff85db33482be0cc6712098e6b484894acd0d2c4e006914c65e5101
 file src/analyze.rs af89e35712f6ad62afdffe4e60e495a4f911356a8ecf0328fd8fe0105fa4c44d
@@ -51,18 +54,18 @@ file src/analyzer/tests/semi_joins.rs 2ebd81d513be1ad9916639f34e3c6bede77dd82bdb
 file src/analyzer/tests/virtuals.rs 2852246bd63a8ea428949fba5e3a5830aaaf6f67791695e3a35fafa61131f3b5
 file src/analyzer/tests_rename.rs 17fb34cb00df4716e525a4c5829bc4f48c2090f34191a69b7b75d4e803205c24
 file src/analyzer/union.rs 9acd5df87a46c597178cd7b8b167041e797f92684d746d48ac60a8b6ee2c79ab
-file src/binlog.rs a951aa923351355eb039c56ab349504d4933b23a1d37690b1ee40d1716e90f78
+file src/binlog.rs 94cdf46069d362b45a2c61db6629283246f7e3433b26944e54d783763d8396cb
 file src/binlog/ca_tests.rs a43dc08bf0403326ea035549161ae743d53221c4ed3cd7839ff0e7167eb63ad3
-file src/binlog/connect.rs daaae83d8ea6d942fd421c57c5f2b45fc77235f87cd3b0d20d1edabea569826b
-file src/binlog/probe.rs d0d156fb4d23b6eab229cad2c90823ec9a3e2a6c7121e203a46aa2679e745577
+file src/binlog/connect.rs 83c2c75da6459ada136fdec244bcad4dc4e096924db32dd669efad10f420c2cf
+file src/binlog/probe.rs 8b28c8efb63786fa016a11a12cf09cde4abf25f476f95b56883aa47d69550ec8
 file src/binlog/query.rs 679745fbc63b0fee2c2e47b7de3046a04fb68dc019e8a35359640ef13d570a84
-file src/binlog/stream.rs 72be31ef58bc56abb471940855c2fec246a29adc4d881fa41c38b205f72b8ec4
+file src/binlog/stream.rs 2614c9119baa4a6d34af7130523d31ec06ecd54249deec714b285d9738155887
 file src/binlog/tests.rs 6c3584c914381a51b771cf6f3bb80418570ecb006017216652b516dd80026a89
 file src/cascade.rs 7e90037f48f40a9100bd4fc25668c5bc33a82f1270889d4e40227da0479c5105
 file src/catalog.rs 36891aa36fcb0864b4817ac4622e9cb64af3d875165797471dc2e88dbcca4d1a
 file src/catalog/tests.rs 9bd3009a9ebcdf38e5d51e9a5e6b0372a9513739dde3c5a69f9538ae7fd2626f
 file src/datum.rs c6088b9dc4b92e0bc7b76105c207b179debb28cdd54301e081d014cd56771def
-file src/dedup/acceptance.rs f147157bbbfaccf9376a7d2968e1917d073913e63bcfd87b312df58897558415
+file src/dedup/acceptance.rs ba2a74b4c338e7dc741d6a0aa2e37704ad81a85ddd86c8a92e418b65de18e2c4
 file src/dedup/buffer.rs 7d6c57c879386c9338fb668cc9f19be9f2ac986c7966c0c4d1b925413c049332
 file src/dedup/consumer.rs aa31ab610dd1c5c9b5db6d381264c4659bd351aef081af342c5cf2261b8eb3d2
 file src/dedup/consumer/tests.rs c32b5462f5dc78da8ff2b1bf1f031a2ced9ae26b20794f901874a5f1b3ef1638
@@ -74,3 +77,6 @@ file src/dedup/stage.rs 6c977ad6a7ea962e8fb7681e93acba86a9fde03239cfc2ce8f0b08c8
 file src/dedup/testkit.rs 213185e2506521a3f2094cf6500f2a76bca368dcc0764919dc6f586a02b7b35e
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
 file src/intset.rs 74132f56dd0e628df8be2f3b31430702f58a4cd4b90405aee5714037b9193bb1
+file src/pgoutput.rs 3ba4b836391ddf5dcc1d364e53aa633a9aa2d4ac8b6bc8e4b78371c600109ebd
+file src/pgoutput/tests.rs de670286a3c1519b38cbc453baf9ecc31f079e59cc7ccd47dfa79ff6951f5882
+file src/source/mod.rs ec38562e1b690e96941f54f8e8e044df858e0455f548ba65b6559f2605f4f0c9
