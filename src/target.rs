@@ -16,10 +16,10 @@ use crate::allow::HostList;
 use crate::aws;
 use crate::http::{BaseUrl, Client as HttpClient, RawRequest, Response, SecretUrl};
 use crate::model::{Kind, TargetDef};
-use crate::redis::{self, Client as RedisClient, RedisAddr, Reply};
 use crate::response::{Expect, Row, Uses};
 use crate::s3::S3Spec;
 use crate::secrets;
+use crate::targets::redis::Client as RedisClient;
 use crate::tls::TlsSpec;
 
 const USER_AGENT: &str = concat!("lazywf/", env!("CARGO_PKG_VERSION"));
@@ -30,7 +30,7 @@ pub struct Endpoint {
     transport: Transport,
 }
 
-enum Transport {
+pub(crate) enum Transport {
     Http {
         client: Arc<HttpClient>,
         /// Prepended to the rendered path (base URL path, or `/<bucket>` for path-style S3).
@@ -428,20 +428,8 @@ impl Target {
         let mut sns = None;
         match def.kind {
             Kind::MySql | Kind::PgSql => {
-                use crate::sqlwire::{Credentials, MySqlClient, PgClient, SqlAddr};
-                let d = def.kind.dialect();
                 for e in &def.endpoints {
-                    let addr = SqlAddr::parse(e, d)?;
-                    let ctx = addr.ctx(d);
-                    let creds = Credentials {
-                        user: def_var(&def, "username").map(str::to_string),
-                        password: def_var(&def, "password").map(str::to_string),
-                    };
-                    let transport = if def.kind == Kind::MySql {
-                        Transport::MySql(MySqlClient::new(addr, &def.tls, creds))
-                    } else {
-                        Transport::Pg(PgClient::new(addr, &def.tls, creds))
-                    };
+                    let (ctx, transport) = crate::targets::sql::new(&def, e)?;
                     endpoints.push(Endpoint { ctx, transport });
                 }
             }
@@ -465,14 +453,7 @@ impl Target {
             }
             Kind::Redis => {
                 for e in &def.endpoints {
-                    let addr = RedisAddr::parse(e)?;
-                    let ctx = json!({"host": addr.host, "port": addr.port, "db": addr.db, "url": addr.url()});
-                    let client = RedisClient::new(
-                        addr,
-                        &def.tls,
-                        def_var(&def, "username").map(str::to_string),
-                        def_var(&def, "password").map(str::to_string),
-                    )?;
+                    let (ctx, client) = crate::targets::redis::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Redis(client),
@@ -1004,30 +985,14 @@ impl Target {
                 crate::targets::smtp::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::Redis(client) => {
-                let args = redis::tokenize(rendered)
-                    .map_err(|e| rejected(format!("the rendered command: {e:#}")))?;
-                if args.is_empty() {
-                    return Ok(Sent::Skipped);
-                }
-                let name = String::from_utf8_lossy(&args[0]).to_uppercase();
-                let reply = client
-                    .command(&args, self.def.timeout)
-                    .await
-                    .with_context(|| format!("{name} on {}", client.addr.url()))?;
-                if let Some(e) = reply.error() {
-                    let msg = format!("{name} on {}: {e}", client.addr.url());
-                    return Err(if redis::transient_error(e) {
-                        anyhow!(msg)
-                    } else {
-                        rejected(msg)
-                    });
-                }
-                self.expect
-                    .row(&self.pool, |u| Row::reply(u, &reply))
-                    .await
-                    .with_context(|| format!("{name} on {}", client.addr.url()))?
-                    .map_err(|e| rejected(format!("{name} on {}: {e}", client.addr.url())))?;
-                Ok(Sent::Ok)
+                crate::targets::redis::send(
+                    client,
+                    rendered,
+                    self.def.timeout,
+                    &self.expect,
+                    &self.pool,
+                )
+                .await
             }
             Transport::PubSub(client) => {
                 crate::targets::pubsub::send(
@@ -1057,28 +1022,14 @@ impl Target {
                 crate::targets::servicebus::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::MySql(_) | Transport::Pg(_) => {
-                let sql = match crate::sqlwire::single_statement(rendered) {
-                    Ok(Some(s)) => s,
-                    Ok(None) => return Ok(Sent::Skipped),
-                    Err(e) => return Err(rejected(format!("{e:#}"))),
-                };
-                let (affected, at) = match &endpoint.transport {
-                    Transport::MySql(c) => (
-                        c.exec(sql, self.def.timeout).await?,
-                        format!("{}/{}", c.addr.host, c.addr.db),
-                    ),
-                    Transport::Pg(c) => (
-                        c.exec(&sql, self.def.timeout).await?,
-                        format!("{}/{}", c.addr.host, c.addr.db),
-                    ),
-                    _ => unreachable!(),
-                };
-                self.expect
-                    .row(&self.pool, |u| Row::affected(u, affected))
-                    .await
-                    .with_context(|| at.clone())?
-                    .map_err(|e| rejected(format!("{at}: {e}")))?;
-                Ok(Sent::Ok)
+                crate::targets::sql::send(
+                    &endpoint.transport,
+                    rendered,
+                    self.def.timeout,
+                    &self.expect,
+                    &self.pool,
+                )
+                .await
             }
         }
     }
@@ -1127,15 +1078,7 @@ impl Target {
             Transport::Amqp(_) => bail!("kind amqp appends: it cannot list keys"),
             Transport::Smtp(_) => bail!("kind smtp appends: it cannot list keys"),
             Transport::Redis(client) => {
-                let args = redis::tokenize(rendered)?;
-                if args.is_empty() {
-                    bail!("the list template rendered nothing");
-                }
-                let reply: Reply = client.command(&args, self.def.timeout).await?;
-                if let Some(e) = reply.error() {
-                    bail!("{e}");
-                }
-                Ok(Row::reply(uses, &reply))
+                crate::targets::redis::fetch(client, rendered, self.def.timeout, uses).await
             }
             Transport::PubSub(_) => {
                 bail!("pubsub targets only publish: a listing is refused")
@@ -1146,15 +1089,9 @@ impl Target {
             }
             Transport::Grpc(_) => bail!("kind grpc pushes: it cannot list keys"),
             Transport::ServiceBus(_) => bail!("kind servicebus appends: it cannot list keys"),
-            Transport::MySql(c) => {
-                let sql = crate::sqlwire::single_statement(rendered)?
-                    .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
-                Ok(Row::json(uses, &c.rows(sql, self.def.timeout).await?))
-            }
-            Transport::Pg(c) => {
-                let sql = crate::sqlwire::single_statement(rendered)?
-                    .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
-                Ok(Row::json(uses, &c.rows(&sql, self.def.timeout).await?))
+            Transport::MySql(_) | Transport::Pg(_) => {
+                crate::targets::sql::fetch(&endpoint.transport, rendered, self.def.timeout, uses)
+                    .await
             }
         }
     }
