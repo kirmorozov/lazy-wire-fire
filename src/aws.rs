@@ -384,12 +384,11 @@ pub fn endpoint(service: &str, region: &str) -> BaseUrl {
     }
 }
 
-// ---- `aws-kinesis://` endpoints ----
+// ---- `aws-<service>://` URL helpers ----
 //
-// `aws-kinesis://[<region>/]<stream-name>`, with an optional `?endpoint=http(s)://host:port`
-// (emulators, VPC endpoints). The region is in the URL, or else from the default chain
-// (`region_from`). Credentials never go in the URL. The helpers here serve every
-// `aws-<service>://` URL, whichever kind's module parses it.
+// Credentials never go in the URL. The helpers here serve every `aws-<service>://` URL,
+// whichever kind's module parses it: the URL type of a kind lives with its kind in
+// [`crate::targets`].
 
 /// The scheme of a URL (`aws-sqs` for `aws-sqs://…`), when it has one.
 pub fn scheme_of(url: &str) -> Option<&str> {
@@ -465,162 +464,6 @@ pub fn address(service: &str, endpoint_override: Option<&str>, region: &str) -> 
     match endpoint_override {
         Some(e) => BaseUrl::parse(e),
         None => Ok(endpoint(service, region)),
-    }
-}
-
-/// An `aws-kinesis://` endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KinesisUrl {
-    pub region: Option<String>,
-    pub stream: String,
-    /// `?endpoint=`, as written (a validated http(s) URL).
-    pub endpoint: Option<String>,
-}
-
-impl KinesisUrl {
-    /// `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`.
-    pub fn parse(url: &str) -> Result<KinesisUrl> {
-        let shown = crate::secrets::redact_url(url);
-        let (segs, endpoint) = split_aws_url(url, "kinesis")?;
-        let (region, stream) = match segs.as_slice() {
-            [s] => (None, s),
-            [r, s] => (Some(r), s),
-            _ => bail!(
-                "`{shown}`: kind kinesis takes `aws-kinesis://<stream-name>` or `aws-kinesis://<region>/<stream-name>`"
-            ),
-        };
-        if let Some(r) = region {
-            if !valid_region(r) {
-                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
-            }
-        }
-        let ok = (1..=128).contains(&stream.len())
-            && stream
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
-        if !ok {
-            bail!("`{shown}`: a stream name is 1 to 128 letters, digits, `-`, `_` or `.`");
-        }
-        Ok(KinesisUrl {
-            region: region.cloned(),
-            stream: stream.clone(),
-            endpoint,
-        })
-    }
-}
-
-// ---- `aws-eventbridge://` endpoints ----
-//
-// `aws-eventbridge://[<region>/]<event-bus-name-or-arn>`, with the usual optional `?endpoint=`
-// (emulators, VPC endpoints). PutEvents is a JSON 1.1 call to the service root: `X-Amz-Target:
-// AWSEvents.PutEvents`, `Content-Type: application/x-amz-json-1.1`, body `{"Entries": [...]}`;
-// SigV4 signs with service `events`, the host is `events.<region>.amazonaws.com`.
-// Source: PutEvents API (docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutEvents.html)
-// and the service endpoints reference (`events.<region>.amazonaws.com`).
-
-/// The most entries a PutEvents request takes: 10 (`Entries` array, "The maximum number of
-/// records per transaction is 10"). Source:
-/// docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutEvents.html
-pub const EVENTBRIDGE_MAX_ENTRIES: usize = 10;
-
-/// The largest sum of all the entries of one PutEvents request: 1 MB (1,048,576 bytes). The
-/// rendered request also carries the JSON around the entries, so the limit is applied to the
-/// rendered body (conservative, as for Kinesis). Source: "Event size" of the PutEvents
-/// user guide (docs.aws.amazon.com/eventbridge/latest/userguide/eb-putevents.html#eb-putevent-size).
-pub const EVENTBRIDGE_MAX_BYTES: usize = 1_048_576;
-
-/// An `aws-eventbridge://` endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventBridgeUrl {
-    pub region: Option<String>,
-    /// The event bus, as `Entries[].EventBusName` takes it: the name, for an ARN endpoint the
-    /// ARN's resource name.
-    pub bus: String,
-    /// `?endpoint=`, as written (a validated http(s) URL).
-    pub endpoint: Option<String>,
-}
-
-/// An event bus name: 1 to 256 letters, digits, `-`, `_` or `.` (CreateEventBus, `Name`;
-/// docs.aws.amazon.com/eventbridge/latest/APIReference/API_CreateEventBus.html).
-fn check_bus_name(shown: &str, name: &str) -> Result<()> {
-    let ok = (1..=256).contains(&name.len())
-        && name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
-    if !ok {
-        bail!("`{shown}`: an event bus name is 1 to 256 letters, digits, `-`, `_` or `.`");
-    }
-    Ok(())
-}
-
-/// The region and the bus name of an event bus ARN:
-/// `arn:<partition>:events:<region>:<account-id>:event-bus/<name>` (CreateEventBus, Arn;
-/// docs.aws.amazon.com/eventbridge/latest/APIReference/API_CreateEventBus.html).
-fn bus_of_eventbus_arn(shown: &str, arn: &str) -> Result<(String, String)> {
-    let bad = || {
-        anyhow!("`{shown}`: an event bus ARN is `arn:aws:events:<region>:<account-id>:event-bus/<event-bus-name>`")
-    };
-    // The resource part (`event-bus/<name>`) is everything after the last colon: it is the
-    // only part a `/` can appear in (a bus name holds no `/`, and `split_aws_url` has just
-    // split the URL on `/`).
-    let (head, resource) = arn.rsplit_once(':').ok_or_else(bad)?;
-    let (res_type, name) = resource.split_once('/').ok_or_else(bad)?;
-    let parts: Vec<&str> = head.split(':').collect();
-    let [_, partition, service, region, account] = parts.as_slice() else {
-        return Err(bad());
-    };
-    if !matches!(*partition, "aws" | "aws-cn" | "aws-us-gov")
-        || *service != "events"
-        || res_type != "event-bus"
-    {
-        return Err(bad());
-    }
-    if !valid_region(region) {
-        bail!("`{shown}`: `{region}` is not an AWS region name, e.g. eu-west-1");
-    }
-    if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
-        bail!("`{shown}`: the account id is twelve digits");
-    }
-    check_bus_name(shown, name)?;
-    Ok((region.to_string(), name.to_string()))
-}
-
-impl EventBridgeUrl {
-    /// `aws-eventbridge://<bus>` or `aws-eventbridge://<region>/<bus>`, the bus a name or its
-    /// ARN (an ARN names its own region).
-    pub fn parse(url: &str) -> Result<EventBridgeUrl> {
-        let shown = crate::secrets::redact_url(url);
-        let (segs, endpoint) = split_aws_url(url, "eventbridge")?;
-        // The ARN's resource part (`event-bus/<name>`) contains a `/`, which `split_aws_url`
-        // has split on; it is rejoined here. A leading region segment therefore needs two
-        // ordinary segments, neither of which starts an ARN.
-        let (region, text) = match segs.as_slice() {
-            [r, name] if !r.starts_with("arn:") && !name.starts_with("arn:") => {
-                if !valid_region(r) {
-                    bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
-                }
-                (Some(r.clone()), name.clone())
-            }
-            _ => (None, segs.join("/")),
-        };
-        if text.starts_with("arn:") {
-            let (arn_region, bus) = bus_of_eventbus_arn(&shown, &text)?;
-            Ok(EventBridgeUrl {
-                region: Some(arn_region),
-                bus,
-                endpoint,
-            })
-        } else {
-            if text.contains("/arn:") {
-                bail!("`{shown}`: an event bus ARN names its own region: write it alone, `aws-eventbridge://<arn>`, or use the bus name with a region");
-            }
-            check_bus_name(&shown, &text)?;
-            Ok(EventBridgeUrl {
-                region,
-                bus: text,
-                endpoint,
-            })
-        }
     }
 }
 

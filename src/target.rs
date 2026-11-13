@@ -124,8 +124,8 @@ pub enum Item {
 }
 
 /// What one `Records[i]` of a `PutRecords` answer says, before `expect` (see
-/// [`kinesis_verdict`]). Kinesis answers by position: the i-th record of the answer is the i-th
-/// record of the request.
+/// [`crate::targets::kinesis::kinesis_verdict`]). Kinesis answers by position: the i-th record of
+/// the answer is the i-th record of the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordVerdict {
     /// No `ErrorCode`: the record was stored. `expect` decides, with the record as `body`.
@@ -137,103 +137,6 @@ pub enum RecordVerdict {
     Rejected(String),
     /// The answer has no entry for this record: it is not known to be stored, so it waits.
     Missing,
-}
-
-/// The per-record mapping of a Kinesis `PutRecords` answer. The transient codes are
-/// `ProvisionedThroughputExceededException`, `InternalFailure` and `ServiceUnavailable` (the
-/// service is unwell: keep retrying, as for a whole-request 503); every other code is a refusal
-/// of that record.
-pub fn kinesis_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
-    let Some(e) = entry else {
-        return RecordVerdict::Missing;
-    };
-    match e
-        .get("ErrorCode")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-    {
-        None => RecordVerdict::Stored(serde_json::to_vec(e).unwrap_or_default()),
-        Some(code) => {
-            let msg = format!(
-                "record {i}: {code}: {}",
-                e.get("ErrorMessage").and_then(Value::as_str).unwrap_or("")
-            );
-            match code {
-                "ProvisionedThroughputExceededException"
-                | "InternalFailure"
-                | "ServiceUnavailable" => RecordVerdict::Transient(msg),
-                _ => RecordVerdict::Rejected(msg),
-            }
-        }
-    }
-}
-
-/// What one `Entries[i]` of a `PutEvents` answer says, before `expect` (see
-/// [`eventbridge_verdict`]). EventBridge answers by position: the i-th entry of the answer is
-/// the i-th entry of the request.
-pub fn eventbridge_verdict(entry: Option<&Value>, i: usize) -> RecordVerdict {
-    let Some(e) = entry else {
-        return RecordVerdict::Missing;
-    };
-    // An `EventId` says the event was stored (PutEvents, PutEventsResponseEntry.EventId).
-    if e.get("EventId")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty())
-    {
-        return RecordVerdict::Stored(serde_json::to_vec(e).unwrap_or_default());
-    }
-    let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    match e
-        .get("ErrorCode")
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-    {
-        // The AWS "not now" codes (aws::transient_code: throttling, the service is unwell) keep
-        // the key waiting, as for a whole-request 503; any other code is the service's clear
-        // refusal of this one entry (PutEvents, PutEventsResultEntry.ErrorCode).
-        Some(code) if crate::aws::transient_code(code) => {
-            RecordVerdict::Transient(format!("entry {i}: {code}: {}", text("ErrorMessage")))
-        }
-        Some(code) => {
-            RecordVerdict::Rejected(format!("entry {i}: {code}: {}", text("ErrorMessage")))
-        }
-        // Neither an `EventId` nor an `ErrorCode`: nothing is known about this entry.
-        None => RecordVerdict::Missing,
-    }
-}
-
-/// The rendered body of a `PutEvents` action: `{"Entries": [...]}` with exactly one entry per
-/// key (`Entries[i]` is answered by position), each holding the members AWS requires on every
-/// entry as non-empty strings (PutEvents, PutEventsRequestEntry: `Source`, `DetailType`,
-/// `Detail`). Checked before the request goes out: a template that renders a broken batch
-/// fails once with one clear error, not as `n` per-entry refusals on every retry.
-fn eventbridge_entries_ok(body: &[u8], n: usize) -> Result<(), String> {
-    let request: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => return Err(format!("the body is not JSON: {e}")),
-    };
-    let Some(entries) = request.get("Entries").and_then(Value::as_array) else {
-        return Err("the body has no `Entries` array".to_string());
-    };
-    if entries.len() != n {
-        return Err(format!(
-            "`Entries` holds {} entries for {n} keys",
-            entries.len()
-        ));
-    }
-    for (i, e) in entries.iter().enumerate() {
-        for field in ["Source", "DetailType", "Detail"] {
-            if e.get(field)
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                return Err(format!(
-                    "entry {i}: `{field}` is not a non-empty string (PutEvents requires it on every entry)"
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The items of a Lambda answer: the keys the function listed in `batchItemFailures` retry
@@ -509,33 +412,9 @@ impl Target {
                 });
             }
             Kind::Kinesis => {
-                // from_row: exactly one `aws-kinesis://[<region>/]<stream>` endpoint. The request
-                // goes to the service root; the stream is named in the body (`endpoint.stream`).
-                let url =
-                    aws::KinesisUrl::parse(def.endpoints.first().ok_or_else(|| {
-                        anyhow!("kind kinesis needs its aws-kinesis:// endpoint")
-                    })?)?;
-                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
-                let mut base = aws::address("kinesis", url.endpoint.as_deref(), &region)?;
-                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
-                                 "region": region, "stream": url.stream});
-                base.base = String::new();
-                let host_header = base.host_header();
-                let client = Arc::new(HttpClient::new(base, &def.tls)?);
-                endpoints.push(Endpoint {
-                    ctx,
-                    transport: Transport::Http {
-                        client,
-                        prefix: String::new(),
-                        host_header,
-                    },
-                });
-                let provider = aws::Provider::new(aws_refs(&def), &region);
-                aws_rt = Some(AwsSign {
-                    service: "kinesis",
-                    region,
-                    provider,
-                });
+                let (ctx, transport, sign) = crate::targets::kinesis::build(&def)?;
+                endpoints.push(Endpoint { ctx, transport });
+                aws_rt = Some(sign);
             }
             Kind::Sqs => {
                 let (ctx, transport, sign) = crate::targets::sqs::build(&def)?;
@@ -576,33 +455,9 @@ impl Target {
                 lambda_url = Some(url);
             }
             Kind::EventBridge => {
-                // from_row: exactly one `aws-eventbridge://[<region>/]<event-bus>` endpoint. The
-                // request goes to the service root; the bus is named in the entries
-                // (`endpoint.bus`).
-                let url = aws::EventBridgeUrl::parse(def.endpoints.first().ok_or_else(|| {
-                    anyhow!("kind eventbridge needs its aws-eventbridge:// endpoint")
-                })?)?;
-                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
-                let mut base = aws::address("events", url.endpoint.as_deref(), &region)?;
-                let ctx = json!({"host": base.host, "port": base.port, "url": base.url(),
-                                 "region": region, "bus": url.bus});
-                base.base = String::new();
-                let host_header = base.host_header();
-                let client = Arc::new(HttpClient::new(base, &def.tls)?);
-                endpoints.push(Endpoint {
-                    ctx,
-                    transport: Transport::Http {
-                        client,
-                        prefix: String::new(),
-                        host_header,
-                    },
-                });
-                let provider = aws::Provider::new(aws_refs(&def), &region);
-                aws_rt = Some(AwsSign {
-                    service: "events",
-                    region,
-                    provider,
-                });
+                let (ctx, transport, sign) = crate::targets::eventbridge::build(&def)?;
+                endpoints.push(Endpoint { ctx, transport });
+                aws_rt = Some(sign);
             }
             Kind::Sns => {
                 // from_row: exactly one `aws-sns://[<region>/]<account-id>/<topic-name>` endpoint.
@@ -1159,8 +1014,8 @@ impl Target {
         };
         if self.def.kind == Kind::EventBridge {
             // The batch is answered by position: check the rendered entries before the request
-            // goes out (see [`eventbridge_entries_ok`]).
-            if let Err(why) = eventbridge_entries_ok(&req.body, n) {
+            // goes out (see [`crate::targets::eventbridge::eventbridge_entries_ok`]).
+            if let Err(why) = crate::targets::eventbridge::eventbridge_entries_ok(&req.body, n) {
                 return Err(rejected(format!("the rendered request: {why}")));
             }
         }
@@ -1210,58 +1065,28 @@ impl Target {
             })?
         };
         if self.def.kind == Kind::Kinesis {
-            // `Records[i]` answers item i. `expect` per record, as for the entries below.
-            let records = answer
-                .get("Records")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let item = match kinesis_verdict(records.get(i), i) {
-                    RecordVerdict::Stored(bytes) => match self
-                        .expect
-                        .http(&self.pool, resp.status, &resp.headers, &bytes)
-                        .await
-                        .with_context(|| format!("record {i} of {}", h.url))?
-                    {
-                        Ok(()) => Item::Ok,
-                        Err(why) => Item::Rejected(format!("record {i}: {why}")),
-                    },
-                    RecordVerdict::Transient(m) => Item::Transient(m),
-                    RecordVerdict::Rejected(m) => Item::Rejected(m),
-                    RecordVerdict::Missing => Item::Transient(format!("record {i}: no answer")),
-                };
-                out.push(item);
-            }
-            return Ok(out);
+            return crate::targets::kinesis::records_items(
+                &answer,
+                n,
+                &self.expect,
+                &self.pool,
+                resp.status,
+                &resp.headers,
+                &h.url,
+            )
+            .await;
         }
         if self.def.kind == Kind::EventBridge {
-            // `Entries[i]` answers item i. `expect` per entry, as for the records above.
-            let entries = answer
-                .get("Entries")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let item = match eventbridge_verdict(entries.get(i), i) {
-                    RecordVerdict::Stored(bytes) => match self
-                        .expect
-                        .http(&self.pool, resp.status, &resp.headers, &bytes)
-                        .await
-                        .with_context(|| format!("entry {i} of {}", h.url))?
-                    {
-                        Ok(()) => Item::Ok,
-                        Err(why) => Item::Rejected(format!("entry {i}: {why}")),
-                    },
-                    RecordVerdict::Transient(m) => Item::Transient(m),
-                    RecordVerdict::Rejected(m) => Item::Rejected(m),
-                    RecordVerdict::Missing => Item::Transient(format!("entry {i}: no answer")),
-                };
-                out.push(item);
-            }
-            return Ok(out);
+            return crate::targets::eventbridge::entries_items(
+                &answer,
+                n,
+                &self.expect,
+                &self.pool,
+                resp.status,
+                &resp.headers,
+                &h.url,
+            )
+            .await;
         }
         aws::batch_items(
             &answer,
@@ -1429,6 +1254,7 @@ mod lambda_items_tests {
 #[cfg(test)]
 mod kinesis_verdict_tests {
     use super::*;
+    use crate::targets::kinesis::kinesis_verdict;
     use serde_json::json;
 
     #[test]

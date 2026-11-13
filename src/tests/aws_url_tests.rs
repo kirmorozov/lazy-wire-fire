@@ -1,4 +1,6 @@
 use super::*;
+use crate::targets::eventbridge::{EventBridgeUrl, EVENTBRIDGE_MAX_BYTES, EVENTBRIDGE_MAX_ENTRIES};
+use crate::targets::kinesis::KinesisUrl;
 use crate::targets::sqs::SqsUrl;
 
 fn sqs(url: &str) -> Result<SqsUrl> {

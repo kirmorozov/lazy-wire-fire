@@ -301,50 +301,14 @@ pub fn kind_errors(
             crate::targets::rabbitmq_stream::MESSAGE_MAX_BYTES,
         ));
     }
-    if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
-        match def.batch_max_keys {
-            None => out.push(
-                "kind kinesis needs `batch_max_keys` (1 to 500: records per PutRecords)".into(),
-            ),
-            Some(n) if n > 500 => out.push(format!(
-                "`batch_max_keys` {n} is over 500, the most records a PutRecords takes"
-            )),
-            Some(_) => {}
-        }
-        if def.batch_max_bytes.is_some_and(|n| n > 5_242_880) {
-            out.push(
-                "`batch_max_bytes` is over 5242880 (5 MiB), the most a PutRecords takes".into(),
-            );
-        }
+    if kind == Kind::Kinesis {
+        out.extend(crate::targets::kinesis::rule_errors(def));
     }
     if kind == Kind::Sqs {
         out.extend(crate::targets::sqs::rule_errors(def, fields, endpoints));
     }
     if kind == Kind::EventBridge {
-        // One action is one PutEvents (aws::EVENTBRIDGE_MAX_ENTRIES / _MAX_BYTES); the engine
-        // splits by bytes, never by count, so the count is a load-time requirement as for sqs.
-        if def.fire_per == FirePer::Batch {
-            match def.batch_max_keys {
-                None => out.push(
-                    "kind eventbridge needs `batch_max_keys` (1 to 10: entries per PutEvents)"
-                        .into(),
-                ),
-                Some(n) if n > crate::aws::EVENTBRIDGE_MAX_ENTRIES => out.push(format!(
-                    "`batch_max_keys` {n} is over {}, the most entries a PutEvents takes",
-                    crate::aws::EVENTBRIDGE_MAX_ENTRIES
-                )),
-                Some(_) => {}
-            }
-        }
-        if def
-            .batch_max_bytes
-            .is_some_and(|n| n > crate::aws::EVENTBRIDGE_MAX_BYTES)
-        {
-            out.push(
-                "`batch_max_bytes` is over 1048576 (1 MB), the most a PutEvents request takes"
-                    .into(),
-            );
-        }
+        out.extend(crate::targets::eventbridge::rule_errors(def));
     }
     if kind == Kind::Sns {
         // One action is one PublishBatch: the same number bounds one message and the whole batch,

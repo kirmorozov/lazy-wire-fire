@@ -269,8 +269,9 @@ impl Kind {
             // topics.publish: 10 MB per request (base64 `data` is in the rendered text).
             Kind::PubSub => Some(10_000_000),
             // PutEvents: 1 MB is the limit for the sum of the entries; the rendered request
-            // carries the JSON around them, so it is the text that is measured (aws::EVENTBRIDGE_MAX_BYTES).
-            Kind::EventBridge => Some(crate::aws::EVENTBRIDGE_MAX_BYTES),
+            // carries the JSON around them, so it is the text that is measured
+            // (crate::targets::eventbridge::EVENTBRIDGE_MAX_BYTES).
+            Kind::EventBridge => Some(crate::targets::eventbridge::EVENTBRIDGE_MAX_BYTES),
             // PublishBatch: 256 KiB is the default for one message and for the sum of the
             // batch; `vars.maximum_message_size` raises it to the topic's
             // `MaximumMessageSize` (see `Target::batch_bytes_limit`).
@@ -478,19 +479,7 @@ impl TargetDef {
                 need("region")?;
                 aws::check_refs(&vars)?;
             }
-            Kind::Kinesis => {
-                // `aws-kinesis://[<region>/]<stream>`: the stream and the region are in the URL.
-                match endpoints.as_slice() {
-                    [url] => {
-                        aws::KinesisUrl::parse(url)?;
-                    }
-                    _ => bail!(
-                        "kind kinesis takes exactly one endpoint: aws-kinesis://[<region>/]<stream-name>"
-                    ),
-                }
-                refuse_vars(&vars, &["region", "stream_name", "stream_arn"], kind, "the region and the stream go in the endpoint: aws-kinesis://[<region>/]<stream-name>")?;
-                aws::check_refs(&vars)?;
-            }
+            Kind::Kinesis => crate::targets::kinesis::check(&endpoints, &vars, kind)?,
             Kind::Sqs => crate::targets::sqs::check(&endpoints, &vars, kind)?,
             Kind::Lambda => {
                 // `aws-lambda://[<region>/]<function>[:<qualifier>][?invocation=…]`: the function,
@@ -511,20 +500,7 @@ impl TargetDef {
                 )?;
                 aws::check_refs(&vars)?;
             }
-            Kind::EventBridge => {
-                // `aws-eventbridge://[<region>/]<event-bus>` (name or ARN): the bus and the
-                // region are in the URL.
-                match endpoints.as_slice() {
-                    [url] => {
-                        aws::EventBridgeUrl::parse(url)?;
-                    }
-                    _ => bail!(
-                        "kind eventbridge takes exactly one endpoint: aws-eventbridge://[<region>/]<event-bus-name-or-arn>"
-                    ),
-                }
-                refuse_vars(&vars, &["region", "event_bus_name", "event_bus_arn"], kind, "the region and the event bus go in the endpoint: aws-eventbridge://[<region>/]<event-bus-name-or-arn>")?;
-                aws::check_refs(&vars)?;
-            }
+            Kind::EventBridge => crate::targets::eventbridge::check(&endpoints, &vars, kind)?,
             Kind::Sns => {
                 // `aws-sns://[<region>/]<account-id>/<topic-name>`: account, topic and region are
                 // in the URL; the ARN is built from them (as SqsUrl builds the queue URL).

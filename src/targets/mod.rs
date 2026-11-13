@@ -13,9 +13,11 @@
 //! expressions, DDL), used far beyond targets.
 
 pub mod amqp;
+pub mod eventbridge;
 pub mod grpc;
 pub mod http;
 pub mod kafka;
+pub mod kinesis;
 pub mod pubsub;
 pub mod rabbitmq_stream;
 pub mod redis;

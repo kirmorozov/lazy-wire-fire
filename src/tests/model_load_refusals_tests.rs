@@ -50,7 +50,7 @@ fn every_kind_is_named_the_way_it_is_written() {
     assert_eq!(Kind::PubSub.batch_bytes_limit(), Some(10_000_000));
     assert_eq!(
         Kind::EventBridge.batch_bytes_limit(),
-        Some(crate::aws::EVENTBRIDGE_MAX_BYTES)
+        Some(crate::targets::eventbridge::EVENTBRIDGE_MAX_BYTES)
     );
     assert_eq!(
         Kind::Kafka.batch_bytes_limit(),

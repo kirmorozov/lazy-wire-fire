@@ -1,4 +1,5 @@
 use super::*;
+use crate::targets::eventbridge::{eventbridge_entries_ok, eventbridge_verdict};
 use serde_json::json;
 
 #[test]
