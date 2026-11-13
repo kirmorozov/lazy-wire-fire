@@ -210,23 +210,7 @@ pub fn kind_errors(
         }
     }
     if kind == Kind::Lambda {
-        // The payload limit is set by the invocation (6 MB sync, 1 MB event), so a larger
-        // `batch_max_bytes` is refused at load.
-        if let Some(u) = endpoints
-            .first()
-            .and_then(|e| crate::aws::LambdaUrl::parse(e).ok())
-        {
-            if def.batch_max_bytes.is_some_and(|n| n > u.payload_limit()) {
-                out.push(format!(
-                    "`batch_max_bytes` is over {} bytes, the most a {} Invoke payload takes",
-                    u.payload_limit(),
-                    match u.invocation {
-                        crate::aws::Invocation::Sync => "synchronous",
-                        crate::aws::Invocation::Event => "asynchronous (event)",
-                    }
-                ));
-            }
-        }
+        out.extend(crate::targets::lambda::rule_errors(def, endpoints));
     }
     if kind == Kind::Amqp {
         out.extend(crate::targets::amqp::rule_errors(def.fire_per));
@@ -311,39 +295,12 @@ pub fn kind_errors(
         out.extend(crate::targets::eventbridge::rule_errors(def));
     }
     if kind == Kind::Sns {
-        // One action is one PublishBatch: the same number bounds one message and the whole batch,
-        // the topic's MaximumMessageSize (256 KiB by default, at most 1 MiB), which
-        // `vars.maximum_message_size` states for the target (checked at load, so it cannot fail
-        // here). The engine splits by bytes, never by count, so the count is a load-time
-        // requirement as for sqs and eventbridge.
-        let limit =
-            crate::sns::maximum_message_size(&target.vars).unwrap_or(crate::aws::SNS_MAX_BYTES);
-        if def.fire_per == FirePer::Batch {
-            match def.batch_max_keys {
-                None => out.push(
-                    "kind sns needs `batch_max_keys` (1 to 10: entries per PublishBatch)".into(),
-                ),
-                Some(n) if n > crate::aws::SNS_MAX_ENTRIES => out.push(format!(
-                    "`batch_max_keys` {n} is over {}, the most entries a PublishBatch takes",
-                    crate::aws::SNS_MAX_ENTRIES
-                )),
-                Some(_) => {}
-            }
-        }
-        if def.batch_max_bytes.is_some_and(|n| n > limit) {
-            out.push(format!(
-                "`batch_max_bytes` is over {limit} bytes, the largest message and the largest batch the topic takes (its MaximumMessageSize, 262144 by default and at most 1048576; `vars.maximum_message_size` states it)"
-            ));
-        }
-        let fifo = endpoints
-            .iter()
-            .any(|e| crate::aws::SnsUrl::parse(e).is_ok_and(|u| u.fifo()));
-        if fifo && !fields.iter().any(|f| f.column == "version") {
-            out.push(
-                "a FIFO topic (a topic name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
-                    .into(),
-            );
-        }
+        out.extend(crate::targets::sns::rule_errors(
+            def,
+            fields,
+            endpoints,
+            &target.vars,
+        ));
     }
     if kind == Kind::Grpc {
         // The rule's columns are the item message's fields: check them against the target's

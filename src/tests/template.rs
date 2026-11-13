@@ -106,7 +106,7 @@ fn helpers() {
 #[test]
 fn add_helper() {
     // The reason it exists: the query protocol numbers the entries of a batch from 1, where
-    // `each` counts from 0 (aws::SNS_MAX_ENTRIES and the `sns` kind's templates).
+    // `each` counts from 0 (targets::sns::SNS_MAX_ENTRIES and the `sns` kind's templates).
     assert_eq!(
         render(
             "{{#each docs}}m{{add @index 1}}={{json this}} {{/each}}",

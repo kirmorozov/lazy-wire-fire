@@ -36,7 +36,6 @@ pub mod rule;
 pub mod s3;
 pub mod secrets;
 pub mod sign;
-pub mod sns;
 pub mod sql;
 pub mod sqlwire;
 pub mod status;

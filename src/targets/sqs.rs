@@ -16,7 +16,7 @@
 //! `Successful`/`Failed`/`Id`/`SenderFault` protocol. That tail belongs to `sqs` and to `sns` and
 //! to no one else: `sns` reaches it from its own branch of
 //! the same front, whose `PublishBatch` answer is XML and is read into the very same shape
-//! ([`crate::sns::batch_answer`]). So it is AWS wire plumbing next to the signer, not a copy of
+//! ([`crate::targets::sns::batch_answer`]). So it is AWS wire plumbing next to the signer, not a copy of
 //! it here. The plain `send` of one action is the generic http path of [`crate::target`] too, as
 //! it is for the other kinds that speak http.
 

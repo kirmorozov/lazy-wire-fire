@@ -220,11 +220,11 @@ fn the_size_a_batch_is_cut_to() {
     let event = lambda(true);
     assert_eq!(
         sync.batch_bytes_limit(),
-        Some(crate::aws::LAMBDA_SYNC_PAYLOAD)
+        Some(crate::targets::lambda::LAMBDA_SYNC_PAYLOAD)
     );
     assert_eq!(
         event.batch_bytes_limit(),
-        Some(crate::aws::LAMBDA_EVENT_PAYLOAD)
+        Some(crate::targets::lambda::LAMBDA_EVENT_PAYLOAD)
     );
     assert!(sync.batch_bytes_limit() > event.batch_bytes_limit());
 }
@@ -266,7 +266,7 @@ fn an_aws_throttle_is_not_a_refusal() {
 #[tokio::test]
 async fn a_payload_an_invoke_cannot_take_is_refused_before_it_goes_out() {
     let event = lambda(true);
-    let over = "x".repeat(crate::aws::LAMBDA_EVENT_PAYLOAD + 1);
+    let over = "x".repeat(crate::targets::lambda::LAMBDA_EVENT_PAYLOAD + 1);
     let e = event
         .send(0, &over)
         .await
