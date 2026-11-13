@@ -211,7 +211,7 @@ async fn an_existing_kind_handshakes_on_ring_with_aws_lc_in_the_tree() {
         )
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let addr = listener.local_addr().unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(server));
     let server_task = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
@@ -223,8 +223,14 @@ async fn an_existing_kind_handshakes_on_ring_with_aws_lc_in_the_tree() {
         tls.flush().await.expect("a flush");
     });
 
-    let spec = TlsSpec::parse(Some("required")).unwrap();
-    let mut stream = Connector::new("localhost", port, &spec, true, &[])
+    // The client connects to the address the test bound, not to "localhost": the name can
+    // resolve to `::1` first and reach another test's IPv6 listener on the same port number
+    // (the flake under `make coverage`). The TLS server name stays "localhost", the name the
+    // certificate above is issued for (`spec.server_name` overrides the connect address for it).
+    let mut spec = TlsSpec::parse(Some("required")).unwrap();
+    spec.server_name = Some("localhost".to_string());
+    let host = addr.ip().to_string();
+    let mut stream = Connector::new(&host, addr.port(), &spec, true, &[])
         .unwrap()
         .connect(Duration::from_secs(10))
         .await
