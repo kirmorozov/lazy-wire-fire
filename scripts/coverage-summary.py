@@ -5,6 +5,7 @@
 #
 #   scripts/coverage-summary.py COV_JSON LOCK
 import json
+import os
 import sys
 
 
@@ -25,6 +26,15 @@ def aggregate(items):
     return out
 
 
+def is_own_test(filename):
+    """lazywf's own unit-test files (all of them under src/tests/, some reached through a
+    `#[path = "../tests/…"]` module, which llvm-cov records un-normalized): test modules never
+    count as production lines (lazyview's convention 5), so they are excluded from the own-code
+    numbers. The vendored section keeps whatever the lock lists, tests included."""
+    p = os.path.normpath(filename)
+    return p.startswith("src/tests/") or "/src/tests/" in p
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(f"usage: {sys.argv[0]} COV_JSON LOCK")
@@ -37,7 +47,10 @@ def main():
     own, ven = [], []
     for f in data["files"]:
         hit = next((v for v in vendored if f["filename"].endswith("/" + v)), None)
-        (ven if hit else own).append(f)
+        if hit:
+            ven.append(f)
+        elif not is_own_test(f["filename"]):
+            own.append(f)
     print("| scope | lines | regions | functions |")
     print("|---|---:|---:|---:|")
     for label, items in (("lazywf's own code", own),
