@@ -7,12 +7,14 @@
 //! property methods stay in [`crate::model`].
 //!
 //! Two shared modules are not kinds and so do not live here:
-//! [`crate::http`] is the http client (the shared transport of many kinds),
-//! and [`crate::sql`] is SQL handling (placeholders, expressions, DDL),
-//! used far beyond targets.
+//! [`crate::http`] is the http client (the shared transport of many kinds, among them
+//! the four plain http kinds of [`http`] below — the client and the kinds share the name
+//! and are not the same thing), and [`crate::sql`] is SQL handling (placeholders,
+//! expressions, DDL), used far beyond targets.
 
 pub mod amqp;
 pub mod grpc;
+pub mod http;
 pub mod kafka;
 pub mod pubsub;
 pub mod rabbitmq_stream;

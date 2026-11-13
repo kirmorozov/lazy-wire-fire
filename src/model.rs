@@ -482,14 +482,8 @@ impl TargetDef {
             Ok(())
         };
         match kind {
-            Kind::HttpBasic => {
-                need("username")?;
-                need("password")?;
-            }
-            Kind::HttpBearer => need("token")?,
-            Kind::HttpHeader => {
-                need("header")?;
-                need("value")?;
+            Kind::Http | Kind::HttpBasic | Kind::HttpBearer | Kind::HttpHeader => {
+                crate::targets::http::check(kind, &need)?
             }
             Kind::HttpS3 => {
                 need("bucket")?;
@@ -586,7 +580,7 @@ impl TargetDef {
             Kind::ServiceBus => {
                 crate::targets::servicebus::check(&endpoints, &vars, r.tls.as_deref())?
             }
-            Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
+            Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         // Webhook signing is an option of the plain http kinds; on the others the settings
         // would go unused (http.s3 signs SigV4, the queue kinds their own way).
