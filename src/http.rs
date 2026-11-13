@@ -312,7 +312,9 @@ impl SecretUrl {
     /// URL: the whole of it below the origin is the secret. A broken authority gets one fixed
     /// message, because `BaseUrl::parse` would quote what it was given, and the cut at the
     /// first `/` can leave a piece of the secret in its place: for `https://user:pa/ss@host/x`
-    /// the authority becomes `user:pa` and its answer is `invalid port `pa``.
+    /// the authority becomes `user:pa` and its answer is `invalid port `pa``. When the
+    /// authority itself carries an `@` the reason is userinfo, and the message adds where
+    /// credentials belong — a fixed sentence, decided by this parse alone.
     pub fn parse(s: &str) -> Result<SecretUrl> {
         let s = s.trim();
         let (scheme, rest) = match s.strip_prefix("https://") {
@@ -328,9 +330,16 @@ impl SecretUrl {
         let (authority, tail) = rest.split_at(cut);
         // Only the origin goes to `BaseUrl::parse` — and not even its message: it quotes the
         // authority it was given, which can be a piece of the secret. One fixed message says
-        // what is wrong and names nothing.
-        let base = BaseUrl::parse(&format!("{scheme}://{authority}"))
-            .map_err(|_| anyhow!("the host or port of a secret endpoint is not valid"))?;
+        // what is wrong and names nothing; with an `@` in the authority the reason is exactly
+        // the credentials before it (`BaseUrl::parse` refuses userinfo), so the message adds
+        // the fixed hint — decided by the shape alone, still naming nothing.
+        let base = match BaseUrl::parse(&format!("{scheme}://{authority}")) {
+            Ok(base) => base,
+            Err(_) if authority.contains('@') => bail!(
+                "the host or port of a secret endpoint is not valid: credentials belong in the target's vars (by reference), never in the URL"
+            ),
+            Err(_) => bail!("the host or port of a secret endpoint is not valid"),
+        };
         if tail.contains('#') {
             bail!("a secret endpoint has no fragment: nothing after `#` is ever sent");
         }

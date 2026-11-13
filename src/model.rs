@@ -420,12 +420,6 @@ pub fn list(s: Option<&str>) -> Result<Vec<String>> {
         .collect())
 }
 
-fn var_str<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
-    vars.get(k)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-}
-
 /// Keys that a kind no longer takes in `vars` (its region and stream come from the endpoint).
 pub(crate) fn refuse_vars(
     vars: &Map<String, Value>,
@@ -464,7 +458,7 @@ impl TargetDef {
             }
         }
         let need = |k: &str| -> Result<()> {
-            if var_str(&vars, k).is_none() {
+            if crate::target::var(&vars, k).is_none() {
                 bail!("kind {:?} needs `vars.{k}`", kind);
             }
             Ok(())

@@ -75,6 +75,33 @@ fn a_url_that_is_not_a_plain_http_one_is_refused_without_naming_it() {
 }
 
 #[test]
+fn a_broken_authority_with_credentials_says_where_they_belong_and_quotes_nothing() {
+    // The hint is decided by the shape of the URL alone — an `@` in the authority is the
+    // credentials `BaseUrl::parse` refuses — and the message stays fixed: it quotes neither
+    // the URL nor any part of it, secret or not.
+    let e = format!(
+        "{:#}",
+        SecretUrl::parse("https://u:SECMARK-6f1a@hooks.example.test/services/x").unwrap_err()
+    );
+    assert_eq!(
+        e,
+        "the host or port of a secret endpoint is not valid: credentials belong in the target's vars (by reference), never in the URL"
+    );
+    // Without credentials in the authority the message is exactly what it was — also when an
+    // `@` sits below the first `/`, where it is no longer part of the authority at all.
+    let e = format!(
+        "{:#}",
+        SecretUrl::parse("https://hooks.example.test:notaport/x").unwrap_err()
+    );
+    assert_eq!(e, "the host or port of a secret endpoint is not valid");
+    let e = format!(
+        "{:#}",
+        SecretUrl::parse("https://user:SECMARK-6f1a/ss@h/x").unwrap_err()
+    );
+    assert_eq!(e, "the host or port of a secret endpoint is not valid");
+}
+
+#[test]
 fn a_debug_shows_the_origin_and_an_ellipsis_and_nothing_else() {
     // Path and query both hold the marker; neither may reach the `{:?}`.
     let u = parse("https://hooks.example.test/services/T0000/SECMARK-6f1a?key=SECMARK-6f1a");
