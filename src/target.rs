@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 
 use crate::allow::HostList;
 use crate::aws;
+use crate::aws::Sign as AwsSign;
 use crate::http::{BaseUrl, Client as HttpClient, RawRequest, Response, SecretUrl};
 use crate::model::{Kind, TargetDef};
 use crate::response::{Expect, Row, Uses};
@@ -102,13 +103,6 @@ pub struct Target {
     allowed: Option<HostList>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
-}
-
-/// How an AWS kind signs its requests.
-struct AwsSign {
-    service: &'static str,
-    region: String,
-    provider: aws::Provider,
 }
 
 /// What an `sns` target knows about its topic beyond the endpoint: whether it is FIFO (every
@@ -257,7 +251,7 @@ pub fn lambda_items(failed: &[String], keys: &[String]) -> Result<Vec<Item>> {
 }
 
 /// The AWS credentials of a target's `vars`, when it gives any.
-fn aws_refs(def: &TargetDef) -> Option<aws::Refs> {
+pub(crate) fn aws_refs(def: &TargetDef) -> Option<aws::Refs> {
     match (
         def_var(def, "access_key_ref"),
         def_var(def, "secret_key_ref"),
@@ -544,35 +538,9 @@ impl Target {
                 });
             }
             Kind::Sqs => {
-                // from_row: exactly one `aws-sqs://[<region>/]<account>/<queue>` endpoint. The
-                // request goes to the service root (`/`); the queue URL is `endpoint.url`.
-                let url = aws::SqsUrl::parse(
-                    def.endpoints
-                        .first()
-                        .ok_or_else(|| anyhow!("kind sqs needs its aws-sqs:// endpoint"))?,
-                )?;
-                let region = aws::resolve_region(url.region.as_deref()).context("`endpoints`")?;
-                let mut base = aws::address("sqs", url.endpoint.as_deref(), &region)?;
-                let queue_url = format!("{}/{}/{}", base.url(), url.account, url.queue);
-                let ctx = json!({"host": base.host, "port": base.port, "url": queue_url,
-                                 "region": region, "queue": url.queue});
-                base.base = String::new();
-                let host_header = base.host_header();
-                let client = Arc::new(HttpClient::new(base, &def.tls)?);
-                endpoints.push(Endpoint {
-                    ctx,
-                    transport: Transport::Http {
-                        client,
-                        prefix: String::new(),
-                        host_header,
-                    },
-                });
-                let provider = aws::Provider::new(aws_refs(&def), &region);
-                aws_rt = Some(AwsSign {
-                    service: "sqs",
-                    region,
-                    provider,
-                });
+                let (ctx, transport, sign) = crate::targets::sqs::build(&def)?;
+                endpoints.push(Endpoint { ctx, transport });
+                aws_rt = Some(sign);
             }
             Kind::Lambda => {
                 // from_row: exactly one `aws-lambda://[<region>/]<function>[:<qualifier>]` endpoint.
@@ -1295,56 +1263,16 @@ impl Target {
             }
             return Ok(out);
         }
-        let entries = |field: &str| -> Vec<Value> {
-            answer
-                .get(field)
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let index = |e: &Value| -> Result<usize> {
-            let id = e.get("Id").and_then(|v| match v {
-                Value::String(s) => s.parse::<usize>().ok(),
-                Value::Number(n) => n.as_u64().map(|n| n as usize),
-                _ => None,
-            });
-            match id {
-                Some(i) if i < n => Ok(i),
-                _ => bail!("the answer names item {:?}, not one of {n}", e.get("Id")),
-            }
-        };
-        let mut out: Vec<Option<Item>> = vec![None; n];
-        for e in entries("Successful") {
-            let i = index(&e)?;
-            // `expect` per item: `status` is the batch's, `body` the entry.
-            let bytes = serde_json::to_vec(&e)?;
-            let item = match self
-                .expect
-                .http(&self.pool, resp.status, &resp.headers, &bytes)
-                .await
-                .with_context(|| format!("item {i} of {}", h.url))?
-            {
-                Ok(()) => Item::Ok,
-                Err(why) => Item::Rejected(format!("item {i}: {why}")),
-            };
-            out[i] = Some(item);
-        }
-        for e in entries("Failed") {
-            let i = index(&e)?;
-            let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-            let why = format!("item {i}: {}: {}", text("Code"), text("Message"));
-            // Only a `SenderFault: true` entry is refused. Without a clear answer, the item
-            // is retried (nothing is lost by waiting).
-            out[i] = Some(match e.get("SenderFault").and_then(Value::as_bool) {
-                Some(true) => Item::Rejected(why),
-                _ => Item::Transient(why),
-            });
-        }
-        Ok(out
-            .into_iter()
-            .enumerate()
-            .map(|(i, it)| it.unwrap_or_else(|| Item::Transient(format!("item {i}: no answer"))))
-            .collect())
+        aws::batch_items(
+            &answer,
+            n,
+            &self.expect,
+            &self.pool,
+            resp.status,
+            &resp.headers,
+            &h.url,
+        )
+        .await
     }
 
     /// Resolves `endpoint` and prepares `req` for it: the URL, the `Host` header, the kind's

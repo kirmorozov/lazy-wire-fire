@@ -26,11 +26,14 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4::SigningParams;
 use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
 use aws_smithy_runtime_api::client::identity::Identity;
-use serde_json::Value;
+use mysql_async::Pool;
+use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::http::{BaseUrl, RawRequest};
+use crate::response::Expect;
 use crate::secrets;
+use crate::target::Item;
 
 /// The target's references (`access_key_ref`, `secret_key_ref`, `session_token_ref`).
 #[derive(Clone, PartialEq, Eq)]
@@ -80,6 +83,27 @@ impl ProvideCredentials for Refs {
     {
         future::ProvideCredentials::ready(self.resolve().map_err(CredentialsError::provider_error))
     }
+}
+
+/// AWS credentials in a target's `vars`: references only, and an access key with its secret.
+/// The load check of every AWS kind (from `TargetDef::from_row`, where each kind's arm ends with
+/// it); [`Refs`] is what a target's `vars` say, this is what they are allowed to say.
+pub fn check_refs(vars: &Map<String, Value>) -> Result<()> {
+    for k in ["access_key_ref", "secret_key_ref", "session_token_ref"] {
+        if let Some(v) = crate::target::var(vars, k) {
+            if !crate::secrets::is_reference(v) {
+                bail!(
+                    "`vars.{k}` must be a reference (`env:NAME` or `file:/path`), never a literal"
+                );
+            }
+        }
+    }
+    if crate::target::var(vars, "access_key_ref").is_some()
+        != crate::target::var(vars, "secret_key_ref").is_some()
+    {
+        bail!("`vars.access_key_ref` and `vars.secret_key_ref` go together");
+    }
+    Ok(())
 }
 
 /// Temporary credentials are fetched again this many seconds before they expire.
@@ -261,6 +285,14 @@ fn percent_decode_path(s: &str) -> String {
 /// lazywf has always signed, so a request's signature does not depend on the signer.
 const SIGNED: &[&str] = &["content-type", "content-md5", "range", "date"];
 
+/// How an AWS kind signs its requests. The kind's own `build` makes one (from `Target::new`);
+/// `Target::prepare` signs every rendered request with it.
+pub struct Sign {
+    pub service: &'static str,
+    pub region: String,
+    pub provider: Provider,
+}
+
 /// Signs `req` for `service` in `region`: rewrites the target in canonical form (prefixed by
 /// `prefix`), and sets `Host`, `x-amz-date`, `x-amz-content-sha256`, `x-amz-security-token`
 /// (with a session token) and `Authorization`.
@@ -352,11 +384,12 @@ pub fn endpoint(service: &str, region: &str) -> BaseUrl {
     }
 }
 
-// ---- `aws-sqs://` and `aws-kinesis://` endpoints ----
+// ---- `aws-kinesis://` endpoints ----
 //
-// `aws-sqs://[<region>/]<account-id>/<queue-name>` and `aws-kinesis://[<region>/]<stream-name>`,
-// each with an optional `?endpoint=http(s)://host:port` (emulators, VPC endpoints). The region is
-// in the URL, or else from the default chain (`region_from`). Credentials never go in the URL.
+// `aws-kinesis://[<region>/]<stream-name>`, with an optional `?endpoint=http(s)://host:port`
+// (emulators, VPC endpoints). The region is in the URL, or else from the default chain
+// (`region_from`). Credentials never go in the URL. The helpers here serve every
+// `aws-<service>://` URL, whichever kind's module parses it.
 
 /// The scheme of a URL (`aws-sqs` for `aws-sqs://…`), when it has one.
 pub fn scheme_of(url: &str) -> Option<&str> {
@@ -383,7 +416,7 @@ fn scheme_error(url: &str, service: &str) -> anyhow::Error {
 }
 
 /// The path segments of an `aws-<service>://` URL, and its `?endpoint=` override (validated).
-fn split_aws_url(url: &str, service: &str) -> Result<(Vec<String>, Option<String>)> {
+pub(crate) fn split_aws_url(url: &str, service: &str) -> Result<(Vec<String>, Option<String>)> {
     let shown = crate::secrets::redact_url(url);
     let rest = url
         .strip_prefix(&format!("aws-{service}://"))
@@ -418,7 +451,7 @@ fn split_aws_url(url: &str, service: &str) -> Result<(Vec<String>, Option<String
     Ok((path.split('/').map(str::to_string).collect(), endpoint))
 }
 
-fn valid_region(r: &str) -> bool {
+pub(crate) fn valid_region(r: &str) -> bool {
     // `eu-west-1`, `us-gov-west-1`: lowercase letters and digits, hyphens, ending in a digit.
     r.contains('-')
         && r.starts_with(|c: char| c.is_ascii_lowercase())
@@ -432,59 +465,6 @@ pub fn address(service: &str, endpoint_override: Option<&str>, region: &str) -> 
     match endpoint_override {
         Some(e) => BaseUrl::parse(e),
         None => Ok(endpoint(service, region)),
-    }
-}
-
-/// An `aws-sqs://` endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqsUrl {
-    pub region: Option<String>,
-    pub account: String,
-    pub queue: String,
-    /// `?endpoint=`, as written (a validated http(s) URL).
-    pub endpoint: Option<String>,
-}
-
-impl SqsUrl {
-    /// `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`.
-    pub fn parse(url: &str) -> Result<SqsUrl> {
-        let shown = crate::secrets::redact_url(url);
-        let (segs, endpoint) = split_aws_url(url, "sqs")?;
-        let (region, account, queue) = match segs.as_slice() {
-            [a, q] => (None, a, q),
-            [r, a, q] => (Some(r), a, q),
-            _ => bail!(
-                "`{shown}`: kind sqs takes `aws-sqs://<account-id>/<queue-name>` or `aws-sqs://<region>/<account-id>/<queue-name>`"
-            ),
-        };
-        if let Some(r) = region {
-            if !valid_region(r) {
-                bail!("`{shown}`: `{r}` is not an AWS region name, e.g. eu-west-1");
-            }
-        }
-        if account.len() != 12 || !account.bytes().all(|c| c.is_ascii_digit()) {
-            bail!("`{shown}`: the account id is twelve digits");
-        }
-        let stem = queue.strip_suffix(".fifo").unwrap_or(queue);
-        let name_ok = !stem.is_empty()
-            && queue.len() <= 80
-            && stem
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
-        if !name_ok {
-            bail!("`{shown}`: the queue name is 1 to 80 letters, digits, `-` or `_`, optionally ending in `.fifo`");
-        }
-        Ok(SqsUrl {
-            region: region.cloned(),
-            account: account.clone(),
-            queue: queue.clone(),
-            endpoint,
-        })
-    }
-
-    /// A FIFO queue: its name ends in `.fifo`.
-    pub fn fifo(&self) -> bool {
-        self.queue.ends_with(".fifo")
     }
 }
 
@@ -649,8 +629,8 @@ impl EventBridgeUrl {
 // `aws-sns://[<region>/]<account-id>/<topic-name>`, with the usual optional `?endpoint=`
 // (emulators). `PublishBatch` is a query-protocol call to the service root
 // (`Action=PublishBatch&Version=2010-03-31`, the `param.n` notation with `n` from 1), so nothing
-// in the URL is a path: the topic is named by its ARN, as `SqsUrl` names the queue URL. SigV4
-// signs with service `sns`, the host is `sns.<region>.amazonaws.com`.
+// in the URL is a path: the topic is named by its ARN, as [`crate::targets::sqs::SqsUrl`]
+// names the queue URL. SigV4 signs with service `sns`, the host is `sns.<region>.amazonaws.com`.
 // Source: PublishBatch API (docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html).
 
 /// The most entries a PublishBatch request takes: 10 ("Publishes up to 10 messages to the
@@ -1028,6 +1008,75 @@ pub fn transient_code(code: &str) -> bool {
             | "InternalError"
             | "KMSThrottling"
     )
+}
+
+/// The `Successful`/`Failed` tail of an AWS batch answer (from `Target::send_items`): each entry
+/// names the item it answers by its `Id`, a `Failed` entry is refused only when the service says
+/// the sender is at fault, and an item the answer does not name waits rather than being refused.
+/// `expect` runs per entry, with the batch's `status` and `headers` and the entry as `body`.
+///
+/// Only `sqs` and `sns` come here: every other kind that answers per item has its own module.
+/// `sqs` from the http-batch front of `Target::send_items`, `sns` from its own branch of that
+/// front — its `PublishBatch` answer is XML, which [`crate::sns::batch_answer`] reads into this
+/// same shape — which is why this tail is AWS plumbing here and not a copy in either kind.
+pub async fn batch_items(
+    answer: &Value,
+    n: usize,
+    expect: &Expect,
+    pool: &Pool,
+    status: u16,
+    headers: &[(String, String)],
+    url: &str,
+) -> Result<Vec<Item>> {
+    let entries = |field: &str| -> Vec<Value> {
+        answer
+            .get(field)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let index = |e: &Value| -> Result<usize> {
+        let id = e.get("Id").and_then(|v| match v {
+            Value::String(s) => s.parse::<usize>().ok(),
+            Value::Number(n) => n.as_u64().map(|n| n as usize),
+            _ => None,
+        });
+        match id {
+            Some(i) if i < n => Ok(i),
+            _ => bail!("the answer names item {:?}, not one of {n}", e.get("Id")),
+        }
+    };
+    let mut out: Vec<Option<Item>> = vec![None; n];
+    for e in entries("Successful") {
+        let i = index(&e)?;
+        // `expect` per item: `status` is the batch's, `body` the entry.
+        let bytes = serde_json::to_vec(&e)?;
+        let item = match expect
+            .http(pool, status, headers, &bytes)
+            .await
+            .with_context(|| format!("item {i} of {}", url))?
+        {
+            Ok(()) => Item::Ok,
+            Err(why) => Item::Rejected(format!("item {i}: {why}")),
+        };
+        out[i] = Some(item);
+    }
+    for e in entries("Failed") {
+        let i = index(&e)?;
+        let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let why = format!("item {i}: {}: {}", text("Code"), text("Message"));
+        // Only a `SenderFault: true` entry is refused. Without a clear answer, the item
+        // is retried (nothing is lost by waiting).
+        out[i] = Some(match e.get("SenderFault").and_then(Value::as_bool) {
+            Some(true) => Item::Rejected(why),
+            _ => Item::Transient(why),
+        });
+    }
+    Ok(out
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| it.unwrap_or_else(|| Item::Transient(format!("item {i}: no answer"))))
+        .collect())
 }
 
 #[cfg(test)]
