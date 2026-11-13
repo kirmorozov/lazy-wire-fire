@@ -22,6 +22,7 @@ pub mod lambda;
 pub mod pubsub;
 pub mod rabbitmq_stream;
 pub mod redis;
+pub mod s3;
 pub mod servicebus;
 pub mod smtp;
 pub mod sns;

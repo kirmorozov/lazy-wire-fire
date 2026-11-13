@@ -18,7 +18,6 @@ use crate::aws::Sign as AwsSign;
 use crate::http::{BaseUrl, Client as HttpClient, RawRequest, Response, SecretUrl};
 use crate::model::{Kind, TargetDef};
 use crate::response::{Expect, Row, Uses};
-use crate::s3::S3Spec;
 use crate::secrets;
 use crate::targets::redis::Client as RedisClient;
 use crate::tls::TlsSpec;
@@ -336,50 +335,11 @@ impl Target {
                 }
             }
             Kind::HttpS3 => {
-                let path_style = match def.vars.get("path_style") {
-                    Some(Value::Bool(b)) => *b,
-                    Some(Value::String(s)) => {
-                        matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
-                    }
-                    Some(Value::Number(n)) => n.as_u64() == Some(1),
-                    _ => false,
-                };
-                let spec = S3Spec {
-                    bucket: def_var(&def, "bucket").unwrap_or_default().to_string(),
-                    region: def_var(&def, "region").unwrap_or_default().to_string(),
-                    path_style,
-                };
-                let mut services: Vec<BaseUrl> = def
-                    .endpoints
-                    .iter()
-                    .map(|e| BaseUrl::parse(e))
-                    .collect::<Result<_>>()?;
-                if services.is_empty() {
-                    services.push(match def_var(&def, "endpoint") {
-                        Some(e) => BaseUrl::parse(e).context("`vars.endpoint`")?,
-                        None => spec.aws_endpoint(),
-                    });
+                let (eps, sign) = crate::targets::s3::build(&def)?;
+                for (ctx, transport) in eps {
+                    endpoints.push(Endpoint { ctx, transport });
                 }
-                for svc in services {
-                    let (base, prefix) = spec.address(&svc);
-                    let ctx = json!({"host": base.host, "port": base.port, "url": format!("{}{prefix}", base.url())});
-                    let host_header = base.host_header();
-                    let client = Arc::new(HttpClient::new(base, &def.tls)?);
-                    endpoints.push(Endpoint {
-                        ctx,
-                        transport: Transport::Http {
-                            client,
-                            prefix,
-                            host_header,
-                        },
-                    });
-                }
-                let provider = aws::Provider::new(aws_refs(&def), &spec.region);
-                aws_rt = Some(AwsSign {
-                    service: "s3",
-                    region: spec.region.clone(),
-                    provider,
-                });
+                aws_rt = Some(sign);
             }
             Kind::PubSub => {
                 // from_row: exactly one `gc-pubsub://` endpoint (the publish path is built from it).

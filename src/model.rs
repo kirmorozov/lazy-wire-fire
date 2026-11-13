@@ -13,7 +13,6 @@ use mysql_async::prelude::*;
 use mysql_async::{Conn, Row};
 use serde_json::{Map, Value};
 
-use crate::aws;
 use crate::sql;
 use crate::tls::TlsSpec;
 
@@ -474,11 +473,7 @@ impl TargetDef {
             Kind::Http | Kind::HttpBasic | Kind::HttpBearer | Kind::HttpHeader => {
                 crate::targets::http::check(kind, &need)?
             }
-            Kind::HttpS3 => {
-                need("bucket")?;
-                need("region")?;
-                aws::check_refs(&vars)?;
-            }
+            Kind::HttpS3 => crate::targets::s3::check(&vars, &need)?,
             Kind::Kinesis => crate::targets::kinesis::check(&endpoints, &vars, kind)?,
             Kind::Sqs => crate::targets::sqs::check(&endpoints, &vars, kind)?,
             Kind::Lambda => crate::targets::lambda::check(&endpoints, &vars, kind)?,
