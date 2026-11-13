@@ -2,7 +2,7 @@
 //! the mapping from a rendered document to a protobuf message.
 //!
 //! A descriptor set is a schema lazywf reads, not a contract it must be given: the pool every
-//! target's method is looked up in always holds lazywf's own [`crate::grpc::contract`] first,
+//! target's method is looked up in always holds lazywf's own [`crate::targets::grpc::contract`] first,
 //! so `grpcs://host/lazywf.v1.Sink/Push` works with no configuration at all, and a target that
 //! ships a `.desc` only adds to it. The envelope and the acks are fixed by that contract; the
 //! body of an item is what the target's `item_type` says, which is the only part of the wire a
@@ -27,7 +27,7 @@ use prost_reflect::{
 use serde_json::{Map as JsonMap, Number, Value as Json};
 
 use crate::docs::{self, ValueKind};
-use crate::grpc::contract;
+use crate::targets::grpc::contract;
 
 /// What a target's endpoint names, checked against the descriptor set.
 #[derive(Debug)]
@@ -619,5 +619,5 @@ fn hint(kind: ValueKind, field: &str) -> &'static str {
 }
 
 #[cfg(test)]
-#[path = "../tests/grpc_schema.rs"]
+#[path = "../../tests/targets_grpc_schema.rs"]
 mod tests;

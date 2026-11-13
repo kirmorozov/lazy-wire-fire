@@ -172,7 +172,7 @@ fn the_grpc_host_and_port_are_matched() {
     let dir = std::env::temp_dir().join(format!("lazywf-allow-grpc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let desc = dir.join("lazywf.desc");
-    std::fs::write(&desc, crate::grpc::contract::DESCRIPTOR).unwrap();
+    std::fs::write(&desc, crate::targets::grpc::contract::DESCRIPTOR).unwrap();
     std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
     let vars = format!(
         r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item"}}"#,

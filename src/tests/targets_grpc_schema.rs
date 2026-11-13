@@ -1,5 +1,5 @@
 use super::*;
-use crate::grpc::contract::PROTO_DIR;
+use crate::targets::grpc::contract::PROTO_DIR;
 use serde_json::json;
 
 /// Compiles a schema the way a deployment's `.desc` was made: protox, no protoc. The

@@ -22,9 +22,9 @@ mod common;
 use std::sync::OnceLock;
 
 use common::grpc_server::{self, doc, rendered, Policy, Server};
-use lazy_wire_fire::grpc::{self, contract};
 use lazy_wire_fire::model::{RawTarget, TargetDef};
 use lazy_wire_fire::response::Expect;
+use lazy_wire_fire::targets::grpc::{self, contract};
 use serde_json::{json, Value};
 
 /// The token `vars.token` holds by reference, for the calls that must carry it.
@@ -680,6 +680,7 @@ fn body_of(keys: &[&str], i: usize) -> Vec<u8> {
     let (_, client) = grpc::Client::new(&def, &def.endpoints[0]).unwrap();
     let body = client.method.body.as_ref().unwrap();
     let document = doc(keys, i);
-    let msg = lazy_wire_fire::grpc::schema::build(body, document.as_object().unwrap()).unwrap();
+    let msg =
+        lazy_wire_fire::targets::grpc::schema::build(body, document.as_object().unwrap()).unwrap();
     prost::Message::encode_to_vec(&msg)
 }

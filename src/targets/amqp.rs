@@ -547,7 +547,7 @@ pub async fn send(client: &Client, rendered: &str, expect: &Expect, pool: &Pool)
 }
 
 #[cfg(test)]
-#[path = "tests/amqp.rs"]
+#[path = "../tests/targets_amqp.rs"]
 mod tests;
 
 #[cfg(test)]

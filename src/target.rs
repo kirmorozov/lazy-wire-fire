@@ -49,24 +49,24 @@ enum Transport {
     },
     Redis(RedisClient),
     /// One RabbitMQ endpoint (see `amqp.rs`).
-    Amqp(Box<crate::amqp::Client>),
+    Amqp(Box<crate::targets::amqp::Client>),
     /// One SMTP endpoint (see `smtp.rs`).
-    Smtp(Box<crate::smtp::Client>),
+    Smtp(Box<crate::targets::smtp::Client>),
     MySql(crate::sqlwire::MySqlClient),
     Pg(crate::sqlwire::PgClient),
     /// Google Cloud Pub/Sub (`src/pubsub.rs`): one publish per action.
-    PubSub(Box<crate::pubsub::Client>),
+    PubSub(Box<crate::targets::pubsub::Client>),
     /// One Kafka endpoint (`src/kafka.rs`): one produce of a batch of records per action.
-    Kafka(Box<crate::kafka::Client>),
+    Kafka(Box<crate::targets::kafka::Client>),
     /// One RabbitMQ Stream endpoint (`src/rabbitmq_stream.rs`): one publish batch of records
     /// per action, on the stream protocol.
-    RabbitMqStream(Box<crate::rabbitmq_stream::Client>),
+    RabbitMqStream(Box<crate::targets::rabbitmq_stream::Client>),
     /// One gRPC endpoint (`src/grpc/`): the rule's documents as protobuf messages on one
     /// long-lived bidirectional stream, acknowledged item by item.
-    Grpc(Box<crate::grpc::Client>),
+    Grpc(Box<crate::targets::grpc::Client>),
     /// One Azure Service Bus endpoint (`src/servicebus.rs`): one batch of messages per
     /// action to a queue or topic, a disposition per message.
-    ServiceBus(Box<crate::servicebus::Client>),
+    ServiceBus(Box<crate::targets::servicebus::Client>),
 }
 
 pub struct Target {
@@ -446,7 +446,7 @@ impl Target {
             }
             Kind::Amqp => {
                 for e in &def.endpoints {
-                    let (ctx, client) = crate::amqp::Client::new(&def, e)?;
+                    let (ctx, client) = crate::targets::amqp::Client::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Amqp(Box::new(client)),
@@ -455,7 +455,7 @@ impl Target {
             }
             Kind::Smtp => {
                 for e in &def.endpoints {
-                    let (ctx, client) = crate::smtp::Client::new(&def, e)?;
+                    let (ctx, client) = crate::targets::smtp::Client::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Smtp(Box::new(client)),
@@ -526,7 +526,7 @@ impl Target {
             }
             Kind::PubSub => {
                 // from_row: exactly one `gc-pubsub://` endpoint (the publish path is built from it).
-                let client = crate::pubsub::Client::new(&def)?;
+                let client = crate::targets::pubsub::Client::new(&def)?;
                 endpoints.push(Endpoint {
                     ctx: client.ctx(),
                     transport: Transport::PubSub(Box::new(client)),
@@ -696,7 +696,7 @@ impl Target {
                 // from_row: exactly one endpoint, `kafka(s)://<broker>[:port][,…]/<topic>` —
                 // one broker set and the topic the records of an action go to.
                 for e in &def.endpoints {
-                    let (ctx, client) = crate::kafka::Client::new(&def, e)?;
+                    let (ctx, client) = crate::targets::kafka::Client::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Kafka(Box::new(client)),
@@ -708,7 +708,7 @@ impl Target {
                 // [vhost/]stream` — one node and the stream (or super stream) the records of
                 // an action go to.
                 for e in &def.endpoints {
-                    let (ctx, client) = crate::rabbitmq_stream::Client::new(&def, e)?;
+                    let (ctx, client) = crate::targets::rabbitmq_stream::Client::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::RabbitMqStream(Box::new(client)),
@@ -721,7 +721,7 @@ impl Target {
                 // so a schema that does not fit is a target that never started and says so
                 // (see `grpc::Client::new`); the stream itself is opened per flush.
                 for e in &def.endpoints {
-                    let (ctx, client) = crate::grpc::Client::new(&def, e)?;
+                    let (ctx, client) = crate::targets::grpc::Client::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::Grpc(Box::new(client)),
@@ -732,7 +732,7 @@ impl Target {
                 // from_row: exactly one endpoint, `sb://<namespace>.servicebus.windows.net/
                 // <queue-or-topic>` (or a plain host with a port for a local broker).
                 for e in &def.endpoints {
-                    let (ctx, client) = crate::servicebus::Client::new(&def, e)?;
+                    let (ctx, client) = crate::targets::servicebus::Client::new(&def, e)?;
                     endpoints.push(Endpoint {
                         ctx,
                         transport: Transport::ServiceBus(Box::new(client)),
@@ -788,13 +788,13 @@ impl Target {
         let oauth = crate::oauth::Provider::new(&def, allowed)?;
         let ctx = json!({"name": def.name, "vars": def.template_vars()});
         let kafka = (def.kind == Kind::Kafka)
-            .then(|| crate::kafka::message_max_bytes(&def.vars))
+            .then(|| crate::targets::kafka::message_max_bytes(&def.vars))
             .and_then(|r| r.ok());
         let grpc = (def.kind == Kind::Grpc)
-            .then(|| crate::grpc::options(&def.vars).map(|o| o.max_message_bytes))
+            .then(|| crate::targets::grpc::options(&def.vars).map(|o| o.max_message_bytes))
             .and_then(|r| r.ok());
         let servicebus = (def.kind == Kind::ServiceBus)
-            .then(|| crate::servicebus::max_message_bytes(&def.vars))
+            .then(|| crate::targets::servicebus::max_message_bytes(&def.vars))
             .and_then(|r| r.ok());
         Ok(Arc::new(Target {
             def,
@@ -997,10 +997,10 @@ impl Target {
                 Ok(Sent::Ok)
             }
             Transport::Amqp(client) => {
-                crate::amqp::send(client, rendered, &self.expect, &self.pool).await
+                crate::targets::amqp::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::Smtp(client) => {
-                crate::smtp::send(client, rendered, &self.expect, &self.pool).await
+                crate::targets::smtp::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::Redis(client) => {
                 let args = redis::tokenize(rendered)
@@ -1029,24 +1029,31 @@ impl Target {
                 Ok(Sent::Ok)
             }
             Transport::PubSub(client) => {
-                crate::pubsub::send(client, rendered, self.def.timeout, &self.expect, &self.pool)
-                    .await
+                crate::targets::pubsub::send(
+                    client,
+                    rendered,
+                    self.def.timeout,
+                    &self.expect,
+                    &self.pool,
+                )
+                .await
             }
             Transport::Kafka(client) => {
                 // A `once` reset step: no keys, the records take partition 0 (see `kafka.rs`).
-                crate::kafka::send(client, rendered, &self.expect, &self.pool).await
+                crate::targets::kafka::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::RabbitMqStream(client) => {
                 // A `once` reset step: no keys, no `lazywf_key` property (see
                 // `rabbitmq_stream.rs`).
-                crate::rabbitmq_stream::send(client, rendered, &self.expect, &self.pool).await
+                crate::targets::rabbitmq_stream::send(client, rendered, &self.expect, &self.pool)
+                    .await
             }
             Transport::Grpc(client) => {
-                crate::grpc::send(client, rendered, &self.expect, &self.pool).await
+                crate::targets::grpc::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::ServiceBus(client) => {
                 // A `once` reset step: no keys, the messages carry no key (see `servicebus.rs`).
-                crate::servicebus::send(client, rendered, &self.expect, &self.pool).await
+                crate::targets::servicebus::send(client, rendered, &self.expect, &self.pool).await
             }
             Transport::MySql(_) | Transport::Pg(_) => {
                 let sql = match crate::sqlwire::single_statement(rendered) {
@@ -1176,8 +1183,14 @@ impl Target {
             let Transport::Kafka(client) = &endpoint.transport else {
                 bail!("target `{}` is not a kafka target", self.def.name);
             };
-            return crate::kafka::send_items(client, rendered, keys, &self.expect, &self.pool)
-                .await;
+            return crate::targets::kafka::send_items(
+                client,
+                rendered,
+                keys,
+                &self.expect,
+                &self.pool,
+            )
+            .await;
         }
         if self.def.kind == Kind::RabbitMqStream {
             let Some(endpoint) = self.endpoints.get(ep) else {
@@ -1186,7 +1199,7 @@ impl Target {
             let Transport::RabbitMqStream(client) = &endpoint.transport else {
                 bail!("target `{}` is not a rabbitmq-stream target", self.def.name);
             };
-            return crate::rabbitmq_stream::send_items(
+            return crate::targets::rabbitmq_stream::send_items(
                 client,
                 rendered,
                 keys,
@@ -1202,7 +1215,14 @@ impl Target {
             let Transport::Grpc(client) = &endpoint.transport else {
                 bail!("target `{}` is not a grpc target", self.def.name);
             };
-            return crate::grpc::send_items(client, rendered, keys, &self.expect, &self.pool).await;
+            return crate::targets::grpc::send_items(
+                client,
+                rendered,
+                keys,
+                &self.expect,
+                &self.pool,
+            )
+            .await;
         }
         if self.def.kind == Kind::ServiceBus {
             let Some(endpoint) = self.endpoints.get(ep) else {
@@ -1211,8 +1231,14 @@ impl Target {
             let Transport::ServiceBus(client) = &endpoint.transport else {
                 bail!("target `{}` is not a servicebus target", self.def.name);
             };
-            return crate::servicebus::send_items(client, rendered, keys, &self.expect, &self.pool)
-                .await;
+            return crate::targets::servicebus::send_items(
+                client,
+                rendered,
+                keys,
+                &self.expect,
+                &self.pool,
+            )
+            .await;
         }
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);

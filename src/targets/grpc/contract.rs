@@ -125,7 +125,10 @@ pub fn hash(key: &[u8], item: &[u8]) -> u64 {
 /// lazywf's own compiled contract, as a `FileDescriptorSet`: what a server that wants to
 /// implement the method directly can generate from, and what the descriptor pool of every
 /// `grpc` target is seeded with.
-pub const DESCRIPTOR: &[u8] = include_bytes!("../../proto/lazywf/v1/lazywf.desc");
+pub const DESCRIPTOR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/proto/lazywf/v1/lazywf.desc"
+));
 
 /// The protobuf full name of the envelope, so the module never repeats it.
 pub const ENVELOPE: &str = "lazywf.v1.Envelope";
@@ -145,5 +148,5 @@ pub const FULL_METHOD: &str = "lazywf.v1.Sink/Push";
 pub const PROTO_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/proto");
 
 #[cfg(test)]
-#[path = "../tests/grpc_contract.rs"]
+#[path = "../../tests/targets_grpc_contract.rs"]
 mod tests;

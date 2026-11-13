@@ -203,7 +203,7 @@ fn the_size_a_batch_is_cut_to() {
     assert_eq!(sqs().batch_bytes_limit(), Some(262_144));
     assert_eq!(
         kafka().batch_bytes_limit(),
-        Some(crate::kafka::MESSAGE_MAX_BYTES)
+        Some(crate::targets::kafka::MESSAGE_MAX_BYTES)
     );
     assert_eq!(
         target(

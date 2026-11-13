@@ -5272,7 +5272,7 @@ async fn kafka_every_key_arrives_once() {
             .unwrap();
         assert_eq!(
             r.partition,
-            lazy_wire_fire::kafka::partition_of(&key, &pids),
+            lazy_wire_fire::targets::kafka::partition_of(&key, &pids),
             "{key}: the partition is the murmur2 of the key mod the count"
         );
         assert_eq!(
@@ -5297,7 +5297,12 @@ async fn kafka_every_key_arrives_once() {
     let pids = k.partitions(&ptopic).await;
     let mut want: Vec<(String, i32)> = keys
         .iter()
-        .map(|k| (k.to_string(), lazy_wire_fire::kafka::partition_of(k, &pids)))
+        .map(|k| {
+            (
+                k.to_string(),
+                lazy_wire_fire::targets::kafka::partition_of(k, &pids),
+            )
+        })
         .collect();
     want.sort();
     // `rpk` reads the partitions at once, so the pairs come back in no particular order.

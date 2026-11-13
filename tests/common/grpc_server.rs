@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
-use lazy_wire_fire::grpc::contract;
+use lazy_wire_fire::targets::grpc::contract;
 use prost::Message as _;
 use serde_json::{json, Value};
 

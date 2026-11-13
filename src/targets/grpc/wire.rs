@@ -4,7 +4,7 @@
 //! The message encodings are the two the gRPC wire names besides identity, gzip and zstd.
 //! lazywf compresses only messages at or over the target's `compress_min_bytes`: below it the
 //! CPU costs more than the bytes saved. The per-message flag and the length prefix are tonic's
-//! (see [`crate::grpc::stream`] for where they are applied); what this module says is which
+//! (see [`crate::targets::grpc::stream`] for where they are applied); what this module says is which
 //! bytes a message's payload holds.
 //!
 //! The status of a whole call is judged by one rule, the rule every kind follows: only an
@@ -204,5 +204,5 @@ pub(crate) fn ensure_frame_len(len: usize, max: usize) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "../tests/grpc_wire.rs"]
+#[path = "../../tests/targets_grpc_wire.rs"]
 mod tests;
