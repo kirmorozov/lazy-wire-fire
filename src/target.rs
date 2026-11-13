@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(test)]
 use base64::Engine as _;
 use mysql_async::Pool;
 use serde_json::{json, Map, Value};
@@ -299,7 +300,7 @@ pub(crate) fn var<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> 
         .filter(|s| !s.is_empty())
 }
 
-fn def_var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
+pub(crate) fn def_var<'a>(def: &'a TargetDef, k: &str) -> Option<&'a str> {
     var(&def.vars, k)
 }
 
@@ -1502,24 +1503,7 @@ impl Target {
             secrets::resolve(def_var(&self.def, k).ok_or_else(|| anyhow!("vars.{k} is missing"))?)
                 .with_context(|| format!("vars.{k}"))
         };
-        match self.def.kind {
-            Kind::HttpBasic => {
-                let token = base64::engine::general_purpose::STANDARD.encode(format!(
-                    "{}:{}",
-                    get("username")?,
-                    get("password")?
-                ));
-                req.set_header("Authorization", format!("Basic {token}"));
-            }
-            Kind::HttpBearer => {
-                req.set_header("Authorization", format!("Bearer {}", get("token")?))
-            }
-            Kind::HttpHeader => {
-                let name = def_var(&self.def, "header").unwrap_or_default().to_string();
-                req.set_header(&name, get("value")?);
-            }
-            _ => {}
-        }
+        crate::targets::http::authorize(&self.def, &mut req, &get)?;
         // The oauth token, after the kind's own credential so that a target can carry only one
         // claim (`TargetDef::from_row` refuses the two together). A request line that rendered
         // its own `Authorization:` is a second claim: refused, naming the setting and where the
