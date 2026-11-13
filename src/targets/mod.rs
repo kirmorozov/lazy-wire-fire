@@ -22,3 +22,4 @@ pub mod redis;
 pub mod servicebus;
 pub mod smtp;
 pub mod sql;
+pub mod sqs;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::targets::sqs::SqsUrl;
 
 fn sqs(url: &str) -> Result<SqsUrl> {
     SqsUrl::parse(url)

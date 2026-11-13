@@ -318,30 +318,7 @@ pub fn kind_errors(
         }
     }
     if kind == Kind::Sqs {
-        if def.fire_per == FirePer::Batch {
-            match def.batch_max_keys {
-                None => out.push(
-                    "kind sqs needs `batch_max_keys` (1 to 10: entries per SendMessageBatch)"
-                        .into(),
-                ),
-                Some(n) if n > 10 => out.push(format!(
-                    "`batch_max_keys` {n} is over 10, the most entries a SendMessageBatch takes"
-                )),
-                Some(_) => {}
-            }
-        }
-        if def.batch_max_bytes.is_some_and(|n| n > 262_144) {
-            out.push("`batch_max_bytes` is over 262144, the most a SendMessageBatch takes".into());
-        }
-        let fifo = endpoints
-            .iter()
-            .any(|e| crate::aws::SqsUrl::parse(e).is_ok_and(|u| u.fifo()));
-        if fifo && !fields.iter().any(|f| f.column == "version") {
-            out.push(
-                "a FIFO queue (a queue name ending in `.fifo`) needs a `version` column in a select: it is the MessageDeduplicationId"
-                    .into(),
-            );
-        }
+        out.extend(crate::targets::sqs::rule_errors(def, fields, endpoints));
     }
     if kind == Kind::EventBridge {
         // One action is one PutEvents (aws::EVENTBRIDGE_MAX_ENTRIES / _MAX_BYTES); the engine

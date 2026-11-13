@@ -427,28 +427,16 @@ fn var_str<'a>(vars: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
 }
 
 /// Keys that a kind no longer takes in `vars` (its region and stream come from the endpoint).
-fn refuse_vars(vars: &Map<String, Value>, keys: &[&str], kind: Kind, hint: &str) -> Result<()> {
+pub(crate) fn refuse_vars(
+    vars: &Map<String, Value>,
+    keys: &[&str],
+    kind: Kind,
+    hint: &str,
+) -> Result<()> {
     for k in keys {
         if vars.contains_key(*k) {
             bail!("`vars.{k}` is not used by kind {}: {hint}", kind.name());
         }
-    }
-    Ok(())
-}
-
-/// AWS credentials in a target's `vars`: references only, and an access key with its secret.
-fn aws_refs(vars: &Map<String, Value>) -> Result<()> {
-    for k in ["access_key_ref", "secret_key_ref", "session_token_ref"] {
-        if let Some(v) = var_str(vars, k) {
-            if !crate::secrets::is_reference(v) {
-                bail!(
-                    "`vars.{k}` must be a reference (`env:NAME` or `file:/path`), never a literal"
-                );
-            }
-        }
-    }
-    if var_str(vars, "access_key_ref").is_some() != var_str(vars, "secret_key_ref").is_some() {
-        bail!("`vars.access_key_ref` and `vars.secret_key_ref` go together");
     }
     Ok(())
 }
@@ -488,7 +476,7 @@ impl TargetDef {
             Kind::HttpS3 => {
                 need("bucket")?;
                 need("region")?;
-                aws_refs(&vars)?;
+                aws::check_refs(&vars)?;
             }
             Kind::Kinesis => {
                 // `aws-kinesis://[<region>/]<stream>`: the stream and the region are in the URL.
@@ -501,26 +489,9 @@ impl TargetDef {
                     ),
                 }
                 refuse_vars(&vars, &["region", "stream_name", "stream_arn"], kind, "the region and the stream go in the endpoint: aws-kinesis://[<region>/]<stream-name>")?;
-                aws_refs(&vars)?;
+                aws::check_refs(&vars)?;
             }
-            Kind::Sqs => {
-                // `aws-sqs://[<region>/]<account>/<queue>`: the queue and the region are in the URL.
-                match endpoints.as_slice() {
-                    [url] => {
-                        aws::SqsUrl::parse(url)?;
-                    }
-                    _ => bail!(
-                        "kind sqs takes exactly one endpoint: aws-sqs://[<region>/]<account-id>/<queue-name>"
-                    ),
-                }
-                refuse_vars(
-                    &vars,
-                    &["region"],
-                    kind,
-                    "the region goes in the endpoint: aws-sqs://<region>/<account-id>/<queue-name>",
-                )?;
-                aws_refs(&vars)?;
-            }
+            Kind::Sqs => crate::targets::sqs::check(&endpoints, &vars, kind)?,
             Kind::Lambda => {
                 // `aws-lambda://[<region>/]<function>[:<qualifier>][?invocation=…]`: the function,
                 // the region and the invocation are in the URL.
@@ -538,7 +509,7 @@ impl TargetDef {
                     kind,
                     "the region goes in the endpoint: aws-lambda://<region>/<function-name>",
                 )?;
-                aws_refs(&vars)?;
+                aws::check_refs(&vars)?;
             }
             Kind::EventBridge => {
                 // `aws-eventbridge://[<region>/]<event-bus>` (name or ARN): the bus and the
@@ -552,7 +523,7 @@ impl TargetDef {
                     ),
                 }
                 refuse_vars(&vars, &["region", "event_bus_name", "event_bus_arn"], kind, "the region and the event bus go in the endpoint: aws-eventbridge://[<region>/]<event-bus-name-or-arn>")?;
-                aws_refs(&vars)?;
+                aws::check_refs(&vars)?;
             }
             Kind::Sns => {
                 // `aws-sns://[<region>/]<account-id>/<topic-name>`: account, topic and region are
@@ -567,7 +538,7 @@ impl TargetDef {
                 }
                 refuse_vars(&vars, &["region", "account_id", "topic_name", "topic_arn"], kind, "the region, the account and the topic go in the endpoint: aws-sns://[<region>/]<account-id>/<topic-name>")?;
                 crate::sns::check_vars(&vars)?;
-                aws_refs(&vars)?;
+                aws::check_refs(&vars)?;
             }
             Kind::Amqp => crate::targets::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::Smtp => crate::targets::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
