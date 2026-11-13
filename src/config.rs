@@ -404,15 +404,7 @@ mod debug_tests {
 
 #[cfg(test)]
 mod query_tests {
-    use super::*;
-
-    fn cfg(pairs: &[(&str, &str)]) -> Result<Config> {
-        let m: std::collections::HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        Config::from_lookup(|k| m.get(k).cloned())
-    }
+    use super::tests::cfg;
 
     #[test]
     fn query_account_user_and_password_on_the_main_dsn() {
