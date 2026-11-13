@@ -271,6 +271,9 @@ impl BinlogReader {
     }
 
     /// The table map currently known for `table_id` (column types / metadata).
+    ///
+    /// Embedder seam: lazyview decodes rows through [`BinlogReader::rows`]; an embedder that
+    /// builds its own column layout reads the TABLE_MAP here.
     pub fn table_map(&self, table_id: u64) -> Option<&TableMapEvent<'static>> {
         self.t.table_map(table_id)
     }
