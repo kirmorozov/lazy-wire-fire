@@ -23,8 +23,8 @@ use mysql_async::prelude::*;
 use mysql_async::{Column, Conn, Params, Pool, Value as My};
 use serde_json::{Map, Value};
 
-use crate::redis::Reply;
 use crate::sql;
+use crate::targets::redis::Reply;
 
 /// The columns of `r` an expression names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -30,7 +30,6 @@ pub mod logging;
 pub mod model;
 pub mod oauth;
 pub mod path;
-pub mod redis;
 pub mod response;
 pub mod rows;
 pub mod rule;

@@ -751,7 +751,7 @@ async fn redis_rules(
     username: Option<&str>,
     password: &str,
 ) {
-    use lazy_wire_fire::redis::{Client, RedisAddr, Reply};
+    use lazy_wire_fire::targets::redis::{Client, RedisAddr, Reply};
     use lazy_wire_fire::tls::TlsSpec;
     let db = Db::fresh(root, name).await;
     db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), active TINYINT)")
@@ -923,16 +923,18 @@ impl Flaky {
 /// One stream entry: its id and fields.
 type Entry = (String, std::collections::BTreeMap<String, String>);
 
-fn bulk(r: &lazy_wire_fire::redis::Reply) -> String {
+fn bulk(r: &lazy_wire_fire::targets::redis::Reply) -> String {
     match r {
-        lazy_wire_fire::redis::Reply::Bulk(Some(b)) => String::from_utf8(b.clone()).unwrap(),
+        lazy_wire_fire::targets::redis::Reply::Bulk(Some(b)) => {
+            String::from_utf8(b.clone()).unwrap()
+        }
         other => panic!("not a bulk string: {other:?}"),
     }
 }
 
 /// `XRANGE` reply as entries, in stream order.
-fn stream_entries(reply: lazy_wire_fire::redis::Reply) -> Vec<Entry> {
-    use lazy_wire_fire::redis::Reply;
+fn stream_entries(reply: lazy_wire_fire::targets::redis::Reply) -> Vec<Entry> {
+    use lazy_wire_fire::targets::redis::Reply;
     let Reply::Array(Some(list)) = reply else {
         panic!("XRANGE reply: {reply:?}")
     };
@@ -954,7 +956,7 @@ fn stream_entries(reply: lazy_wire_fire::redis::Reply) -> Vec<Entry> {
 }
 
 /// The entries of a stream, once there are at least `n`.
-async fn entries_at_least(redis: &lazy_wire_fire::redis::Client, n: usize) -> Vec<Entry> {
+async fn entries_at_least(redis: &lazy_wire_fire::targets::redis::Client, n: usize) -> Vec<Entry> {
     let t = Duration::from_secs(3);
     wait_for(
         Duration::from_secs(30),
@@ -993,7 +995,7 @@ fn change(f: &std::collections::BTreeMap<String, String>) -> (String, String, Va
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_stream_target() {
     let root = need_db!();
-    use lazy_wire_fire::redis::{Client, RedisAddr};
+    use lazy_wire_fire::targets::redis::{Client, RedisAddr};
     use lazy_wire_fire::tls::TlsSpec;
     let db = Db::fresh(&root, "redis_stream").await;
     db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")

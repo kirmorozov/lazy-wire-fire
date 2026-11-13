@@ -16,5 +16,7 @@ pub mod grpc;
 pub mod kafka;
 pub mod pubsub;
 pub mod rabbitmq_stream;
+pub mod redis;
 pub mod servicebus;
 pub mod smtp;
+pub mod sql;

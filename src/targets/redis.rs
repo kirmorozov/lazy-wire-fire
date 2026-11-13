@@ -4,11 +4,15 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::Value;
+use mysql_async::Pool;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::http::split_host_port;
+use crate::model::TargetDef;
+use crate::response::{Expect, Row, Uses};
+use crate::target::{def_var, rejected, Sent};
 use crate::tls::{Connector, Stream, TlsSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,8 +419,68 @@ impl Client {
     }
 }
 
+/// The endpoint's context (`endpoint` in templates) and its client.
+pub fn new(def: &TargetDef, endpoint: &str) -> Result<(Value, Client)> {
+    let addr = RedisAddr::parse(endpoint)?;
+    let ctx = json!({"host": addr.host, "port": addr.port, "db": addr.db, "url": addr.url()});
+    let client = Client::new(
+        addr,
+        &def.tls,
+        def_var(def, "username").map(str::to_string),
+        def_var(def, "password").map(str::to_string),
+    )?;
+    Ok((ctx, client))
+}
+
+/// Sends one rendered command to a `redis` endpoint (see the module docs).
+pub async fn send(
+    client: &Client,
+    rendered: &str,
+    timeout: Duration,
+    expect: &Expect,
+    pool: &Pool,
+) -> Result<Sent> {
+    let args = tokenize(rendered).map_err(|e| rejected(format!("the rendered command: {e:#}")))?;
+    if args.is_empty() {
+        return Ok(Sent::Skipped);
+    }
+    let name = String::from_utf8_lossy(&args[0]).to_uppercase();
+    let reply = client
+        .command(&args, timeout)
+        .await
+        .with_context(|| format!("{name} on {}", client.addr.url()))?;
+    if let Some(e) = reply.error() {
+        let msg = format!("{name} on {}: {e}", client.addr.url());
+        return Err(if transient_error(e) {
+            anyhow!(msg)
+        } else {
+            rejected(msg)
+        });
+    }
+    expect
+        .row(pool, |u| Row::reply(u, &reply))
+        .await
+        .with_context(|| format!("{name} on {}", client.addr.url()))?
+        .map_err(|e| rejected(format!("{name} on {}: {e}", client.addr.url())))?;
+    Ok(Sent::Ok)
+}
+
+/// Runs one rendered listing command on a `redis` endpoint and answers its reply as the
+/// row (see the module docs).
+pub async fn fetch(client: &Client, rendered: &str, timeout: Duration, uses: Uses) -> Result<Row> {
+    let args = tokenize(rendered)?;
+    if args.is_empty() {
+        bail!("the list template rendered nothing");
+    }
+    let reply: Reply = client.command(&args, timeout).await?;
+    if let Some(e) = reply.error() {
+        bail!("{e}");
+    }
+    Ok(Row::reply(uses, &reply))
+}
+
 #[cfg(test)]
-#[path = "tests/redis.rs"]
+#[path = "../tests/targets_redis.rs"]
 mod tests;
 
 #[cfg(test)]
