@@ -1143,9 +1143,11 @@ pub fn triggers_by_rule(raw: &RawConfig) -> BTreeMap<String, Vec<RawTrigger>> {
 }
 
 #[cfg(test)]
+#[path = "tests/model.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/model_aws_endpoint_tests.rs"]
 mod aws_endpoint_tests;
 
 #[cfg(test)]
@@ -1173,4 +1175,5 @@ mod target_debug_tests {
 }
 
 #[cfg(test)]
+#[path = "tests/model_load_refusals_tests.rs"]
 mod load_refusals_tests;

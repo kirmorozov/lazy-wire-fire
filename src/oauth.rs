@@ -960,6 +960,7 @@ fn digest_assertion(iss: &str, sub: &str, aud: &str, key: &[u8]) -> [u8; 32] {
 // tests
 
 #[cfg(test)]
+#[path = "tests/oauth.rs"]
 mod tests;
 
 /// The tests' verifier of the RFC 7523 §2.1 form: what a token endpoint must do with an
@@ -967,4 +968,5 @@ mod tests;
 /// here with `ring` (a dev-dependency: the same one the lock carries through rustls) so
 /// the tests pin the shape of the credential, not only its presence.
 #[cfg(test)]
+#[path = "tests/oauth_jwt_check.rs"]
 pub(crate) mod jwt_check;

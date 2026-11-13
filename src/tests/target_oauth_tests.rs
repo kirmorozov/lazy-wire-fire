@@ -591,7 +591,7 @@ async fn the_jwt_bearer_action_carries_the_token_and_the_endpoint_verifies_the_a
     let _env = crate::secrets::ENV_LOCK.lock().await;
     let key = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/testdata/rsa-test-key-pkcs8.pem"
+        "/src/tests/testdata/rsa-test-key-pkcs8.pem"
     ));
     std::env::set_var(
         "LWF_UNIT_OAUTH_JWT_KEY",
@@ -648,7 +648,7 @@ async fn every_jwt_token_endpoint_failure_keeps_the_key_and_names_the_cause() {
     let _env = crate::secrets::ENV_LOCK.lock().await;
     let key = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/testdata/rsa-test-key-pkcs8.pem"
+        "/src/tests/testdata/rsa-test-key-pkcs8.pem"
     ));
     std::env::set_var(
         "LWF_UNIT_OAUTH_JWT_KEY",

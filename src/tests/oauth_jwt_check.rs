@@ -12,10 +12,10 @@ pub(crate) struct Expect {
     pub scope: Option<String>,
 }
 
-/// A fixture from `src/testdata` (the test-only keys).
+/// A fixture from `src/tests/testdata` (the test-only keys).
 pub(crate) fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
-        "{}/src/testdata/{name}",
+        "{}/src/tests/testdata/{name}",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap()

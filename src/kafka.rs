@@ -963,7 +963,9 @@ pub fn rule_errors(def: &RuleDef, limit: usize) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[path = "tests/kafka.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/kafka_action_body_tests.rs"]
 mod action_body_tests;

@@ -241,4 +241,5 @@ pub fn text_set<'a>(keys: impl IntoIterator<Item = &'a str>) -> IdSet {
 }
 
 #[cfg(test)]
+#[path = "tests/keyspace.rs"]
 mod tests;

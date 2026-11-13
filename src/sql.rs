@@ -636,4 +636,5 @@ impl Ddl<'_> {
 }
 
 #[cfg(test)]
+#[path = "tests/sql.rs"]
 mod tests;

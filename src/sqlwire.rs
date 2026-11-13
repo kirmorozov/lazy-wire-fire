@@ -584,4 +584,5 @@ fn pg_value(r: &tokio_postgres::Row, i: usize) -> Value {
 }
 
 #[cfg(test)]
+#[path = "tests/sqlwire.rs"]
 mod tests;

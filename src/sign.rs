@@ -265,4 +265,5 @@ pub fn apply(req: &mut RawRequest, target: &str, spec: &Spec, now: u64) -> Resul
 }
 
 #[cfg(test)]
+#[path = "tests/sign.rs"]
 mod tests;

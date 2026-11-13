@@ -619,4 +619,5 @@ fn hint(kind: ValueKind, field: &str) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "../tests/grpc_schema.rs"]
 mod tests;

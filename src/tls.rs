@@ -372,4 +372,5 @@ impl AsyncWrite for Stream {
 }
 
 #[cfg(test)]
+#[path = "tests/tls.rs"]
 mod tests;

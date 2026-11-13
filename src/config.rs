@@ -490,4 +490,5 @@ mod query_tests {
 /// A wrong secret or address is refused when the process reads its environment, never
 /// discovered halfway through a flush.
 #[cfg(test)]
+#[path = "tests/config_secret_refusals_tests.rs"]
 mod secret_refusals_tests;
