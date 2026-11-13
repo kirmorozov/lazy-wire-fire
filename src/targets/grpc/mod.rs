@@ -772,5 +772,5 @@ fn schema_of(target: &TargetDef, url: &str) -> Result<(prost_reflect::Descriptor
 }
 
 #[cfg(test)]
-#[path = "../tests/grpc.rs"]
+#[path = "../../tests/targets_grpc.rs"]
 mod tests;

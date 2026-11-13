@@ -178,7 +178,7 @@ async fn compile_selects(
 ///   raised by its `vars.message_max_bytes`).
 /// - `grpc`: the rule's payload columns are the item message's fields, so they are checked
 ///   against the target's descriptor set, and a batch is held to the target's
-///   `vars.max_message_bytes` (see [`crate::grpc::rule_errors`]).
+///   `vars.max_message_bytes` (see [`crate::targets::grpc::rule_errors`]).
 /// - a plain http kind with `vars.oauth`: the token sets the `Authorization` header, so a
 ///   template whose own header block carries a literal one is refused (see
 ///   [`crate::oauth::rule_errors`]).
@@ -229,10 +229,10 @@ pub fn kind_errors(
         }
     }
     if kind == Kind::Amqp {
-        out.extend(crate::amqp::rule_errors(def.fire_per));
+        out.extend(crate::targets::amqp::rule_errors(def.fire_per));
     }
     if kind == Kind::Smtp {
-        out.extend(crate::smtp::rule_errors(def.fire_per));
+        out.extend(crate::targets::smtp::rule_errors(def.fire_per));
     }
     if matches!(
         kind,
@@ -266,7 +266,7 @@ pub fn kind_errors(
         }
     }
     if kind == Kind::PubSub {
-        out.extend(crate::pubsub::rule_errors(def));
+        out.extend(crate::targets::pubsub::rule_errors(def));
     }
     if matches!(
         kind,
@@ -281,24 +281,24 @@ pub fn kind_errors(
     if kind == Kind::Kafka {
         // The batch's byte limit: the target's own (the broker's `message.max.bytes`, raised
         // by its `vars.message_max_bytes` — checked at load, so it cannot fail here).
-        let limit = crate::kafka::message_max_bytes(&target.vars)
-            .unwrap_or(crate::kafka::MESSAGE_MAX_BYTES);
-        out.extend(crate::kafka::rule_errors(def, limit));
+        let limit = crate::targets::kafka::message_max_bytes(&target.vars)
+            .unwrap_or(crate::targets::kafka::MESSAGE_MAX_BYTES);
+        out.extend(crate::targets::kafka::rule_errors(def, limit));
     }
     if kind == Kind::ServiceBus {
         // The batch's byte limit: the entity's maximum message size (256 KiB by default,
         // raised by the target's `vars.max_message_size` — checked at load, so the read
         // cannot fail here).
-        let limit = crate::servicebus::max_message_bytes(&target.vars)
-            .unwrap_or(crate::servicebus::MAX_MESSAGE_BYTES);
-        out.extend(crate::servicebus::rule_errors(def, limit));
+        let limit = crate::targets::servicebus::max_message_bytes(&target.vars)
+            .unwrap_or(crate::targets::servicebus::MAX_MESSAGE_BYTES);
+        out.extend(crate::targets::servicebus::rule_errors(def, limit));
     }
     if kind == Kind::RabbitMqStream {
         // One publish is one stream frame: 1 MiB, with no var to raise it (the crate sends
         // the batch as a single frame).
-        out.extend(crate::rabbitmq_stream::rule_errors(
+        out.extend(crate::targets::rabbitmq_stream::rule_errors(
             def,
-            crate::rabbitmq_stream::MESSAGE_MAX_BYTES,
+            crate::targets::rabbitmq_stream::MESSAGE_MAX_BYTES,
         ));
     }
     if kind == Kind::Kinesis && def.fire_per == FirePer::Batch {
@@ -407,8 +407,8 @@ pub fn kind_errors(
     if kind == Kind::Grpc {
         // The rule's columns are the item message's fields: check them against the target's
         // descriptor set now, so a schema that does not fit is a rule that never started
-        // rather than a flush whose documents are all refused (see [`crate::grpc::rule_errors`]).
-        out.extend(crate::grpc::rule_errors(def, target, fields));
+        // rather than a flush whose documents are all refused (see [`crate::targets::grpc::rule_errors`]).
+        out.extend(crate::targets::grpc::rule_errors(def, target, fields));
     }
     out
 }

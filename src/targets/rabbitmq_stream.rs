@@ -1005,5 +1005,5 @@ pub fn rule_errors(def: &RuleDef, limit: usize) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[path = "tests/rabbitmq_stream.rs"]
+#[path = "../tests/targets_rabbitmq_stream.rs"]
 mod tests;

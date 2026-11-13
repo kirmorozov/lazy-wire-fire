@@ -1540,7 +1540,7 @@ async fn servicebus_secrets_never_appear() {
 
     // The token the kind builds for that key and audience: as secret as the key itself.
     let now = lazy_wire_fire::time::unix_now_ms() / 1000;
-    let token = lazy_wire_fire::servicebus::sas_token(
+    let token = lazy_wire_fire::targets::servicebus::sas_token(
         &format!("sb://{broker}/queues/{q}"),
         "RootManageSharedAccessKey",
         SB_KEY,
@@ -2626,7 +2626,7 @@ async fn no_secret_in_the_logs_grpc() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("grpc-token"), format!("{GRPC_TOKEN}\n")).unwrap();
     let desc = dir.join("logsecrets.desc");
-    std::fs::write(&desc, lazy_wire_fire::grpc::contract::DESCRIPTOR).unwrap();
+    std::fs::write(&desc, lazy_wire_fire::targets::grpc::contract::DESCRIPTOR).unwrap();
     // The schema a flushing target builds its documents onto: an app's own message, and a service
     // of the contract's shape to call. This binary compiles it here, once.
     let schema = common::grpc_server::write_schema(&dir);
@@ -2654,7 +2654,8 @@ async fn no_secret_in_the_logs_grpc() {
     // What a template can render, and what a Debug of the endpoint holds: the token is in
     // neither, so nothing that logs them can print it.
     tracing::debug!(vars = %def.template_vars(), "grpc target loaded");
-    let (ctx, client) = lazy_wire_fire::grpc::Client::new(&def, &def.endpoints[0]).expect("starts");
+    let (ctx, client) =
+        lazy_wire_fire::targets::grpc::Client::new(&def, &def.endpoints[0]).expect("starts");
     tracing::trace!(?ctx, ?client.opts, "the endpoint of a grpc target");
 
     let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");

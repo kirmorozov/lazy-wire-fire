@@ -54,11 +54,11 @@ fn every_kind_is_named_the_way_it_is_written() {
     );
     assert_eq!(
         Kind::Kafka.batch_bytes_limit(),
-        Some(crate::kafka::MESSAGE_MAX_BYTES)
+        Some(crate::targets::kafka::MESSAGE_MAX_BYTES)
     );
     assert_eq!(
         Kind::RabbitMqStream.batch_bytes_limit(),
-        Some(crate::rabbitmq_stream::MESSAGE_MAX_BYTES)
+        Some(crate::targets::rabbitmq_stream::MESSAGE_MAX_BYTES)
     );
     for k in [Kind::Http, Kind::Redis, Kind::MySql, Kind::Smtp] {
         assert_eq!(k.batch_bytes_limit(), None, "{}", k.name());

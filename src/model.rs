@@ -277,16 +277,16 @@ impl Kind {
             Kind::Sns => Some(crate::aws::SNS_MAX_BYTES),
             // The broker's `message.max.bytes`, by default; `vars.message_max_bytes` raises it
             // (see `Target::batch_bytes_limit`).
-            Kind::Kafka => Some(crate::kafka::MESSAGE_MAX_BYTES),
+            Kind::Kafka => Some(crate::targets::kafka::MESSAGE_MAX_BYTES),
             // One stream frame, 1 MiB (the crate sends a batch as a single frame; see
             // `rabbitmq_stream.rs`).
-            Kind::RabbitMqStream => Some(crate::rabbitmq_stream::MESSAGE_MAX_BYTES),
+            Kind::RabbitMqStream => Some(crate::targets::rabbitmq_stream::MESSAGE_MAX_BYTES),
             // The server's own maximum message size, 4 MiB in the usual implementations;
             // `vars.max_message_bytes` raises it (see `Target::batch_bytes_limit`).
-            Kind::Grpc => Some(crate::grpc::MAX_MESSAGE_BYTES),
+            Kind::Grpc => Some(crate::targets::grpc::MAX_MESSAGE_BYTES),
             // The entity's maximum message size, 256 KiB by default; `vars.max_message_size`
             // raises it to the entity's (see `servicebus.rs`).
-            Kind::ServiceBus => Some(crate::servicebus::MAX_MESSAGE_BYTES),
+            Kind::ServiceBus => Some(crate::targets::servicebus::MAX_MESSAGE_BYTES),
             _ => None,
         }
     }
@@ -575,15 +575,17 @@ impl TargetDef {
                 crate::sns::check_vars(&vars)?;
                 aws_refs(&vars)?;
             }
-            Kind::Amqp => crate::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
-            Kind::Smtp => crate::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
-            Kind::PubSub => crate::pubsub::check(&vars, &endpoints)?,
-            Kind::Kafka => crate::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::Amqp => crate::targets::amqp::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::Smtp => crate::targets::smtp::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::PubSub => crate::targets::pubsub::check(&vars, &endpoints)?,
+            Kind::Kafka => crate::targets::kafka::check(&endpoints, &vars, r.tls.as_deref())?,
             Kind::RabbitMqStream => {
-                crate::rabbitmq_stream::check(&endpoints, &vars, r.tls.as_deref())?
+                crate::targets::rabbitmq_stream::check(&endpoints, &vars, r.tls.as_deref())?
             }
-            Kind::Grpc => crate::grpc::check(&endpoints, &vars, r.tls.as_deref())?,
-            Kind::ServiceBus => crate::servicebus::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::Grpc => crate::targets::grpc::check(&endpoints, &vars, r.tls.as_deref())?,
+            Kind::ServiceBus => {
+                crate::targets::servicebus::check(&endpoints, &vars, r.tls.as_deref())?
+            }
             Kind::Http | Kind::Redis | Kind::MySql | Kind::PgSql => {}
         }
         // Webhook signing is an option of the plain http kinds; on the others the settings
@@ -626,11 +628,11 @@ impl TargetDef {
                 );
             }
         }
-        crate::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
-        crate::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
-        crate::rabbitmq_stream::refuse_scheme(kind == Kind::RabbitMqStream, &endpoints)?;
-        crate::grpc::refuse_scheme(kind == Kind::Grpc, &endpoints)?;
-        crate::servicebus::refuse_scheme(kind == Kind::ServiceBus, &endpoints)?;
+        crate::targets::pubsub::refuse_scheme(kind == Kind::PubSub, &endpoints)?;
+        crate::targets::kafka::refuse_scheme(kind == Kind::Kafka, &endpoints)?;
+        crate::targets::rabbitmq_stream::refuse_scheme(kind == Kind::RabbitMqStream, &endpoints)?;
+        crate::targets::grpc::refuse_scheme(kind == Kind::Grpc, &endpoints)?;
+        crate::targets::servicebus::refuse_scheme(kind == Kind::ServiceBus, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
         }

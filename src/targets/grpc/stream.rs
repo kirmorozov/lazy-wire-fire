@@ -7,7 +7,7 @@
 //! arrive. That only pays if the call stays open — one HTTP/2 stream, its headers sent once,
 //! batches pipelined behind each other — so the stream is opened on the first flush and kept
 //! until the server or the network ends it. The next flush opens another, and its sequence
-//! numbers start at 1 again: the hash an item carries ([`crate::grpc::contract`]) is what tells
+//! numbers start at 1 again: the hash an item carries ([`crate::targets::grpc::contract`]) is what tells
 //! two streams' items apart, and a server that has a key and a hash it has already stored can
 //! acknowledge the duplicate without doing the work again.
 //!
@@ -80,9 +80,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request as TonicRequest, Status, Streaming};
 use tower_service::Service as TowerService;
 
-use crate::grpc::contract::{self, Ack, Acks, Envelope, Status as AckStatus};
-use crate::grpc::wire::{self, Codec, Failure};
 use crate::secrets;
+use crate::targets::grpc::contract::{self, Ack, Acks, Envelope, Status as AckStatus};
+use crate::targets::grpc::wire::{self, Codec, Failure};
 use crate::tls;
 
 /// How many items may be unacknowledged at once: deep enough that the round trip stops
@@ -1271,5 +1271,5 @@ impl TowerService<http::Uri> for Pipe {
 }
 
 #[cfg(test)]
-#[path = "../tests/grpc_stream.rs"]
+#[path = "../../tests/targets_grpc_stream.rs"]
 mod tests;
