@@ -7,7 +7,7 @@ IMAGE ?= lazywf:dev
 # Keep in step with the FROM lines of the Dockerfile.
 BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
-.PHONY: build release test test-roaring lint servers servers-down test-e2e test-e2e-all test-e2e-search \
+.PHONY: build release test test-roaring test-grpc lint servers servers-down test-e2e test-e2e-all test-e2e-search \
 	test-e2e-queues test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
 	docker-smoke docker-e2e image-digests
 
@@ -25,11 +25,18 @@ release:
 test:
 	$(CARGO) test --lib
 	$(CARGO) test --test reserved
+	$(MAKE) --no-print-directory test-grpc
 	$(MAKE) --no-print-directory test-roaring
 
 test-roaring:
 	$(CARGO) test --lib --features roaring
 	$(CARGO) test --test reserved --features roaring
+
+# The `grpc` kind end to end (tests/grpc_stream.rs): the client the tool ships against a
+# hand-rolled h2 server of lazywf's own, in the same process on 127.0.0.1. No servers, no
+# containers, no environment variables: it runs with the unit tests, locally and on CI.
+test-grpc:
+	$(CARGO) test --test grpc_stream
 
 # The lazyview copies (vendor/lazyview.lock) are checked against the lock, and on CI
 # (CI=true) also against lazyview itself at the locked commit.
