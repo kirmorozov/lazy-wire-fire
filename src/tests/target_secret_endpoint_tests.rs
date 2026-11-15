@@ -355,9 +355,9 @@ async fn the_allow_list_checks_the_resolved_host() {
 async fn a_reference_endpoint_is_for_the_http_kinds_only() {
     for kind in ["http", "http.basic", "http.bearer", "http.header"] {
         let vars = match kind {
-            "http.basic" => r#"{"username":"u","password":"p"}"#,
-            "http.bearer" => r#"{"token":"t"}"#,
-            "http.header" => r#"{"header":"X-Key","value":"v"}"#,
+            "http.basic" => r#"{"username":"u","password":"env:LWF_UNIT_PW"}"#,
+            "http.bearer" => r#"{"token":"env:LWF_UNIT_PW"}"#,
+            "http.header" => r#"{"header":"X-Key","value":"env:LWF_UNIT_PW"}"#,
             _ => "{}",
         };
         assert!(
@@ -378,12 +378,12 @@ async fn a_reference_endpoint_is_for_the_http_kinds_only() {
         ("lambda", "{}"),
         ("eventbridge", "{}"),
         ("sns", "{}"),
-        ("amqp", r#"{"username":"u","password":"p"}"#),
-        ("smtp", r#"{"username":"u","password":"p"}"#),
+        ("amqp", r#"{"username":"u","password":"env:LWF_UNIT_PW"}"#),
+        ("smtp", r#"{"username":"u","password":"env:LWF_UNIT_PW"}"#),
         ("pubsub", r#"{"topic":"t"}"#),
         ("kafka", "{}"),
-        ("mysql", r#"{"username":"u","password":"p"}"#),
-        ("pgsql", r#"{"username":"u","password":"p"}"#),
+        ("mysql", r#"{"username":"u","password":"env:LWF_UNIT_PW"}"#),
+        ("pgsql", r#"{"username":"u","password":"env:LWF_UNIT_PW"}"#),
     ] {
         let e = err(kind, vars);
         assert!(

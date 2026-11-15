@@ -43,12 +43,14 @@ fn redis() -> Arc<Target> {
 fn smtp() -> Arc<Target> {
     target("smtp", "smtp://mail.example.test:587", "{}")
 }
+/// `vars` with a credential: the secret fields hold a reference, never the secret.
+fn cred_vars() -> &'static str {
+    std::env::set_var("LWF_TEST_TARGET_PW", "p");
+    r#"{"username":"u","password":"env:LWF_TEST_TARGET_PW"}"#
+}
+
 fn amqp() -> Arc<Target> {
-    target(
-        "amqp",
-        "amqp://mq.example.test:5672/",
-        r#"{"username":"u","password":"p"}"#,
-    )
+    target("amqp", "amqp://mq.example.test:5672/", cred_vars())
 }
 fn pubsub() -> Arc<Target> {
     target(
@@ -58,11 +60,7 @@ fn pubsub() -> Arc<Target> {
     )
 }
 fn mysql() -> Arc<Target> {
-    target(
-        "mysql",
-        "mysql://db.example.test:3306/app",
-        r#"{"username":"u","password":"p"}"#,
-    )
+    target("mysql", "mysql://db.example.test:3306/app", cred_vars())
 }
 
 /// A template that renders nothing is neither a delivery nor a failure: the keys

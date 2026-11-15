@@ -17,10 +17,13 @@ CONNECTION (either):
   LAZYWF_HOST, LAZYWF_PORT (3306), LAZYWF_USER, LAZYWF_PASSWORD, LAZYWF_DATABASE
   LAZYWF_DSN=mysql://user:pass@host:3306/database      (mariadb:// accepted)
   LAZYWF_TLS=disabled|required|verify-ca|verify-full   LAZYWF_TLS_CA=/path/ca.pem
+      (unset: TLS required for non-loopback hosts, plaintext on loopback)
   LAZYWF_BINLOG_USER / LAZYWF_BINLOG_PASSWORD (or LAZYWF_BINLOG_DSN): replication account
 
 COMMON SETTINGS:
   LAZYWF_INSTANCE=default   LAZYWF_HEALTH_ADDR=127.0.0.1:8081 (or off)
+  LAZYWF_STATUS_TOKEN=...   /status then needs the X-Lazywf-Token header (/livez, /readyz open)
+  LAZYWF_ALLOWED_HOSTS=host,*.dom,10.0.0.0/8  (unset denies all target egress; * allows any)
   LAZYWF_LOG_FORMAT=text|json   RUST_LOG=info
 
 Rules, triggers and targets are rows in lazy_wire_fire_rule, lazy_wire_fire_trigger and
@@ -133,7 +136,9 @@ async fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let health = Arc::new(lazy_wire_fire::health::Health::default());
+    let health = Arc::new(lazy_wire_fire::health::Health::new(
+        cfg.status_token.clone(),
+    ));
     if let Some(addr) = cfg.health_addr {
         tokio::spawn(lazy_wire_fire::health::serve(addr, health.clone()));
     }

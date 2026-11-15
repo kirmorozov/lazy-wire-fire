@@ -1927,6 +1927,7 @@ async fn targets_add_their_authentication() {
     shop(&db).await;
     let mock = Mock::start().await;
     std::env::set_var("LWF_TEST_TOKEN", "t0ken");
+    std::env::set_var("LWF_TEST_HEADER_KEY", "k3y");
     let dir = std::env::current_dir().unwrap().join("tmp/out/secrets");
     std::fs::create_dir_all(&dir).unwrap();
     let secret = dir.join("basic-pw");
@@ -1956,7 +1957,8 @@ async fn targets_add_their_authentication() {
         "http.header",
         &url,
         None,
-        r#"{"header": "X-Api-Key", "value": "k3y", "note": "visible"}"#,
+        // The secret fields of the http kinds are references only.
+        r#"{"header": "X-Api-Key", "value": "env:LWF_TEST_HEADER_KEY", "note": "visible"}"#,
     )
     .await;
     for t in ["basic", "bearer", "header"] {
@@ -4054,6 +4056,13 @@ fn amqp_envelope(exchange: &str) -> String {
     )
 }
 
+/// `vars` of the `amqp` kind: the password of the test broker as a reference, since a
+/// secret-bearing field never holds the secret itself.
+fn amqp_vars() -> String {
+    std::env::set_var("LWF_TEST_AMQP_PW", "lwftest");
+    json!({"username": "lwftest", "password": "env:LWF_TEST_AMQP_PW"}).to_string()
+}
+
 /// The `amqp` kind as a message producer: one persistent JSON message per changed key on a bound
 /// queue; a delete arrives as op delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4069,7 +4078,7 @@ async fn amqp_target() {
     let (ex, q) = ("lwf.amqp_target", "lwf.amqp_target.q");
     let admin = Amqp::setup(&broker, ex, q).await;
 
-    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    let vars = amqp_vars();
     db.target(
         "bus",
         "amqp",
@@ -4144,7 +4153,7 @@ async fn amqp_refusal() {
         "/order.changed",
         "/{{#if (eq doc.sku \"NOROUTE\")}}no.such.key{{else}}order.changed{{/if}}",
     );
-    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    let vars = amqp_vars();
     db.target(
         "bus",
         "amqp",
@@ -4205,7 +4214,7 @@ async fn amqp_restart() {
 
     let upstream: &'static str = Box::leak(broker.clone().into_boxed_str());
     let proxy = Flaky::start(upstream).await;
-    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    let vars = amqp_vars();
     db.target(
         "bus",
         "amqp",
@@ -4410,7 +4419,7 @@ async fn amqp_stream_queue_target() {
     );
     let admin = StreamQueue::setup(&broker, ex, q).await;
 
-    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    let vars = amqp_vars();
     db.target(
         "bus",
         "amqp",
@@ -4484,7 +4493,7 @@ async fn amqp_stream_queue_restart() {
 
     let upstream: &'static str = Box::leak(broker.clone().into_boxed_str());
     let proxy = Flaky::start(upstream).await;
-    let vars = json!({"username": "lwftest", "password": "lwftest"});
+    let vars = amqp_vars();
     let cfg = config(&db, &[]);
     db.target(
         "bus",
@@ -7489,6 +7498,64 @@ async fn allowed_hosts_refuse_unlisted_endpoints() {
     );
     // Only the listed target was called, and only with the listed rule's key.
     assert!(mock.requests().iter().all(|r| r.body == "7"));
+    inst.stop().await;
+}
+
+/// The default of `LAZYWF_ALLOWED_HOSTS` denies every target: with the variable unset (the empty
+/// value is the unset one) the target is refused at load, its rule's `last_error` names the
+/// variable and the `*` opt-out, and the backend is never called. `*` brings it back to life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allowed_hosts_unset_denies_every_target() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "allowdeny").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, 'POST /hook HTTP/1.1\n\n{{join keys \",\"}}', 100)",
+        ("hook", "hook"),
+    )
+    .await;
+    db.trigger("hook", "orders", Some("{{new.id}}"), None).await;
+
+    let inst = Instance::ready(config(&db, &[("LAZYWF_ALLOWED_HOSTS", "")])).await;
+    db.exec("INSERT INTO orders VALUES (8, 1, 'new', 1)").await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(10),
+        "the denied rule's error",
+        || async {
+            let (_, _, _, err) = db.status("hook").await?;
+            err.filter(|e| e.contains("LAZYWF_ALLOWED_HOSTS is not set"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    let (_, _, _, err) = db.status("hook").await.unwrap();
+    let err = err.unwrap();
+    assert!(err.contains("127.0.0.1"), "{err}");
+    assert!(err.contains('*'), "{err}");
+    // The refused target's backend never heard from the engine.
+    assert!(mock.requests().is_empty(), "{:?}", mock.requests());
+    inst.stop().await;
+
+    // `*` is the opt out: the same rule delivers now. The denied key of the first phase was
+    // never struck (nothing was sent, so nothing was judged), so it comes along in the batch.
+    mock.clear();
+    let inst = Instance::ready(config(&db, &[("LAZYWF_ALLOWED_HOSTS", "*")])).await;
+    db.exec("INSERT INTO orders VALUES (9, 1, 'new', 1)").await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(10),
+        "the allowed target delivers",
+        || async {
+            mock.requests()
+                .iter()
+                .any(|r| r.body.split(',').any(|k| k == "9"))
+                .then_some(())
+        },
+    )
+    .await;
     inst.stop().await;
 }
 

@@ -33,8 +33,13 @@ pub struct Config {
     pub status_every: Duration,
     pub max_backoff: Duration,
     pub stop_grace: Duration,
-    /// `LAZYWF_ALLOWED_HOSTS`: the endpoint hosts a target may connect to; `None` when unset.
+    /// `LAZYWF_ALLOWED_HOSTS`: the endpoint hosts a target may connect to. `from_lookup`
+    /// always sets it: unset becomes the deny-all list (0.3.0), `*` the allow-all one.
+    /// `None` only exists for tests that carry no operator setting.
     pub allowed_hosts: Option<HostList>,
+    /// `LAZYWF_STATUS_TOKEN`: when set, `/status` on the health listener requires the
+    /// `X-Lazywf-Token` header (constant-time compare). `/livez` and `/readyz` never need it.
+    pub status_token: Option<String>,
 }
 
 /// The DSNs are shown without their passwords (`mysql://***@host/...`): a `{:?}` of the
@@ -63,6 +68,8 @@ impl std::fmt::Debug for Config {
                 "allowed_hosts",
                 &self.allowed_hosts.as_ref().map(HostList::len),
             )
+            // The token itself never appears: only whether it is set.
+            .field("status_token", &self.status_token.as_ref().map(|_| "set"))
             .finish()
     }
 }
@@ -73,14 +80,23 @@ impl Config {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
-        let dsn = connection(&get, "LAZYWF")?.ok_or_else(|| {
-            anyhow!(
-                "no database configured: set LAZYWF_HOST, LAZYWF_USER, LAZYWF_PASSWORD, LAZYWF_DATABASE \
-                 (or LAZYWF_DSN=mysql://user:pass@host:3306/db)"
-            )
-        })?;
+        // The connections assemble without TLS parameters first: the level for each one
+        // depends on its own host (loopback stays plaintext, a remote host is required).
+        let (dsn, mut plain_remote) = match connection(&get, "LAZYWF")? {
+            (Some(d), warn) => (d, warn),
+            (None, _) => {
+                return Err(anyhow!(
+                    "no database configured: set LAZYWF_HOST, LAZYWF_USER, LAZYWF_PASSWORD, LAZYWF_DATABASE \
+                     (or LAZYWF_DSN=mysql://user:pass@host:3306/db)"
+                ))
+            }
+        };
         let binlog_dsn = match get("LAZYWF_BINLOG_DSN").filter(|v| !v.is_empty()) {
-            Some(d) => finish_dsn(&d, tls_mode(&get, "LAZYWF")?.as_deref(), "LAZYWF")?,
+            Some(d) => {
+                let (tls, warn) = tls_for(&get, "LAZYWF", &d)?;
+                plain_remote |= warn;
+                finish_dsn(&d, tls.as_deref(), "LAZYWF")?
+            }
             None => match get("LAZYWF_BINLOG_USER").filter(|v| !v.is_empty()) {
                 Some(user) => {
                     with_credentials(&dsn, &user, get("LAZYWF_BINLOG_PASSWORD").as_deref())?
@@ -89,10 +105,11 @@ impl Config {
             },
         };
         let (query_dsn, query_account) = match get("LAZYWF_QUERY_DSN").filter(|v| !v.is_empty()) {
-            Some(d) => (
-                finish_dsn(&d, tls_mode(&get, "LAZYWF")?.as_deref(), "LAZYWF")?,
-                true,
-            ),
+            Some(d) => {
+                let (tls, warn) = tls_for(&get, "LAZYWF", &d)?;
+                plain_remote |= warn;
+                (finish_dsn(&d, tls.as_deref(), "LAZYWF")?, true)
+            }
             None => match get("LAZYWF_QUERY_USER").filter(|v| !v.is_empty()) {
                 Some(user) => (
                     with_credentials(&dsn, &user, get("LAZYWF_QUERY_PASSWORD").as_deref())?,
@@ -139,7 +156,7 @@ impl Config {
             bail!("LAZYWF_INSTANCE must be at most 64 characters and not `*`");
         }
         let ms = |k: &str, d: u64| num(k, d).map(Duration::from_millis);
-        Ok(Config {
+        let cfg = Config {
             dsn,
             binlog_dsn,
             query_dsn,
@@ -157,39 +174,126 @@ impl Config {
             status_every: ms("LAZYWF_STATUS_MS", 5_000)?.max(Duration::from_millis(100)),
             max_backoff: ms("LAZYWF_MAX_BACKOFF_MS", 60_000)?.max(Duration::from_millis(100)),
             stop_grace: ms("LAZYWF_STOP_GRACE_MS", 10_000)?,
-            allowed_hosts: HostList::parse(&get("LAZYWF_ALLOWED_HOSTS").unwrap_or_default())
-                .context("LAZYWF_ALLOWED_HOSTS")?,
-        })
+            // Unset denies all target egress (0.3.0): the configuration rows are SQL, and an
+            // INSERT grant must not be able to turn a target into a channel to any address.
+            // The operator opts out with `LAZYWF_ALLOWED_HOSTS=*` (the behaviour unset had
+            // before) or lists the hosts.
+            allowed_hosts: Some(
+                HostList::parse(&get("LAZYWF_ALLOWED_HOSTS").unwrap_or_default())
+                    .context("LAZYWF_ALLOWED_HOSTS")?
+                    .unwrap_or_else(HostList::deny_all),
+            ),
+            status_token: get("LAZYWF_STATUS_TOKEN").filter(|v| !v.trim().is_empty()),
+        };
+        if plain_remote {
+            // One loud line, at startup, for the explicit opt-out: it must not scroll by
+            // unnoticed, because the binlog behind it carries every watched row.
+            tracing::warn!(
+                "LAZYWF_TLS says disabled while the source host is not loopback: the \
+                 connection to the database is UNENCRYPTED. The binlog stream carries every \
+                 watched row, so anyone on the network path can read them. This is the \
+                 explicit opt-out from the TLS that lazywf 0.3.0 requires by default: remove \
+                 LAZYWF_TLS to get `required`, or set it to verify-ca / verify-full to check \
+                 the server's certificate too."
+            );
+        }
+        Ok(cfg)
     }
 }
 
-fn tls_mode(get: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Option<String>> {
-    let ca = get(&format!("{prefix}_TLS_CA")).filter(|v| !v.is_empty());
-    Ok(get(&format!("{prefix}_TLS"))
-        .filter(|v| !v.is_empty())
-        .or_else(|| ca.map(|_| "verify-full".to_string())))
+/// The TLS level for one DSN, decided per connection (0.3.0): the explicit `<PREFIX>_TLS`
+/// value when set (a blank value is unset), the `<PREFIX>_TLS_CA` setting implying
+/// `verify-full` as before, and otherwise: `required` for a host that is not loopback, no
+/// TLS parameters for a loopback one (the machine's own server needs no certificate).
+/// The bool says an explicit `disabled` was chosen against a non-loopback host: the
+/// connection is plaintext by choice, and the process logs one loud WARN for it.
+fn tls_for(
+    get: &impl Fn(&str) -> Option<String>,
+    prefix: &str,
+    dsn: &str,
+) -> Result<(Option<String>, bool)> {
+    match get(&format!("{prefix}_TLS")).filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let off = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "disabled" | "off" | "false"
+            );
+            // The level's own validity is checked by finish_dsn, whose message names the
+            // setting; here only the plaintext opt-out is noticed.
+            Ok((Some(v), off && !is_loopback_dsn(dsn)))
+        }
+        None => {
+            if get(&format!("{prefix}_TLS_CA"))
+                .filter(|v| !v.is_empty())
+                .is_some()
+            {
+                Ok((Some("verify-full".to_string()), false))
+            } else if is_loopback_dsn(dsn) {
+                Ok((None, false))
+            } else {
+                Ok((Some("required".to_string()), false))
+            }
+        }
+    }
+}
+
+/// The host of a DSN as lazywf connects to it: between `://` (and any userinfo) and the
+/// path, without the port or the IPv6 brackets; empty when the DSN names no host (a
+/// socket connection). No DNS: the name as written.
+fn dsn_host(dsn: &str) -> String {
+    let rest = dsn.split_once("://").map(|(_, r)| r).unwrap_or(dsn);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let hostport = authority.rsplit('@').next().unwrap_or(authority).trim();
+    if let Some(inner) = hostport.strip_prefix('[') {
+        return inner.split(']').next().unwrap_or_default().to_string();
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h.to_string(),
+        _ => hostport.to_string(),
+    }
+}
+
+/// Whether the DSN's host cannot leave the machine: a loopback address, `localhost` (any
+/// case, trailing dot allowed), or a local socket (no host, or a `socket=` parameter).
+/// Everything else is remote: since 0.3.0 the connection to it requires TLS unless
+/// `LAZYWF_TLS` says otherwise.
+fn is_loopback_dsn(dsn: &str) -> bool {
+    if dsn.split_once('?').is_some_and(|(_, q)| {
+        q.split('&')
+            .any(|p| p == "socket" || p.starts_with("socket="))
+    }) {
+        return true;
+    }
+    let host = dsn_host(dsn);
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    h.is_empty() || h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback())
 }
 
 /// `<PREFIX>_DSN`, or one assembled from `<PREFIX>_HOST`, `_PORT`, `_USER`, `_PASSWORD`,
 /// `_DATABASE` (values verbatim, no URL encoding needed), with `<PREFIX>_TLS` / `_TLS_CA`.
-fn connection(get: &impl Fn(&str) -> Option<String>, prefix: &str) -> Result<Option<String>> {
+/// Returns the DSN and whether an explicit `disabled` left a non-loopback host plaintext.
+fn connection(
+    get: &impl Fn(&str) -> Option<String>,
+    prefix: &str,
+) -> Result<(Option<String>, bool)> {
     let part = |k: &str| get(&format!("{prefix}_{k}")).filter(|v| !v.is_empty());
     let ca = part("TLS_CA");
-    let tls = tls_mode(get, prefix)?;
     let dsn = match part("DSN") {
         Some(dsn) => Some(dsn),
         None => assemble(&part, prefix)?,
     };
-    dsn.map(|d| {
-        let mut d = finish_dsn(&d, tls.as_deref(), prefix)?;
-        if let Some(ca) = &ca {
-            d.push(if d.contains('?') { '&' } else { '?' });
-            d.push_str("tls_ca=");
-            d.push_str(&encode(ca));
-        }
-        Ok(d)
-    })
-    .transpose()
+    let Some(dsn) = dsn else {
+        return Ok((None, false));
+    };
+    let (tls, plain_remote) = tls_for(get, prefix, &dsn)?;
+    let mut d = finish_dsn(&dsn, tls.as_deref(), prefix)?;
+    if let Some(ca) = &ca {
+        d.push(if d.contains('?') { '&' } else { '?' });
+        d.push_str("tls_ca=");
+        d.push_str(&encode(ca));
+    }
+    Ok((Some(d), plain_remote))
 }
 
 /// Accepts `mariadb://` as an alias and appends TLS parameters for `<PREFIX>_TLS`.
@@ -319,14 +423,16 @@ mod tests {
 
     #[test]
     fn connection_forms() {
+        // The loopback host keeps the assembly under test free of the TLS default (the
+        // TLS table lives in `config_tls_default_tests`).
         let c = cfg(&[
-            ("LAZYWF_HOST", "db"),
+            ("LAZYWF_HOST", "127.0.0.1"),
             ("LAZYWF_USER", "app"),
             ("LAZYWF_PASSWORD", "p@ss:w/rd"),
             ("LAZYWF_DATABASE", "shop"),
         ])
         .unwrap();
-        assert_eq!(c.dsn, "mysql://app:p%40ss%3Aw%2Frd@db:3306/shop");
+        assert_eq!(c.dsn, "mysql://app:p%40ss%3Aw%2Frd@127.0.0.1:3306/shop");
         assert_eq!(c.binlog_dsn, c.dsn);
         assert_eq!(c.query_dsn, c.dsn);
         assert!(!c.query_account);
@@ -366,21 +472,40 @@ mod tests {
 mod allow_tests {
     use super::*;
 
+    fn with_allowed(v: Option<&'static str>) -> Config {
+        Config::from_lookup(|k| match k {
+            "LAZYWF_DSN" => Some("mysql://u:p@db.test:3306/app".into()),
+            "LAZYWF_ALLOWED_HOSTS" => v.map(Into::into),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    /// Unset denies every host; `*` allows every host; a list is matched as written.
     #[test]
-    fn allowed_hosts_is_opt_in() {
-        let set = |v: &'static str| {
-            Config::from_lookup(|k| match k {
-                "LAZYWF_DSN" => Some("mysql://u:p@db.test:3306/app".into()),
-                "LAZYWF_ALLOWED_HOSTS" => Some(v.into()),
-                _ => None,
-            })
-        };
-        assert!(set("").unwrap().allowed_hosts.is_none());
-        assert!(set("  ").unwrap().allowed_hosts.is_none());
-        let cfg = set("api.test, *.cdn.test, 10.0.0.0/8:443").unwrap();
+    fn allowed_hosts_denies_until_it_is_set() {
+        for unset in [None, Some(""), Some("  ")] {
+            let cfg = with_allowed(unset);
+            let l = cfg.allowed_hosts.expect("always a list");
+            assert!(l.is_deny_all(), "{unset:?}");
+            assert!(!l.allows("api.test", 443));
+            assert!(!l.allows("127.0.0.1", 6379));
+        }
+        let cfg = with_allowed(Some("*"));
+        assert!(cfg.allowed_hosts.as_ref().unwrap().is_allow_all());
+        assert!(format!("{cfg:?}").contains("allowed_hosts: Some(1)"));
+        let cfg = with_allowed(Some("api.test, *.cdn.test, 10.0.0.0/8:443"));
         assert_eq!(cfg.allowed_hosts.as_ref().map(|l| l.len()), Some(3));
         assert!(format!("{cfg:?}").contains("allowed_hosts: Some(3)"));
-        let err = format!("{:#}", set("bad host name").unwrap_err());
+        let err = format!(
+            "{:#}",
+            Config::from_lookup(|k| match k {
+                "LAZYWF_DSN" => Some("mysql://u:p@db.test:3306/app".into()),
+                "LAZYWF_ALLOWED_HOSTS" => Some("bad host name".into()),
+                _ => None,
+            })
+            .unwrap_err()
+        );
         assert!(err.contains("LAZYWF_ALLOWED_HOSTS"), "{err}");
     }
 }
@@ -406,17 +531,19 @@ mod debug_tests {
 mod query_tests {
     use super::tests::cfg;
 
+    // The hosts are loopback: these tests are about which account a DSN carries, and a loopback
+    // source keeps the DSN free of the TLS parameters (`tls_default_tests` covers the TLS side).
     #[test]
     fn query_account_user_and_password_on_the_main_dsn() {
         let c = cfg(&[
-            ("LAZYWF_DSN", "mysql://app:pw@db:3306/shop"),
+            ("LAZYWF_DSN", "mysql://app:pw@127.0.0.1:3306/shop"),
             ("LAZYWF_QUERY_USER", "lwf_query"),
             ("LAZYWF_QUERY_PASSWORD", "q p"),
         ])
         .unwrap();
         assert!(c.query_account);
-        assert_eq!(c.query_dsn, "mysql://lwf_query:q%20p@db:3306/shop");
-        assert_eq!(c.dsn, "mysql://app:pw@db:3306/shop");
+        assert_eq!(c.query_dsn, "mysql://lwf_query:q%20p@127.0.0.1:3306/shop");
+        assert_eq!(c.dsn, "mysql://app:pw@127.0.0.1:3306/shop");
         assert_eq!(c.binlog_dsn, c.dsn);
         assert_eq!(c.schema, "shop");
     }
@@ -424,7 +551,7 @@ mod query_tests {
     #[test]
     fn query_account_user_without_password_keeps_the_host() {
         let c = cfg(&[
-            ("LAZYWF_HOST", "db2"),
+            ("LAZYWF_HOST", "127.0.0.2"),
             ("LAZYWF_PORT", "3307"),
             ("LAZYWF_USER", "app"),
             ("LAZYWF_PASSWORD", "pw"),
@@ -432,7 +559,7 @@ mod query_tests {
             ("LAZYWF_QUERY_USER", "lwf_query"),
         ])
         .unwrap();
-        assert_eq!(c.query_dsn, "mysql://lwf_query@db2:3307/shop");
+        assert_eq!(c.query_dsn, "mysql://lwf_query@127.0.0.2:3307/shop");
     }
 
     #[test]
@@ -484,3 +611,8 @@ mod query_tests {
 #[cfg(test)]
 #[path = "tests/config_secret_refusals_tests.rs"]
 mod secret_refusals_tests;
+
+/// The TLS that 0.3.0 requires by default, connection by connection.
+#[cfg(test)]
+#[path = "tests/config_tls_default_tests.rs"]
+mod tls_default_tests;

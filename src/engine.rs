@@ -683,11 +683,20 @@ pub async fn run(
     };
     info!(server = %info.version, schema = %cfg.schema, instance = %cfg.instance, query_account = %query_user, "lazywf {} starting", env!("CARGO_PKG_VERSION"));
     match &cfg.allowed_hosts {
+        Some(list) if list.is_deny_all() => warn!(
+            "LAZYWF_ALLOWED_HOSTS is not set: target egress is denied and every target will \
+             fail at load. List the hosts targets may reach, or set `LAZYWF_ALLOWED_HOSTS=*` \
+             to allow any host (the pre-0.3 behaviour, not recommended)"
+        ),
+        Some(list) if list.is_allow_all() => info!(
+            "LAZYWF_ALLOWED_HOSTS=*: target endpoints may use any host (the operator's \
+             explicit opt-out; a target row can then reach any address)"
+        ),
         Some(list) => info!(
             patterns = list.len(),
             "LAZYWF_ALLOWED_HOSTS is set: target endpoints must match it"
         ),
-        None => info!("LAZYWF_ALLOWED_HOSTS is not set: target endpoints may use any host"),
+        None => info!("no allow-list: target endpoints may use any host (tests only)"),
     }
     let (tx, rx) = mpsc::unbounded_channel();
     let mut e = Engine {

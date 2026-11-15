@@ -1,7 +1,9 @@
 use super::tests::cfg;
 use super::*;
 
-const DSN: (&str, &str) = ("LAZYWF_DSN", "mysql://app:secret@db:3306/shop");
+/// Loopback, so that these tests of *other* settings see the DSN without the TLS parameters a
+/// remote host gets by default (`config_tls_default_tests` is where the default is tested).
+const DSN: (&str, &str) = ("LAZYWF_DSN", "mysql://app:secret@127.0.0.1:3306/shop");
 
 #[test]
 fn tls_levels_are_translated_or_refused() {
@@ -22,14 +24,15 @@ fn tls_levels_are_translated_or_refused() {
         let c = cfg(&[DSN, ("LAZYWF_TLS", level)]).unwrap();
         assert_eq!(
             c.dsn,
-            format!("mysql://app:secret@db:3306/shop?{params}"),
+            format!("mysql://app:secret@127.0.0.1:3306/shop?{params}"),
             "{level}"
         );
     }
-    // A level that is off, and a value that is merely blank, both mean "no TLS".
-    for off in ["disabled", "OFF", "false", ""] {
+    // A level that is off means "no TLS"; a blank value is the variable being unset, which on
+    // this loopback host is no TLS too (a remote host gets `required`: tls_default_tests).
+    for off in ["disabled", "OFF", "false", "", "   disabled"] {
         let c = cfg(&[DSN, ("LAZYWF_TLS", off)]).unwrap();
-        assert_eq!(c.dsn, "mysql://app:secret@db:3306/shop", "{off}");
+        assert_eq!(c.dsn, "mysql://app:secret@127.0.0.1:3306/shop", "{off}");
     }
     // Parameters join whatever the DSN already carried.
     let c = cfg(&[
@@ -64,7 +67,7 @@ fn a_ca_file_implies_verify_full_and_is_encoded() {
     let c = cfg(&[DSN, ("LAZYWF_TLS_CA", ca.as_str())]).unwrap();
     assert!(
         c.dsn.starts_with(
-            "mysql://app:secret@db:3306/shop?require_ssl=true&verify_ca=true\
+            "mysql://app:secret@127.0.0.1:3306/shop?require_ssl=true&verify_ca=true\
                  &verify_identity=true&"
         ),
         "{}",
@@ -95,6 +98,7 @@ fn second_accounts_replace_only_the_credentials() {
     // `@` inside the database name must not be read as the end of the credentials.
     let c = cfg(&[
         ("LAZYWF_DSN", "mysql://h:3306/sh@op"),
+        ("LAZYWF_TLS", "disabled"), // loopback would be the param-free case; the host is a name here
         ("LAZYWF_BINLOG_USER", "repl"),
         ("LAZYWF_BINLOG_PASSWORD", "p@ss"),
         ("LAZYWF_QUERY_USER", "reader"),
@@ -109,8 +113,8 @@ fn second_accounts_replace_only_the_credentials() {
     assert_eq!(
         (c.binlog_dsn.as_str(), c.query_dsn.as_str()),
         (
-            "mysql://app:secret@db:3306/shop",
-            "mysql://app:secret@db:3306/shop"
+            "mysql://app:secret@127.0.0.1:3306/shop",
+            "mysql://app:secret@127.0.0.1:3306/shop"
         )
     );
     assert!(!c.query_account);
