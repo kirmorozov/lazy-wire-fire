@@ -49,6 +49,7 @@ cleanup
 docker run -d --name "$name" --network host \
   -e LAZYWF_DSN="mysql://root:root@127.0.0.1:34184/${schema}" \
   -e LAZYWF_HEALTH_ADDR="$health" -e LAZYWF_STATUS_MS=500 -e LWF_REDIS_PW=redispw \
+  -e LAZYWF_ALLOWED_HOSTS=127.0.0.1 \
   --health-interval 2s --health-start-period 30s \
   "$image" >/dev/null
 

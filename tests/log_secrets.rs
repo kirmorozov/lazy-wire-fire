@@ -233,6 +233,7 @@ async fn no_secret_in_the_logs_at_any_level() {
     std::env::set_var("LWF_LOGSECRETS_S3_SK", S3_SECRET);
     std::env::set_var("LWF_LOGSECRETS_REDIS_PW", REDIS_PW);
     std::env::set_var("LWF_LOGSECRETS_SQL_PW", SQL_PW);
+    std::env::set_var("LWF_LOGSECRETS_HEADER_KEY", HEADER_VALUE);
 
     // An S3 bucket on the test server, created as the e2e suite does.
     let bucket = format!("lwfls{}", std::process::id());
@@ -326,7 +327,7 @@ async fn no_secret_in_the_logs_at_any_level() {
         "http.header",
         &url,
         None,
-        &json!({"header": "X-Api-Key", "value": HEADER_VALUE}).to_string(),
+        &json!({"header": "X-Api-Key", "value": "env:LWF_LOGSECRETS_HEADER_KEY"}).to_string(),
     )
     .await;
     db.target(

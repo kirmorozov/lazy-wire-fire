@@ -112,6 +112,22 @@ mod tests {
     }
 }
 
+/// Whether two strings are equal, taken equally long for strings of equal length: every
+/// byte of both is examined, so neither a prefix nor a first-difference position leaks
+/// through the clock. For the `/status` token ([`crate::health`]); a secret is never
+/// compared with `==`.
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let n = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..n {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
 /// `s` for a message: a URL's userinfo (`scheme://user:password@host`) is masked as `***`.
 /// Endpoint strings are echoed in refusals, and a refused credential must not reach the log.
 pub fn redact_url(s: &str) -> String {
@@ -137,5 +153,28 @@ mod redact_tests {
         assert_eq!(redact_url("u:pw@h:3306/db"), "***@h:3306/db");
         assert_eq!(redact_url("http://h:1/a@b"), "http://h:1/a@b");
         assert_eq!(redact_url("host:3306/db"), "host:3306/db");
+    }
+}
+
+#[cfg(test)]
+mod ct_tests {
+    use super::ct_eq;
+
+    #[test]
+    fn equal_strings_match_and_others_do_not() {
+        assert!(ct_eq("", ""));
+        assert!(ct_eq("t0ken", "t0ken"));
+        assert!(!ct_eq("t0ken", "t0ke"));
+        assert!(!ct_eq("t0ke", "t0ken"));
+        assert!(!ct_eq("t0ken", "t0kem"));
+        assert!(!ct_eq("t0ken", ""));
+        assert!(!ct_eq("", "x"));
+        // NULs inside: the padding of the shorter side must not equal a real byte.
+        assert!(!ct_eq("ab\0", "ab"));
+        assert!(!ct_eq("ab", "ab\0"));
+        assert!(ct_eq(
+            "a longer token with spaces  ",
+            "a longer token with spaces  "
+        ));
     }
 }

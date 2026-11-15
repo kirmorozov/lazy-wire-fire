@@ -186,6 +186,10 @@ pub fn config(db: &Db, extra: &[(&str, &str)]) -> Config {
         ("LAZYWF_MAX_BACKOFF_MS".into(), "800".into()),
         ("LAZYWF_HEARTBEAT_MS".into(), "1000".into()),
         ("LAZYWF_STOP_GRACE_MS".into(), "3000".into()),
+        // The product default denies every target host; a suite that wants egress allows the
+        // hosts it uses here (an individual test may still override this, or leave the
+        // variable unset to see the deny-all refusal).
+        ("LAZYWF_ALLOWED_HOSTS".into(), "*".into()),
     ];
     for (k, v) in extra {
         vars.retain(|(a, _)| a != k);
@@ -219,7 +223,9 @@ impl Instance {
     pub fn start(cfg: Config) -> Instance {
         logs();
         let (tx, rx) = watch::channel(false);
-        let health = Arc::new(Health::default());
+        // The token comes from the config as it does in `main`, so a test that sets
+        // LAZYWF_STATUS_TOKEN gets a `/status` that asks for it.
+        let health = Arc::new(Health::new(cfg.status_token.clone()));
         let h = health.clone();
         let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
         let d = done.clone();

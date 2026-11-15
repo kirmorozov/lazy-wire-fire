@@ -107,19 +107,22 @@ fn each_kind_checks_its_effective_host() {
         (
             "mysql",
             "mysql://db.example.test:3306/app",
-            r#"{"username":"u","password":"p"}"#,
+            // The password arrives as a reference: a secret-bearing var never holds the secret.
+            r#"{"username":"u","password":"env:LWF_TEST_TARGET_PW"}"#,
             "db.example.test",
         ),
         (
             "pgsql",
             "postgres://pg.example.test:5432/app",
-            r#"{"username":"u","password":"p"}"#,
+            // The password arrives as a reference: a secret-bearing var never holds the secret.
+            r#"{"username":"u","password":"env:LWF_TEST_TARGET_PW"}"#,
             "pg.example.test",
         ),
         (
             "amqp",
             "amqp://mq.example.test:5672/",
-            r#"{"username":"u","password":"p"}"#,
+            // The password arrives as a reference: a secret-bearing var never holds the secret.
+            r#"{"username":"u","password":"env:LWF_TEST_TARGET_PW"}"#,
             "mq.example.test",
         ),
         (
@@ -254,6 +257,65 @@ fn the_port_of_an_endpoint_is_matched_too() {
         "*.example.test:6379"
     )
     .is_err());
+}
+
+/// The unset setting: nothing is allowed, and the refusal says what to do about it (the
+/// message is what an operator reads in `last_error`, so it names the variable and the opt-out).
+#[test]
+fn an_unset_setting_denies_every_host_and_names_the_setting() {
+    let load_denied = |kind: &str, endpoint: &str, vars: &str| {
+        let def = TargetDef::from_row(&RawTarget {
+            name: "t".into(),
+            kind: Some(kind.into()),
+            endpoints: Some(endpoint.into()),
+            vars: Some(vars.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+        Target::new(def, pool, Some(&HostList::deny_all()))
+    };
+    for (kind, endpoint, vars, host) in [
+        (
+            "http",
+            "https://api.example.test:8443/hook",
+            "{}",
+            "api.example.test",
+        ),
+        (
+            "redis",
+            "redis://cache.example.test:6380/0",
+            "{}",
+            "cache.example.test",
+        ),
+        (
+            "http.s3",
+            "",
+            r#"{"bucket":"orders","region":"eu-west-1"}"#,
+            "orders.s3.eu-west-1.amazonaws.com",
+        ),
+    ] {
+        let e = format!("{:#}", load_denied(kind, endpoint, vars).err().unwrap());
+        assert!(e.contains("LAZYWF_ALLOWED_HOSTS is not set"), "{kind}: {e}");
+        assert!(e.contains(host), "{kind}: {e}");
+        assert!(e.contains("`*`"), "{kind}: {e}");
+        assert!(e.contains("LAZYWF_ALLOWED_HOSTS"), "{kind}: {e}");
+    }
+}
+
+/// `*` is the opt out: every host loads with it, which is the behaviour an unset setting had
+/// before 0.3.0.
+#[test]
+fn a_star_loads_any_host() {
+    assert!(load("http", "https://anything.example.test:8443/hook", "{}", "*").is_ok());
+    assert!(load("redis", "redis://cache.example.test:6380/0", "{}", "*").is_ok());
+    assert!(load(
+        "http.s3",
+        "",
+        r#"{"bucket":"orders","region":"eu-west-1"}"#,
+        "*"
+    )
+    .is_ok());
 }
 
 /// Wildcards and CIDR ranges are matched on the effective host of each kind as well.

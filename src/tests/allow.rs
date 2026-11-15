@@ -35,8 +35,37 @@ fn wildcard_matches_subdomains_not_the_apex() {
 fn wildcard_needs_a_name_after_the_star() {
     assert!(HostList::parse("*.").is_err());
     assert!(HostList::parse("*.example.com:443:1").is_err());
-    assert!(HostList::parse("*").is_err());
     assert!(HostList::parse("a.*.com").is_err());
+}
+
+/// A bare `*` is the allow-all opt out (the pre-hardening behaviour); a `*` with a port is not a
+/// pattern anyone means, so it stays a parse error rather than a silent allow.
+#[test]
+fn a_bare_star_allows_every_host() {
+    let l = list("*");
+    assert!(l.is_allow_all());
+    assert!(!l.is_deny_all());
+    assert!(l.allows("anything.example", 443));
+    assert!(l.allows("10.0.0.9", 5672));
+    assert!(l.allows("", 1));
+    // The star is the whole list: with it, other entries cannot restrict anything.
+    let mixed = list("*.example.com, * , other.test");
+    assert!(mixed.is_allow_all());
+    assert!(mixed.allows("unlisted.example", 8080));
+    // A star with a port is refused: it reads as a typo, not as an opt out.
+    assert!(HostList::parse("*:443").is_err());
+    assert!(HostList::parse("a.test, *:443").is_err());
+}
+
+#[test]
+fn the_denied_list_allows_nothing() {
+    let l = HostList::deny_all();
+    assert!(l.is_deny_all());
+    assert!(!l.is_allow_all());
+    assert_eq!(l.len(), 0);
+    assert!(!l.allows("127.0.0.1", 80));
+    assert!(!l.allows("api.example.com", 443));
+    assert!(!l.allows("localhost", 6379));
 }
 
 #[test]

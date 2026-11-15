@@ -1,15 +1,25 @@
-//! `LAZYWF_ALLOWED_HOSTS`: the opt-in allow-list of endpoint hosts. Every target endpoint's
-//! effective host (after `?endpoint=` overrides and the derived AWS / Google service hosts) must
-//! match a pattern. Matching is on the name lazywf connects to; nothing is resolved in DNS.
+//! `LAZYWF_ALLOWED_HOSTS`: the allow-list of endpoint hosts. Every target endpoint's effective
+//! host (after `?endpoint=` overrides and the derived AWS / Google service hosts) must match a
+//! pattern. Matching is on the name lazywf connects to; nothing is resolved in DNS.
+//!
+//! Since 0.3.0 the setting is opt-out, not opt-in: unset means no host is allowed at all
+//! ([`HostList::deny_all`] — the engine refuses every target at load), and the operator opts out
+//! explicitly with `LAZYWF_ALLOWED_HOSTS=*` ([`HostList::allow_all`], the behaviour an unset
+//! setting had before). The configuration rows are SQL: an INSERT grant must not be able to turn
+//! a target into a channel to any address.
 
 use std::net::IpAddr;
 
 use anyhow::{anyhow, bail, Result};
 
-/// The patterns of a set allow-list (never empty: an empty setting is no list).
+/// The patterns of an allow-list, or its two special forms: refuse everything (the unset
+/// default) and allow everything (`*`, the pre-0.3 unset behaviour).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostList {
     patterns: Vec<Pattern>,
+    /// The setting was absent: every host is refused with a message that names it (the
+    /// engine builds such a list when `LAZYWF_ALLOWED_HOSTS` is unset).
+    deny_all: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,18 +38,61 @@ enum Host {
     Ip(IpAddr),
     /// An IP range: the address and its prefix length.
     Cidr(IpAddr, u8),
+    /// `*`: any host (the setting's whole value, the explicit opt-out of 0.3.0's refusal).
+    Any,
 }
 
 impl HostList {
-    /// Parses the setting. `None` when it is blank (no restriction).
+    /// Parses the setting. `None` when it is blank (the caller decides what unset means;
+    /// the engine denies all egress, see [`HostList::deny_all`]). The single pattern `*`
+    /// allows every host; a `*` among other patterns makes the list allow everything.
     pub fn parse(setting: &str) -> Result<Option<HostList>> {
-        let patterns = setting
+        let mut patterns = setting
             .split(',')
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(Pattern::parse)
             .collect::<Result<Vec<_>>>()?;
-        Ok((!patterns.is_empty()).then_some(HostList { patterns }))
+        if patterns.iter().any(|p| p.host == Host::Any) {
+            patterns = vec![Pattern {
+                host: Host::Any,
+                port: None,
+            }];
+        }
+        Ok((!patterns.is_empty()).then_some(HostList {
+            patterns,
+            deny_all: false,
+        }))
+    }
+
+    /// No setting: every host is refused, and the refusal names the setting (0.3.0's
+    /// default; the operator restores the old behaviour with `LAZYWF_ALLOWED_HOSTS=*`).
+    pub fn deny_all() -> HostList {
+        HostList {
+            patterns: Vec::new(),
+            deny_all: true,
+        }
+    }
+
+    /// The `*` setting: every host is allowed (what an unset setting meant before 0.3.0).
+    pub fn allow_all() -> HostList {
+        HostList {
+            patterns: vec![Pattern {
+                host: Host::Any,
+                port: None,
+            }],
+            deny_all: false,
+        }
+    }
+
+    /// Whether this is the unset default (every host refused).
+    pub fn is_deny_all(&self) -> bool {
+        self.deny_all
+    }
+
+    /// Whether this is the `*` opt-out (every host allowed).
+    pub fn is_allow_all(&self) -> bool {
+        self.patterns.iter().any(|p| p.host == Host::Any)
     }
 
     /// The number of patterns (the only thing the log shows).
@@ -61,8 +114,9 @@ impl HostList {
 }
 
 impl Pattern {
-    /// `name`, `*.name`, `ip`, `ip/len`, each optionally with `:port`; an IPv6 address with a
-    /// port is written in brackets: `[2001:db8::1]:443`, `[2001:db8::/32]:443`.
+    /// `name`, `*.name`, `ip`, `ip/len`, `*` (any host), each optionally with `:port`; an
+    /// IPv6 address with a port is written in brackets: `[2001:db8::1]:443`,
+    /// `[2001:db8::/32]:443`.
     fn parse(p: &str) -> Result<Pattern> {
         let (spec, port) = if let Some(rest) = p.strip_prefix('[') {
             let (inner, tail) = rest
@@ -84,6 +138,15 @@ impl Pattern {
                 None => (p, None),
             }
         };
+        if spec == "*" {
+            if port.is_some() {
+                bail!("allow-list pattern `{p}`: `*` is the whole list, it takes no port");
+            }
+            return Ok(Pattern {
+                host: Host::Any,
+                port: None,
+            });
+        }
         Ok(Pattern {
             host: Host::parse(spec, p)?,
             port,
@@ -95,6 +158,7 @@ impl Pattern {
             return false;
         }
         match &self.host {
+            Host::Any => true,
             Host::Name(n) => host == n,
             Host::Suffix(s) => host.len() > s.len() + 1 && host.ends_with(&format!(".{s}")),
             Host::Ip(a) => ip == Some(a.to_canonical()),

@@ -98,7 +98,8 @@ pub struct Target {
     /// The `aws-sns://` endpoint of an `sns` target and its batch byte limit.
     sns: Option<crate::targets::sns::Sns>,
     /// `LAZYWF_ALLOWED_HOSTS`, kept for the endpoints that are resolved per request: a rotated
-    /// secret file must not be able to move a target to a host the operator did not allow.
+    /// secret file must not be able to move a target to a host the operator did not allow. In
+    /// the engine always present: unset is the deny-all list.
     allowed: Option<HostList>,
     /// The source database, which evaluates `expect`.
     pool: Pool,
@@ -247,12 +248,19 @@ fn check_allowed(list: &HostList, endpoints: &[Endpoint]) -> Result<()> {
     Ok(())
 }
 
-/// One host against the allow-list, with the message every refusal of it uses (at load and on
-/// a request): the host and the setting, nothing else — a caller that resolves a secret URL
-/// must be able to say this without naming the URL.
 /// The operator's allow-list applied to one outbound host (also the token host of an oauth
-/// target, see [`crate::oauth`]).
+/// target, see [`crate::oauth`]). One host, with the message every refusal of it uses (at load
+/// and on a request): the host and the setting, nothing else — a caller that resolves a secret
+/// URL must be able to say this without naming the URL. An unset setting (the deny-all list)
+/// says so and names the opt-out, so a refused target tells the operator what to set.
 pub(crate) fn check_host(list: &HostList, host: &str, port: u16) -> Result<()> {
+    if list.is_deny_all() {
+        bail!(
+            "endpoint host `{host}` (port {port}): LAZYWF_ALLOWED_HOSTS is not set, so target \
+             egress is denied; list the host in LAZYWF_ALLOWED_HOSTS, or set it to `*` to \
+             allow any host"
+        );
+    }
     if !list.allows(host, port) {
         bail!("endpoint host `{host}` (port {port}) is not in LAZYWF_ALLOWED_HOSTS");
     }
@@ -292,8 +300,10 @@ fn secret_client(
 }
 
 impl Target {
-    /// Loads a target. With an allow-list (`LAZYWF_ALLOWED_HOSTS`), every endpoint's effective
-    /// host and port must match it, or the target is refused.
+    /// Loads a target. Every endpoint's effective host and port must match the allow-list
+    /// (`LAZYWF_ALLOWED_HOSTS`), or the target is refused: since 0.3.0 the list is never absent
+    /// in the engine (unset means deny all; see [`HostList::deny_all`]). `None` skips the check
+    /// and is for tests that carry no operator setting.
     pub fn new(def: TargetDef, pool: Pool, allowed: Option<&HostList>) -> Result<Arc<Target>> {
         let expect = Expect::new(def.expect.as_deref()).context("`expect`")?;
         let mut endpoints = Vec::new();

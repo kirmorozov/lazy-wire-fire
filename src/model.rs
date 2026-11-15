@@ -350,6 +350,38 @@ impl Kind {
             Kind::ServiceBus => &["key", "password"],
         }
     }
+
+    /// The `vars` fields whose value is the target's password, token or key: since 0.3.0 they
+    /// accept an `env:` / `file:` reference only, and a literal is refused at load
+    /// ([`TargetDef::from_row`]). The configuration rows are SQL: an INSERT grant must not be
+    /// able to plant a credential that sits readable in the table. `username`, `client_id` and
+    /// the header name are not secret and stay literals. The kinds' own `check` functions
+    /// enforce the same rule for most of these fields earlier, with their own wording; this
+    /// one table keeps the audit whole.
+    pub fn secret_ref_fields(self) -> &'static [&'static str] {
+        match self {
+            Kind::Http => &[],
+            Kind::HttpBasic => &["password"],
+            Kind::HttpBearer => &["token"],
+            Kind::HttpHeader => &["value"],
+            Kind::HttpS3
+            | Kind::Sqs
+            | Kind::Kinesis
+            | Kind::Lambda
+            | Kind::EventBridge
+            | Kind::Sns => &["access_key_ref", "secret_key_ref", "session_token_ref"],
+            Kind::PubSub => &["credentials_ref"],
+            Kind::Amqp
+            | Kind::Smtp
+            | Kind::Redis
+            | Kind::MySql
+            | Kind::PgSql
+            | Kind::Kafka
+            | Kind::RabbitMqStream => &["password"],
+            Kind::Grpc => &["token"],
+            Kind::ServiceBus => &["key", "password"],
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -533,6 +565,20 @@ impl TargetDef {
         crate::targets::servicebus::refuse_scheme(kind == Kind::ServiceBus, &endpoints)?;
         if endpoints.is_empty() && !matches!(kind, Kind::HttpS3) {
             bail!("`endpoints` is empty");
+        }
+        // 0.3.0: the password- and token-bearing `vars` fields hold the target's credential,
+        // and a credential is never a literal in a SQL row — only an `env:` / `file:`
+        // reference. The kind checks above catch most of these first, with the same refusal.
+        for k in kind.secret_ref_fields() {
+            if let Some(v) = crate::target::var(&vars, k) {
+                if !crate::secrets::is_reference(v) {
+                    bail!(
+                        "`vars.{k}` of kind {} must be a reference (`env:NAME` or `file:/path`), \
+                         never a literal: it is the target's credential",
+                        kind.name()
+                    );
+                }
+            }
         }
         let timeout = Duration::from_millis(match r.timeout_ms {
             Some(0) | None => 10_000,
@@ -1077,3 +1123,8 @@ mod target_debug_tests {
 #[cfg(test)]
 #[path = "tests/model_load_refusals_tests.rs"]
 mod load_refusals_tests;
+
+/// The credential fields of `vars` are references only (0.3.0).
+#[cfg(test)]
+#[path = "tests/model_secret_ref_tests.rs"]
+mod secret_ref_tests;
