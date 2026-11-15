@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 3e748b43da363c17eefb85742030d1069af06701
+commit f3f33c19c870ba0b14f8547cea9e977b1fd43472
 glob src/access.rs
 glob src/access/**
 glob src/analyze.rs
@@ -24,13 +24,13 @@ file src/access.rs 341d32d4dd32b6ff99aa5461f7dbbcf8fe7bc7271fb0b20621dc515431a07
 file src/access/tests.rs 1bb3b9537ff85db33482be0cc6712098e6b484894acd0d2c4e006914c65e5101
 file src/analyze.rs af89e35712f6ad62afdffe4e60e495a4f911356a8ecf0328fd8fe0105fa4c44d
 file src/analyze/build.rs 32774b7fa09d72ac6ce0d81e7e136e2296dad4f9b3499aa00e624c215c040bd3
-file src/analyze/columns.rs 0bf811bc5564018876452afd9c87104dd76ec0ce92d42fce904112a64c353a81
-file src/analyze/expr.rs 6304938985474fb244ee2551bf97420fb82afbe9304e7b072e91ad18733cb7d2
+file src/analyze/columns.rs 5e0b1b3451d7992dd1475a206eb724b3e3d674f835839b85119f7142a4da6760
+file src/analyze/expr.rs 814bc102842355dd2c965f51afe99bdecf753d409a02ff30ee7e122b6fb18f4e
 file src/analyze/parse.rs 400426634725d1bc054d75b305aa23a6ff0e3563d9c69fa777e1a4278bebfe43
 file src/analyze/plan.rs b595c9f2b78a2ceb8f5b3f529f2c92403aa64afea8b4d7c1ae19c1f3708580b6
 file src/analyze/routes.rs 0bfc8d354c2dfe4792c224b847268c21e18f5b95420286cdb467ba2ece338e9d
 file src/analyze/tests.rs 734958fcfdecd9373cd083270490d5c23d6bf391f4db1c9aa4149c5b75335b1f
-file src/analyze/vocab.rs 47bc86693496215fbd5b38c2e60020bfc6a7aaf343e312e7d6f86fb4c6b48f56
+file src/analyze/vocab.rs 8714013d8f22c3c8cc6f5c9f808ed2e28dc2e2dcafff46402e4409836695bb49
 file src/analyzer/ast.rs 2796d2ecb544678be94d159b39ea11b496f214d5cb5d5bfa591d3b62e74773fa
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
 file src/analyzer/internal.rs 9b226a82771b875808fbee30c7ef3738ffa90965316182db23781d18c0401bfd
@@ -77,7 +77,7 @@ file src/dedup/mod.rs c6ffe5b186b01cadefbab64a11ccdfd380d0619343cf9dbdc8a033f37d
 file src/dedup/stage.rs 6c977ad6a7ea962e8fb7681e93acba86a9fde03239cfc2ce8f0b08c8b4a9dd33
 file src/dedup/testkit.rs 213185e2506521a3f2094cf6500f2a76bca368dcc0764919dc6f586a02b7b35e
 file src/dialect/mod.rs efca63af92b39a0ce1ac75b7cb580ec62729e3346e90531d0f98f2558e057443
-file src/dialect/mysql.rs 76d1a962aebaf12503717ea46d163087080607539a7056731b606a3d35932904
+file src/dialect/mysql.rs 4bdcfede627fca6d7468690d63bbfc7bc92a2c0605a454c51e6ac40012fcfb9f
 file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f85
 file src/intset.rs 74132f56dd0e628df8be2f3b31430702f58a4cd4b90405aee5714037b9193bb1
 file src/pgoutput.rs 3ba4b836391ddf5dcc1d364e53aa633a9aa2d4ac8b6bc8e4b78371c600109ebd
