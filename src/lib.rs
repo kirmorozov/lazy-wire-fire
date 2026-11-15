@@ -16,6 +16,12 @@ pub mod catalog;
 pub mod config;
 pub mod datum;
 pub mod dedup;
+// The dialect seam is copied verbatim, and some of its answers serve callers that live in
+// lazyview only (the mv layer's row normalization, its MySQL target's session setup and source
+// reads): lazywf has no such call sites, so `pub(crate)` items here are never used here. They
+// stay, byte for byte, for the day a lazywf caller appears; the allow is what keeps the copy
+// unedited. (Same arrangement as the `#![allow(dead_code)]` copy-set files write for themselves.)
+#[allow(dead_code)]
 pub mod dialect;
 pub mod docs;
 pub mod engine;
