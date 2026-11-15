@@ -224,7 +224,7 @@ impl Instance {
         let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
         let d = done.clone();
         let task = tokio::spawn(async move {
-            let r = lazy_wire_fire::engine::run(cfg, h, rx).await;
+            let r = lazy_wire_fire::engine::run(cfg, h, None, rx).await;
             *d.lock().unwrap() = Some(r);
         });
         Instance {

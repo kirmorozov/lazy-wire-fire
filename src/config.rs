@@ -25,6 +25,9 @@ pub struct Config {
     pub server_id: u32,
     pub server_id_fixed: bool,
     pub health_addr: Option<SocketAddr>,
+    /// `LAZYWF_METRICS_ADDR`: when set, serve `GET /metrics` on this address. Opt-in: unset (the
+    /// default) keeps the whole surface off — no listener, no counters maintained.
+    pub metrics_addr: Option<SocketAddr>,
     pub heartbeat: Duration,
     pub visibility_delay: Duration,
     pub pool_size: usize,
@@ -51,6 +54,7 @@ impl std::fmt::Debug for Config {
             .field("server_id", &self.server_id)
             .field("server_id_fixed", &self.server_id_fixed)
             .field("health_addr", &self.health_addr)
+            .field("metrics_addr", &self.metrics_addr)
             .field("heartbeat", &self.heartbeat)
             .field("visibility_delay", &self.visibility_delay)
             .field("pool_size", &self.pool_size)
@@ -132,6 +136,15 @@ impl Config {
             ),
             None => Some(([127, 0, 0, 1], 8081).into()),
         };
+        // Opt-in, unlike the health address: unset stays off entirely (no listener, no counters).
+        let metrics_addr = match get("LAZYWF_METRICS_ADDR").map(|v| v.trim().to_string()) {
+            Some(v) if v.eq_ignore_ascii_case("off") || v.is_empty() => None,
+            Some(v) => Some(
+                v.parse()
+                    .with_context(|| format!("LAZYWF_METRICS_ADDR `{v}` is not host:port"))?,
+            ),
+            None => None,
+        };
         let instance = get("LAZYWF_INSTANCE")
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "default".into());
@@ -149,6 +162,7 @@ impl Config {
             server_id,
             server_id_fixed,
             health_addr,
+            metrics_addr,
             heartbeat: ms("LAZYWF_HEARTBEAT_MS", 5_000)?,
             visibility_delay: ms("LAZYWF_VISIBILITY_DELAY_MS", 20)?,
             pool_size: num("LAZYWF_POOL_SIZE", 16)?.max(2) as usize,
@@ -333,6 +347,7 @@ mod tests {
         assert_eq!(c.schema, "shop");
         assert_eq!(c.instance, "default");
         assert_eq!(c.health_addr, Some(([127, 0, 0, 1], 8081).into()));
+        assert_eq!(c.metrics_addr, None, "metrics are opt-in: unset stays off");
         let c = cfg(&[
             ("LAZYWF_DSN", "mariadb://a:b@h:3307/s"),
             ("LAZYWF_BINLOG_USER", "repl"),
@@ -359,6 +374,27 @@ mod tests {
         assert!(cfg(&[]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/")]).is_err());
         assert!(cfg(&[("LAZYWF_DSN", "mysql://h/s"), ("LAZYWF_SERVER_ID", "0")]).is_err());
+    }
+
+    /// `LAZYWF_METRICS_ADDR` is opt-in: unset or `off`/empty is off entirely; a bad host:port is a
+    /// refused start (the listener would otherwise bind the wrong place).
+    #[test]
+    fn metrics_addr_is_opt_in() {
+        let on = cfg(&[
+            ("LAZYWF_DSN", "mysql://h/s"),
+            ("LAZYWF_METRICS_ADDR", "127.0.0.1:8082"),
+        ])
+        .unwrap();
+        assert_eq!(on.metrics_addr, Some(([127, 0, 0, 1], 8082).into()));
+        for off in ["off", "OFF", ""] {
+            let c = cfg(&[("LAZYWF_DSN", "mysql://h/s"), ("LAZYWF_METRICS_ADDR", off)]).unwrap();
+            assert_eq!(c.metrics_addr, None, "`{off}` must be off");
+        }
+        assert!(cfg(&[
+            ("LAZYWF_DSN", "mysql://h/s"),
+            ("LAZYWF_METRICS_ADDR", "nope")
+        ])
+        .is_err());
     }
 }
 
