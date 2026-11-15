@@ -1,13 +1,25 @@
-//! The MySQL family's answers on the dialect seam: the identifier quoting and the function
-//! vocabularies, moved verbatim from `crate::analyze::vocab`, `crate::analyze::columns` and
-//! `crate::analyze::expr`. `std` and `sqlparser` only — no host code.
+//! The MySQL family's answers on the dialect seam: the identifier quoting, the function
+//! vocabularies, the parameter and coercion renderings, the session renderings (the statements a
+//! session is set up with and the `sql_mode` they carry), the parse profile (how a definition's
+//! text is tokenized and handed to the query parser, and how a rendered select item loses its
+//! alias), the source-read renderings (the `UNIX_TIMESTAMP` epoch `SELECT`, its read list and
+//! the epoch-to-datetime reading back) and the row-value normalizations, moved verbatim from
+//! `crate::analyze::vocab`, `crate::analyze::columns`, `crate::analyze::expr`,
+//! `crate::analyze::parse`, `crate::mv` and `crate::target::mysql`. `std`, `sqlparser`,
+//! `anyhow`, `mysql_async`'s `Value` and `serde_json` only, plus `crate::datum` (a copy-set
+//! file too, the owner of the TIME parameter form) — no host code.
 //!
 //! Copy set: lazy-wire-fire copies this file together with `src/dialect/mod.rs` (its parent,
-//! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers and
-//! the function name lists the copy-set forwarders in `crate::analyze::vocab` delegate to
-//! compile standalone.
+//! the [`Family`](super::Family) discriminator) verbatim, as a pair, so the quoting answers, the
+//! function name lists the copy-set forwarders in `crate::analyze::vocab` delegate to, and the row
+//! forms compile standalone.
 
+use anyhow::anyhow;
+use mysql_async::Value;
 use sqlparser::ast::Ident;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{TokenWithSpan, Tokenizer};
 
 /// The name a (raw-tokenized) identifier stands for: a doubled quote character inside a quoted
 /// identifier is one character of the name. The owner of both readings of a name, shared with
@@ -34,6 +46,164 @@ pub(crate) fn qident(id: &str) -> Ident {
 /// A backtick-quoted identifier: the name `` a`b `` renders as `` `a``b` ``.
 pub(crate) fn quote_ident(id: &str) -> String {
     format!("`{}`", id.replace('`', "``"))
+}
+
+// The parameter and coercion renderings: what a bound value is written as belongs to the family,
+// so a caller that renders a parameter or a character-set coercion asks these instead of writing
+// the shape itself (the write side's JSON unit keys and a source reader's parameter column are such
+// callers). `pub`, unlike the answers above with an in-crate caller only, because these two are
+// asked from outside this crate as well. The PostgreSQL forms (`$n`, a JSON text with no cast) come
+// with the PostgreSQL dialect.
+
+/// How a bound parameter is written: `?`. PostgreSQL numbers its parameters (`$1`, `$2`, …) instead.
+pub fn placeholder() -> &'static str {
+    "?"
+}
+
+/// How a JSON value is bound: the server needs the type, so it is `CAST(? AS JSON)`. A JSON text
+/// needs no cast on PostgreSQL, which is why the question belongs to the dialect.
+pub fn json_param() -> &'static str {
+    "CAST(? AS JSON)"
+}
+
+/// How a bound `?` is converted to the character set `cs`, cut to `n` characters when the column
+/// has a length: `CONVERT(? USING cs)`, inside `LEFT(…, n)` in that case. The VIRTUAL-column
+/// reader (`crate::analyze::columns`) asks this; PostgreSQL has no `CONVERT … USING` form.
+pub(crate) fn charset_coercion(cs: &str, n: Option<u64>) -> String {
+    match n {
+        Some(n) => format!("LEFT(CONVERT(? USING {cs}), {n})"),
+        None => format!("CONVERT(? USING {cs})"),
+    }
+}
+
+// The row-value normalizations, moved from the mv layer (`Layout::normalize`,
+// `Layout::normalize_source`, `json_canonical`): the form the values this family's servers send
+// are put into before a row is compared or written back. What a layout knows about its own columns
+// (their type names, which of them are the TIMESTAMP ones) is passed in, so these answer the
+// family's question only; `pub(crate)`, their caller is the mv layer's `Layout`.
+
+/// A row in the form that is compared and written back: BIT values as unsigned integers (bound as
+/// strings the server stores 0 for `b'11111111'`), TIME values in the form every server accepts as
+/// a parameter (see [`crate::datum::time_param`]), TIMESTAMP epochs as UTC datetimes through
+/// `to_utc` (the caller's `UNIX_TIMESTAMP` reading of them). `data_types` are the row's column type
+/// names in row order, `epoch` the positions of its TIMESTAMP columns.
+pub(crate) fn normalize_row<'a>(
+    data_types: impl Iterator<Item = &'a str>,
+    epoch: impl Iterator<Item = usize>,
+    row: &mut [Value],
+    mut to_utc: impl FnMut(Value) -> Value,
+) {
+    for (data_type, v) in data_types.zip(row.iter_mut()) {
+        match (data_type, &*v) {
+            ("bit", Value::Bytes(b)) => {
+                *v = Value::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64));
+            }
+            // TIME values MySQL >= 9.0 rejects as binary parameters go as text (both the
+            // rows read from the source and those read back from the table, so they
+            // still compare equal).
+            ("time", Value::Time(..)) => {
+                *v = crate::datum::time_param(std::mem::replace(v, Value::NULL));
+            }
+            _ => {}
+        }
+    }
+    for p in epoch {
+        if let Some(v) = row.get_mut(p) {
+            *v = to_utc(std::mem::replace(v, Value::NULL));
+        }
+    }
+}
+
+/// A row read with the family's source SELECT in the form of [`normalize_row`]: that SELECT carries
+/// one `UNIX_TIMESTAMP` column per TIMESTAMP column, in front, so when `read_epochs` says the read
+/// included them and the row is the length such a read gives (`n_cols` + `n_epoch`), the epochs take
+/// the TIMESTAMP positions they were read for.
+pub(crate) fn normalize_source_row(
+    epoch: impl Iterator<Item = usize>,
+    n_epoch: usize,
+    n_cols: usize,
+    read_epochs: bool,
+    mut row: Vec<Value>,
+) -> Vec<Value> {
+    if read_epochs && row.len() == n_cols + n_epoch {
+        let epochs: Vec<Value> = row.drain(..n_epoch).collect();
+        for (p, e) in epoch.zip(epochs) {
+            row[p] = e;
+        }
+    }
+    row
+}
+
+/// A JSON text in the form the server stores it, for comparisons. MySQL parses JSON text into
+/// its binary format: integers stay integers, every other number becomes a DOUBLE, object keys
+/// are sorted and the last of duplicate keys wins. So a DECIMAL inside a JSON value the view
+/// computes (`JSON_ARRAYAGG(amount)` gives `[10.00, 20.50]`) is stored as `[10.0, 20.5]`: no
+/// client can write it back as a DECIMAL. Two texts get the same result here when the server
+/// stores the same value for them (numbers parsed with correct rounding, like the server's
+/// parser); the result is JSON-equal to the input, so it also binds as a `CAST(? AS JSON)`
+/// unit key. Text that does not parse is kept as it is.
+pub fn json_canonical(text: &[u8]) -> Vec<u8> {
+    serde_json::from_slice::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| serde_json::to_vec(&v).ok())
+        .unwrap_or_else(|| text.to_vec())
+}
+
+// The session renderings, moved verbatim from `crate::target::mysql` (`init_session`'s two SQL
+// builders): what a family's session statements and its permissive `sql_mode` are written as
+// belongs to the family, and both are pure text — no connection, no IO — so the host module that
+// runs them over the wire asks these instead of owning them. The PostgreSQL forms come with the
+// PostgreSQL family's answers.
+
+/// The statements that give a connection the service's session settings with `sql_mode` (a mode
+/// [`permissive_sql_mode`] returned) and a table-lock wait of at most `lock_wait_s` seconds:
+/// `init_session` (`src/target/mysql.rs`) runs them on a direct connection, the supervisor's pools
+/// (`src/supervisor.rs`) on every new pooled connection.
+pub(crate) fn session_setup(sql_mode: &str, lock_wait_s: u64) -> [String; 3] {
+    [
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+        format!("SET SESSION sql_mode = '{}'", sql_mode.replace('\'', "")),
+        format!("SET SESSION lock_wait_timeout = {lock_wait_s}"),
+    ]
+}
+
+/// `mode` without the flags that reject values the source holds (strict mode, zero dates) and
+/// without the flags that change how SQL text is parsed (`ANSI_QUOTES`, `PIPES_AS_CONCAT`,
+/// `HIGH_NOT_PRECEDENCE`, `NO_BACKSLASH_ESCAPES`, `IGNORE_SPACE`): lazyview parses definitions
+/// and writes its SQL in the default mode, so under `ANSI_QUOTES` a `"paid"` the analyzer
+/// traced as a string would be a column for the server. The combination modes (`ANSI`,
+/// `TRADITIONAL`, `ORACLE`, ...) imply some of them and go too: the server lists their member
+/// flags individually, so nothing else is lost.
+pub(crate) fn permissive_sql_mode(mode: &str) -> String {
+    mode.split(',')
+        .map(str::trim)
+        .filter(|m| {
+            !m.is_empty()
+                && m.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && !matches!(
+                    m.to_ascii_uppercase().as_str(),
+                    "STRICT_TRANS_TABLES"
+                        | "STRICT_ALL_TABLES"
+                        | "NO_ZERO_DATE"
+                        | "NO_ZERO_IN_DATE"
+                        | "ANSI_QUOTES"
+                        | "PIPES_AS_CONCAT"
+                        | "HIGH_NOT_PRECEDENCE"
+                        | "NO_BACKSLASH_ESCAPES"
+                        | "IGNORE_SPACE"
+                        | "TRADITIONAL"
+                        | "ANSI"
+                        | "DB2"
+                        | "MAXDB"
+                        | "MSSQL"
+                        | "ORACLE"
+                        | "POSTGRESQL"
+                        | "MYSQL323"
+                        | "MYSQL40"
+                )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // The function vocabularies, moved verbatim from `crate::analyze` (`vocab.rs`, `columns.rs`,
@@ -318,3 +488,300 @@ pub(crate) const JSON_FIRST_ARG_FUNCTIONS: &[&str] = &["NULLIF"];
 /// The functions whose value is JSON when an argument after the first one is (`IF`, whose
 /// first argument is the condition).
 pub(crate) const JSON_TAIL_ARG_FUNCTIONS: &[&str] = &["IF"];
+
+// The parse profile, moved verbatim from `crate::analyze::parse::parse_definition`: how the
+// definition text is read belongs to the family. `crate::dialect` dispatches on it; the
+// PostgreSQL profile (sqlparser's `PostgreSqlDialect`, no MySQL comment expansion) arrives with
+// `pgsrc-parse-profile`.
+
+/// The MySQL-family parse profile, one instance shared by [`tokenize_view`] and [`new_parser`].
+static PROFILE: MySqlDialect = MySqlDialect {};
+
+/// Tokens of a definition with locations (no unescaping: literals keep their escapes). MySQL and
+/// MariaDB execute the content of `/*! ... */`, `/*!NNNNN ... */` and `/*M! ... */`: sqlparser
+/// expands the first two unconditionally (whatever the version gate says) and ignores the third,
+/// so what lazyview plans could differ from what the server runs. Refuse them anywhere in the
+/// text (also inside a string literal: no quote-aware scan that could disagree with the server's
+/// escape rules).
+pub(crate) fn tokenize_view(sql: &str) -> anyhow::Result<Vec<TokenWithSpan>> {
+    if sql.contains("/*!") || sql.to_ascii_uppercase().contains("/*M!") {
+        return Err(anyhow!(
+            "the definition contains an executable comment (`/*!` or `/*M!`): the server would run its content; write the SQL without it"
+        ));
+    }
+    Tokenizer::new(&PROFILE, sql)
+        .with_unescape(false)
+        .tokenize_with_location()
+        .map_err(|_| anyhow!("tokenize: the text does not tokenize"))
+}
+
+/// A query parser over tokens with locations on the MySQL-family profile: the
+/// `Parser::new(&MySqlDialect {})` of the definition parser, so the profile has one home.
+pub(crate) fn new_parser(tokens: Vec<TokenWithSpan>) -> Parser<'static> {
+    Parser::new(&PROFILE).with_tokens_with_locations(tokens)
+}
+
+/// The expression of a rendered select item: without its trailing `AS <alias>`, if any. The
+/// backtick/double-quote/bare-alias rule is the family's answer (moved verbatim from
+/// `crate::mv`); PostgreSQL's alias forms arrive with `pgsrc-parse-profile`.
+pub(crate) fn item_expr(item: &str) -> &str {
+    let Some((expr, alias)) = item.rsplit_once(" AS ") else {
+        return item;
+    };
+    let alias = alias.trim();
+    let quoted = |o: char, c: char| {
+        alias.len() >= 2
+            && alias.starts_with(o)
+            && alias.ends_with(c)
+            && !alias[1..alias.len() - 1]
+                .replace(&format!("{c}{c}"), "")
+                .contains(c)
+    };
+    let bare = !alias.is_empty()
+        && alias
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$');
+    if quoted('`', '`') || quoted('"', '"') || bare {
+        expr
+    } else {
+        item
+    }
+}
+
+// The source-read renderings: reading TIMESTAMP columns as epoch seconds is the MySQL family's
+// answer (`UNIX_TIMESTAMP()` yields the epoch in the session zone, which is what carries a DST
+// fold through the round trip). The caller (`crate::mv`'s `Layout`) hands these its rendered data
+// and keeps no rendering of its own; the PostgreSQL forms arrive beside these, not as a
+// server-name branch at the call site.
+
+/// The source `SELECT` for the plan's already-rendered `SELECT`: `UNIX_TIMESTAMP(<expr>)`
+/// as `_lv_ts{k}` of each epoch column in front of the select list. (Applied to the
+/// expressions themselves: over the column of a derived table MySQL converts through the
+/// session's local time and loses the DST fold.) Returns `sql` unchanged when there are no
+/// epoch columns or it does not start with `SELECT ` (checked by `probe`: the SELECT of an
+/// incremental plan starts like this).
+pub(crate) fn source_select(sql: &str, epoch: &[(usize, String)]) -> String {
+    if epoch.is_empty() {
+        return sql.to_string();
+    }
+    let Some(rest) = sql.strip_prefix("SELECT ") else {
+        return sql.to_string();
+    };
+    let extra: Vec<String> = epoch
+        .iter()
+        .enumerate()
+        .map(|(k, (_, e))| format!("UNIX_TIMESTAMP({e}) AS `_lv_ts{k}`"))
+        .collect();
+    format!("SELECT {}, {rest}", extra.join(", "))
+}
+
+/// Column list that reads a materialized table: every name backtick-quoted, except the
+/// column positions in `epoch` (the TIMESTAMP columns read through [`source_select`]), which
+/// come back as `UNIX_TIMESTAMP(name)`.
+pub(crate) fn read_list(names: &[String], epoch: &[usize]) -> String {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if epoch.contains(&i) {
+                format!("UNIX_TIMESTAMP({})", quote_ident(name))
+            } else {
+                quote_ident(name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The TIMESTAMP columns of a probed plan with the expressions that compute them: `ts` holds
+/// the positions of the TIMESTAMP columns in the materialized layout (the caller's own
+/// type test), `projection` and `unit_exprs` are the plan's rendered items split by
+/// `n_visible` and `hidden`. Empty unless the plan is incremental, its SELECT starts with
+/// `SELECT `, and every TIMESTAMP column has a known expression (all-or-nothing: a layout
+/// without epochs reads none through [`source_select`]).
+pub(crate) fn epoch_prefix(
+    incremental: bool,
+    select_sql: &str,
+    projection: &[String],
+    unit_exprs: &[String],
+    ts: &[usize],
+    n_visible: usize,
+    hidden: &[usize],
+) -> Vec<(usize, String)> {
+    if !incremental || !select_sql.starts_with("SELECT ") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &i in ts {
+        let expr = if i < n_visible {
+            projection.get(i).cloned()
+        } else {
+            hidden
+                .get(i - n_visible)
+                .and_then(|&u| unit_exprs.get(u).cloned())
+        };
+        match expr {
+            Some(e) => out.push((i, e)),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// A `UNIX_TIMESTAMP()` result (`<seconds>[.<fraction>]`) as the UTC datetime; 0 is the zero
+/// TIMESTAMP. Other values are returned unchanged.
+pub(crate) fn epoch_to_utc(v: Value) -> Value {
+    let (secs, micros) = match &v {
+        Value::Int(s) => (*s, 0),
+        Value::UInt(s) => match i64::try_from(*s) {
+            Ok(s) => (s, 0),
+            Err(_) => return v,
+        },
+        Value::Bytes(b) => match parse_epoch(b) {
+            Some(e) => e,
+            None => return v,
+        },
+        _ => return v,
+    };
+    if secs == 0 && micros == 0 {
+        return Value::Date(0, 0, 0, 0, 0, 0, 0);
+    }
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let t = secs.rem_euclid(86_400);
+    let Ok(y) = u16::try_from(y) else { return v };
+    Value::Date(
+        y,
+        m,
+        d,
+        (t / 3600) as u8,
+        (t % 3600 / 60) as u8,
+        (t % 60) as u8,
+        micros,
+    )
+}
+
+pub(crate) fn parse_epoch(b: &[u8]) -> Option<(i64, u32)> {
+    let s = std::str::from_utf8(b).ok()?;
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if !frac.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let frac = format!("{:0<6}", &frac[..frac.len().min(6)]);
+    Some((int.parse().ok()?, frac.parse().ok()?))
+}
+
+/// Proleptic Gregorian (year, month, day) of a day number counted from 1970-01-01.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The renderings a caller on the seam gets: pinned to the exact SQL the servers accept, so a
+    /// moved literal cannot quietly rewrite a statement.
+    #[test]
+    fn parameter_and_coercion_renderings() {
+        assert_eq!(placeholder(), "?");
+        assert_eq!(json_param(), "CAST(? AS JSON)");
+        assert_eq!(
+            charset_coercion("utf8mb4", None),
+            "CONVERT(? USING utf8mb4)"
+        );
+        assert_eq!(
+            charset_coercion("utf8mb4", Some(12)),
+            "LEFT(CONVERT(? USING utf8mb4), 12)"
+        );
+    }
+
+    /// The expression of a rendered select item: the trailing alias comes off only where it
+    /// really is one (moved verbatim with [`item_expr`] from `crate::mv`).
+    #[test]
+    fn select_item_expressions() {
+        assert_eq!(item_expr("MAX(ts) AS mx"), "MAX(ts)");
+        assert_eq!(item_expr("MAX(`e`.`ts`) AS `m x`"), "MAX(`e`.`ts`)");
+        assert_eq!(item_expr("x AS `a``b`"), "x");
+        assert_eq!(item_expr("x AS \"q\""), "x");
+        assert_eq!(item_expr("CAST(x AS SIGNED)"), "CAST(x AS SIGNED)");
+        assert_eq!(item_expr("'a AS b'"), "'a AS b'");
+        assert_eq!(item_expr("`ev`.`ts`"), "`ev`.`ts`");
+        assert_eq!(item_expr("x AS `a` + 1"), "x AS `a` + 1");
+    }
+
+    /// JSON texts compare as the server stores them: a DECIMAL's scale and the formatting are
+    /// lost, integers and doubles stay apart.
+    #[test]
+    fn json_texts_compare_as_stored() {
+        let c = |s: &str| String::from_utf8(json_canonical(s.as_bytes())).unwrap();
+        // The text a view computes vs. what the MV table returns for it (measured, MySQL 8.4).
+        for (computed, stored) in [
+            ("[10.00, 20.50]", "[10.0, 20.5]"),
+            (r#"{"amt": 1.50}"#, r#"{"amt": 1.5}"#),
+            ("100.000", "100.0"),
+            ("0.000000150", "0.00000015"),
+            ("12345678901234567890.1234567890", "1.2345678901234567e19"),
+            ("18446744073709551616", "1.8446744073709552e19"),
+            (
+                r#"{"b":1,"a":2,"aa":3,"a":4}"#,
+                r#"{"a": 4, "b": 1, "aa": 3}"#,
+            ),
+            ("[0.30000000000000004, 1e20]", "[0.30000000000000004, 1e20]"),
+        ] {
+            assert_eq!(c(computed), c(stored), "{computed} vs {stored}");
+            assert_eq!(c(&c(stored)), c(stored), "canonical text is stable");
+        }
+        // Integers and doubles are different values in the server's format (`1` vs `1.0`).
+        assert_ne!(c("[1]"), c("[1.0]"));
+        assert_ne!(c(r#"{"a": 10}"#), c(r#"{"a": 10.0}"#));
+        assert_eq!(
+            c("[18446744073709551615, -9223372036854775808]"),
+            "[18446744073709551615,-9223372036854775808]"
+        );
+        assert_ne!(c("[10.00]"), c("[10.01]"));
+        assert_ne!(c(r#"["10.00"]"#), c(r#"["10.0"]"#), "strings stay exact");
+        assert_eq!(c("not json"), "not json");
+    }
+
+    /// The three statements a session gets and the SQL modes the service drops when it reads a
+    /// source (moved verbatim with the items they test from `crate::target::mysql`).
+    #[test]
+    fn session_setup_statements() {
+        assert_eq!(
+            session_setup("ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION", 60),
+            [
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'".to_string(),
+                "SET SESSION lock_wait_timeout = 60".to_string(),
+            ]
+        );
+        // A quote cannot end the string literal early.
+        assert_eq!(session_setup("A'B", 2)[1], "SET SESSION sql_mode = 'AB'");
+        assert_eq!(session_setup("", 2)[2], "SET SESSION lock_wait_timeout = 2");
+        assert_eq!(
+            permissive_sql_mode(
+                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+            ),
+            "ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+        );
+        // Parser flags and the combination modes implying them go too (the server lists the
+        // members of a combination mode individually, so `ANSI` keeps `REAL_AS_FLOAT`).
+        assert_eq!(permissive_sql_mode("TRADITIONAL,ANSI_QUOTES"), "");
+        assert_eq!(
+            permissive_sql_mode(
+                "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI,\
+                 NO_BACKSLASH_ESCAPES,HIGH_NOT_PRECEDENCE,NO_ENGINE_SUBSTITUTION"
+            ),
+            "REAL_AS_FLOAT,ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION"
+        );
+    }
+}

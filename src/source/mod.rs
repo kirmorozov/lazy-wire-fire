@@ -1,6 +1,7 @@
 //! The flavor-neutral side of a replication source: where it is (`Position`), what it is
-//! (`Flavor`, `ServerInfo`), what its stream yielded (`Item`, `RowsKind`) and what an error from
-//! it means (`MissingBinlog`, `is_missing_binlog`, `is_access_denied`, `is_duplicate_server_id`).
+//! (`Flavor`, `SourceCaps`, `ServerInfo`), what its stream yielded (`Item`, `RowsKind`) and what
+//! an error from it means (`MissingBinlog`, `is_missing_binlog`, `is_access_denied`,
+//! `is_duplicate_server_id`).
 //!
 //! These types name the source, not the wire protocol, so they live here rather than in
 //! [`crate::binlog`]: the reader, the engine and the catalog all speak them, and only `binlog`
@@ -9,9 +10,18 @@
 //! Copy set: `std` + `anyhow` + `mysql_async` only, no `crate::` beyond the copy set, no
 //! environment variables (a knob is a parameter the caller passes), no logging.
 
+/// The MySQL-family side (MySQL and Percona run the same server): preflight, the status
+/// statement spelling, GTID text, transaction payloads, the QUERY/XA classifications and the
+/// TIME(1)/(2) decode twin. MariaDB reaches what it shares through it, never by copy, and
+/// Percona reaches all of it through `percona.rs`.
+pub mod mysql;
+
 use std::cmp::Ordering;
 
-use mysql_async::binlog::events::Event;
+use mysql_async::binlog::events::{BinlogEventHeader, Event};
+
+pub(crate) mod maria;
+pub(crate) mod percona;
 
 /// A binlog coordinate. `pos` is the offset of the next event to read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,16 +63,106 @@ impl std::fmt::Display for Position {
 pub enum Flavor {
     MySql,
     MariaDb,
+    /// Percona Server: the MySQL server's code, so every answer here is MySQL's and
+    /// `percona.rs` only forwards to [`mysql`]. It is its own flavor so that the product name and
+    /// whatever Percona starts doing differently have a file of their own (D1 row 1).
+    Percona,
 }
 
 impl Flavor {
-    /// Flavor from a `VERSION()` string (`10.11.14-MariaDB-log` → MariaDB; Percona is MySQL).
+    /// Flavor from a `VERSION()` string (`10.11.14-MariaDB-log` → MariaDB). Percona's
+    /// `VERSION()` is indistinguishable from MySQL's, so it takes [`from_version_comment`].
+    ///
+    /// [`from_version_comment`]: Flavor::from_version_comment
     pub fn from_version(version: &str) -> Flavor {
         if version.to_ascii_lowercase().contains("mariadb") {
             Flavor::MariaDb
         } else {
             Flavor::MySql
         }
+    }
+
+    /// Flavor from `VERSION()` plus `@@GLOBAL.version_comment`: the same answer as
+    /// [`from_version`], except that a MySQL-looking server whose comment names Percona
+    /// (`Percona Server (GPL), Release …`) is [`Flavor::Percona`] — read by that flavor itself
+    /// (`percona::is_this`). A caller that has no comment passes `""`.
+    ///
+    /// [`from_version`]: Flavor::from_version
+    pub fn from_version_comment(version: &str, version_comment: &str) -> Flavor {
+        let flavor = Self::from_version(version);
+        if flavor == Flavor::MySql && percona::is_this(version_comment) {
+            Flavor::Percona
+        } else {
+            flavor
+        }
+    }
+
+    /// Whether this flavor runs the MySQL server's code, so the MySQL-family answers in
+    /// [`mysql`] (and `crate::fence`, which only it calls) are its answers too.
+    pub fn is_mysql_family(self) -> bool {
+        matches!(self, Flavor::MySql | Flavor::Percona)
+    }
+
+    /// The capabilities of this flavor, detected once at connect: callers read a flag here
+    /// instead of matching on the flavor or threading a `mariadb` bool through the call chain.
+    pub fn detect(self) -> SourceCaps {
+        SourceCaps {
+            fresh_snapshot: self == Flavor::MariaDb,
+            json_cast: self.is_mysql_family(),
+            sql_generation_expressions: self == Flavor::MariaDb,
+        }
+    }
+}
+
+/// What this source can do, chosen from its [`Flavor`] once at connect. A `Copy` value the
+/// engine holds beside the flavor, so no per-call flavor compare reaches the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceCaps {
+    /// Source reads must be prepared for this execution instead of reused from the
+    /// prepared-statement cache: MariaDB's cache keeps answering from the old plan after a DDL.
+    pub fresh_snapshot: bool,
+    /// The server accepts `CAST(? AS JSON)` as a parameter cast (MariaDB has no JSON cast type).
+    pub json_cast: bool,
+    /// `GENERATION_EXPRESSION` comes back as plain SQL (MariaDB) rather than string-escaped
+    /// the way MySQL / Percona print it.
+    pub sql_generation_expressions: bool,
+}
+
+impl From<bool> for SourceCaps {
+    /// The legacy `mariadb: bool` spelling (`true`: MariaDB), kept so callers built before
+    /// [`SourceCaps`] still compile; new callers pass the caps chosen at connect.
+    fn from(mariadb: bool) -> SourceCaps {
+        (if mariadb {
+            Flavor::MariaDb
+        } else {
+            Flavor::MySql
+        })
+        .detect()
+    }
+}
+
+/// What one event whose header carries `log_pos = 0` does to the tracked file offset: the
+/// value [`crate::binlog::stream`]'s `Tracker::advance` gets from [`position_rule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The event is not part of the file layout: the position does not move.
+    Keep,
+    /// The event is contiguous in the file: add `size` to the position; `exact` = false means
+    /// the offset stops being trustworthy as a resume point inside a transaction from here on
+    /// (an event with a real `log_pos` trusts it again).
+    Advance { size: u64, exact: bool },
+}
+
+/// The one place the per-flavor `log_pos = 0` position rule lives: `Tracker::advance` calls
+/// this for such an event, after excluding the FORMAT_DESCRIPTION re-send and ROTATE (whose
+/// zero `log_pos` never means "inside a transaction"). The MySQL family's arm is trivial — its
+/// `log_pos = 0` events are the decompressed inner events of a `TRANSACTION_PAYLOAD`, which
+/// `advance` consumes before the hook. MariaDB's rule lives in
+/// [`maria::position_rule`](maria::position_rule).
+pub(crate) fn position_rule(flavor: Flavor, header: BinlogEventHeader) -> Step {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => Step::Keep,
+        Flavor::MariaDb => maria::position_rule(header),
     }
 }
 
