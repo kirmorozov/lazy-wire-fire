@@ -52,7 +52,7 @@ fn a_purged_binlog_and_a_rival_reader_are_told_apart() {
         assert!(binlog_unusable(&e), "{wording} must mean the file is gone");
     }
     // The reader's own error for the same case.
-    let e = anyhow::Error::new(binlog::MissingBinlog {
+    let e = anyhow::Error::new(source::MissingBinlog {
         from: position(4),
         message: "gone".into(),
     });

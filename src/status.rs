@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Row};
 
-use crate::binlog::Position;
+use crate::source::Position;
 
 /// The instance's own row: where the stream resumes, and the server it belongs to.
 pub const INSTANCE_ROW: &str = "*";
