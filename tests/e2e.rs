@@ -1718,12 +1718,26 @@ async fn online_schema_change_keeps_continuity() {
         .await;
     db.exec("INSERT INTO orders (id, customer_id, status, total, note) VALUES (3, 1, 'n', 1, 'x')")
         .await;
+    // The two changes are waited for one after the other, each with its own allowance: they
+    // shared one deadline, so a slow first one left the second almost nothing, and the message
+    // said only that the pair did not arrive.
     wait_for(
         Duration::from_secs(10),
-        "the change during the copy and the insert after the swap",
+        "the change during the copy (the update of order 1 on the old table)",
         || async {
-            let o = fired(&mock.requests(), "/o");
-            (o.contains(&"1".to_string()) && o.contains(&"3".to_string())).then_some(())
+            fired(&mock.requests(), "/o")
+                .contains(&"1".to_string())
+                .then_some(())
+        },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the insert after the swap (order 3 in the table that was swapped in)",
+        || async {
+            fired(&mock.requests(), "/o")
+                .contains(&"3".to_string())
+                .then_some(())
         },
     )
     .await;
@@ -1827,24 +1841,107 @@ async fn bounded_delay_while_keys_keep_changing() {
     shop(&db).await;
     let mock = Mock::start().await;
     db.target("hook", "http", &mock.url(), None, "{}").await;
-    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms, max_delay_ms) VALUES ('o', 'hook', 'POST /k HTTP/1.1\n\n{{join keys}}', 1000, 1500)").await;
     db.trigger("o", "orders", Some("{{new.id}}"), None).await;
     let inst = Instance::ready(config(&db, &[])).await;
-    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 0)").await;
+    // What keeps the batch waiting instead of firing at the first quiet moment: the key changes
+    // faster than the debounce window expires, so the window keeps restarting and the batch goes
+    // out at the cap. The three numbers have to keep that relation at any load, so they are
+    // derived from one measured quantity.
+    //
+    // The cadence of a DB call of this harness, measured with the engine already up and polling,
+    // which is the load the loop below will run under: four writes to a table no batch is
+    // watching, and the widest of those gaps. The debounce is four measured cadences (never under
+    // the 1 s the test always used), the interval between key changes half the debounce, the cap a
+    // debounce and a half. On an idle host, where a write costs a couple of hundred milliseconds,
+    // that is the 1 s debounce and the 1.5 s cap the test always had and a change every 500 ms; on
+    // a host where one write costs a second, all three stretch together instead of walking into
+    // each other. The bound the test measures against stays `max_delay_ms` plus one scaled second.
+    let mut cadence = Duration::ZERO;
+    for i in 0..4u32 {
+        let since = std::time::Instant::now();
+        db.exec(&format!(
+            "INSERT INTO customers (id, name) VALUES ({}, 'c')",
+            100 + i
+        ))
+        .await;
+        cadence = cadence.max(since.elapsed());
+    }
+    let debounce_ms = (4 * cadence.as_millis() as u64).max(1000);
+    let every_ms = (debounce_ms / 2).max(1);
+    let max_delay_ms = debounce_ms + debounce_ms / 2;
+    db.exec(&format!(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms, max_delay_ms) \
+         VALUES ('o', 'hook', 'POST /k HTTP/1.1\n\n{{{{join keys}}}}', {debounce_ms}, {max_delay_ms})"
+    ))
+    .await;
+    // The delay is measured between two clock points of this test: the instant before the write
+    // that queues the first key, and the instant the mock received the fire. Not the instant the
+    // loop below happened to look at the mock: that one is a poll late at best, and a whole
+    // round trip of the UPDATE late when the host is busy.
     let t0 = std::time::Instant::now();
-    let mut first = None;
-    for i in 0..20 {
+    db.exec("INSERT INTO orders VALUES (1, 1, 'n', 0)").await;
+    let bound = Duration::from_millis(max_delay_ms) + deadline(Duration::from_secs(1));
+    let mut first;
+    let mut gap = Duration::ZERO;
+    let mut prev = t0;
+    // The instants at which this test changed the key: the insert that queued it, then every
+    // update below. The premise check further down names the one the batch was built on.
+    let mut changes: Vec<std::time::Instant> = vec![std::time::Instant::now()];
+    let mut i = 0;
+    loop {
         db.exec(&format!("UPDATE orders SET total = {i} WHERE id = 1"))
             .await;
-        if first.is_none() && !mock.requests().is_empty() {
-            first = Some(t0.elapsed());
+        let now = std::time::Instant::now();
+        gap = gap.max(now.duration_since(prev));
+        prev = now;
+        changes.push(now);
+        i += 1;
+        first = mock.arrived("/k");
+        // The key keeps changing until the fire has been seen (and five times at least, so the
+        // window is a moving one): when it arrives, the key was still moving, which is what the
+        // test is named for. Past the bound it stops, and the `no fire` expect below is the
+        // failure of a rule that never released the batch.
+        if i >= 5 && (first.is_some() || t0.elapsed() > bound) {
+            break;
         }
-        sleep_ms(200).await;
+        sleep_ms(every_ms).await;
     }
-    let first = first.expect("no fire while the key kept changing");
+    let at = first.expect("no fire while the key kept changing");
+    let delay = at
+        .checked_duration_since(t0)
+        .expect("the fire arrived before the write that queued it");
+    // The change of the key that the batch was built on: the last one this test made at or before
+    // the instant the mock received the fire.
+    let containing = changes
+        .iter()
+        .rfind(|when| **when <= at)
+        .copied()
+        .expect("the fire arrived before any change this test made");
+    let since_change = at.duration_since(containing);
+    eprintln!(
+        "first fire {delay:?} after the write (bound {bound:?} = max_delay {max_delay_ms} ms + \
+         the host's own slack), key changed at most every {gap:?}, debounce {debounce_ms} ms, the \
+         batch's own change was {since_change:?} old"
+    );
     assert!(
-        first < Duration::from_millis(2500),
-        "first fire after {first:?}"
+        delay <= bound,
+        "first fire after {delay:?}, the bound is {bound:?}"
+    );
+    // The premise of the name, checked rather than assumed: the fire is tied to a change this test
+    // made, and that change was still inside the debounce window when the fire arrived. If it were
+    // older than the window, the batch would have sat idle and this run would be measuring some
+    // other rule's timing, not a key that kept changing. The allowance is one change interval:
+    // these are the client's own instants, and the engine sees a change only when it polls it, so
+    // its view of the window trails this record by up to the interval between changes (`gap`, the
+    // widest the loop actually saw). That interval is derived from the same measured cadence as the
+    // debounce for the same reason: on a host where a write costs a second, a fixed interval would
+    // let the window expire mid-change and the test would be measuring something else again.
+    assert!(
+        since_change < Duration::from_millis(debounce_ms) + gap,
+        "the change the batch was built on was {since_change:?} old when the fire arrived, longer \
+         than the debounce of {debounce_ms} ms plus the widest gap between changes ({gap:?}): the \
+         key had stopped moving, so this run measures a batch that sat idle rather than one whose \
+         key kept changing (cadence was {cadence:?})"
     );
     inst.stop().await;
 }

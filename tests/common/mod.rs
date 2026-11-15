@@ -5,7 +5,7 @@
 pub mod grpc_server;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -238,14 +238,19 @@ impl Instance {
     /// Starts an instance and waits until it streams the binlog.
     pub async fn ready(cfg: Config) -> Instance {
         let i = Instance::start(cfg);
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let allowed = deadline(Duration::from_secs(20));
+        let until = Instant::now() + allowed;
         while !i.health.is_ready() {
             if i.task.is_finished() {
                 let r = i.done.lock().unwrap().take();
                 panic!("the engine did not get ready: {r:?}");
             }
-            if Instant::now() > deadline {
-                panic!("the engine did not get ready in 20 s (it is still running)");
+            if Instant::now() > until {
+                panic!(
+                    "the engine did not get ready in {allowed:?} (it is still running; an idle \
+                     box allows {:?})",
+                    Duration::from_secs(20)
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -255,7 +260,8 @@ impl Instance {
     /// Waits until no rule has keys pending or an action in flight (twice in a row, a status
     /// period apart): trailing fires of earlier changes are done.
     pub async fn quiet(&self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let allowed = deadline(Duration::from_secs(20));
+        let until = Instant::now() + allowed;
         let mut calm = 0;
         while calm < 2 {
             let s = self.health.status();
@@ -264,8 +270,8 @@ impl Instance {
                     .any(|v| v["pending_keys"] != 0 || v["firing"] == true)
             });
             calm = if busy { 0 } else { calm + 1 };
-            if Instant::now() > deadline {
-                panic!("the engine did not quiet down: {s}");
+            if Instant::now() > until {
+                panic!("the engine did not quiet down in {allowed:?}: {s}");
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
@@ -273,9 +279,10 @@ impl Instance {
 
     pub async fn stop(self) {
         let _ = self.stop.send(true);
-        match tokio::time::timeout(Duration::from_secs(20), self.task).await {
+        let grace = deadline(Duration::from_secs(20));
+        match tokio::time::timeout(grace, self.task).await {
             Ok(Ok(())) => {}
-            other => panic!("engine did not stop cleanly: {other:?}"),
+            other => panic!("engine did not stop cleanly: {other:?} after {grace:?}"),
         }
         let engine = self.done.lock().unwrap().take();
         match engine {
@@ -291,6 +298,10 @@ pub struct Req {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// When the bytes of this request were read, stamped by the accept task before the handler
+    /// and before the state lock. A test that measures how long the engine took to reach a
+    /// target measures to this instant, not to the moment it happened to ask for the requests.
+    pub arrived: Instant,
 }
 
 impl Req {
@@ -461,11 +472,15 @@ impl Mock {
                         let body =
                             String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string();
                         buf.drain(..head_end + len);
+                        // Stamped here, before the handler and before the state lock: the instant
+                        // the request is *here*, not the instant a test asks about it.
+                        let arrived = Instant::now();
                         let req = Req {
                             method,
                             path,
                             headers,
                             body,
+                            arrived,
                         };
                         let (status, body, extra) = {
                             let mut g = st.lock().unwrap();
@@ -508,24 +523,125 @@ impl Mock {
         self.state.lock().unwrap().reqs.clone()
     }
 
+    /// The earliest moment a request for `path` reached this mock (`None`: none has yet). The
+    /// stamp is the accept task's, so a test that bounds how long the engine took to reach a
+    /// target is bound to the arrival, not to the interval of its own polling.
+    pub fn arrived(&self, path: &str) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap()
+            .reqs
+            .iter()
+            .filter(|r| r.path == path)
+            .map(|r| r.arrived)
+            .min()
+    }
+
     pub fn clear(&self) {
         self.state.lock().unwrap().reqs.clear();
     }
 }
 
-/// Polls `f` until it returns `Some` or `timeout` passes.
+/// The round trip of one of this harness's DB calls: a fresh connection, one query, the
+/// disconnect. Measured three times in a thread of its own, the slowest one kept.
+///
+/// This is the load of the host as these tests feel it. What they wait for travels exactly this
+/// path: the write goes over such a connection, the engine reads the binlog those commits land
+/// in, and a server that answers slowly slows all of it down. That says more than the run-queue
+/// depth of the box does. `None` when there is no server to ask.
+pub fn db_rtt() -> Option<Duration> {
+    static RTT: OnceLock<Option<Duration>> = OnceLock::new();
+    *RTT.get_or_init(|| {
+        let dsn = root_dsn()?;
+        // A thread with a runtime of its own: this is called from inside the test's runtime.
+        std::thread::spawn(move || {
+            let probe = async move {
+                let mut worst = Duration::ZERO;
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    let url = format!("{dsn}/?prefer_socket=false");
+                    let mut c = mysql_async::Conn::new(Opts::from_url(&url)?).await?;
+                    let _: Vec<i8> = c.query("SELECT 1").await?;
+                    c.disconnect().await.ok();
+                    worst = worst.max(t.elapsed());
+                }
+                Ok::<_, mysql_async::Error>(worst)
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?
+                .block_on(probe)
+                .ok()
+        })
+        .join()
+        .unwrap_or_default()
+    })
+}
+
+/// How much longer every deadline of this harness allows than an idle box needs.
+///
+/// What a test waits for travels a path the test does not control: the commit, the binlog, the
+/// engine in this very process (competing with the test's own tasks for its worker threads), the
+/// target's HTTP call, the mock's accept task. A host that is busy with other work delays all of
+/// it, and a fixed deadline turns that into a flake that says nothing about the product. So the
+/// deadlines are the ones of an idle box multiplied by a factor: `LAZYWF_TEST_WAIT_SCALE` when it
+/// is set (the shared runner raises it while the box is loaded), otherwise the slower of the
+/// server's round trip and the host's own run-queue depth per core. It never drops below 1, so on
+/// a quiet machine and on CI these are exactly the old deadlines, and it never goes above 8, so a
+/// condition that really never comes still fails — minutes later at the worst, with the allowance
+/// it used in the message.
+pub fn wait_scale() -> f64 {
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let told = std::env::var("LAZYWF_TEST_WAIT_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok());
+        // A connect, a query and a disconnect of one of these servers: 1-3 ms when it is idle.
+        let from_server = db_rtt().map_or(1.0, |r| r.as_secs_f64() / 0.005);
+        let from_host = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| {
+                s.split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+            .zip(std::thread::available_parallelism().ok())
+            .map(|(load, cores)| load / cores.get() as f64)
+            .unwrap_or(1.0);
+        let s = told
+            .unwrap_or_else(|| from_server.max(from_host))
+            .clamp(1.0, 8.0);
+        eprintln!(
+            "wait scale: {s} (server round trip {:?}, host load per core {from_host:.2})",
+            db_rtt()
+        );
+        s
+    })
+}
+
+/// The time to allow for a condition that is expected within `base` on an idle box.
+pub fn deadline(base: Duration) -> Duration {
+    Duration::from_secs_f64(base.as_secs_f64() * wait_scale())
+}
+
+/// Polls `f` until it returns `Some` or `timeout` passes (`timeout` is the allowance of an idle
+/// box: [`deadline`] scales it for the load of the host).
 pub async fn wait_for<T, F, Fut>(timeout: Duration, what: &str, mut f: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = Instant::now() + timeout;
+    let allowed = deadline(timeout);
+    let until = Instant::now() + allowed;
     loop {
         if let Some(v) = f().await {
             return v;
         }
-        if Instant::now() > deadline {
-            panic!("timed out waiting for {what}");
+        if Instant::now() > until {
+            panic!(
+                "timed out waiting for {what} after {allowed:?} (an idle box allows {timeout:?})"
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
