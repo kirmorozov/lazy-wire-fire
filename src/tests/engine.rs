@@ -80,7 +80,7 @@ fn server_error(code: u16, message: &str) -> anyhow::Error {
 /// A 1236 (the server's catch-all for a failed binlog dump) resets the rules only when its
 /// own message says the requested position cannot be served. The wordings are the servers'
 /// (MySQL 8.0/8.4/9.x `sql/rpl_binlog_sender.cc`, MariaDB 10.11–13.1 `sql/sql_repl.cc`);
-/// a purged file or GTIDs is caught by `binlog::is_missing_binlog`, the rest by
+/// a purged file or GTIDs is caught by `source::is_missing_binlog`, the rest by
 /// `position_unavailable`.
 #[test]
 fn only_a_1236_that_says_the_position_is_gone_loses_continuity() {
@@ -118,7 +118,7 @@ fn only_a_1236_that_says_the_position_is_gone_loses_continuity() {
         );
     }
     // The reader's own error for a position the server no longer has.
-    let e = anyhow::Error::new(binlog::MissingBinlog {
+    let e = anyhow::Error::new(source::MissingBinlog {
         from: Position {
             file: "binlog.000001".into(),
             pos: 4,
@@ -161,7 +161,7 @@ fn a_1236_about_the_servers_own_binlog_keeps_the_position() {
             !binlog_unusable(&e),
             "{wording:?} says nothing about the position: retry, never reset"
         );
-        assert!(!binlog::is_access_denied(&e));
+        assert!(!source::is_access_denied(&e));
     }
     // The duplicate server id keeps its own path (roll the id, keep the position).
     let rival = server_error(
@@ -169,7 +169,7 @@ fn a_1236_about_the_servers_own_binlog_keeps_the_position() {
         "A replica with the same server_uuid/server_id as this replica has connected to \
              the source; the first event 'binlog.000009' at 4",
     );
-    assert!(!binlog_unusable(&rival) && binlog::is_duplicate_server_id(&rival));
+    assert!(!binlog_unusable(&rival) && source::is_duplicate_server_id(&rival));
     // A server error that is not 1236 is not a lost position either.
     assert!(!binlog_unusable(&server_error(
         2013,

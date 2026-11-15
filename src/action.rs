@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
-use crate::binlog::{Flavor, Position};
 use crate::dedup::buffer::IdSet;
 use crate::dedup::key::Key;
 use crate::docs::{self, Doc, Merger, Plan};
@@ -23,6 +22,7 @@ use crate::fence;
 use crate::keyspace::text_set;
 use crate::model::{FirePer, StepKind};
 use crate::rule::{self, Rule};
+use crate::source::{Flavor, Position};
 use crate::target::{Item, Sent, Target};
 
 /// The commit fence's row id: one row, changed by every commit.

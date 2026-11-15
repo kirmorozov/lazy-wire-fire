@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::action::{self, Env, FenceSpec, Fired, KeyQuery};
 use crate::analyze;
-use crate::binlog::{self, BinlogReader, Flavor, Item, Position, RowsKind};
+use crate::binlog::{self, BinlogReader};
 use crate::config::Config;
 use crate::dedup::{buffer, key};
 use crate::fence;
@@ -37,6 +37,7 @@ use crate::lock;
 use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
 use crate::rows::{Catalog, Layout, LayoutMismatch};
 use crate::rule::{self, KeyTemplate, Rule};
+use crate::source::{self, Flavor, Item, Position, RowsKind};
 use crate::status::{self, Saved, INSTANCE_ROW};
 use crate::target::Target;
 use crate::template;
@@ -484,7 +485,7 @@ fn server_messages(e: &anyhow::Error) -> impl Iterator<Item = String> + '_ {
 /// purged or is gone, the position is past the end of the file, or the GTIDs needed are gone.
 /// From the servers' own sources — MySQL/Percona `sql/rpl_binlog_sender.cc` (8.0, 8.4, 9.x) and
 /// MariaDB `sql/sql_repl.cc` (10.11–13.1); a purged file or GTIDs is already caught by
-/// `binlog::is_missing_binlog`. Every other 1236 message — an event larger than
+/// `source::is_missing_binlog`. Every other 1236 message — an event larger than
 /// `max_allowed_packet`, a damaged event, the binlog closed, a GTID mode mismatch — reports a
 /// server-side problem that says nothing about the position, so the position is kept and the
 /// dump retried; an unknown message retries too, since the default must never re-send a target.
@@ -509,9 +510,9 @@ fn position_unavailable(e: &anyhow::Error) -> bool {
 /// other message (or none recognised) is the server failing to read its own binlog — not a lost
 /// position — and is retried in place by the callers below.
 fn binlog_unusable(e: &anyhow::Error) -> bool {
-    binlog::is_missing_binlog(e)
+    source::is_missing_binlog(e)
         || (server_code(e) == Some(1236)
-            && !binlog::is_duplicate_server_id(e)
+            && !source::is_duplicate_server_id(e)
             && position_unavailable(e))
 }
 
@@ -1429,13 +1430,13 @@ impl Engine {
                         pos = self.boundary.clone();
                         continue 'reconnect;
                     }
-                    if binlog::is_duplicate_server_id(&e) && self.reroll_server_id() {
+                    if source::is_duplicate_server_id(&e) && self.reroll_server_id() {
                         continue 'reconnect;
                     }
-                    if binlog::is_access_denied(&e) {
+                    if source::is_access_denied(&e) {
                         return Err(e);
                     }
-                    if server_code(&e) == Some(1236) && !binlog::is_duplicate_server_id(&e) {
+                    if server_code(&e) == Some(1236) && !source::is_duplicate_server_id(&e) {
                         self.on_kept_binlog_error(&e, &pos, backoff);
                         kept_position = true;
                     } else {
@@ -1497,7 +1498,7 @@ impl Engine {
                             Err(e) => {
                                 if binlog_unusable(&e) {
                                     self.on_missing_binlog(&e).await?;
-                                } else if binlog::is_duplicate_server_id(&e) {
+                                } else if source::is_duplicate_server_id(&e) {
                                     self.reroll_server_id();
                                 } else if server_code(&e) == Some(1236) {
                                     let at = self.boundary.clone();
