@@ -579,7 +579,7 @@ async fn query_account_that_cannot_connect_stops_the_start() {
     );
     let (_tx, rx) = watch::channel(false);
     let health = Arc::new(lazy_wire_fire::health::Health::default());
-    let err = lazy_wire_fire::engine::run(cfg, health, rx)
+    let err = lazy_wire_fire::engine::run(cfg, health, None, rx)
         .await
         .expect_err("the start must fail");
     let shown = format!("{err:#}");

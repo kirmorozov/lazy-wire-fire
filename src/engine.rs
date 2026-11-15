@@ -34,6 +34,7 @@ use crate::filters::{self, Role};
 use crate::health::Health;
 use crate::keyspace::{op_text, text_set, IdSets, KeySpaces};
 use crate::lock;
+use crate::metrics::{FlushOutcome, Metrics, PairHandle, RuleHandle};
 use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
 use crate::rows::{Catalog, Layout, LayoutMismatch};
 use crate::rule::{self, KeyTemplate, Rule};
@@ -312,6 +313,10 @@ struct RuleState {
     strikes: HashMap<String, u32>,
     written: Option<(Position, Instant)>,
     dirty: bool,
+    /// The rule's resolved metric handles (`None` when metrics are off). Resolved once at rule
+    /// load from the loaded config; the flush/drop sites only touch these atomics.
+    mrule: Option<Arc<RuleHandle>>,
+    mpair: Option<Arc<PairHandle>>,
 }
 
 impl RuleState {
@@ -333,9 +338,16 @@ impl RuleState {
         dropped: &[(String, String)],
         now_ms: u64,
     ) {
+        let mpair = self.mpair.clone();
         for (k, why) in dropped {
             let k: String = k.chars().take(200).collect();
             log_undelivered(rule, target, &k, why, STRIKES);
+            // The one place a key is given up after the fifth strike: count it here, next to the
+            // `lazywf::undelivered` WARN. The label pair is the pre-resolved handle, no name is
+            // named to the registry.
+            if let Some(p) = &mpair {
+                p.dropped(1);
+            }
             self.last_error = Some((
                 format!("key `{k}` refused {STRIKES} times, dropped: {why}"),
                 now_ms,
@@ -408,6 +420,8 @@ pub struct Engine {
     identity: String,
     lower_names: bool,
     health: Arc<Health>,
+    /// The metrics registry when `LAZYWF_METRICS_ADDR` is set (`None` = off entirely).
+    metrics: Option<Arc<Metrics>>,
     catalog: Catalog,
 
     /// After the last transaction read.
@@ -620,6 +634,7 @@ async fn server_identity(conn: &mut Conn, flavor: Flavor) -> Result<String> {
 pub async fn run(
     cfg: Config,
     health: Arc<Health>,
+    metrics: Option<Arc<Metrics>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     // The reader names lazyview in its messages unless told otherwise (main does it earlier).
@@ -709,6 +724,7 @@ pub async fn run(
         identity,
         lower_names: lower.unwrap_or(0) != 0,
         health,
+        metrics,
         catalog: Catalog::default(),
         boundary: Position {
             file: String::new(),
@@ -1290,6 +1306,12 @@ impl Engine {
         self.incarnations += 1;
         let frozen = rule.trigger_error.is_some();
         let error = rule.error.clone().or_else(|| rule.trigger_error.clone());
+        // Resolve this rule's metric handles from the loaded config (bounded by config size).
+        // Off (`None`), the rule keeps no handles and every flush/drop site is a skipped branch.
+        let (mrule, mpair) = match &self.metrics {
+            Some(reg) => (Some(reg.rule(name)), Some(reg.pair(name, &rule.def.target))),
+            None => (None, None),
+        };
         let st = RuleState {
             rule: rule.clone(),
             incarnation: self.incarnations,
@@ -1313,6 +1335,8 @@ impl Engine {
             strikes: HashMap::new(),
             written: None,
             dirty: true,
+            mrule,
+            mpair,
         };
         self.rules.insert(name.to_string(), st);
         if !initial {
@@ -1333,9 +1357,16 @@ impl Engine {
     fn update_rule(&mut self, name: &str, rule: Arc<Rule>) {
         let pos = self.rule_pos(&self.rules[name]);
         let settled = self.settled.clone();
+        // Re-resolve the (rule, target) handle: a reload may move the rule to another target. The
+        // pair set stays bounded by the loaded config (only config names reach `pair`).
+        let new_pair = self
+            .metrics
+            .as_ref()
+            .map(|reg| reg.pair(name, &rule.def.target));
         let st = self.rules.get_mut(name).expect("present");
         let changed = st.rule.fingerprint != rule.fingerprint || st.rule.error != rule.error;
         st.rule = rule.clone();
+        st.mpair = new_pair;
         if changed {
             st.backoff.ok();
             if let Some(e) = rule.error.clone().or_else(|| rule.trigger_error.clone()) {
@@ -2237,8 +2268,16 @@ impl Engine {
             keep_queries: true,
             resolved: Vec::new(),
         };
+        let mrule = st.mrule.clone();
         spawn_job(tx, name, incarnation, failed, async move {
-            flush_job(&env, &rule, spec, keys, queries).await
+            let start = Instant::now();
+            let out = flush_job(&env, &rule, spec, keys, queries).await;
+            // The flush duration is the job's own wall time (fence + resolve + fire); recorded
+            // through the pre-resolved handle: one bucket bump, no name to the registry.
+            if let Some(m) = &mrule {
+                m.observe_flush(start.elapsed());
+            }
+            out
         });
     }
 
@@ -2474,8 +2513,12 @@ impl Engine {
                 let keyless = fired.error.is_some()
                     && fired.failed_keys.is_empty()
                     && fired.rejected.is_empty();
+                // A permanent refusal (the target refused keys on their own), read before the
+                // strike logic consumes `rejected` and splits it into retry-or-drop.
+                let had_refusals = !fired.rejected.is_empty();
                 let (retry, dropped) = st.judge(fired.rejected, fired.keys_done > 0);
                 st.report_dropped(&d.rule, &target, &dropped, now_ms);
+                let mpair = st.mpair.clone();
                 let mut again = IdSets::default();
                 for k in fired.failed_keys.iter().chain(retry.iter()) {
                     let (s, key) = st.buffer.locate(k);
@@ -2486,8 +2529,11 @@ impl Engine {
                         st.strikes.remove(k);
                     }
                 }
+                // `expect_met`: nothing stays pending and the flush was not keyless → the position
+                // advanced. The same condition picks the success arm of the match below.
+                let expect_met = again.is_empty() && !keyless;
                 match fired.error {
-                    _ if again.is_empty() && !keyless => {
+                    _ if expect_met => {
                         st.backoff.ok();
                         target_ok = !fired.target_error;
                         if st.buffer.core.in_flight() {
@@ -2540,6 +2586,11 @@ impl Engine {
                         warn!(rule = %d.rule, "flush failed: {err}; retrying in {delay:?}");
                         st.last_error = Some((err, now_ms));
                     }
+                }
+                // One counter bump per flush completion, on the pre-resolved handle. A refusal
+                // (permanent) dominates; otherwise expect-met is a success, else a retry.
+                if let Some(p) = &mpair {
+                    p.flush(FlushOutcome::classify(had_refusals, expect_met));
                 }
                 st.dirty = true;
             }
@@ -2749,6 +2800,11 @@ impl Engine {
         for (name, st) in &self.rules {
             let pos = self.rule_pos(st);
             let lag = self.rule_lag_ms(st);
+            // The pending gauge reads the same source the status table shows (`pending_keys`,
+            // which reads the dedup buffer's `pending_len`); the value is pushed to the atomic.
+            if let Some(m) = &st.mrule {
+                m.set_pending(st.buffer.pending_keys() as u64);
+            }
             let reset_state = if st.reset_state.is_empty() {
                 "none".to_string()
             } else {
@@ -2802,6 +2858,11 @@ impl Engine {
                 last_error_at: None,
                 server_identity: Some(self.identity.clone()),
             });
+        }
+        // The instance-wide binlog lag: the same `stream_lag_ms` the status table's instance row
+        // writes (the reader's distance behind the server, seconds).
+        if let Some(reg) = &self.metrics {
+            reg.set_binlog_lag(self.stream_lag_ms() as f64 / 1000.0);
         }
         self.health.set_status(json!({
             "instance": self.cfg.instance,
