@@ -3,7 +3,8 @@ name: ci
 # Every push, pull request, weekly and on demand:
 #   lint         cargo fmt --check, clippy -D warnings for the default and the roaring feature
 #                (make lint), Cargo.lock up to date
-#   unit         make test: the unit tests for the default and the roaring feature
+#   unit         make test: the unit tests for the default and the roaring feature, and the
+#                grpc streaming suite (the kind's client against an in-process h2 server; no servers)
 #   integration  make servers + make test-e2e-all: MySQL 8.4 and MariaDB 10.11 (the default set)
 #                with Redis, Valkey, PostgreSQL, S3 and Varnish as targets
 #   matrix       make test-matrix, one job per server: every other required line (MySQL 8.0, 9.7,
@@ -86,7 +87,9 @@ jobs:
   unit:
     name: unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The grpc suite's binary compiles the protox tree (a dev-dependency no other step of this
+    # job needs) before it runs; the 20 the unit tests alone needed did not count for that.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
