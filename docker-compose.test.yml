@@ -11,6 +11,7 @@
 #   docker compose -f docker-compose.test.yml --profile amqp up -d --wait      # + RabbitMQ (the amqp target tests)
 #   docker compose -f docker-compose.test.yml --profile smtp up -d --wait      # + Mailpit (the smtp target tests)
 #   docker compose -f docker-compose.test.yml --profile kafka up -d --wait     # + Redpanda (the kafka target tests, host network)
+#   make test-e2e-pgsrc      # + the source PostgreSQL (profile `pgsrc`: logical decoding, the pgoutput tests)
 #   make servers-down        # every profile, volumes included
 #
 # MySQL and Percona run with GTIDs on except MySQL 8.0 (off, as in RDS for MySQL's default
@@ -52,6 +53,27 @@ services:
     environment: { POSTGRES_PASSWORD: pgpw, POSTGRES_DB: sink }
     ports: ["127.0.0.1:34432:5432"]
     healthcheck: { test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], interval: 2s, retries: 30 }
+
+  # The SOURCE PostgreSQL for the pgoutput tests (tests/e2e.rs, `pg_*`; issue #57: lazyview is
+  # integrating PostgreSQL as a replication source, lazywf copies the reader when it lands).
+  # Its own server with its own settings — the `postgres` service above stays the sink, untouched.
+  # Not started by `make servers`: `make test-e2e-pgsrc`, or
+  # `docker compose -f docker-compose.test.yml --profile pgsrc up -d --wait pgsrc`. Logical
+  # decoding on (wal_level=logical, the slot and walsender budgets the reader needs); the
+  # replication role the tests connect as is created by docker/pgsrc/init.sql.
+  pgsrc:
+    image: postgres:17.11-alpine
+    profiles: ["pgsrc"]
+    command: ["-c", "wal_level=logical", "-c", "max_replication_slots=16", "-c", "max_wal_senders=16"]
+    environment: { POSTGRES_PASSWORD: pgsrcpw, POSTGRES_DB: lwfsrc }
+    volumes: ["./docker/pgsrc/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    ports: ["127.0.0.1:34532:5432"]
+    # pg_isready and the setting the tests depend on. Through the socket (trust): the health
+    # check has no PGPASSWORD, and POSTGRES_HOST_AUTH_METHOD stays the scram default.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres && [ \"$(psql -U postgres -d lwfsrc -Atc 'SHOW wal_level')\" = logical ]"]
+      interval: 2s
+      retries: 30
 
   s3:
     image: versity/versitygw:v1.10.0

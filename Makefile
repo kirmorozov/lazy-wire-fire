@@ -8,7 +8,7 @@ IMAGE ?= lazywf:dev
 BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
 .PHONY: build release test test-roaring test-grpc lint servers servers-down test-e2e test-e2e-all test-e2e-search \
-	test-e2e-queues test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
+	test-e2e-queues test-e2e-pgsrc test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
 	docker-smoke docker-e2e image-digests
 
 build:
@@ -52,7 +52,7 @@ servers:
 servers-down:
 	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease \
 	  --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
-	  --profile kafka --profile eventbridge --profile sns down -v
+	  --profile kafka --profile eventbridge --profile sns --profile pgsrc down -v
 
 # The integration servers and test threads; override them to run against other servers.
 E2E_DSN ?= mysql://root:root@127.0.0.1:34184
@@ -116,6 +116,20 @@ test-e2e-queues:
 	    $(CARGO) test --test log_secrets -- --test-threads=$(E2E_THREADS) || rc=1; \
 	fi; \
 	$(COMPOSE) $(QUEUE_PROFILES) stop $(QUEUE_SERVICES); exit $$rc
+
+# The pgoutput source tests against the `pgsrc` compose service (a PostgreSQL with
+# wal_level=logical, the same image as the sink). Opt-in like the queue kinds: the engine cannot
+# read a PG source yet (issue #57 — lazyview leads the integration and lazywf copies the reader),
+# so this joins neither test-e2e, test-e2e-all nor the default matrix until the engine PR lands;
+# CI runs it as the advisory `postgres-src` job. The tests gate on LAZYWF_TEST_PG (absent: they
+# skip) and drive the publisher through SQL only — the replication-protocol client is not here.
+E2E_PG_DSN ?= host=127.0.0.1 port=34532 user=lwfsrc password=lwfsrcpw dbname=lwfsrc
+test-e2e-pgsrc:
+	$(COMPOSE) --profile pgsrc up -d --wait pgsrc; rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	  LAZYWF_TEST_PG=1 LAZYWF_TEST_PG_DSN="$(E2E_PG_DSN)" $(CARGO) test --test e2e pg_ -- --test-threads=$(E2E_THREADS) || rc=1; \
+	fi; \
+	$(COMPOSE) --profile pgsrc stop pgsrc; exit $$rc
 
 # The integration tests on every other required line (README "Supported servers"), one server
 # at a time (service:port; the targets of `make servers` must be up). MariaDB 10.6 goes after
