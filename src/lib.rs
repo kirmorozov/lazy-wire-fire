@@ -28,6 +28,7 @@ pub mod intset;
 pub mod keyspace;
 pub mod lock;
 pub mod logging;
+pub mod metrics;
 pub mod model;
 pub mod oauth;
 pub mod path;
