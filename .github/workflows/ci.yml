@@ -15,6 +15,10 @@ name: ci
 #                against ElasticMQ, kinesis-mock, RabbitMQ, Google's Pub/Sub emulator, Mailpit
 #                and a Redpanda single node; the log-secrets binary with the same emulators up
 #                (its S3 and Redis flows use the default target servers)
+#   postgres-src make test-e2e-pgsrc: the pgoutput source tests (tests/e2e.rs `pg_*`) against a
+#                PostgreSQL 17.11 publisher (wal_level=logical, compose profile `pgsrc`),
+#                advisory (continue-on-error, never blocking, not in the edge/release needs):
+#                the engine cannot read a PG source yet (issue #57)
 #   image        linux/amd64 + linux/arm64 cross-compiled (cargo-zigbuild, no QEMU in the build),
 #                make docker-smoke on both, then make docker-e2e on amd64
 # Two jobs run on narrower triggers:
@@ -376,6 +380,71 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: queues-logs
+          path: |
+            server-logs/
+            e2e.log
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: stop the servers
+        if: always()
+        run: make servers-down
+
+  postgres-src:
+    # Advisory until the engine can read a PostgreSQL source (issue #57: lazyview integrates it
+    # first, lazywf copies the reader when it lands). make test-e2e-pgsrc starts the `pgsrc`
+    # compose service — the only server this job needs, the pg_ tests never touch MySQL — and
+    # runs the e2e binary with LAZYWF_TEST_PG=1. Without that variable the same tests skip, so
+    # the integration job is unaffected. continue-on-error: it reports, it never blocks.
+    name: postgres source (pgoutput, advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: reserve the test ports
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=34070-34881
+      - name: start the source PostgreSQL (in the background)
+        run: docker compose --profile pgsrc up -d --quiet-pull pgsrc
+      - name: rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Reads the integration job's cache (same test binary).
+          shared-key: e2e
+          save-if: false
+      - name: build the integration tests
+        run: CARGO_BUILD_JOBS=4 cargo test --locked --test e2e --no-run
+      - name: wait for the source PostgreSQL
+        run: docker compose --profile pgsrc up -d --wait --wait-timeout 300 pgsrc
+      - name: server version
+        run: |
+          echo "| \`pgsrc\` | $(docker compose --profile pgsrc exec -T pgsrc psql -U postgres -d lwfsrc -Atc 'SHOW server_version') |" > versions.md
+      - name: make test-e2e-pgsrc
+        timeout-minutes: 15
+        run: make test-e2e-pgsrc 2>&1 | tee e2e.log
+      - name: summary
+        if: always()
+        run: |
+          scripts/ci-summary.sh report "PostgreSQL source: pgoutput (advisory)" e2e.log versions.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: advisory failure
+        if: failure()
+        run: |
+          echo "::warning title=postgres source (advisory) failed::the pgoutput source tests failed: advisory, does not block edge or a release (issue #57): see the logs"
+      - name: collect server logs
+        if: failure()
+        run: |
+          mkdir -p server-logs
+          docker compose --profile pgsrc logs --no-color --timestamps > server-logs/compose.log 2>&1 || true
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: postgres-src-logs
           path: |
             server-logs/
             e2e.log

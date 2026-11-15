@@ -8393,3 +8393,298 @@ async fn sns_fifo_entry_without_a_group_id_is_refused_before_it_is_sent() {
     assert_eq!(moto.count(&url).await, 0, "a refused batch was sent");
     inst.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The pgoutput SOURCE (issue #57): a PostgreSQL publisher with wal_level=logical — the compose
+// `pgsrc` service (`LAZYWF_TEST_PG=1`, `make test-e2e-pgsrc`). lazyview integrates PostgreSQL as
+// a replication source and lazywf copies the reader when it lands; these tests prepare the
+// matrix. They drive the publisher through SQL only (the slot functions of the server itself),
+// never the replication protocol: the walsender transport (START_REPLICATION, CopyData 'w'/'k'
+// framing, keepalives, standby status updates) belongs to the replication client crate that
+// arrives with the engine PR, and no such client lives in src/ (the reader code is copy-set-only,
+// CLAUDE.md). src/pgoutput.rs decodes the payloads these peek rows carry.
+
+/// The publisher's DSN when the suite has one (`LAZYWF_TEST_PG=1`); `LAZYWF_TEST_PG_DSN` points
+/// it somewhere other than the compose `pgsrc` service.
+fn pg_src_dsn() -> Option<String> {
+    match std::env::var("LAZYWF_TEST_PG")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(_) => Some(std::env::var("LAZYWF_TEST_PG_DSN").unwrap_or_else(|_| {
+            "host=127.0.0.1 port=34532 user=lwfsrc password=lwfsrcpw dbname=lwfsrc".to_string()
+        })),
+        None => {
+            eprintln!("LAZYWF_TEST_PG not set: skipping (make test-e2e-pgsrc)");
+            None
+        }
+    }
+}
+
+macro_rules! need_pg_src {
+    () => {
+        match pg_src_dsn() {
+            Some(d) => d,
+            None => return,
+        }
+    };
+}
+
+/// The test table, its publication and the peeked slot: names of these tests only, created and
+/// dropped by them (a leftover from an interrupted run is dropped at the start).
+const PG_SRC_TABLE: &str = "pgsrc_items";
+const PG_SRC_PUB: &str = "lwf_pgsrc_pub";
+const PG_SRC_SLOT: &str = "lwf_pgsrc_peek";
+
+/// The publisher as the replication role (docker/pgsrc/init.sql).
+async fn pg_src_client(dsn: &str) -> tokio_postgres::Client {
+    let (client, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("the pgsrc publisher: compose profile `pgsrc` (make test-e2e-pgsrc)");
+    tokio::spawn(conn);
+    client
+}
+
+/// The pgoutput payloads the slot holds, without consuming them: one row per message, `data`
+/// the payload bytes verbatim (the OUT columns are `slot_name, lsn` — the aliases pin the
+/// names, which differ between minor lines). The variadic options are what the replication
+/// client will pass in START_REPLICATION: protocol version 1, the one publication.
+async fn pg_peek(pg: &tokio_postgres::Client) -> Vec<tokio_postgres::Row> {
+    let slot = PG_SRC_SLOT.to_string();
+    let sql = format!(
+        "SELECT lsn::text, xid::text, data \
+           FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, \
+                'proto_version', '1', 'publication_names', '{PG_SRC_PUB}') AS t(lsn, xid, data)"
+    );
+    pg.query(&sql, &[&slot]).await.unwrap()
+}
+
+/// The message kinds of the peeked payloads decoded by the vendored reader: every payload
+/// must parse, and a parse error here is a decoder bug found against a real PostgreSQL
+/// publisher — report it (issue #57), never loosen this.
+fn pg_decode(rows: &[tokio_postgres::Row]) -> Vec<lazy_wire_fire::pgoutput::Message<'_>> {
+    rows.iter()
+        .map(|r| {
+            let data = r.get::<_, &[u8]>(2);
+            lazy_wire_fire::pgoutput::parse(data).unwrap_or_else(|e| {
+                panic!("the decoder refused a real publisher's payload ({e}): {data:?}")
+            })
+        })
+        .collect()
+}
+
+/// The cells of a tuple as text (an INSERT of plain columns sends only `'t'` values).
+fn pg_tuple(t: &lazy_wire_fire::pgoutput::Tuple) -> Vec<String> {
+    t.columns()
+        .map(
+            |c| match c.expect("the tuple cells of a parsed message decode") {
+                lazy_wire_fire::pgoutput::Column::Text(v) => {
+                    String::from_utf8_lossy(v).into_owned()
+                }
+                other => panic!("a non-text cell in an INSERT: {other:?}"),
+            },
+        )
+        .collect()
+}
+
+/// The publisher is what the pgoutput plugin needs: `wal_level=logical`, a role that may hold
+/// slots, and the walsender/slot budgets the reader will use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_publisher_is_a_logical_decoder() {
+    let dsn = need_pg_src!();
+    let pg = pg_src_client(&dsn).await;
+    let wal_level: String = pg
+        .query_one("SELECT current_setting('wal_level')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        wal_level, "logical",
+        "the pgoutput plugin needs wal_level=logical"
+    );
+    let row = pg
+        .query_one(
+            "SELECT (SELECT rolreplication FROM pg_roles WHERE rolname = current_user), \
+                    current_setting('max_replication_slots')::int, \
+                    current_setting('max_wal_senders')::int",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        row.get::<_, bool>(0),
+        "the test role connects without REPLICATION: docker/pgsrc/init.sql"
+    );
+    assert!(
+        row.get::<_, i32>(1) >= 16,
+        "max_replication_slots = {}",
+        row.get::<_, i32>(1)
+    );
+    assert!(
+        row.get::<_, i32>(2) >= 16,
+        "max_wal_senders = {}",
+        row.get::<_, i32>(2)
+    );
+}
+
+/// The SQL half of the reader's future feed: a publication, a pgoutput slot, a commit — and the
+/// peek returns it as the BEGIN, RELATION, INSERT, COMMIT payloads `src/pgoutput.rs` decodes
+/// (the data column of `pg_logical_slot_peek_binary_changes` is the plugin payload verbatim,
+/// the bytes XLogData carries). The drop is clean: no leftover slot pins WAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_slot_peek_yields_begin_insert_commit() {
+    let dsn = need_pg_src!();
+    let pg = pg_src_client(&dsn).await;
+    // From nothing: drop what an interrupted run may have left (the slot last; it holds WAL,
+    // not locks, so the table and publication go first and freely).
+    pg.batch_execute(&format!(
+        "DROP PUBLICATION IF EXISTS {PG_SRC_PUB};
+         DROP TABLE IF EXISTS {PG_SRC_TABLE};
+         SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+          WHERE slot_name = '{PG_SRC_SLOT}'"
+    ))
+    .await
+    .unwrap();
+    // Table, then publication, then slot: the slot's consistent point is after both, so every
+    // change below it is one the publisher may decode.
+    pg.batch_execute(&format!(
+        "CREATE TABLE {PG_SRC_TABLE} (id INT PRIMARY KEY, note TEXT);
+         CREATE PUBLICATION {PG_SRC_PUB} FOR TABLE {PG_SRC_TABLE}"
+    ))
+    .await
+    .unwrap();
+    let slot = PG_SRC_SLOT.to_string();
+    let row = pg
+        .query_one(
+            "SELECT slot_name::text, lsn::text \
+               FROM pg_create_logical_replication_slot($1, 'pgoutput', false)",
+            &[&slot],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), PG_SRC_SLOT);
+    assert!(
+        row.get::<_, String>(1).contains('/'),
+        "the consistent point is no LSN"
+    );
+    // One transaction, two rows: the INSERT two-row statement is a single commit record.
+    pg.batch_execute(&format!(
+        "INSERT INTO {PG_SRC_TABLE} VALUES (1, 'gift'), (2, 'express')"
+    ))
+    .await
+    .unwrap();
+
+    use lazy_wire_fire::pgoutput::{replica_identity, Message};
+
+    // Not the kind bytes: the payloads through the vendored decoder, so the assertions are on
+    // what the reader will actually consume. An Err from `parse` is a decoder bug found against
+    // a real PostgreSQL 17 publisher (issue #57) — report it, never loosen this.
+    let rows = pg_peek(&pg).await;
+    let msgs = pg_decode(&rows);
+    // The shape of one committed two-row INSERT: the transaction opens with BEGIN and closes
+    // with COMMIT, the RELATION describes the table before the INSERTs name it, and the INSERTs
+    // come one per row, in the commit's order. (A fresh publisher sends nothing else: no origin,
+    // no Type.)
+    let [Message::Begin {
+        final_lsn,
+        xid: begin_xid,
+        ..
+    }, Message::Relation(rel), Message::Insert {
+        rel_id: r1,
+        new: t1,
+    }, Message::Insert {
+        rel_id: r2,
+        new: t2,
+    }, Message::Commit { commit_lsn, .. }] = &msgs[..]
+    else {
+        panic!("the peek of the committed two-row INSERT decoded to: {msgs:?}");
+    };
+
+    // The RELATION describes the table we created, replica identity DEFAULT (the primary key,
+    // which is what an INSERT needs no old tuple for), columns in declaration order with only
+    // the key flagged.
+    assert_eq!(rel.namespace, "public", "the relation's namespace");
+    assert_eq!(rel.name, PG_SRC_TABLE, "the relation's name");
+    assert_eq!(
+        rel.replica_identity,
+        replica_identity::DEFAULT,
+        "the relation's replica identity"
+    );
+    let cols: Vec<_> = rel
+        .columns()
+        .map(|c| c.expect("the column descriptors of a parsed RELATION decode"))
+        .collect();
+    let names: Vec<&str> = cols.iter().map(|c| c.name).collect();
+    assert_eq!(names, ["id", "note"], "the relation's columns, in order");
+    assert!(cols[0].key, "the primary key column is not flagged");
+    assert!(!cols[1].key, "the plain column is flagged as a key");
+
+    // The two rows, decoded: the values we inserted, cell by cell, and they name this relation.
+    assert_eq!(pg_tuple(t1), ["1", "gift"], "the first INSERT's new tuple");
+    assert_eq!(
+        pg_tuple(t2),
+        ["2", "express"],
+        "the second INSERT's new tuple"
+    );
+    assert_eq!(r1, &rel.rel_id, "the first INSERT names another relation");
+    assert_eq!(r2, &rel.rel_id, "the second INSERT names another relation");
+
+    // BEGIN and COMMIT describe the same commit record.
+    assert_eq!(
+        final_lsn, commit_lsn,
+        "the BEGIN's final LSN is not the COMMIT's LSN"
+    );
+
+    // One transaction: one xid on every SQL row, not the zero xid of a non-transactional
+    // change, and the BEGIN carries that same id.
+    let xid = rows[0].get::<_, String>(1);
+    assert_ne!(xid, "0");
+    assert!(
+        rows.iter().all(|r| r.get::<_, String>(1) == xid),
+        "the rows do not belong to one transaction"
+    );
+    assert_eq!(
+        begin_xid.to_string(),
+        xid,
+        "the decoded BEGIN's xid is not the one the publisher reported"
+    );
+
+    // Peeking does not consume: the same messages, decoded, again unchanged.
+    assert_eq!(
+        pg_decode(&pg_peek(&pg).await),
+        msgs,
+        "peeking advanced the slot"
+    );
+
+    // Drop the slot cleanly and confirm it is gone: a leftover slot pins WAL forever.
+    pg.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await
+        .unwrap();
+    let left: i64 = pg
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0, "the slot survived pg_drop_replication_slot");
+    pg.batch_execute(&format!(
+        "DROP PUBLICATION {PG_SRC_PUB}; DROP TABLE {PG_SRC_TABLE}"
+    ))
+    .await
+    .unwrap();
+}
+
+/// The piece that is missing: real XLogData bytes from a walsender, end to end — START_REPLICATION
+/// over a replication connection, the CopyData `'w'`/`'k'` framing, keepalives and standby status
+/// updates, feeding `src/pgoutput.rs` with the bytes of a live stream (the peeked payloads above
+/// prove the content; this proves the transport carries them). It belongs to the engine PR that
+/// follows: the reader and the replication client (lazyview's pgwire-replication client) arrive
+/// there, issue #57 — `make test-e2e-pgsrc` runs it with `--ignored` once they do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the replication client: it activates with the engine PR that lands the reader (issue #57)"]
+async fn pg_decode_real_xlogdata_bytes_end_to_end() {
+    let _dsn = need_pg_src!();
+    unimplemented!("the walsender transport (START_REPLICATION, CopyData framing) is not here yet");
+}
