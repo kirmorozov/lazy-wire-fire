@@ -425,3 +425,7 @@ mod tests {
         assert_eq!(header_value(buf, STATUS_TOKEN_HEADER), None);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/health_serve_tests.rs"]
+mod serve_tests;

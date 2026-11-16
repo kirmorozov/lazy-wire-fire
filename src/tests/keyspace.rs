@@ -227,6 +227,110 @@ fn keys_cost() {
     }
 }
 
+/// The `{{op}}` text a template sees for a row change.
+#[test]
+fn op_text_names_the_row_change() {
+    assert_eq!(op_text(Op::Insert), "insert");
+    assert_eq!(op_text(Op::Update), "update");
+    assert_eq!(op_text(Op::Delete), "delete");
+}
+
+/// `as_map` is the raw view `render` and `take_texts` read: one set per space, in space order
+/// (the text space first, then the prefix slots as they were assigned), empties kept — dropping
+/// them is `into_pairs`, the shape the core's buffer takes back.
+#[test]
+fn as_map_holds_one_set_per_space_in_space_order() {
+    let mut ks = KeySpaces::new();
+    let mut sets = IdSets::default();
+    for k in ["sku-x", "item_1", "item_2", "42"] {
+        let (s, key) = ks.locate(k);
+        sets.insert(s, key);
+    }
+    // Text space 0 first, then the prefix slots in the order they were assigned: `item_`
+    // took slot 1 and the bare-number prefix `""` took slot 2.
+    assert_eq!(
+        sets.as_map().keys().map(|s| s.0).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(sets.as_map().values().map(|s| s.len()).sum::<usize>(), 4);
+    assert_eq!(sets.as_map()[&ks.text()].len(), 1, "sku-x is the text key");
+    assert_eq!(sets.as_map()[&SpaceId(1)].len(), 2, "the `item_` slot");
+
+    // An empty set stays in `as_map` and is dropped by `into_pairs`.
+    sets.sets.entry(SpaceId(7)).or_default();
+    assert!(sets.as_map().contains_key(&SpaceId(7)));
+    assert!(sets.as_map()[&SpaceId(7)].is_empty());
+    assert_eq!(
+        sets.clone()
+            .into_pairs()
+            .iter()
+            .map(|(_, s)| s.len())
+            .sum::<usize>(),
+        4,
+        "the empty space is not handed to the core"
+    );
+    assert_eq!(sets.clone().into_pairs().len(), 3);
+}
+
+/// A key the core holds as a multi-part tuple (only an embedding's own keys are such): it
+/// renders as the core names it — the parts' `Debug` forms joined by `,`, which is a log form,
+/// never data — where a one-part `Bytes` tuple renders as its text.
+#[test]
+fn a_multi_part_tuple_renders_as_the_core_names_it() {
+    let mut ks = KeySpaces::new();
+    let (slot, _) = ks.locate("p_1");
+    let mut sets = IdSets::default();
+    assert!(sets.insert(
+        slot,
+        Key::Tuple(Box::new([Datum::Bytes(b"item".to_vec()), Datum::Int(7)]))
+    ));
+    assert_eq!(
+        ks.render(&sets.sets),
+        vec!["Bytes([105, 116, 101, 109]),Int(7)".to_string()]
+    );
+    // The same key through the bounded take of a reset batch.
+    let mut sets = sets;
+    assert_eq!(
+        sets.take_texts(1, &ks),
+        vec!["Bytes([105, 116, 101, 109]),Int(7)".to_string()]
+    );
+    assert!(sets.is_empty());
+}
+
+/// A set of text keys as the core holds them (`Key::from_text`): what a listing or a snapshot
+/// page is, and the seen-keys of one flush. Every key written is found again, a duplicate is
+/// one key, and the two kinds of id — the integer `1`, the tuple `007` — live side by side.
+#[test]
+fn a_text_set_holds_the_keys_as_the_core_holds_them() {
+    let set = text_set(["1", "item_1", "sku-x", "007", ""]);
+    assert_eq!(set.len(), 5);
+    for k in ["1", "item_1", "sku-x", "007", ""] {
+        assert!(set.contains(&Key::from_text(k)), "{k}");
+    }
+    assert!(!set.contains(&Key::from_text("2")), "a key never written");
+    assert_eq!(text_set(["1", "1"]).len(), 1, "a duplicate is one key");
+    assert!(text_set(std::iter::empty::<&str>()).is_empty());
+    // The canonical integer is the integer id, held as `intset::from_i64` maps it; `007` is
+    // not canonical, so it is a tuple of its bytes.
+    let set = text_set(["1", "007"]);
+    assert!(
+        set.ints.contains(crate::intset::from_i64(1)),
+        "`1` is an integer id"
+    );
+    let k7 = Key::from_text("007");
+    let Key::Tuple(t) = &k7 else {
+        panic!("`007` is not canonical, so it is a tuple id, not {k7:?}");
+    };
+    assert!(set.keys.contains(t), "`007` is a tuple id");
+    // Rendering them back gives the text that went in.
+    let ks = KeySpaces::new();
+    let mut sets = IdSets::default();
+    sets.sets.insert(ks.text(), text_set(["sku-x", "item_1"]));
+    let mut got = ks.render(&sets.sets);
+    got.sort();
+    assert_eq!(got, vec!["item_1".to_string(), "sku-x".to_string()]);
+}
+
 /// A counting allocator: while `ON`, every live heap byte is tallied (a `#[test]`-only
 /// global allocator; the shipping binary is unaffected).
 mod measure {

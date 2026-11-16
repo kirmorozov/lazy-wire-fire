@@ -610,3 +610,105 @@ fn key_fast_path() {
     assert_eq!(simple_key_template("{{{new.a}}}"), None);
     assert_eq!(simple_key_template("{{vars.a}}"), None);
 }
+
+/// `yaml` is the one helper that writes its output itself, exempt from escaping, because a
+/// document is multi-line: that is what its `call` does. In a subexpression there is nothing to
+/// write, so `call_inner` hands the same text over as a value — and then the caller's braces
+/// decide what reaches the socket: `{{ }}` renders helper output on one line (a newline
+/// becomes a space), `{{{ }}}` keeps the document's own line breaks. That asymmetry is exactly
+/// why the plain tag writes its bytes itself.
+#[test]
+fn yaml_in_a_subexpression_is_the_document_as_a_value() {
+    let doc = json!({"a": "b", "c": 1});
+    assert_eq!(
+        render("{{{yaml doc}}}", json!({"doc": doc.clone()})),
+        "a: b\nc: 1"
+    );
+    // The value arm through `{{ }}` is the same text with its newlines rendered as spaces...
+    assert_eq!(
+        render("{{upper (yaml doc)}}", json!({"doc": doc.clone()})),
+        "A: B C: 1"
+    );
+    // ...while the raw braces keep them, so the composition says the same text the tag writes.
+    assert_eq!(
+        render("{{{upper (yaml doc)}}}", json!({"doc": doc.clone()})),
+        "A: B\nC: 1"
+    );
+    assert_eq!(
+        render("{{json (yaml doc)}}", json!({"doc": doc})),
+        "\"a: b\\nc: 1\""
+    );
+
+    // The value arm is exactly what the tag writes, blocks and all.
+    let nested = json!({"a": {"b": [1, "x"]}});
+    let written = render("{{{yaml doc}}}", json!({"doc": nested.clone()}));
+    assert_eq!(written, "a:\n  b:\n    - 1\n    - x");
+    assert_eq!(
+        render("{{json (yaml doc)}}", json!({"doc": nested})),
+        serde_json::to_string(&written).unwrap()
+    );
+
+    // With no parameter at all it is the document of a null, in both arms.
+    assert_eq!(render("{{yaml}}", json!({})), "null");
+    assert_eq!(render("{{{yaml}}}", json!({})), "null");
+    assert_eq!(render("{{upper (yaml)}}", json!({})), "NULL");
+    // An empty collection is the flow form on the line, never an empty line.
+    assert_eq!(render("{{yaml doc}}", json!({"doc": {}})), "{}");
+    assert_eq!(render("{{yaml doc}}", json!({"doc": []})), "[]");
+    assert_eq!(render("{{yaml doc}}", json!({"doc": {"a": {}}})), "a: {}");
+    assert_eq!(render("{{yaml doc}}", json!({"doc": {"a": []}})), "a: []");
+    // A value whose scalar would start a new key or item stays inside an escaped
+    // double-quoted scalar: the raw line breaks of the output are the document's own.
+    assert_eq!(
+        render(
+            "{{yaml doc}}",
+            json!({"doc": {"a": "x\ny", "b": "- z", "c": "n"}})
+        ),
+        "a: \"x\\ny\"\nb: \"- z\"\nc: \"n\""
+    );
+}
+
+/// A helper called without a parameter says which one is missing (the names are static strings,
+/// so the message holds the helper's own name), and `replace` refuses a pattern that does not
+/// compile rather than matching nothing.
+#[test]
+fn replace_arms_and_helper_names_in_errors() {
+    let err = |src: &str| {
+        let mut t = Templates::new();
+        t.add("t", src, ACTION_ROOTS).unwrap();
+        format!("{:#}", t.render("t", &json!({"x": "a1b22"})).unwrap_err())
+    };
+
+    // The third parameter is optional: without it a match is deleted, as with an empty one.
+    assert_eq!(
+        render("{{replace x \"[0-9]+\"}}", json!({"x": "a1b22c"})),
+        "abc"
+    );
+    assert_eq!(
+        render("{{replace x \"[0-9]+\" \"\"}}", json!({"x": "a1b22c"})),
+        "abc"
+    );
+    // The replacement is a replacement string: `$1` is the first group.
+    assert_eq!(
+        render("{{replace x \"(a)(b+)\" \"$2$1\"}}", json!({"x": "abb"})),
+        "bba"
+    );
+    // A pattern that does not compile is the template's error, and the message names the
+    // pattern it could not read.
+    let e = err("{{replace x \"(\"}}");
+    assert!(
+        e.contains("replace: invalid regex `(`"),
+        "the refusal names the pattern: {e}"
+    );
+    assert!(e.contains("unclosed group"), "and says why: {e}");
+    // A missing parameter is refused by name.
+    let e = err("{{replace}}");
+    assert!(e.contains("replace"), "{e}");
+    assert!(e.contains("index 0"), "{e}");
+    let e = err("{{replace x}}");
+    assert!(e.contains("replace"), "{e}");
+    assert!(e.contains("index 1"), "{e}");
+    let e = err("{{redis_quote}}");
+    assert!(e.contains("redis_quote"), "{e}");
+    assert!(e.contains("index 0"), "{e}");
+}
