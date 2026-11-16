@@ -109,7 +109,7 @@ services:
   # queue emulators hold; 34572 is 5552 of the stream plugin for the `rabbitmq-stream`
   # tests (`LAZYWF_TEST_RABBITMQ_STREAM`), also outside that block.
   rabbitmq:
-    image: rabbitmq:4.3.7@sha256:2afee120d039c78a16c930036ac47568ed7fc45dabdc56fc3d890d2d9273ac49
+    image: rabbitmq:4.3.7@sha256:6c988780c85e08b7f12395973b89bda8fb3fe2f656498a74b1479a37f9903e48
     profiles: ["amqp"]
     command: sh -c "rabbitmq-plugins enable --offline rabbitmq_stream && exec rabbitmq-server"
     environment: { RABBITMQ_DEFAULT_USER: lwftest, RABBITMQ_DEFAULT_PASS: lwftest }
@@ -121,7 +121,7 @@ services:
   # AUTH takes any credentials (the log_secrets flow); anonymous sends still work. The recipient
   # allow-list (a 550 on the rest) is what the refusal test addresses against.
   mailpit:
-    image: axllent/mailpit:v1.33.0@sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231
+    image: axllent/mailpit:v1.33.1@sha256:aef2aacc11f075ec0fb6874275ee4a421e688e11a96ebb296134d1735c7761ce
     profiles: ["smtp"]
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
@@ -133,7 +133,7 @@ services:
   # pinned by digest; ~1.1 GB). Not started by `make servers`: `docker compose -f
   # docker-compose.test.yml --profile pubsub up -d --wait pubsub-emulator`. REST and gRPC on 8085.
   pubsub-emulator:
-    image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:f81c8c688f09b97b5c78c80e732517f88584eafa5eff50d4ae6b2a5025a37079
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:0114e8ce2b8405f08d55d080ea9e45897d99e2bf0865c29f2ae25d2ee9421645
     profiles: ["pubsub"]
     command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=lwf-test"]
     ports: ["127.0.0.1:34563:8085"]
@@ -323,7 +323,7 @@ services:
   # ---- profile `prerelease`: advisory, never required (make test-prerelease) ----------------
   # MySQL and Percona publish no pre-release image (MySQL early access ships as downloads only).
   mariadb131-rc:
-    image: mariadb:13.1.1-rc@sha256:99205f09d838b6dcb37de2b1d672d1fbb1f42040bf8fb5d0c5b6998d00cfa360
+    image: mariadb:13.1.1-rc@sha256:fa0f01b29a8a082133834957dacf0b3d2cddb0de63a9b71da26866783c208d9a
     profiles: ["prerelease"]
     command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
               "--max-connections=500", "--innodb-buffer-pool-size=128M"]
