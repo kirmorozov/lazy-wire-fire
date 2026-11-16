@@ -227,39 +227,6 @@ fn keys_cost() {
     }
 }
 
-/// A counting allocator: while `ON`, every live heap byte is tallied (a `#[test]`-only
-/// global allocator; the shipping binary is unaffected).
-mod measure {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-
-    static LIVE: AtomicIsize = AtomicIsize::new(0);
-    pub static ON: AtomicBool = AtomicBool::new(false);
-
-    pub fn live() -> isize {
-        LIVE.load(Ordering::Relaxed)
-    }
-
-    struct Counting;
-
-    // SAFETY: delegates every allocation to `System` and only tallies sizes.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let p = System.alloc(layout);
-            if ON.load(Ordering::Relaxed) && !p.is_null() {
-                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-            }
-            p
-        }
-
-        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-            if ON.load(Ordering::Relaxed) {
-                LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-            }
-            System.dealloc(p, layout);
-        }
-    }
-
-    #[global_allocator]
-    static COUNTING: Counting = Counting;
-}
+/// The counting allocator the tests measure with: while `ON`, every live heap byte is tallied
+/// (see [`crate::alloc_count`], the `#[test]`-only global allocator).
+use crate::alloc_count as measure;

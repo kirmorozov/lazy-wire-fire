@@ -46,3 +46,9 @@ pub mod targets;
 pub mod template;
 pub mod time;
 pub mod tls;
+
+/// The counting allocator the tests measure with (see `src/tests/alloc_count.rs`); it is the
+/// `#[global_allocator]` of the test build only.
+#[cfg(test)]
+#[path = "tests/alloc_count.rs"]
+mod alloc_count;

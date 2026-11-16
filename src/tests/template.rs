@@ -610,3 +610,64 @@ fn key_fast_path() {
     assert_eq!(simple_key_template("{{{new.a}}}"), None);
     assert_eq!(simple_key_template("{{vars.a}}"), None);
 }
+
+/// `push_text` appends exactly what `text` returns, for every shape a column's value can have:
+/// the engine builds a row's keys with it, so a key's bytes must not change.
+#[test]
+fn push_text_appends_what_text_returns() {
+    let cases: Vec<Value> = vec![
+        Value::Null,
+        Value::Bool(true),
+        Value::Bool(false),
+        json!(-7),
+        json!(0),
+        json!(4_294_967_295u64),
+        json!(i64::MIN),
+        json!(u64::MAX),
+        json!(1.5),
+        json!(-0.0),
+        json!(1e300),
+        json!(0.1),
+        // a decimal keeps the digits it was written with (`arbitrary_precision`)
+        serde_json::from_str("12.340000").unwrap(),
+        serde_json::from_str("-0.000000").unwrap(),
+        Value::String(String::new()),
+        Value::String("abc".into()),
+        Value::String("1.10".into()),
+        Value::String("  spaces  ".into()),
+        Value::String("tab\tand\nnewline".into()),
+        Value::String("é\"\\u0000".into()),
+        json!([]),
+        json!([1, "two", null, true, [3.5], {"k": "v"}]),
+        json!({"b": 1, "a": [2, {"z": null}], "": ""}),
+        Value::Object(serde_json::Map::new()),
+    ];
+    for (i, v) in cases.iter().enumerate() {
+        let mut s = String::from("head|");
+        push_text(v, &mut s);
+        assert_eq!(s, format!("head|{}", text(v)), "case {i}: {v}");
+    }
+    // the bytes themselves, spelled out: a trigger key is these strings
+    let exact: Vec<(Value, &str)> = vec![
+        (Value::Null, ""),
+        (Value::Bool(true), "true"),
+        (json!(-7), "-7"),
+        (json!(4_294_967_295u64), "4294967295"),
+        (json!(1.5), "1.5"),
+        (serde_json::from_str("12.340000").unwrap(), "12.340000"),
+        (Value::String("1.10".into()), "1.10"),
+        (Value::String("tab\tand".into()), "tab\tand"),
+        (json!([1, "x"]), "[1,\"x\"]"),
+        (json!({"a": 1, "b": null}), "{\"a\":1,\"b\":null}"),
+    ];
+    for (v, want) in exact {
+        let mut s = String::new();
+        push_text(&v, &mut s);
+        assert_eq!(s, want, "unexpected text for {v}");
+    }
+    // two columns of one key: the second appends to the first
+    let mut s = String::new();
+    push_text(&json!(7), &mut s);
+    push_text(&Value::String("|x".into()), &mut s);
+    assert_eq!(s, "7|x");
+}

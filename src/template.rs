@@ -13,6 +13,7 @@
 //!   concatenated, as one double-quoted redis-cli argument).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -25,12 +26,26 @@ use serde_json::Value;
 
 /// Text form of a value as templates print it: strings raw, `null` empty, others as JSON.
 pub fn text(v: &Value) -> String {
+    let mut s = String::new();
+    push_text(v, &mut s);
+    s
+}
+
+/// Appends what [`text`] returns, to a string the caller reuses: a trigger key is built one
+/// row at a time and a fresh `String` per column would allocate on every row. The rendering is
+/// the same `Display` `text` goes through, so the bytes are identical.
+pub fn push_text(v: &Value, out: &mut String) {
     match v {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        other => other.to_string(),
+        Value::String(s) => out.push_str(s),
+        Value::Null => {}
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        // written straight into `out`: `to_string` would be one `String` per column per row
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
+        }
+        other => {
+            let _ = write!(out, "{other}");
+        }
     }
 }
 
