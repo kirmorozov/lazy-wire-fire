@@ -227,6 +227,6 @@ fn keys_cost() {
     }
 }
 
-/// The counting allocator the tests measure with: while `ON`, every live heap byte is tallied
-/// (see [`crate::alloc_count`], the `#[test]`-only global allocator).
-use crate::alloc_count as measure;
+// The counting allocator lives in the dedicated `crate::alloc_measure` module; the tests
+// above use it as `measure`.
+use crate::alloc_measure as measure;

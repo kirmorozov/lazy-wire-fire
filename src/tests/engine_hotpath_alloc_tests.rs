@@ -4,7 +4,7 @@
 //! one column value per watched column, which is finding 2 (`Layout::value`, another PR).
 
 use super::*;
-use crate::alloc_count;
+use crate::alloc_measure;
 use crate::model::{On, RawRule};
 use crate::rows::ColKind;
 use crate::rule::Trigger;
@@ -94,6 +94,9 @@ fn state(rule: &Arc<Rule>) -> RuleState {
         strikes: HashMap::new(),
         written: None,
         dirty: false,
+        // metrics off: a row's keys are what is measured here, not its counters
+        mrule: None,
+        mpair: None,
     }
 }
 
@@ -179,8 +182,8 @@ fn simple_id() -> KeyTemplate {
 /// One allocation: `serde_json` is built with `arbitrary_precision`, so the digits of a number
 /// are a boxed string. Everything a row costs beyond this is the machinery below, which is what
 /// these tests measure (and what the audit's findings 3, 6 and 7 are about).
-fn value_cost() -> u64 {
-    let (_, n) = alloc_count::counted(|| std::hint::black_box(Value::from(7i64)));
+fn value_cost() -> usize {
+    let (_, n) = alloc_measure::count(|| std::hint::black_box(Value::from(7i64)));
     n
 }
 
@@ -196,7 +199,7 @@ fn a_repeated_row_costs_its_column_values_and_nothing_else() {
     assert_eq!(hot.keys(), "o-7");
     assert_eq!(hot.rows(), Some(1));
 
-    let ((), n) = alloc_count::counted(|| {
+    let ((), n) = alloc_measure::count(|| {
         for _ in 0..20 {
             hot.feed(RowsKind::Update, &before, &after);
         }
@@ -224,7 +227,7 @@ fn the_row_machinery_itself_allocates_nothing() {
     let (before, after) = (row(7, "sku-1", 3), row(7, "sku-2", 5));
     hot.feed(RowsKind::Update, &before, &after);
     assert_eq!(hot.keys(), "7");
-    let ((), n) = alloc_count::counted(|| {
+    let ((), n) = alloc_measure::count(|| {
         for _ in 0..20 {
             hot.feed(RowsKind::Update, &before, &after);
         }
@@ -234,7 +237,7 @@ fn the_row_machinery_itself_allocates_nothing() {
     let only = row(9, "sku-9", 1);
     hot.feed(RowsKind::Insert, &None, &only);
     hot.feed(RowsKind::Delete, &only, &None);
-    let ((), n) = alloc_count::counted(|| {
+    let ((), n) = alloc_measure::count(|| {
         for _ in 0..10 {
             hot.feed(RowsKind::Insert, &None, &only);
             hot.feed(RowsKind::Delete, &only, &None);
@@ -250,12 +253,12 @@ fn a_rule_name_is_cloned_once_per_transaction_not_per_row() {
     // finding 6: the first row of a transaction takes the name, the rest only look it up.
     let mut hot = Hot::new(simple_id(), &[], false);
     let (before, after) = (row(7, "sku-1", 3), row(7, "sku-2", 5));
-    let ((), first) = alloc_count::counted(|| hot.feed(RowsKind::Update, &before, &after));
+    let ((), first) = alloc_measure::count(|| hot.feed(RowsKind::Update, &before, &after));
     assert!(
         first > 2 * value_cost(),
         "the transaction's first row pays for the rule's name and the key's slot: {first}"
     );
-    let ((), later) = alloc_count::counted(|| hot.feed(RowsKind::Update, &before, &after));
+    let ((), later) = alloc_measure::count(|| hot.feed(RowsKind::Update, &before, &after));
     assert_eq!(later, 2 * value_cost(), "a later row cloned the name again");
     assert_eq!(hot.rows(), Some(2));
 }
@@ -277,7 +280,7 @@ fn changed_columns_still_decide_what_a_row_marks() {
     loud.feed(RowsKind::Update, &before, &after);
     assert_eq!(loud.rows(), Some(1));
     assert_eq!(loud.keys(), "o-7");
-    let ((), n) = alloc_count::counted(|| loud.feed(RowsKind::Update, &before, &after));
+    let ((), n) = alloc_measure::count(|| loud.feed(RowsKind::Update, &before, &after));
     assert_eq!(n, 4 * value_cost(), "a row that marks again cost {n}");
 }
 

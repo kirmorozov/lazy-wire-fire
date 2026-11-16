@@ -24,6 +24,7 @@ COMMON SETTINGS:
   LAZYWF_INSTANCE=default   LAZYWF_HEALTH_ADDR=127.0.0.1:8081 (or off)
   LAZYWF_STATUS_TOKEN=...   /status then needs the X-Lazywf-Token header (/livez, /readyz open)
   LAZYWF_ALLOWED_HOSTS=host,*.dom,10.0.0.0/8  (unset denies all target egress; * allows any)
+  LAZYWF_METRICS_ADDR=127.0.0.1:8082 (opt-in Prometheus /metrics; off unless set)
   LAZYWF_LOG_FORMAT=text|json   RUST_LOG=info
 
 Rules, triggers and targets are rows in lazy_wire_fire_rule, lazy_wire_fire_trigger and
@@ -142,13 +143,21 @@ async fn run() -> ExitCode {
     if let Some(addr) = cfg.health_addr {
         tokio::spawn(lazy_wire_fire::health::serve(addr, health.clone()));
     }
+    // Opt-in Prometheus exposition on its own listener (the unauthenticated status surface stays
+    // narrow). Unset = off entirely: no listener, and the engine keeps no counters (a `None`
+    // registry makes every flush/drop site a skipped branch).
+    let metrics = cfg.metrics_addr.map(|addr| {
+        let m = Arc::new(lazy_wire_fire::metrics::Metrics::default());
+        tokio::spawn(lazy_wire_fire::metrics::serve(addr, m.clone()));
+        m
+    });
     let (tx, rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("shutdown requested");
         let _ = tx.send(true);
     });
-    match lazy_wire_fire::engine::run(cfg, health, rx).await {
+    match lazy_wire_fire::engine::run(cfg, health, metrics, rx).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("fatal: {}", chain(&e));

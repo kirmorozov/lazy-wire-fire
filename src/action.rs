@@ -103,12 +103,12 @@ pub enum Path {
     Delay,
 }
 
-/// The decision table of the commit fence: MySQL / Percona (`Flavor::MySql`) with the probe
-/// `Ordered` writes the fence; MariaDB never does (its snapshot position is exact); every other
-/// probe result sleeps the delay.
+/// The decision table of the commit fence: the MySQL family (`Flavor::MySql`, `Flavor::Percona`)
+/// with the probe `Ordered` writes the fence; MariaDB never does (its snapshot position is
+/// exact); every other probe result sleeps the delay.
 pub fn path(flavor: Flavor, probe: Probe) -> Path {
     match (flavor, probe) {
-        (Flavor::MySql, Probe::Ordered) => Path::Commit,
+        (Flavor::MySql | Flavor::Percona, Probe::Ordered) => Path::Commit,
         _ => Path::Delay,
     }
 }
@@ -144,7 +144,7 @@ fn warn_once(flag: &AtomicBool) -> bool {
 /// in binlog order. Else `LAZYWF_VISIBILITY_DELAY_MS`.
 pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
     let mut conn = env.pool.get_conn().await.context("fence connection")?;
-    if env.flavor == Flavor::MySql {
+    if env.flavor.is_mysql_family() {
         if let Some(g) = &spec.gtid {
             let r: Result<Option<Option<i64>>, _> = conn
                 .exec_first("SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)", (g,))
@@ -197,7 +197,7 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
         }
     }
     // Neither exact path answered: the commit fence on MySQL / Percona, else the delay.
-    if env.flavor == Flavor::MySql && commit_fence(env, &mut conn, &spec.pos).await {
+    if env.flavor.is_mysql_family() && commit_fence(env, &mut conn, &spec.pos).await {
         return Ok(());
     }
     if !env.visibility_delay.is_zero() {
@@ -266,12 +266,19 @@ pub struct KeyQuery {
 }
 
 impl KeyQuery {
+    /// The dedup key of this query: `trigger:sql:<params json>`. The parameters are
+    /// serialized by reference — `Value`'s `Display` and `serde_json::to_string` share the
+    /// serializer, so the string is byte-identical to the old
+    /// `format!("{}:{}:{}", trigger, sql, Value::Array(params.clone()))` without the deep
+    /// clone. Ids are in-memory map keys only, never persisted.
     pub fn id(&self) -> String {
         format!(
             "{}:{}:{}",
             self.trigger,
             self.sql,
-            Value::Array(self.params.clone())
+            // A `Vec<Value>` always serializes (only NaN/Infinity or non-string map keys
+            // fail, and a `Value` cannot hold either); the fallback keeps `id` infallible.
+            serde_json::to_string(&self.params).unwrap_or_else(|_| "[]".into())
         )
     }
 }
@@ -322,11 +329,15 @@ fn keys_of(rows: Vec<Row>) -> Vec<String> {
     keys
 }
 
-/// Runs the key queries of a flush; returns the keys they found.
-pub async fn resolve_keys(env: &Env, queries: &[KeyQuery]) -> Result<Vec<String>> {
+/// Runs the key queries of a flush; returns the keys they found. Takes the queries by
+/// reference so callers holding `(id, query)` pairs pass the payloads without cloning them.
+pub async fn resolve_keys<'a>(
+    env: &Env,
+    queries: impl IntoIterator<Item = &'a KeyQuery>,
+) -> Result<Vec<String>> {
     // Futures collected first: closures inside stream combinators trip `Send` inference.
     let futs: Vec<_> = queries
-        .iter()
+        .into_iter()
         .map(|q| async move {
             let mut conn = env.query.get_conn().await?;
             let params: Vec<My> = q.params.iter().map(to_param).collect();
@@ -1126,11 +1137,13 @@ mod tests {
 
     #[test]
     fn commit_fence_only_on_mysql_when_ordered() {
-        // MySQL / Percona (one flavor) with binlog_order_commits ON: the commit fence.
+        // MySQL / Percona (the MySQL family) with binlog_order_commits ON: the commit fence.
         assert_eq!(path(Flavor::MySql, Probe::Ordered), Path::Commit);
+        assert_eq!(path(Flavor::Percona, Probe::Ordered), Path::Commit);
         // Not ordered, or the probe failed: the delay.
         assert_eq!(path(Flavor::MySql, Probe::Unordered), Path::Delay);
         assert_eq!(path(Flavor::MySql, Probe::Failed), Path::Delay);
+        assert_eq!(path(Flavor::Percona, Probe::Unordered), Path::Delay);
         // MariaDB keeps its snapshot position and its delay; it never writes the fence.
         assert_eq!(path(Flavor::MariaDb, Probe::Ordered), Path::Delay);
         assert_eq!(path(Flavor::MariaDb, Probe::Unordered), Path::Delay);
@@ -1183,3 +1196,7 @@ mod tests {
         assert!(!warn_once(&flag));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/action_keyquery_tests.rs"]
+mod keyquery_tests;
