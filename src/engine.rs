@@ -398,6 +398,37 @@ struct Watched {
     layout: Arc<Layout>,
     table: String,
     triggers: Vec<(String, Arc<Rule>, usize)>,
+    /// Some trigger of the table builds its keys with a Full template, so a row's image has to
+    /// be built as an object (computed once here: a row of a table with Simple keys only never
+    /// pays for it).
+    any_full: bool,
+}
+
+/// The text a row's Simple keys are built in, reused from row to row: building one key is a
+/// `clear` and some pushes, never an allocation.
+#[derive(Default)]
+struct KeyScratch {
+    key: String,
+}
+
+impl KeyScratch {
+    /// Empties the scratch (its capacity stays) and hands it out to build one key line in.
+    fn begin(&mut self) -> &mut String {
+        self.key.clear();
+        &mut self.key
+    }
+}
+
+/// What building one row's keys touches in the engine, borrowed as pieces: `marks` the rules
+/// this transaction has marked so far, `rules` their buffers, `scratch` the string a key line is
+/// built in, `render_warnings` the Full keys that did not render, `invalid` the keys holding
+/// control characters (reported once the rows are done).
+struct RowCtx<'a> {
+    marks: &'a mut HashMap<String, Marks>,
+    rules: &'a mut BTreeMap<String, RuleState>,
+    scratch: &'a mut KeyScratch,
+    render_warnings: &'a mut u64,
+    invalid: &'a mut Vec<(String, u64, String)>,
 }
 
 struct XaTxn {
@@ -442,6 +473,8 @@ pub struct Engine {
     caught_up: bool,
     table_ids: HashMap<u64, Route>,
     txn_marks: HashMap<String, Marks>,
+    /// The string a row's Simple keys are built in (see [`KeyScratch`]).
+    key_scratch: KeyScratch,
     xa_current: Option<(String, XaTxn)>,
     xa_pending: HashMap<String, XaTxn>,
     /// Rules enabled again at a position the stream has passed: replayed from there (see
@@ -746,6 +779,7 @@ pub async fn run(
         caught_up: false,
         table_ids: HashMap::new(),
         txn_marks: HashMap::new(),
+        key_scratch: KeyScratch::default(),
         xa_current: None,
         xa_pending: HashMap::new(),
         rewinds: Vec::new(),
@@ -1837,10 +1871,14 @@ impl Engine {
                     .filter_map(|(n, i)| self.rules.get(n).map(|s| (n.clone(), s.rule.clone(), *i)))
                     .collect();
                 self.check_columns(&layout, schema, table, &triggers);
+                let any_full = triggers.iter().any(|(_, rule, i)| {
+                    matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
+                });
                 Ok(Route::Watched(Arc::new(Watched {
                     layout,
                     table: format!("{schema}.{table}"),
                     triggers,
+                    any_full,
                 })))
             }
             Err(e) if e.downcast_ref::<LayoutMismatch>().is_some() => {
@@ -1907,136 +1945,25 @@ impl Engine {
         kind: RowsKind,
         rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
     ) {
-        let op = match kind {
-            RowsKind::Insert => key::Op::Insert,
-            RowsKind::Update => key::Op::Update,
-            RowsKind::Delete => key::Op::Delete,
-        };
+        // Borrowed as pieces, so one row's keys are built with no borrow of the whole engine
+        // (see `row_keys`).
+        let Engine {
+            txn_marks,
+            rules,
+            key_scratch,
+            render_warnings,
+            ..
+        } = self;
         let mut invalid: Vec<(String, u64, String)> = Vec::new();
         for (before, after) in rows {
-            let images: Vec<&BinlogRow> = match kind {
-                RowsKind::Insert => after.iter().collect(),
-                RowsKind::Delete => before.iter().collect(),
-                RowsKind::Update => before.iter().chain(after.iter()).collect(),
+            let mut ctx = RowCtx {
+                marks: txn_marks,
+                rules,
+                scratch: key_scratch,
+                render_warnings,
+                invalid: &mut invalid,
             };
-            let mut objects: Vec<Option<Value>> = vec![None; images.len()];
-            for (name, rule, ti) in &w.triggers {
-                let t = &rule.triggers[*ti];
-                let on = match kind {
-                    RowsKind::Insert => t.def.on.insert,
-                    RowsKind::Update => t.def.on.update,
-                    RowsKind::Delete => t.def.on.delete,
-                };
-                if !on {
-                    continue;
-                }
-                if kind == RowsKind::Update && !t.def.changed_columns.is_empty() {
-                    let (Some(b), Some(a)) = (before, after) else {
-                        continue;
-                    };
-                    let changed = t
-                        .def
-                        .changed_columns
-                        .iter()
-                        .any(|c| match w.layout.index(c) {
-                            Some(i) => w.layout.value(b, i) != w.layout.value(a, i),
-                            None => true,
-                        });
-                    if !changed {
-                        continue;
-                    }
-                }
-                let marks = self.txn_marks.entry(name.clone()).or_default();
-                marks.rows += 1;
-                for (ii, img) in images.iter().enumerate() {
-                    match &t.key {
-                        Some(KeyTemplate::Simple(lines)) => {
-                            'line: for line in lines {
-                                let mut k = String::new();
-                                for seg in line {
-                                    match seg {
-                                        template::Seg::Lit(s) => k.push_str(s),
-                                        template::Seg::Col(c) => {
-                                            match w.layout.index(c).map(|i| w.layout.value(img, i))
-                                            {
-                                                None | Some(Value::Null) => continue 'line,
-                                                Some(v) => k.push_str(&template::text(&v)),
-                                            }
-                                        }
-                                    }
-                                }
-                                let k = k.trim();
-                                if template::valid_key(k) {
-                                    let (s, key) =
-                                        self.rules.get_mut(name).expect("present").buffer.locate(k);
-                                    marks.ids.insert(s, key);
-                                } else if !k.is_empty() {
-                                    invalid.push((name.clone(), t.def.id, k.to_string()));
-                                }
-                            }
-                        }
-                        Some(KeyTemplate::Full(lines)) => {
-                            let obj = objects[ii]
-                                .get_or_insert_with(|| w.layout.object(img))
-                                .clone();
-                            let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op_text(op), "table": w.table});
-                            for tpl in lines {
-                                match rule.templates.render(tpl, &ctx) {
-                                    Ok(s) => {
-                                        let k = s.trim();
-                                        if template::valid_key(k) {
-                                            let (s2, key) = self
-                                                .rules
-                                                .get_mut(name)
-                                                .expect("present")
-                                                .buffer
-                                                .locate(k);
-                                            marks.ids.insert(s2, key);
-                                        } else if !k.is_empty() {
-                                            invalid.push((name.clone(), t.def.id, k.to_string()));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Reported on the rule, so a key that cannot be rendered
-                                        // does not pass unnoticed.
-                                        self.render_warnings += 1;
-                                        if self.render_warnings <= 10
-                                            || self.render_warnings.is_multiple_of(1000)
-                                        {
-                                            warn!(rule = %name, "trigger {} key: {e:#}", t.def.id);
-                                        }
-                                        if let Some(st) = self.rules.get_mut(name) {
-                                            st.last_error = Some((
-                                                format!("trigger {} key: {e:#}", t.def.id),
-                                                crate::time::unix_now_ms(),
-                                            ));
-                                            st.dirty = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-                    if let Some(ks) = &t.keys_sql {
-                        let params = ks
-                            .columns
-                            .iter()
-                            .map(|c| {
-                                w.layout
-                                    .index(c)
-                                    .map_or(Value::Null, |i| w.layout.value(img, i))
-                            })
-                            .collect();
-                        let q = KeyQuery {
-                            trigger: t.def.id,
-                            sql: ks.sql.clone(),
-                            params,
-                        };
-                        marks.queries.insert(q.id(), q);
-                    }
-                }
-            }
+            Self::row_keys(w, kind, before, after, &mut ctx);
         }
         for (name, trigger, k) in invalid {
             self.invalid_keys += 1;
@@ -2054,6 +1981,164 @@ impl Engine {
         }
     }
 
+    /// One row of a watched table: every trigger that is `on` for this kind marks the row's
+    /// images — its keys located in the rule's buffer, its `keys_sql` query kept for the flush.
+    /// The engine's pieces come in [`RowCtx`], borrowed rather than through `self`, so a test
+    /// can feed a row without an engine; a row of a table whose triggers use Simple keys costs
+    /// no allocation at all (`KeyScratch` holds the key text, the images are an array, and row
+    /// objects exist only for a table with a Full-key trigger).
+    fn row_keys(
+        w: &Watched,
+        kind: RowsKind,
+        before: &Option<BinlogRow>,
+        after: &Option<BinlogRow>,
+        ctx: &mut RowCtx<'_>,
+    ) {
+        let op = match kind {
+            RowsKind::Insert => key::Op::Insert,
+            RowsKind::Update => key::Op::Update,
+            RowsKind::Delete => key::Op::Delete,
+        };
+        // Both images at hand, the unused slot `None` (an insert or a delete has one): an
+        // array, so a row costs no `Vec`.
+        let images: [Option<&BinlogRow>; 2] = match kind {
+            RowsKind::Insert => [after.as_ref(), None],
+            RowsKind::Delete => [before.as_ref(), None],
+            RowsKind::Update => [before.as_ref(), after.as_ref()],
+        };
+        // The images as objects, which only a Full key reads: allocated for a table that has a
+        // Full-key trigger and never for one that has none (see `Watched::any_full`).
+        let mut objects: Option<[Option<Value>; 2]> = w.any_full.then(|| [None, None]);
+        let RowCtx {
+            marks,
+            rules,
+            scratch,
+            render_warnings,
+            invalid,
+        } = ctx;
+        for (name, rule, ti) in &w.triggers {
+            let t = &rule.triggers[*ti];
+            let on = match kind {
+                RowsKind::Insert => t.def.on.insert,
+                RowsKind::Update => t.def.on.update,
+                RowsKind::Delete => t.def.on.delete,
+            };
+            if !on {
+                continue;
+            }
+            if kind == RowsKind::Update && !t.def.changed_columns.is_empty() {
+                let (Some(b), Some(a)) = (images[0], images[1]) else {
+                    continue;
+                };
+                let changed = t
+                    .def
+                    .changed_columns
+                    .iter()
+                    .any(|c| match w.layout.index(c) {
+                        Some(i) => w.layout.value(b, i) != w.layout.value(a, i),
+                        None => true,
+                    });
+                if !changed {
+                    continue;
+                }
+            }
+            // The rule's name is cloned only for the transaction's first row that marks it.
+            if marks.get_mut(name.as_str()).is_none() {
+                marks.insert(name.clone(), Marks::default());
+            }
+            let marks = marks
+                .get_mut(name.as_str())
+                .expect("inserted just above if it was missing");
+            marks.rows += 1;
+            for ii in 0..2 {
+                let Some(img) = images[ii] else {
+                    continue;
+                };
+                match &t.key {
+                    Some(KeyTemplate::Simple(lines)) => {
+                        'line: for line in lines {
+                            let k = scratch.begin();
+                            for seg in line {
+                                match seg {
+                                    template::Seg::Lit(s) => k.push_str(s),
+                                    template::Seg::Col(c) => {
+                                        match w.layout.index(c).map(|i| w.layout.value(img, i)) {
+                                            None | Some(Value::Null) => continue 'line,
+                                            Some(v) => template::push_text(&v, k),
+                                        }
+                                    }
+                                }
+                            }
+                            let k = k.trim();
+                            if template::valid_key(k) {
+                                let (s, key) =
+                                    rules.get_mut(name).expect("present").buffer.locate(k);
+                                marks.ids.insert(s, key);
+                            } else if !k.is_empty() {
+                                invalid.push((name.clone(), t.def.id, k.to_string()));
+                            }
+                        }
+                    }
+                    Some(KeyTemplate::Full(lines)) => {
+                        let objs = objects
+                            .as_mut()
+                            .expect("a Full-key trigger means the table has objects");
+                        let obj = objs[ii].get_or_insert_with(|| w.layout.object(img)).clone();
+                        let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op_text(op), "table": w.table});
+                        for tpl in lines {
+                            match rule.templates.render(tpl, &ctx) {
+                                Ok(s) => {
+                                    let k = s.trim();
+                                    if template::valid_key(k) {
+                                        let (s2, key) =
+                                            rules.get_mut(name).expect("present").buffer.locate(k);
+                                        marks.ids.insert(s2, key);
+                                    } else if !k.is_empty() {
+                                        invalid.push((name.clone(), t.def.id, k.to_string()));
+                                    }
+                                }
+                                Err(e) => {
+                                    // Reported on the rule, so a key that cannot be rendered
+                                    // does not pass unnoticed.
+                                    **render_warnings += 1;
+                                    if **render_warnings <= 10
+                                        || (**render_warnings).is_multiple_of(1000)
+                                    {
+                                        warn!(rule = %name, "trigger {} key: {e:#}", t.def.id);
+                                    }
+                                    if let Some(st) = rules.get_mut(name) {
+                                        st.last_error = Some((
+                                            format!("trigger {} key: {e:#}", t.def.id),
+                                            crate::time::unix_now_ms(),
+                                        ));
+                                        st.dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(ks) = &t.keys_sql {
+                    let params = ks
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            w.layout
+                                .index(c)
+                                .map_or(Value::Null, |i| w.layout.value(img, i))
+                        })
+                        .collect();
+                    let q = KeyQuery {
+                        trigger: t.def.id,
+                        sql: ks.sql.clone(),
+                        params,
+                    };
+                    marks.queries.insert(q.id(), q);
+                }
+            }
+        }
+    }
     /// Applies one committed transaction's marks (it ended at `end` and began after `since`).
     fn apply(&mut self, marks: HashMap<String, Marks>, end: &Position, since: &Position) {
         let now = Instant::now();
@@ -2201,25 +2286,39 @@ impl Engine {
 
     fn schedule(&mut self) {
         let now = Instant::now();
-        let names: Vec<String> = self.rules.keys().cloned().collect();
-        for name in names {
-            let st = &self.rules[&name];
-            let target_blocked = self
-                .target_backoff
+        // Borrowed as pieces: the reset of one rule is driven with its own state, so iterating
+        // the rules needs no clone of a name. A rule can fire a flush instead, which takes the
+        // engine, so its name is collected there — the usual iteration has no such rule.
+        let Engine {
+            rules,
+            target_backoff,
+            env,
+            tx,
+            ..
+        } = self;
+        let mut due: Vec<String> = Vec::new();
+        for (name, st) in rules.iter_mut() {
+            let target_blocked = target_backoff
                 .get(&st.rule.def.target)
                 .and_then(|b| b.blocked(now))
                 .is_some();
             let lane_free =
                 st.lane.is_none() && st.backoff.blocked(now).is_none() && !target_blocked;
-            if lane_free {
-                if let Some(due) = st.buffer.due(st.rule.def.debounce, st.rule.def.max_delay) {
-                    if due <= now {
-                        self.spawn_flush(&name);
-                        continue;
-                    }
-                }
+            let fire = lane_free
+                && matches!(
+                    st.buffer.due(st.rule.def.debounce, st.rule.def.max_delay),
+                    Some(at) if at <= now
+                );
+            if fire {
+                due.push(name.clone());
+            } else {
+                Self::drive_reset(st, env, tx, name, now, lane_free);
             }
-            self.drive_reset(&name, now, lane_free);
+        }
+        // No rule driven above can have taken the lane of one of these: a reset touches its own
+        // rule only, so each of these is still free and due, as checked just now.
+        for name in due {
+            self.spawn_flush(&name);
         }
     }
 
@@ -2286,13 +2385,22 @@ impl Engine {
     }
 
     /// Starts the next job of a rule's reset, if one can run now.
-    fn drive_reset(&mut self, name: &str, now: Instant, lane_free: bool) {
-        let (env, tx) = (self.env.clone(), self.tx.clone());
-        let st = self.rules.get_mut(name).expect("present");
+    /// Drives one rule's reset steps. Takes the rule's state rather than the engine, so
+    /// `schedule` can drive every rule without cloning its name; `lane_free`: no flush of this
+    /// rule is in flight (a step that sends takes the rule's lane, the one a flush uses too).
+    fn drive_reset(
+        st: &mut RuleState,
+        env: &Arc<Env>,
+        tx: &mpsc::UnboundedSender<Done>,
+        name: &str,
+        now: Instant,
+        lane_free: bool,
+    ) {
         let Some(run) = st.reset.as_mut() else { return };
         if st.prep || run.backoff.blocked(now).is_some() || st.rule.error.is_some() {
             return;
         }
+        let (env, tx) = (Arc::clone(env), Clone::clone(tx));
         let rule = st.rule.clone();
         let (incarnation, rid) = (st.incarnation, run.id);
         let rname = name.to_string();
@@ -3005,3 +3113,7 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "tests/engine_stream_verdict_tests.rs"]
 mod stream_verdict_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_hotpath_alloc_tests.rs"]
+mod hotpath_alloc_tests;
