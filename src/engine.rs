@@ -602,7 +602,7 @@ async fn managed_service_checks(conn: &mut Conn, flavor: Flavor) {
         .await
         .map(|v| v.flatten().and_then(|h| h.trim().parse::<u64>().ok()))
         .map_err(|e| e.to_string());
-    let gtid: Option<String> = if flavor == Flavor::MySql {
+    let gtid: Option<String> = if flavor.is_mysql_family() {
         conn.query_first("SELECT @@GLOBAL.gtid_mode")
             .await
             .unwrap_or(None)
@@ -620,7 +620,7 @@ async fn managed_service_checks(conn: &mut Conn, flavor: Flavor) {
 
 async fn server_identity(conn: &mut Conn, flavor: Flavor) -> Result<String> {
     let q = match flavor {
-        Flavor::MySql => "SELECT CAST(@@server_uuid AS CHAR)",
+        Flavor::MySql | Flavor::Percona => "SELECT CAST(@@server_uuid AS CHAR)",
         Flavor::MariaDb => "SELECT CAST(CONCAT(@@server_id, ':', @@gtid_domain_id) AS CHAR)",
     };
     let v: Option<String> = conn

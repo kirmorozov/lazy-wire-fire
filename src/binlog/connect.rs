@@ -140,7 +140,7 @@ pub(super) fn probe_var_is_absent(err: &mysql_async::Error) -> bool {
 /// `SELECT` is idempotent, so a repeat is a re-read. This file is copy set, so it owns its small
 /// loop: no metrics and no logging — the heartbeat is the engine's job, and the engine's startup
 /// path already retries the whole [`server_info`] call through `connect_wait`.
-async fn probe_var_retry(conn: &mut Conn, var: &str) -> Result<Option<String>> {
+pub(crate) async fn probe_var_retry(conn: &mut Conn, var: &str) -> Result<Option<String>> {
     let mut attempt = 1;
     loop {
         match probe_var(conn, var).await {
@@ -175,14 +175,19 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
     let log_bin = value_str(row.as_ref(1));
     let format = value_str(row.as_ref(2));
     let image = value_str(row.as_ref(3));
-    let flavor = Flavor::from_version(&version);
+    let mut flavor = Flavor::from_version(&version);
     let mut compress: Option<String> = None;
     let mut storage_engine: Option<String> = None;
     if flavor == Flavor::MariaDb {
-        // Variables missing on older servers (binlog_storage_engine before 12.3) come back `None`:
-        // nothing to check. A probe that only failed is an error, never "absent".
-        compress = probe_var_retry(conn, "log_bin_compress").await?;
-        storage_engine = probe_var_retry(conn, "binlog_storage_engine").await?;
+        // The MariaDB preflight probes are flavor code: [`crate::source::maria::probes`].
+        (compress, storage_engine) = crate::source::maria::probes(conn).await?;
+    } else {
+        // Percona's `VERSION()` is a plain MySQL version string, so its product name comes from
+        // `@@GLOBAL.version_comment`; only a MySQL-looking server has to ask. The probe is here
+        // (it is the network edge); reading the value is the flavor's own answer,
+        // [`crate::source::percona::is_this`].
+        let comment = probe_var_retry(conn, "version_comment").await?;
+        flavor = Flavor::from_version_comment(&version, comment.as_deref().unwrap_or(""));
     }
     let mut problems = requirement_problems(
         flavor,
@@ -192,20 +197,19 @@ pub async fn server_info(conn: &mut Conn) -> Result<ServerInfo> {
         compress.as_deref().unwrap_or(""),
         storage_engine.as_deref().unwrap_or(""),
     );
-    if flavor == Flavor::MySql {
+    if flavor.is_mysql_family() {
         // Partial JSON row images carry diffs instead of values; lazyview needs full values.
+        // The probe is here (it is the network edge); the check and its message are the
+        // MySQL family's: [`crate::source::mysql::preflight`], which Percona reaches through
+        // [`crate::source::percona`] — a call into `mysql.rs`, never a copy of it.
         let opts = probe_var_retry(conn, "binlog_row_value_options").await?;
-        if opts
-            .unwrap_or_default()
-            .to_ascii_uppercase()
-            .contains("PARTIAL_JSON")
-        {
-            problems.push(
-                "binlog_row_value_options is PARTIAL_JSON (must be empty); fix: SET PERSIST \
-                 binlog_row_value_options='' (Amazon RDS/Aurora: set it in the DB parameter group)"
-                    .into(),
-            );
-        }
+        let partial_json = match flavor {
+            Flavor::MySql => crate::source::mysql::preflight(opts.as_deref()),
+            Flavor::Percona => crate::source::percona::preflight(opts.as_deref()),
+            // Reached only through the guard above: MariaDB has no partial-JSON row images.
+            Flavor::MariaDb => None,
+        };
+        problems.extend(partial_json);
     }
     if !problems.is_empty() {
         bail!(unmet_requirements(&version, &problems));
