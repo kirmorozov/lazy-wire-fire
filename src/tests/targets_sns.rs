@@ -34,6 +34,39 @@ fn a_rendered_batch_of_two_entries_is_ok() {
 }
 
 #[test]
+fn a_raw_percent_before_a_character_is_data_not_a_panic() {
+    // The audit's shape (report §3): a record whose Message holds a raw `%`
+    // right before a multi-byte character, so `form_pairs` used to slice a
+    // `&str` inside the character. The entry is checked, not panicked.
+    let raw = body(&[("0", "100%\u{20AC}")]);
+    assert!(entries_ok(raw.as_bytes(), 1, false).is_ok());
+    // The fields are there under the decoded names, with the escape kept.
+    let pairs = form_pairs(raw.as_bytes());
+    assert_eq!(
+        pairs
+            .iter()
+            .find(|(k, _)| k == "PublishBatchRequestEntries.member.1.Message")
+            .map(|(_, v)| v.as_str()),
+        Some("100%\u{20AC}")
+    );
+    // A real encoded body still decodes to the same value (round trip).
+    let pairs =
+        form_pairs("PublishBatchRequestEntries.member.1.Message=%7B%22a%22%3A1%7D".as_bytes());
+    assert_eq!(
+        pairs[0],
+        (
+            "PublishBatchRequestEntries.member.1.Message".to_string(),
+            "{\"a\":1}".to_string()
+        )
+    );
+    // An empty Message keeps refusing with exactly the text it had before.
+    assert_eq!(
+        entries_ok(body(&[("0", "")]).as_bytes(), 1, false).unwrap_err(),
+        "entry 0 (member 1): `Message` is not a non-empty value (PublishBatch requires a message)"
+    );
+}
+
+#[test]
 fn entries_are_numbered_from_one() {
     // The mistake a template makes when it forgets `{{add @index 1}}`.
     let mut from_zero = String::from("Action=PublishBatch");
