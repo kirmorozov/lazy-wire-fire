@@ -266,12 +266,19 @@ pub struct KeyQuery {
 }
 
 impl KeyQuery {
+    /// The dedup key of this query: `trigger:sql:<params json>`. The parameters are
+    /// serialized by reference — `Value`'s `Display` and `serde_json::to_string` share the
+    /// serializer, so the string is byte-identical to the old
+    /// `format!("{}:{}:{}", trigger, sql, Value::Array(params.clone()))` without the deep
+    /// clone. Ids are in-memory map keys only, never persisted.
     pub fn id(&self) -> String {
         format!(
             "{}:{}:{}",
             self.trigger,
             self.sql,
-            Value::Array(self.params.clone())
+            // A `Vec<Value>` always serializes (only NaN/Infinity or non-string map keys
+            // fail, and a `Value` cannot hold either); the fallback keeps `id` infallible.
+            serde_json::to_string(&self.params).unwrap_or_else(|_| "[]".into())
         )
     }
 }
@@ -322,11 +329,15 @@ fn keys_of(rows: Vec<Row>) -> Vec<String> {
     keys
 }
 
-/// Runs the key queries of a flush; returns the keys they found.
-pub async fn resolve_keys(env: &Env, queries: &[KeyQuery]) -> Result<Vec<String>> {
+/// Runs the key queries of a flush; returns the keys they found. Takes the queries by
+/// reference so callers holding `(id, query)` pairs pass the payloads without cloning them.
+pub async fn resolve_keys<'a>(
+    env: &Env,
+    queries: impl IntoIterator<Item = &'a KeyQuery>,
+) -> Result<Vec<String>> {
     // Futures collected first: closures inside stream combinators trip `Send` inference.
     let futs: Vec<_> = queries
-        .iter()
+        .into_iter()
         .map(|q| async move {
             let mut conn = env.query.get_conn().await?;
             let params: Vec<My> = q.params.iter().map(to_param).collect();
@@ -1185,3 +1196,7 @@ mod tests {
         assert!(!warn_once(&flag));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/action_keyquery_tests.rs"]
+mod keyquery_tests;
