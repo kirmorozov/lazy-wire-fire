@@ -46,3 +46,8 @@ pub mod targets;
 pub mod template;
 pub mod time;
 pub mod tls;
+
+/// The test-only counting allocator (live bytes and per-thread allocation counts).
+#[cfg(test)]
+#[path = "tests/alloc_measure.rs"]
+mod alloc_measure;

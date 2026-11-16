@@ -145,28 +145,29 @@ impl Buffer {
     }
 
     /// A pending `keys_sql` query: the payload here, an item in the core (which holds the
-    /// position floor like a marked key).
-    fn add_query(&mut self, q: KeyQuery, origin: &Position) {
-        let id = q.id();
+    /// position floor like a marked key). The id is computed once at the insert site and
+    /// passed in (it keys this map and names the item).
+    fn add_query(&mut self, id: String, q: KeyQuery, origin: &Position) {
         self.queries.insert(id.clone(), q);
         self.core.item(key::Item::User(id), origin);
     }
 
     /// Puts back the queries of a failed flush (the items are re-added separately: `done`
-    /// carries them when the generation is still there).
-    fn put_back_queries(&mut self, queries: Vec<KeyQuery>) {
-        for q in queries {
-            self.queries.entry(q.id()).or_insert(q);
+    /// carries them when the generation is still there), under the ids they were taken with.
+    fn put_back_queries(&mut self, queries: Vec<(String, KeyQuery)>) {
+        for (id, q) in queries {
+            self.queries.entry(id).or_insert(q);
         }
     }
 
-    /// The payloads of the queries one taken generation carried, in item order.
-    fn take_query_payloads(&mut self, items: &[key::Item<String>]) -> Vec<KeyQuery> {
+    /// The payloads of the queries one taken generation carried, in item order, each with
+    /// the id it was held under (the item's own id, moved out of `items`: never recomputed).
+    fn take_query_payloads(&mut self, items: Vec<key::Item<String>>) -> Vec<(String, KeyQuery)> {
         let mut out = Vec::with_capacity(items.len());
         for i in items {
             if let key::Item::User(id) = i {
-                if let Some(q) = self.queries.shift_remove(id) {
-                    out.push(q);
+                if let Some(q) = self.queries.shift_remove(&id) {
+                    out.push((id, q));
                 }
             }
         }
@@ -195,7 +196,10 @@ enum Lane {
         first: Option<Instant>,
         /// Keys of this flush that have strikes.
         struck: Vec<String>,
-        queries: Vec<KeyQuery>,
+        /// The pending queries taken for this flush, each with its id (the dedup key it was
+        /// inserted under, so a failed flush puts it back and completes the generation
+        /// without recomputing ids).
+        queries: Vec<(String, KeyQuery)>,
     },
     Reset,
 }
@@ -2053,8 +2057,8 @@ impl Engine {
                     st.buffer.mark(s, key::Key::Tuple(t), since);
                 }
             }
-            for q in m.queries.into_values() {
-                st.buffer.add_query(q, since);
+            for (id, q) in m.queries.into_iter() {
+                st.buffer.add_query(id, q, since);
             }
             // The old `hold` kept the MINIMUM of the positions it was given. `mark` and
             // `item` pin the origin only when there is none, and marks do not all arrive in
@@ -2212,7 +2216,7 @@ impl Engine {
             .expect("begin moved the pending ids into the generation");
         let maps: BTreeMap<key::SpaceId, buffer::IdSet> = taken.ids.into_iter().collect();
         let keys: Vec<String> = buf.keys.render(&maps);
-        let queries: Vec<KeyQuery> = buf.take_query_payloads(&taken.items);
+        let queries: Vec<(String, KeyQuery)> = buf.take_query_payloads(taken.items);
         // Only the keys with strikes are remembered (to clear them once confirmed).
         let struck = if st.strikes.is_empty() {
             Vec::new()
@@ -2500,7 +2504,10 @@ impl Engine {
                         // Back into the buffer, carrying the position the generation was
                         // taken at (the core re-pins it; today's `hold` of the lane's since).
                         let items: Vec<key::Item<String>> = if keep_queries {
-                            queries.iter().map(|q| key::Item::User(q.id())).collect()
+                            queries
+                                .iter()
+                                .map(|(id, _)| key::Item::User(id.clone()))
+                                .collect()
                         } else {
                             Vec::new()
                         };
@@ -2882,7 +2889,7 @@ async fn flush_job(
     rule: &Rule,
     spec: FenceSpec,
     mut keys: Vec<String>,
-    queries: Vec<KeyQuery>,
+    queries: Vec<(String, KeyQuery)>,
 ) -> Outcome {
     let fail = |e: anyhow::Error, keys: Vec<String>| Outcome::Flush {
         fired: Fired {
@@ -2898,7 +2905,7 @@ async fn flush_job(
     }
     let mut resolved = Vec::new();
     if !queries.is_empty() {
-        match action::resolve_keys(env, &queries).await {
+        match action::resolve_keys(env, queries.iter().map(|(_, q)| q)).await {
             Ok(found) => {
                 let mut seen = text_set(keys.iter().map(String::as_str));
                 for k in found {
