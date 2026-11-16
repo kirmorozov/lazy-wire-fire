@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit bb9d2da7a215dfbb6ffcd125de2cbcb277c17958
+commit 4b267fa3ee862dc5e9d57d02cdd8f03ae65ae892
 glob src/access.rs
 glob src/access/**
 glob src/analyze.rs
@@ -82,7 +82,7 @@ file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f
 file src/intset.rs 74132f56dd0e628df8be2f3b31430702f58a4cd4b90405aee5714037b9193bb1
 file src/pgoutput.rs 3ba4b836391ddf5dcc1d364e53aa633a9aa2d4ac8b6bc8e4b78371c600109ebd
 file src/pgoutput/tests.rs de670286a3c1519b38cbc453baf9ecc31f079e59cc7ccd47dfa79ff6951f5882
-file src/source/maria.rs b8a47f43b9d4874d9ff68a2af18cc6bfdac15e6ec8bc8ee6bc22e7632a3bcfb7
-file src/source/mod.rs 084425d24744b20af3c5676169eb9ef1ef4cf2ffca61ab28836a0e8449cc9517
-file src/source/mysql.rs fbd28a49f79da29061d3c632a8882e168f0d2433f104bd71b93506c4d611892e
+file src/source/maria.rs 330d9bb58c38c0c338ff97ea8691807d96c526b8c58928be7b01f5a2260c7796
+file src/source/mod.rs 3da0e9a2c4e369a8c2e5f5fb727f6a0c8d568a373610fe3e645ffef328f84ba4
+file src/source/mysql.rs 2dbc1c66047848a7694292d11aac3f40ec27f33b7dde1daa23c89653302fe2ce
 file src/source/percona.rs 84c142385d50f80afbfe458e910aaecba504d9834f2d54d336d717a804dd7ef7
