@@ -242,7 +242,7 @@ Content-Length: 33
 | | |
 |---|---|
 | **Endpoint** | `POST /v1/batch` on `https://api.segment.io` (EU workspaces: `https://events.eu1.segmentapis.com`) |
-| **Auth** | `kind = 'http.basic'`, `vars.username` → `env:SEGMENT_WRITE_KEY`, `vars.password` → `""`. Basic is documented as the write key as username with an empty password; the alternative is the write key in the body (`"writeKey":"…"`) with `kind = 'http'` |
+| **Auth** | `kind = 'http.basic'`, `vars.username` → `env:SEGMENT_WRITE_KEY`, `vars.password` → `env:SEGMENT_EMPTY_PW` (a variable set to empty: since 0.3.0 the password accepts references only, see the second bullet). Basic is documented as the write key as username with an empty password; the alternative is the write key in the body (`"writeKey":"…"`) with `kind = 'http'` |
 | **Renders** | `{"batch":[{…},{…}]}` — one event object per changed row. `Content-Type: application/json` is required by the API, and lazywf sends it only because the template writes it |
 | **`expect`** | NULL — any 2xx. See the first bullet: a 200 is what Segment answers for almost everything, including events it then drops |
 | **Batch and rate limit** | 500 KB per request, 32 KB per event, at most 2500 events per batch; the API recommends staying under 1000 requests per second per workspace, and requests over the limit can come back 429 with `Retry-After` → `batch_max_keys = 200` and `batch_max_bytes` under half a megabyte |
@@ -251,7 +251,7 @@ Content-Length: 33
 ```sql
 INSERT INTO lazy_wire_fire_target (name, kind, endpoints, timeout_ms, vars) VALUES
  ('segment', 'http.basic', 'https://api.segment.io', 10000,
-  '{"username": "env:SEGMENT_WRITE_KEY", "password": ""}');
+  '{"username": "env:SEGMENT_WRITE_KEY", "password": "env:SEGMENT_EMPTY_PW"}');
 
 INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, batch_max_bytes, selects, template) VALUES
  ('segment_order_events', 'segment', 'batch', 200, 400000,
@@ -284,10 +284,13 @@ Content-Length: 174
   `event` name is missing, or whose `messageId` repeats. The 2xx band catches the 400s on its own
   and nothing here can catch the rest; that half is the Segment Debugger's job, which is why
   `expect` above is left empty instead of pretending to check more.
-* **`vars.password` is an empty string, not a missing key.** `http.basic` base64-encodes
-  `username:password` as one string, and the documented form is the write key, a colon, and
-  nothing after it. A reference that resolves to nothing is a valid credential value; omitting
-  `vars.password` is not — the kind requires both names.
+* **`vars.password` is a reference that resolves to the empty string.** `http.basic`
+  base64-encodes `username:password` as one string, and the documented form is the write key, a
+  colon, and nothing after it. Since 0.3.0 a password in `vars` is a reference only, and an empty
+  literal counts as unset — `"password": ""` is refused at load like a missing key (the kind
+  requires both names). Point the reference at a variable set to empty (`export SEGMENT_EMPTY_PW=''`)
+  or at an empty file under `LAZYWF_SECRET_DIRS`; a reference that resolves to nothing is a valid
+  credential value.
 * **`messageId` is the deduplication key**, matched on values under 100 characters, so the
   example builds it from the row rather than leaving it out. The same value on a retry is what
   makes a resend harmless; the same value across two genuinely different states of a row is what
