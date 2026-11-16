@@ -84,7 +84,7 @@ twox-hash = { version = "2.1", default-features = false, features = ["std", "xxh
 # rest of the TLS here (the newer 0.18 line enables rustls' default features, which pull
 # aws-lc-rs and cmake). The `rustls` feature is the TLS; CBS (claims-based security) is built on
 # the bare link primitives here, in src/servicebus.rs.
-fe2o3-amqp = { version = "0.14", default-features = false, features = ["rustls"] }
+fe2o3-amqp = { version = "0.18", default-features = false, features = ["rustls"] }
 # The gRPC call itself (src/grpc/stream.rs): tonic's generic client over the hyper/rustls
 # transport. Default features off; `channel` is the client half of the transport. TLS goes
 # through a connector on src/tls.rs (so lazywf's CA, verify mode and server name apply, and
