@@ -136,32 +136,13 @@ fn warn_once(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
 }
 
-/// Whether the binlog position this flavor reports for a consistent snapshot
-/// (`binlog_snapshot_%`) is a watermark of *committed* transactions: whether waiting for it to
-/// reach the boundary the engine read from the binlog proves every transaction up to there is
-/// visible to a new reader.
-///
-/// It is lazyview's `Flavor::snapshot_position_is_watermark` answer (9b3d14e): MariaDB's pair is
-/// a watermark, the MySQL family's is not. `Flavor` lives in a vendored file
-/// (`src/source/mod.rs`), so the answer lives here as a free function until PR-2 re-syncs to
-/// 74d0fd8 and replaces this with the flavor's own method.
-///
-/// The MySQL family's pair is the raw binlog WRITE position: events are written before the
-/// transaction commits, so it has already passed transactions still in flight that the snapshot
-/// taken in the same moment cannot read (measured on Percona Server 8.4 with GTIDs off), and a
-/// wait on it approves a read of stale rows. Such a flavor is fenced by the GTID wait when it has
-/// GTIDs and by the commit fence otherwise.
-fn snapshot_is_watermark(flavor: Flavor) -> bool {
-    !flavor.is_mysql_family()
-}
-
 /// Waits until every transaction up to `spec` is visible to readers (binlog events are shipped
 /// before the engine commit completes). MySQL / Percona with GTIDs:
 /// `WAIT_FOR_EXECUTED_GTID_SET`; the flavors whose consistent-snapshot position is a
-/// committed-transaction watermark (`snapshot_is_watermark`, i.e. MariaDB): that position. The
-/// MySQL family never waits on `binlog_snapshot_%` — its pair is the raw binlog write position,
-/// not a watermark — so without a GTID it goes straight to the commit fence (`commit_fence`),
-/// when commits are in binlog order. Else `LAZYWF_VISIBILITY_DELAY_MS`.
+/// committed-transaction watermark (`Flavor::snapshot_position_is_watermark`, i.e. MariaDB): that
+/// position. The MySQL family never waits on `binlog_snapshot_%` — its pair is the raw binlog write
+/// position, not a watermark — so without a GTID it goes straight to the commit fence
+/// (`commit_fence`), when commits are in binlog order. Else `LAZYWF_VISIBILITY_DELAY_MS`.
 pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
     let mut conn = env.pool.get_conn().await.context("fence connection")?;
     if env.flavor.is_mysql_family() {
@@ -178,12 +159,13 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
         }
     }
     // The consistent-snapshot wait is a fence only where the reported pair is a
-    // committed-transaction watermark (`snapshot_is_watermark`): MariaDB's is. The MySQL family
-    // reports its raw binlog write position, which has already passed transactions still in
-    // flight that the snapshot taken in the same moment cannot read, so waiting on it would
-    // approve a stale read — those flavors take the GTID wait above and the commit fence below.
-    // A server that reports no pair at all (MySQL Community) rules itself out by answering nothing.
-    if snapshot_is_watermark(env.flavor)
+    // committed-transaction watermark (`Flavor::snapshot_position_is_watermark`): MariaDB's is.
+    // The MySQL family reports its raw binlog write position, which has already passed
+    // transactions still in flight that the snapshot taken in the same moment cannot read, so
+    // waiting on it would approve a stale read — those flavors take the GTID wait above and the
+    // commit fence below. A server that reports no pair at all (MySQL Community) rules itself out
+    // by answering nothing.
+    if env.flavor.snapshot_position_is_watermark()
         && env.snapshot_fence.load(Ordering::Relaxed) != 2
         && !spec.pos.file.is_empty()
     {
@@ -1183,14 +1165,16 @@ mod tests {
 
     #[test]
     fn only_a_watermark_flavor_waits_on_the_snapshot_position() {
-        // MariaDB's `binlog_snapshot_%` names the point of the stream its snapshot reads as of,
-        // so waiting for it to reach the boundary is an exact fence.
-        assert!(snapshot_is_watermark(Flavor::MariaDb));
+        // What `fence` asks before the consistent-snapshot wait. The flavor answers it
+        // (`Flavor::snapshot_position_is_watermark`, a vendored copy of lazyview's): MariaDB's
+        // `binlog_snapshot_%` names the point of the stream its snapshot reads as of, so waiting
+        // for it to reach the boundary is an exact fence.
+        assert!(Flavor::MariaDb.snapshot_position_is_watermark());
         // The MySQL family's pair is the raw binlog WRITE position (Percona Server 8.4 with GTIDs
         // off: it had advanced past an in-flight update whose row the snapshot still read as old),
         // so `fence` must not wait on it: the GTID wait or the commit fence fences these flavors.
-        assert!(!snapshot_is_watermark(Flavor::MySql));
-        assert!(!snapshot_is_watermark(Flavor::Percona));
+        assert!(!Flavor::MySql.snapshot_position_is_watermark());
+        assert!(!Flavor::Percona.snapshot_position_is_watermark());
     }
 
     #[test]
