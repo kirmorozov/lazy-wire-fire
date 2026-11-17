@@ -22,8 +22,13 @@ release:
 # default.
 # The reserved-tables test is a unit test in its own process: set_reserved takes effect once per
 # process, and the planner's own unit tests take that call in the lib test binary.
+# `--bins` runs the binary's own unit tests (`src/main.rs`): `--lib` does not build them, so
+# without that line nothing but the informational coverage job would ever run them. The `roaring`
+# feature gates only the lib's key set (`src/intset.rs`) and nothing those tests reach, so
+# `test-roaring` needs no twin of the line.
 test:
 	$(CARGO) test --lib
+	$(CARGO) test --bins
 	$(CARGO) test --test reserved
 	$(MAKE) --no-print-directory test-grpc
 	$(MAKE) --no-print-directory test-roaring
