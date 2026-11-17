@@ -5,7 +5,7 @@ CARGO := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) cargo
 COMPOSE := docker compose -f docker-compose.test.yml
 IMAGE ?= lazywf:dev
 # Keep in step with the FROM lines of the Dockerfile.
-BASE_IMAGES := docker.io/library/rust:1.99.1-slim-bookworm gcr.io/distroless/static-debian12:nonroot
+BASE_IMAGES := docker.io/library/rust:1.100.0-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
 .PHONY: build release test test-roaring test-grpc lint servers servers-down test-e2e test-e2e-all test-e2e-search \
 	test-e2e-queues test-e2e-pgsrc test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
