@@ -12,7 +12,7 @@
 # tag@digest the digest wins). The FROM lines are literal so Dependabot can bump them;
 # `make image-digests` prints the current digests. CI publishes ghcr.io/kirmorozov/lazy-wire-fire.
 
-FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS toolchain
+FROM --platform=$BUILDPLATFORM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS toolchain
 ARG ZIG_VERSION=0.17.0
 ARG CARGO_ZIGBUILD_VERSION=0.23.4
 ARG BUILDARCH
@@ -58,7 +58,11 @@ COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     set -eux; mkdir -p src; echo 'fn main() {}' > src/main.rs; : > src/lib.rs; \
-    cargo zigbuild --release --locked --target "$(cat /rust-target)"; rm -rf src
+    cargo zigbuild --release --locked --target "$(cat /rust-target)"; \
+    # Keep the stub binary: the application layer proves it replaced this one.
+    mkdir -p /stub; \
+    cp "target/$(cat /rust-target)/release/lazywf" /stub/lazywf; \
+    rm -rf src
 COPY src ./src
 # The gRPC contract the binary embeds with `include_bytes!` (src/grpc/contract.rs): a .proto and
 # its compiled descriptor set, committed, so building the image needs no protoc.
@@ -66,9 +70,20 @@ COPY proto ./proto
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     set -eux; t="$(cat /rust-target)"; \
-    rm -rf "target/${t}/release/.fingerprint/lazy-wire-fire-"* "target/${t}/release/deps/lazy_wire_fire-"* \
-           "target/${t}/release/deps/liblazy_wire_fire-"* "target/${t}/release/deps/lazywf-"*; \
+    # The stub build left artifacts for our own crate whose fingerprints are newer than the
+    # COPYed sources, so cargo sees them as fresh and would ship the stub (which prints
+    # nothing, which is what `make docker-smoke` caught on the 1.100 bump). Forcing the
+    # rebuild must not depend on how this cargo names its bookkeeping: the old
+    # `rm -rf .../lazy-wire-fire-*` globs matched nothing on cargo 1.100 (neither .fingerprint/
+    # nor deps/ files carry the package name any more). So ask cargo to drop our package's
+    # own artifacts, and stamp the sources newer than the stub build; deps stay cached.
+    cargo clean -p lazy-wire-fire --release --target "${t}"; \
+    find src -type f -exec touch {} +; \
     cargo zigbuild --release --locked --target "${t}"; \
+    if cmp -s "target/${t}/release/lazywf" /stub/lazywf; then \
+      echo "lazywf was not rebuilt from src/: the binary is still the stub" >&2; \
+      exit 1; \
+    fi; \
     mkdir -p /out; cp "target/${t}/release/lazywf" /out/lazywf
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
