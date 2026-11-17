@@ -35,7 +35,7 @@ use crate::health::Health;
 use crate::keyspace::{op_text, text_set, IdSets, KeySpaces};
 use crate::lock;
 use crate::metrics::{FlushOutcome, Metrics, PairHandle, RuleHandle};
-use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
+use crate::model::{self, On, RuleDef, StepKind, TargetDef, TriggerDef};
 use crate::rows::{Catalog, Layout, LayoutMismatch};
 use crate::rule::{self, KeyTemplate, Rule};
 use crate::source::{self, Flavor, Item, Position, RowsKind};
@@ -402,6 +402,24 @@ struct Watched {
     /// be built as an object (computed once here: a row of a table with Simple keys only never
     /// pays for it).
     any_full: bool,
+    /// Some trigger of the table fires on this row kind (the union of the triggers' `on` flags,
+    /// computed once here beside `any_full`, see [`Engine::watched_kinds`]): a rows event of a
+    /// kind none of them watches marks nothing, so it is never even decoded (see
+    /// [`Engine::on_rows`]).
+    any_on: On,
+}
+
+impl Watched {
+    /// Does any trigger of this table fire on `kind`? If none does, the rows events of that
+    /// kind mark nothing (the `on` check in [`Engine::row_keys`] drops every row), so they are
+    /// skipped undecoded (see [`Engine::on_rows`]).
+    fn watches(&self, kind: RowsKind) -> bool {
+        match kind {
+            RowsKind::Insert => self.any_on.insert,
+            RowsKind::Update => self.any_on.update,
+            RowsKind::Delete => self.any_on.delete,
+        }
+    }
 }
 
 /// The text a row's Simple keys are built in, reused from row to row: building one key is a
@@ -422,12 +440,14 @@ impl KeyScratch {
 /// What building one row's keys touches in the engine, borrowed as pieces: `marks` the rules
 /// this transaction has marked so far, `rules` their buffers, `scratch` the string a key line is
 /// built in, `render_warnings` the Full keys that did not render, `invalid` the keys holding
-/// control characters (reported once the rows are done).
+/// control characters and `invalid_keys` how many were ever reported (the invalid ones are
+/// reported once the rows are done).
 struct RowCtx<'a> {
     marks: &'a mut HashMap<String, Marks>,
     rules: &'a mut BTreeMap<String, RuleState>,
     scratch: &'a mut KeyScratch,
     render_warnings: &'a mut u64,
+    invalid_keys: &'a mut u64,
     invalid: &'a mut Vec<(String, u64, String)>,
 }
 
@@ -1755,8 +1775,24 @@ impl Engine {
                         self.config_dirty.get_or_insert_with(Instant::now);
                     }
                     Some(Route::Watched(w)) => {
-                        let rows = reader.rows(table_id, &event)?;
-                        self.feed(&w, kind, &rows);
+                        let Engine {
+                            txn_marks,
+                            rules,
+                            key_scratch,
+                            render_warnings,
+                            invalid_keys,
+                            ..
+                        } = self;
+                        let mut invalid = Vec::new();
+                        let mut ctx = RowCtx {
+                            marks: txn_marks,
+                            rules,
+                            scratch: key_scratch,
+                            render_warnings,
+                            invalid_keys,
+                            invalid: &mut invalid,
+                        };
+                        Engine::on_rows(&w, kind, || reader.rows(table_id, &event), &mut ctx)?;
                     }
                     _ => {}
                 }
@@ -1874,11 +1910,13 @@ impl Engine {
                 let any_full = triggers.iter().any(|(_, rule, i)| {
                     matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
                 });
+                let any_on = Self::watched_kinds(&triggers);
                 Ok(Route::Watched(Arc::new(Watched {
                     layout,
                     table: format!("{schema}.{table}"),
                     triggers,
                     any_full,
+                    any_on,
                 })))
             }
             Err(e) if e.downcast_ref::<LayoutMismatch>().is_some() => {
@@ -1938,40 +1976,66 @@ impl Engine {
         }
     }
 
-    /// Marks the keys of these rows' images for every trigger on the table.
-    fn feed(
-        &mut self,
+    /// The row kinds any trigger of the table fires on: the union of their `on` flags,
+    /// computed once at route time (see [`Watched::watches`]).
+    fn watched_kinds(triggers: &[(String, Arc<Rule>, usize)]) -> On {
+        let mut on = On::default();
+        for (_, rule, i) in triggers {
+            let t = &rule.triggers[*i].def.on;
+            on.insert |= t.insert;
+            on.update |= t.update;
+            on.delete |= t.delete;
+        }
+        on
+    }
+
+    /// One `Rows` event of a watched table: decode its row images, mark every row's keys for
+    /// every trigger that is `on` for this kind, and report the invalid keys. When no trigger
+    /// of the table fires on this kind the event is passed over undecoded: every effect of the
+    /// per-row path — the transaction's marks, the rows' count, the warnings, the invalid-key
+    /// reports — sits behind the `on` check in `row_keys`, so nothing an unwatched kind does
+    /// today is lost by skipping it (the hot-path audit's finding 4; `skip_kinds_tests` proves
+    /// the skipped state identical to the decoded one, for a decodable and for an undecodable
+    /// image alike). The skip costs no safety either: `reader.rows` decodes against the
+    /// TABLE_MAP this transaction's `map_event` already stored and moves no position, its
+    /// errors are row-image-vs-table-map mismatches, and the next watched-kind event of this
+    /// table decodes against the same map, so a real layout mismatch still surfaces there;
+    /// the event's framing (header, size, payload) was checked in `reader.next()` before this
+    /// arm, and the server reports a corrupt event when it streams its own binlog. The client
+    /// does not verify the event's CRC32 to begin with — `Event::read` (mysql_common) only
+    /// stores the trailing checksum and `calc_checksum` runs on write alone — so the skip
+    /// forgoes no checksum. The decode comes in as a closure, so a test can see whether it
+    /// ran without a binlog reader.
+    fn on_rows(
         w: &Watched,
         kind: RowsKind,
-        rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
-    ) {
-        // Borrowed as pieces, so one row's keys are built with no borrow of the whole engine
-        // (see `row_keys`).
-        let Engine {
-            txn_marks,
-            rules,
-            key_scratch,
-            render_warnings,
-            ..
-        } = self;
-        let mut invalid: Vec<(String, u64, String)> = Vec::new();
-        for (before, after) in rows {
-            let mut ctx = RowCtx {
-                marks: txn_marks,
-                rules,
-                scratch: key_scratch,
-                render_warnings,
-                invalid: &mut invalid,
-            };
-            Self::row_keys(w, kind, before, after, &mut ctx);
+        decode: impl FnOnce() -> Result<Vec<(Option<BinlogRow>, Option<BinlogRow>)>>,
+        ctx: &mut RowCtx<'_>,
+    ) -> Result<()> {
+        if !w.watches(kind) {
+            return Ok(());
         }
-        for (name, trigger, k) in invalid {
-            self.invalid_keys += 1;
+        let rows = decode()?;
+        // The pieces borrowed as one bag, re-borrowed per row, so a row's keys are built with
+        // no borrow of the whole engine (see `row_keys`).
+        for (before, after) in &rows {
+            let mut row = RowCtx {
+                marks: &mut *ctx.marks,
+                rules: &mut *ctx.rules,
+                scratch: &mut *ctx.scratch,
+                render_warnings: &mut *ctx.render_warnings,
+                invalid_keys: &mut *ctx.invalid_keys,
+                invalid: &mut *ctx.invalid,
+            };
+            Self::row_keys(w, kind, before, after, &mut row);
+        }
+        for (name, trigger, k) in std::mem::take(&mut *ctx.invalid) {
+            *ctx.invalid_keys += 1;
             let shown: String = k.escape_debug().take(120).collect();
-            if self.invalid_keys <= 10 || self.invalid_keys.is_multiple_of(1000) {
+            if *ctx.invalid_keys <= 10 || (*ctx.invalid_keys).is_multiple_of(1000) {
                 warn!(rule = %name, "trigger {trigger}: key \"{shown}\" holds control characters and is ignored");
             }
-            if let Some(st) = self.rules.get_mut(&name) {
+            if let Some(st) = ctx.rules.get_mut(&name) {
                 st.last_error = Some((
                     format!("trigger {trigger}: key \"{shown}\" holds control characters and is ignored"),
                     crate::time::unix_now_ms(),
@@ -1979,6 +2043,7 @@ impl Engine {
                 st.dirty = true;
             }
         }
+        Ok(())
     }
 
     /// One row of a watched table: every trigger that is `on` for this kind marks the row's
@@ -2015,6 +2080,7 @@ impl Engine {
             scratch,
             render_warnings,
             invalid,
+            ..
         } = ctx;
         for (name, rule, ti) in &w.triggers {
             let t = &rule.triggers[*ti];
@@ -3117,3 +3183,7 @@ mod stream_verdict_tests;
 #[cfg(test)]
 #[path = "tests/engine_hotpath_alloc_tests.rs"]
 mod hotpath_alloc_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_skip_kinds_tests.rs"]
+mod skip_kinds_tests;
