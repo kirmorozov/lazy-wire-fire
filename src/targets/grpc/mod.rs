@@ -549,7 +549,12 @@ pub async fn send(
                     )
                 }
                 contract::Status::Unspecified => {
-                    unreachable!("an ack with no status is never a verdict")
+                    // The reader filters an ack with no status before it can become a
+                    // verdict (stream.rs `answer`); should one ever be here, it says
+                    // nothing about the item, so it is a wait and never a refusal — and
+                    // the stream warns about such a server once, however chatty it gets.
+                    client.call.warn_no_status(&client.url);
+                    bail!("`{}`: the server acknowledged without a status", client.url)
                 }
             },
             Verdict::Lost(why) => bail!("`{}`: {why}", client.url),
@@ -610,31 +615,48 @@ pub async fn send_items(
             Verdict::Ack {
                 seq,
                 hash,
-                status,
+                status: contract::Status::Ok,
                 reason,
-            } => match status {
-                contract::Status::Ok => match expect
-                    .row(pool, |u| ack_row(u, *seq, *hash, *status, reason))
-                    .await
-                    .with_context(|| at.clone())?
-                {
-                    Ok(()) => Item::Ok,
-                    Err(why) => Item::Rejected(format!("{at}: {why}")),
-                },
-                contract::Status::Refused => {
-                    Item::Rejected(format!("{at}: the server refused it: {reason}"))
-                }
-                contract::Status::Retry => {
-                    Item::Transient(format!("{at}: the server asked for it again: {reason}"))
-                }
-                contract::Status::Unspecified => {
-                    unreachable!("an ack with no status is never a verdict")
-                }
+            } => match expect
+                .row(pool, |u| {
+                    ack_row(u, *seq, *hash, contract::Status::Ok, reason)
+                })
+                .await
+                .with_context(|| at.clone())?
+            {
+                Ok(()) => Item::Ok,
+                Err(why) => Item::Rejected(format!("{at}: {why}")),
             },
-            Verdict::Lost(why) => Item::Transient(format!("{at}: {why}")),
+            other => item_verdict(client, &at, other),
         });
     }
     Ok(out_items)
+}
+
+/// What a verdict other than the server's `OK` says about its key: the refusal, the wait,
+/// or the nothing the server said. `OK` is the caller's, since the rule's `expect` has the
+/// last say on what it means. The ack with no status is the stream reader's filter kept
+/// honest in this module as well: it is a wait, never a refusal, and the stream warns
+/// about such a server once rather than once per answer.
+fn item_verdict(client: &Client, at: &str, v: &Verdict) -> Item {
+    match v {
+        Verdict::Ack { status, reason, .. } => match status {
+            // Not met from `send_items`, which answers `OK` itself: the honest answer for
+            // completeness, so no arm of this mapping can panic.
+            contract::Status::Ok => Item::Ok,
+            contract::Status::Refused => {
+                Item::Rejected(format!("{at}: the server refused it: {reason}"))
+            }
+            contract::Status::Retry => {
+                Item::Transient(format!("{at}: the server asked for it again: {reason}"))
+            }
+            contract::Status::Unspecified => {
+                client.call.warn_no_status(&client.url);
+                Item::Transient(format!("{at}: the server acknowledged without a status"))
+            }
+        },
+        Verdict::Lost(why) => Item::Transient(format!("{at}: {why}")),
+    }
 }
 
 /// The row `r` of one acknowledgement: `status` 200 and the acknowledgement as JSON for what the

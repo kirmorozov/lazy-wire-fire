@@ -329,6 +329,9 @@ pub(crate) struct Call {
     opened: AtomicU64,
     /// The reconnect curve of failed stream openings (see [`BACKOFF_START`]).
     backoff: StdMutex<Backoff>,
+    /// Whether this stream has already warned about an acknowledgement with no status:
+    /// the module's verdict mapping asks for it, once per stream, not once per answer.
+    no_status: AtomicBool,
 }
 
 struct Backoff {
@@ -346,6 +349,22 @@ impl Call {
                 fails: 0,
                 until: tokio::time::Instant::now(),
             }),
+            no_status: AtomicBool::new(false),
+        }
+    }
+
+    /// The stream's one warning about a server that acknowledges without a status: the
+    /// verdict mapping asks for it at every such verdict, so the log says it once.
+    pub(crate) fn warn_no_status(&self, url: &str) {
+        if self
+            .no_status
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                endpoint = %url,
+                "grpc: the server acknowledged without a status"
+            );
         }
     }
 
@@ -701,6 +720,10 @@ impl Tail {
     ///
     /// One lookup per item, none of them a hash: the ring is indexed by the sequence number.
     fn reserve(&self, items: &[Outbound]) -> Option<Reservation> {
+        // The arithmetic below (the last sequence is `from + n - 1`) and the window assume
+        // what `push` guarantees before calling: a flush of at least one item. A caller
+        // that breaks that contract must meet it here, not at `st.next`.
+        debug_assert!(!items.is_empty(), "an empty flush never reaches the ring");
         let mut st = self.state.lock().unwrap();
         if st.over.is_some() {
             return None;
