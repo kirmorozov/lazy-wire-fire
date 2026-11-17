@@ -42,7 +42,7 @@ httparse = "1"
 indexmap = "2"
 foldhash = "0.2"
 roaring = { version = "0.12", optional = true }
-sqlparser = { version = "0.63", features = ["visitor"] }
+sqlparser = { version = "0.64", features = ["visitor"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 lapin = { version = "4.12", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
 # SMTP (src/smtp.rs). Default features off: they pull native-tls (OpenSSL); the rustls backend
