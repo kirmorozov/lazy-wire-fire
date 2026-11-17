@@ -226,3 +226,99 @@ fn the_health_address_and_instance_are_checked_at_load() {
         assert!(cfg(&[DSN, ("LAZYWF_INSTANCE", bad)]).is_err(), "`{bad}`");
     }
 }
+
+/// `LAZYWF_HEALTH_TOKEN_FILE`: the token is the trimmed content of the file the variable names.
+/// Both variables together, a file that cannot be read and a file that holds nothing are startup
+/// errors that name the variable and never the token — the endpoints stay open only when the
+/// operator never asked for a token, never because reading one failed.
+#[test]
+fn the_health_token_file_is_read_or_refused() {
+    let base = std::env::temp_dir().join(format!("lazywf-health-token-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let token = base.join("token");
+    std::fs::write(&token, "  s3cr3t-token\n\n").unwrap();
+    let path = token.display().to_string();
+
+    // Padded by the editor or by `echo`: the whitespace around it is not part of the secret.
+    let c = cfg(&[DSN, ("LAZYWF_HEALTH_TOKEN_FILE", path.as_str())]).unwrap();
+    assert_eq!(c.health_token.as_deref(), Some("s3cr3t-token"));
+    assert!(
+        !format!("{c:?}").contains("s3cr3t-token"),
+        "Debug shows the value: {c:?}"
+    );
+
+    // One setting, one source: both at once is refused rather than settled by precedence, and the
+    // refusal repeats neither value.
+    let err = cfg(&[
+        DSN,
+        ("LAZYWF_HEALTH_TOKEN", "s3cr3t-token"),
+        ("LAZYWF_HEALTH_TOKEN_FILE", path.as_str()),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("LAZYWF_HEALTH_TOKEN and LAZYWF_HEALTH_TOKEN_FILE are both set"),
+        "{err}"
+    );
+    assert!(!err.contains("s3cr3t-token"), "{err}");
+
+    // A blank variable is the variable unset, so the file still answers (and the other way
+    // round: a blank `_FILE` leaves the value to do the work).
+    let c = cfg(&[
+        DSN,
+        ("LAZYWF_HEALTH_TOKEN", "  "),
+        ("LAZYWF_HEALTH_TOKEN_FILE", path.as_str()),
+    ])
+    .unwrap();
+    assert_eq!(c.health_token.as_deref(), Some("s3cr3t-token"));
+    let c = cfg(&[
+        DSN,
+        ("LAZYWF_HEALTH_TOKEN", "s3cr3t-token"),
+        ("LAZYWF_HEALTH_TOKEN_FILE", ""),
+    ])
+    .unwrap();
+    assert_eq!(c.health_token.as_deref(), Some("s3cr3t-token"));
+
+    // A file that is not there, or not a file: the start stops with the variable's name on it.
+    let missing = base.join("nope").display().to_string();
+    let err = cfg(&[DSN, ("LAZYWF_HEALTH_TOKEN_FILE", missing.as_str())])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("LAZYWF_HEALTH_TOKEN_FILE"), "{err}");
+    assert!(err.contains("nope"), "the path must be named: {err}");
+    let dir = base.display().to_string();
+    let err = cfg(&[DSN, ("LAZYWF_HEALTH_TOKEN_FILE", dir.as_str())])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("LAZYWF_HEALTH_TOKEN_FILE"), "{err}");
+
+    // A file of nothing but whitespace: there is no token to gate with, and opening both
+    // endpoints because the file was empty is the refusal an operator must hear about.
+    let blank = base.join("blank");
+    std::fs::write(&blank, "\n\t \r\n").unwrap();
+    let blank = blank.display().to_string();
+    let err = cfg(&[DSN, ("LAZYWF_HEALTH_TOKEN_FILE", blank.as_str())])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("LAZYWF_HEALTH_TOKEN_FILE"), "{err}");
+    assert!(err.contains("holds no token"), "{err}");
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// The replaced spelling is gone, not kept as an alias: nothing reads `LAZYWF_STATUS_TOKEN`
+/// any more, so setting it opens nothing and gating with it is impossible.
+#[test]
+fn the_retired_status_token_variable_sets_nothing() {
+    let c = cfg(&[
+        DSN,
+        ("LAZYWF_STATUS_TOKEN", "s3cr3t-token"),
+        ("X-Lazywf-Token", "s3cr3t-token"),
+    ])
+    .unwrap();
+    assert_eq!(
+        c.health_token, None,
+        "the retired variable must not gate anything"
+    );
+    assert!(!format!("{c:?}").contains("s3cr3t-token"), "{c:?}");
+}

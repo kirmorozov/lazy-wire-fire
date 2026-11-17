@@ -224,8 +224,8 @@ impl Instance {
         logs();
         let (tx, rx) = watch::channel(false);
         // The token comes from the config as it does in `main`, so a test that sets
-        // LAZYWF_STATUS_TOKEN gets a `/status` that asks for it.
-        let health = Arc::new(Health::new(cfg.status_token.clone()));
+        // LAZYWF_HEALTH_TOKEN gets a `/status` (and a `/metrics`) that ask for it.
+        let health = Arc::new(Health::new(cfg.health_token.clone()));
         let h = health.clone();
         let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
         let d = done.clone();

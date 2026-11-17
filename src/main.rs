@@ -22,7 +22,8 @@ CONNECTION (either):
 
 COMMON SETTINGS:
   LAZYWF_INSTANCE=default   LAZYWF_HEALTH_ADDR=127.0.0.1:8081 (or off)
-  LAZYWF_STATUS_TOKEN=...   /status then needs the X-Lazywf-Token header (/livez, /readyz open)
+  LAZYWF_HEALTH_TOKEN=...   /status and /metrics then need the Authorization: Bearer header
+  LAZYWF_HEALTH_TOKEN_FILE=/path  the same token in a file (not both); /livez, /readyz stay open
   LAZYWF_ALLOWED_HOSTS=host,*.dom,10.0.0.0/8  (unset denies all target egress; * allows any)
   LAZYWF_METRICS_ADDR=127.0.0.1:8082 (opt-in Prometheus /metrics; off unless set)
   LAZYWF_LOG_FORMAT=text|json   RUST_LOG=info
@@ -138,17 +139,23 @@ async fn run() -> ExitCode {
         }
     };
     let health = Arc::new(lazy_wire_fire::health::Health::new(
-        cfg.status_token.clone(),
+        cfg.health_token.clone(),
     ));
     if let Some(addr) = cfg.health_addr {
         tokio::spawn(lazy_wire_fire::health::serve(addr, health.clone()));
     }
     // Opt-in Prometheus exposition on its own listener (the unauthenticated status surface stays
     // narrow). Unset = off entirely: no listener, and the engine keeps no counters (a `None`
-    // registry makes every flush/drop site a skipped branch).
+    // registry makes every flush/drop site a skipped branch). A scrape names the rules and targets
+    // of the configuration, so it is gated by the same token `/status` is: one setting, both
+    // listeners.
     let metrics = cfg.metrics_addr.map(|addr| {
         let m = Arc::new(lazy_wire_fire::metrics::Metrics::default());
-        tokio::spawn(lazy_wire_fire::metrics::serve(addr, m.clone()));
+        tokio::spawn(lazy_wire_fire::metrics::serve(
+            addr,
+            m.clone(),
+            cfg.health_token.clone(),
+        ));
         m
     });
     let (tx, rx) = watch::channel(false);

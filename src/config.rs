@@ -40,9 +40,12 @@ pub struct Config {
     /// always sets it: unset becomes the deny-all list (0.3.0), `*` the allow-all one.
     /// `None` only exists for tests that carry no operator setting.
     pub allowed_hosts: Option<HostList>,
-    /// `LAZYWF_STATUS_TOKEN`: when set, `/status` on the health listener requires the
-    /// `X-Lazywf-Token` header (constant-time compare). `/livez` and `/readyz` never need it.
-    pub status_token: Option<String>,
+    /// `LAZYWF_HEALTH_TOKEN` (or `LAZYWF_HEALTH_TOKEN_FILE`, the path of a file holding it):
+    /// when set, `/status` on the health listener and `/metrics` on the metrics listener require
+    /// the `Authorization: Bearer <token>` header (constant-time compare, 401 with
+    /// `WWW-Authenticate: Bearer` otherwise). `/livez`, `/readyz`, the index and
+    /// `lazywf healthcheck` never need it.
+    pub health_token: Option<String>,
 }
 
 /// The DSNs are shown without their passwords (`mysql://***@host/...`): a `{:?}` of the
@@ -73,7 +76,7 @@ impl std::fmt::Debug for Config {
                 &self.allowed_hosts.as_ref().map(HostList::len),
             )
             // The token itself never appears: only whether it is set.
-            .field("status_token", &self.status_token.as_ref().map(|_| "set"))
+            .field("health_token", &self.health_token.as_ref().map(|_| "set"))
             .finish()
     }
 }
@@ -197,7 +200,7 @@ impl Config {
                     .context("LAZYWF_ALLOWED_HOSTS")?
                     .unwrap_or_else(HostList::deny_all),
             ),
-            status_token: get("LAZYWF_STATUS_TOKEN").filter(|v| !v.trim().is_empty()),
+            health_token: token_from_var(&get, "LAZYWF_HEALTH_TOKEN")?,
         };
         if plain_remote {
             // One loud line, at startup, for the explicit opt-out: it must not scroll by
@@ -248,6 +251,39 @@ fn tls_for(
                 Ok((Some("required".to_string()), false))
             }
         }
+    }
+}
+
+/// The token of `name` (or of the file whose path is in `name_FILE`): one of the two, never
+/// both — the same shape lazyview's `LAZYVIEW_HEALTH_TOKEN` has, so the two projects read alike.
+///
+/// A file's contents are trimmed (a copied token carries its newline; a trailing one is not part
+/// of the secret). An unset `name` is no token, and a blank one is the same as unset — the
+/// endpoints stay open, as they were before any token existed. A set `name_FILE` whose file
+/// cannot be read or holds nothing but whitespace is an error instead: an operator who named a
+/// file clearly wanted the endpoints gated, and opening them because the read failed is the one
+/// reading that must never happen quietly. Errors name the variable and the path, never the
+/// value.
+fn token_from_var(get: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Option<String>> {
+    let value = get(name).filter(|v| !v.trim().is_empty());
+    let file = get(&format!("{name}_FILE")).filter(|v| !v.trim().is_empty());
+    match (value, file) {
+        (Some(_), Some(_)) => bail!(
+            "{name} and {name}_FILE are both set; give the token in one of them \
+             ({name}_FILE names a file to read, {name} holds the value)"
+        ),
+        (Some(v), None) => Ok(Some(v.trim().to_string())),
+        (None, Some(path)) => {
+            let path = path.trim();
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("{name}_FILE: cannot read the token file `{path}`"))?;
+            let token = text.trim().to_string();
+            if token.is_empty() {
+                bail!("{name}_FILE: the token file `{path}` holds no token");
+            }
+            Ok(Some(token))
+        }
+        (None, None) => Ok(None),
     }
 }
 
