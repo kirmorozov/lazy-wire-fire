@@ -233,6 +233,9 @@ pub(crate) fn header_value(buf: &[u8], name: &str) -> Option<String> {
     })
 }
 
+/// The one gate both listeners ask about: `/status` here, `/metrics` in
+/// [`crate::metrics::serve_listener`].
+///
 /// True when `header` is exactly `Bearer <token>` for `want`, compared in constant time: the
 /// header is a secret presented over the network, so neither its length nor its first difference
 /// may come back early. The scheme word is case-insensitive (HTTP allows it) and both sides are
@@ -240,7 +243,6 @@ pub(crate) fn header_value(buf: &[u8], name: &str) -> Option<String> {
 /// credential the same way, so the whitespace around a token is never part of the secret.
 /// Anything else — no header, a bare `Bearer`, another scheme, a prefix of the token, the token
 /// plus a word — is refused.
-/// The one gate both listeners ask about ([`crate::metrics::serve`]).
 pub(crate) fn bearer_ok(header: Option<&str>, want: &str) -> bool {
     // An empty token authorizes nothing — not even an empty credential. `token_of` makes it
     // unreachable from either listener, and the gate does not rely on that.
