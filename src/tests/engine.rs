@@ -350,3 +350,153 @@ fn backoff_grows_and_caps() {
     b.ok();
     assert!(b.blocked(Instant::now()).is_none());
 }
+
+/// The statement-format DML warning is rate limited per (schema, table): the first event for a
+/// table logs at once — an entry that has never logged has no time to compare against, which is
+/// what keeps the clock off the path where subtracting the interval from `now` would panic below
+/// the clock's origin, a host up for less than the interval — and an event inside the interval
+/// folds into the line that follows it. Another table is never folded into that line.
+#[test]
+fn the_first_statement_dml_line_logs_at_once() {
+    let t0 = Instant::now();
+    let mut slot = (None, 0u64); // a table never warned about
+    assert_eq!(
+        stmt_dml_gate(&mut slot, t0),
+        Some(1),
+        "the first event logs at once, whatever the host's uptime"
+    );
+    assert_eq!(slot, (Some(t0), 0), "the line stamps its table");
+    assert_eq!(
+        stmt_dml_gate(&mut slot, t0 + Duration::from_secs(59)),
+        None,
+        "an event inside the interval folds instead of logging"
+    );
+    assert_eq!(
+        slot,
+        (Some(t0), 1),
+        "the folded event waits for the next line"
+    );
+    assert_eq!(
+        stmt_dml_gate(&mut slot, t0 + STMT_DML_LOG_INTERVAL),
+        Some(2),
+        "the line that follows carries the folded event too"
+    );
+    assert_eq!(slot, (Some(t0 + STMT_DML_LOG_INTERVAL), 0));
+    assert_eq!(
+        stmt_dml_gate(&mut slot, t0 + STMT_DML_LOG_INTERVAL * 2),
+        Some(1),
+        "a quiet interval reports one event"
+    );
+}
+
+/// The same rate limit over the map the engine keeps: two tables of one schema owe two lines,
+/// each with its own folded count, and the map holds one entry for each.
+#[test]
+fn the_statement_dml_lines_are_rate_limited_per_table() {
+    let t0 = Instant::now();
+    let mut map: HashMap<(String, String), (Option<Instant>, u64)> = HashMap::new();
+    let mut capped = false;
+    let mut line = |table: &str, at: Instant| -> Option<u64> {
+        let slot = stmt_dml_slot(&mut map, ("shop".into(), table.into()), &mut capped)?;
+        stmt_dml_gate(slot, at)
+    };
+    assert_eq!(line("orders", t0), Some(1));
+    assert_eq!(
+        line("items", t0),
+        Some(1),
+        "another table owes its own line"
+    );
+    assert_eq!(line("orders", t0 + Duration::from_secs(30)), None);
+    assert_eq!(line("items", t0 + Duration::from_secs(30)), None);
+    assert_eq!(
+        line("orders", t0 + STMT_DML_LOG_INTERVAL),
+        Some(2),
+        "its own folded event, not the other table's"
+    );
+    assert_eq!(line("items", t0 + STMT_DML_LOG_INTERVAL), Some(2));
+    assert_eq!(
+        line("orders", t0 + STMT_DML_LOG_INTERVAL * 2),
+        Some(1),
+        "a quiet interval reports one event"
+    );
+    assert_eq!(map.len(), 2, "one entry per (schema, table)");
+    assert!(!capped);
+}
+
+/// The map's ceiling: the key is a name the source states, so a new table beyond the cap gets no
+/// line and no entry (its event is still counted, by the caller), while a table the map already
+/// holds keeps its line. The cap says itself once, not once per refused table.
+#[test]
+fn the_statement_dml_table_set_stays_bounded() {
+    let t0 = Instant::now();
+    let mut map: HashMap<(String, String), (Option<Instant>, u64)> = HashMap::new();
+    let mut capped = false;
+    for i in 0..MAX_STMT_DML_TABLES {
+        let slot = stmt_dml_slot(&mut map, ("shop".into(), format!("t{i}")), &mut capped)
+            .expect("room while under the cap");
+        assert_eq!(stmt_dml_gate(slot, t0), Some(1));
+    }
+    assert!(!capped, "a map that fits says nothing about its cap");
+    assert!(
+        stmt_dml_slot(&mut map, ("shop".into(), "late".into()), &mut capped).is_none(),
+        "a new table past the cap gets no line"
+    );
+    assert!(capped, "the lines stopping is said out loud");
+    assert_eq!(map.len(), MAX_STMT_DML_TABLES, "and the map did not grow");
+    let slot = stmt_dml_slot(&mut map, ("shop".into(), "t0".into()), &mut capped)
+        .expect("a table the map holds keeps its line");
+    assert_eq!(stmt_dml_gate(slot, t0 + STMT_DML_LOG_INTERVAL), Some(1));
+    assert!(stmt_dml_slot(&mut map, ("shop".into(), "later".into()), &mut capped).is_none());
+}
+
+/// The WARN line of a statement-format DML event names the schema, the table, the kind, the
+/// binlog position and the folded count — and nothing of the statement, which in statement format
+/// carries the row values: the only things [`warn_statement_dml`] is given are those five.
+#[test]
+fn the_statement_dml_line_carries_no_statement() {
+    let out = Captured::default();
+    let sub = tracing_subscriber::fmt()
+        .json()
+        .with_writer(out.clone())
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let d = crate::sql::statement_dml(
+        "UPDATE orders SET note = 'unpaid-42-mark' WHERE id = 7",
+        "shop",
+    )
+    .expect("an UPDATE in a QUERY event is statement-format DML");
+    let at = Position {
+        file: "binlog.000007".into(),
+        pos: 4211,
+    };
+    tracing::subscriber::with_default(sub, || warn_statement_dml(&d, &at, 3));
+    let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "one line per reported table: {text}");
+    let v: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["level"], "WARN");
+    assert_eq!(v["fields"]["kind"], "UPDATE");
+    assert_eq!(v["fields"]["schema"], "shop");
+    assert_eq!(v["fields"]["table"], "orders");
+    assert_eq!(
+        v["fields"]["at"], "binlog.000007:4211",
+        "the binlog position"
+    );
+    assert_eq!(v["fields"]["count"], 3, "the events folded into this line");
+    assert!(
+        v["fields"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not in the binlog")),
+        "the consequence is stated: {}",
+        v["fields"]["message"]
+    );
+    let upper = text.to_ascii_uppercase();
+    assert!(
+        !text.contains("unpaid-42-mark"),
+        "a row value reached the log: {text}"
+    );
+    assert!(
+        !upper.contains("UPDATE ORDERS") && !upper.contains("SET NOTE"),
+        "the statement text reached the log: {text}"
+    );
+}

@@ -8852,3 +8852,197 @@ async fn pg_decode_real_xlogdata_bytes_end_to_end() {
     let _dsn = need_pg_src!();
     unimplemented!("the walsender transport (START_REPLICATION, CopyData framing) is not here yet");
 }
+
+/// What `/metrics` says about DML the binlog carried as text: the sample value of
+/// `lazywf_statement_events_ignored_total` in the exposition a scrape would be handed (the
+/// endpoint's handler renders nothing else).
+fn statement_events_ignored(m: &lazy_wire_fire::metrics::Metrics) -> u64 {
+    m.render()
+        .lines()
+        .find_map(|l| l.strip_prefix("lazywf_statement_events_ignored_total "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("the counter is on the exposition")
+}
+
+/// A session that switches its own `binlog_format` to STATEMENT logs its DML as QUERY events, so
+/// the rows are not in the stream: the rules reading the table miss the change and their targets
+/// stay wrong until they are rebuilt. The engine must not drop such an event without a trace — one
+/// `lazywf_statement_events_ignored_total` count per event, one WARN per table per interval with
+/// the kind, the schema, the table and the binlog position, and never the statement text, which in
+/// statement format carries the row values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statement_format_dml_is_counted_and_warned() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "stmt_dml").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    order_rule(&db, &mock).await;
+    let metrics = Arc::new(lazy_wire_fire::metrics::Metrics::default());
+    let inst = Instance::ready_with_metrics(config(&db, &[]), metrics.clone()).await;
+
+    // The baseline: a row-format change does reach the target, so a later silence about the
+    // statement-format one means the rows were missing and not the rule asleep.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (10, 1, 'new', 12.50)")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "orders 10 delivered from its row events",
+        || async {
+            last_docs(&mock.requests())
+                .get("10")
+                .cloned()
+                .flatten()
+                .filter(|d| d["status"] == "new")
+        },
+    )
+    .await;
+    inst.quiet().await;
+    let before = statement_events_ignored(&metrics);
+
+    // The twisted session: one connection, its own session only — a session variable, never the
+    // server's. A server without the variable (MySQL 9 removed `binlog_format`) or without the
+    // privilege for it says so, and the test skips with the reason rather than failing. A macro
+    // and not a closure: the connection and the instance are each moved into the stop path, which
+    // every one of the four reasons below takes exactly once.
+    let mut t = db.conn().await;
+    macro_rules! skip {
+        ($why:expr) => {{
+            eprintln!("statement-format DML: skipping, {}", $why);
+            t.disconnect().await.ok();
+            inst.stop().await;
+            return;
+        }};
+    }
+    let log_bin: i64 = t
+        .query_first("SELECT @@log_bin")
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
+    if log_bin == 0 {
+        skip!("the server logs no binlog, so no QUERY event would arrive");
+    }
+    if let Err(e) = t
+        .query_drop("SET SESSION binlog_format = 'STATEMENT'")
+        .await
+    {
+        skip!(format!("the server refuses it for a session: {e}"));
+    }
+    let fmt: String = t
+        .query_first("SELECT @@session.binlog_format")
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    if !fmt.eq_ignore_ascii_case("STATEMENT") {
+        skip!(format!("the session still reads binlog_format={fmt}"));
+    }
+
+    // Three statements from that one session: two on the table the rule reads (they owe one line
+    // between them, the interval is far longer than this test) and one on another watched table
+    // (its own line: the rate limit is per table). A marker in a value proves nothing of the
+    // statement ever reaches a log or a target.
+    mock.clear();
+    for q in [
+        "UPDATE orders SET status = 'twstmark' WHERE id = 10",
+        "UPDATE orders SET total = 13.50 WHERE id = 10",
+        "INSERT INTO customers VALUES (2, 'Bobmark')",
+    ] {
+        t.query_drop(q)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e} (binlog_format=STATEMENT)"));
+    }
+    t.disconnect().await.ok();
+    inst.quiet().await;
+
+    // Every one of the three events is counted, whatever the rate-limited lines do, on `/metrics`
+    // and on `/status` alike.
+    assert_eq!(
+        statement_events_ignored(&metrics) - before,
+        3,
+        "one count per statement-format DML event"
+    );
+    assert_eq!(
+        inst.health.status()["statement_events_ignored"],
+        3,
+        "the same count on /status"
+    );
+    // And the rows are gone: the rule never saw them, so the target still holds `new` at 12.50.
+    sleep_ms(500).await;
+    assert!(
+        !mock
+            .requests()
+            .iter()
+            .any(|r| r.body.contains("twstmark") || r.body.contains("Bobmark")),
+        "a statement-format row reached the target: {:?}",
+        mock.requests().iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+
+    // One WARN line per table, no more, and nothing of the statement in any of them.
+    let warned = wait_for(
+        Duration::from_secs(10),
+        "one WARN line per table",
+        || async {
+            let w: Vec<String> = warnings()
+                .into_iter()
+                .filter(|l| l.contains(&db.schema) && l.contains("statement format"))
+                .collect();
+            (w.len() == 2).then_some(w)
+        },
+    )
+    .await;
+    let mut tables: Vec<&str> = warned
+        .iter()
+        .map(|l| {
+            l.split("table=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("")
+        })
+        .collect();
+    tables.sort_unstable();
+    assert_eq!(
+        tables,
+        vec!["customers", "orders"],
+        "one line per table, each naming it:\n{}",
+        warned.join("\n")
+    );
+    for line in &warned {
+        assert!(line.contains("WARN"), "not a WARN: {line}");
+        assert!(
+            line.contains(&format!("schema={}", db.schema)),
+            "the schema missing: {line}"
+        );
+        let at = line
+            .split("at=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("");
+        assert!(at.contains(':'), "the binlog position missing: {line}");
+        assert!(line.contains("count="), "the folded count missing: {line}");
+        assert!(
+            !line.contains("twstmark") && !line.contains("Bobmark"),
+            "a row value reached the log: {line}"
+        );
+        let upper = line.to_ascii_uppercase();
+        assert!(
+            !upper.contains("UPDATE ORDERS") && !upper.contains("INSERT INTO CUSTOMERS"),
+            "the statement text reached the log: {line}"
+        );
+    }
+    assert!(
+        warned
+            .iter()
+            .any(|l| l.contains("kind=UPDATE") && l.contains("table=orders")),
+        "no UPDATE line for orders:\n{}",
+        warned.join("\n")
+    );
+    assert!(
+        warned
+            .iter()
+            .any(|l| l.contains("kind=INSERT") && l.contains("table=customers")),
+        "no INSERT line for customers:\n{}",
+        warned.join("\n")
+    );
+    inst.stop().await;
+}

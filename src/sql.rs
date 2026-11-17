@@ -434,6 +434,68 @@ pub fn renames(query: &str, default_schema: &str) -> Vec<((String, String), (Str
     out
 }
 
+/// A DML statement the binlog carries as text: what a session that switched its own
+/// `binlog_format` away from `ROW` leaves in the stream where its row events should be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StmtDml {
+    /// The statement kind, upper case: `INSERT`, `REPLACE`, `UPDATE` or `DELETE`.
+    pub kind: &'static str,
+    /// The schema of the table it changes: the one the QUERY event carries, when the statement
+    /// does not qualify the name.
+    pub schema: String,
+    /// The table it changes; `*` when the text names none the lexer can read. It is the rate
+    /// limit's key and what an operator reads, so the first name the statement states is enough
+    /// — the statement itself is never kept and never logged, because in statement format it
+    /// carries the row values.
+    pub table: String,
+}
+
+/// The DML a QUERY event states, when it states any. With `binlog_format=ROW` a QUERY event
+/// carries DDL and administrative statements only, so an `INSERT` / `REPLACE` / `UPDATE` /
+/// `DELETE` here was logged in statement format by the executing session (the engine's
+/// `note_statement_dml` reports those). `default_schema` is the schema the event carries.
+pub fn statement_dml(query: &str, default_schema: &str) -> Option<StmtDml> {
+    let toks: Vec<Tok> = lex(query).into_iter().map(|l| l.tok).collect();
+    // The leading comments and whitespace are gone with the lexer, so the first token is the
+    // keyword (an executable comment is SQL the server ran, so its tokens count).
+    let kind = match toks.first() {
+        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("INSERT") => "INSERT",
+        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("REPLACE") => "REPLACE",
+        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("UPDATE") => "UPDATE",
+        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("DELETE") => "DELETE",
+        _ => return None,
+    };
+    let mut p = Ddl {
+        t: &toks,
+        i: 1,
+        schema: default_schema,
+        out: Vec::new(),
+    };
+    // `INSERT [IGNORE] [INTO] t`, `REPLACE [INTO] t`, `UPDATE [LOW_PRIORITY] [IGNORE] t`,
+    // `DELETE [LOW_PRIORITY] [QUICK] [IGNORE] [FROM] t`: the target is the name after the
+    // keyword, its modifiers and the one `INTO` / `FROM`. The first name is the one the rows
+    // leave (`INSERT INTO t SELECT …` changes `t`, not the selected tables); a multi-table
+    // statement names only its first table, which is all the rate limit reads.
+    while p.eat("IGNORE")
+        || p.eat("LOW_PRIORITY")
+        || p.eat("HIGH_PRIORITY")
+        || p.eat("DELAYED")
+        || p.eat("QUICK")
+    {}
+    // `INSERT … INTO t` / `DELETE … FROM t`: the name follows that keyword too.
+    let _ = p.eat("INTO") || p.eat("FROM");
+    let (schema, table) = match p.name() {
+        Some(n) => n,
+        // An unreadable name still says which schema lost a change: the limiter keys on `*`.
+        None => (default_schema.to_string(), "*".to_string()),
+    };
+    Some(StmtDml {
+        kind,
+        schema,
+        table,
+    })
+}
+
 struct Ddl<'a> {
     t: &'a [Tok],
     i: usize,

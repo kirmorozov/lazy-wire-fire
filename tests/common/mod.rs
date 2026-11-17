@@ -4,6 +4,7 @@
 
 pub mod grpc_server;
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use lazy_wire_fire::config::Config;
 use lazy_wire_fire::health::Health;
+use lazy_wire_fire::metrics::Metrics;
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -205,7 +207,8 @@ pub fn config(db: &Db, extra: &[(&str, &str)]) -> Config {
     cfg
 }
 
-/// Engine logs on the test output (`RUST_LOG`, default `info`).
+/// Engine logs on the test output (`RUST_LOG`, default `info`), with the lines at `WARN` and above
+/// kept for [`warnings`].
 pub fn logs() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -214,13 +217,130 @@ pub fn logs() {
         // `try_init`: a test binary that installs its own subscriber first keeps it.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_test_writer()
+            .with_writer(Tee::new())
             .try_init();
     });
 }
 
+/// How many lines [`warnings`] keeps: the oldest goes when a new one arrives, so a whole suite
+/// costs a bounded buffer instead of every line the engines of every test ever logged. It has to
+/// hold a full suite's worth: the tests run in parallel through one subscriber, and a test reads
+/// its own line only after the others have logged around it.
+const MAX_LOGGED: usize = 8192;
+
+fn captured() -> Arc<Mutex<VecDeque<String>>> {
+    static CAPTURED: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
+    CAPTURED
+        .get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+        .clone()
+}
+
+/// The `WARN`-and-above lines the engines of this test binary logged, oldest first, with the
+/// colour gone (the subscriber paints field names and separators, so a line that reads
+/// `table=<red>orders` on the terminal is `table\x1b[0m\x1b[2m=orders` in bytes: what a test
+/// matches is the plain text). The suite runs the engine in-process, so a test that expects a
+/// WARN reads its own line here — and filters by what makes a line its own, which for every
+/// engine test is its own schema.
+pub fn warnings() -> Vec<String> {
+    captured().lock().unwrap().iter().cloned().collect()
+}
+
+/// The colour codes of one rendered line, dropped: `ESC [ … m` sequences are markup, not text.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // The sequence ends at `m`; anything else it holds (the parameter bytes) is markup too.
+        for c in chars.by_ref() {
+            if c == 'm' {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The subscriber's writer: every line goes to the test writer, as `with_test_writer` sends it,
+/// and every complete line at `WARN` or above is kept (uncoloured) for [`warnings`]. The
+/// subscriber makes one writer per event, so `buf` holds the pieces of one line. The writer has
+/// to be `Clone` and `TestWriter` is not, so the one instance goes behind a lock the lines are
+/// written through.
+#[derive(Clone)]
+struct Tee {
+    test: Arc<Mutex<tracing_subscriber::fmt::TestWriter>>,
+    keep: Arc<Mutex<VecDeque<String>>>,
+    buf: Vec<u8>,
+}
+
+impl Tee {
+    fn new() -> Tee {
+        Tee {
+            test: Arc::new(Mutex::new(tracing_subscriber::fmt::TestWriter::new())),
+            keep: captured(),
+            buf: Vec::new(),
+        }
+    }
+
+    /// A panic in a logged line must not poison the queue for every test after it.
+    fn test(&self) -> std::sync::MutexGuard<'_, tracing_subscriber::fmt::TestWriter> {
+        self.test.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl std::io::Write for Tee {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let mut test = self.test();
+        std::io::Write::write_all(&mut *test, b)?;
+        drop(test);
+        self.buf.extend_from_slice(b);
+        while let Some(i) = self.buf.iter().position(|&c| c == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=i).collect();
+            let line = plain(String::from_utf8_lossy(&raw).trim_end());
+            if line.contains("WARN") || line.contains("ERROR") {
+                let mut q = self.keep.lock().unwrap();
+                if q.len() >= MAX_LOGGED {
+                    q.pop_front();
+                }
+                q.push_back(line);
+            }
+        }
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut test = self.test();
+        std::io::Write::flush(&mut *test)
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Tee {
+    type Writer = Tee;
+    fn make_writer(&'a self) -> Tee {
+        Tee {
+            test: self.test.clone(),
+            keep: self.keep.clone(),
+            buf: Vec::new(),
+        }
+    }
+}
+
 impl Instance {
     pub fn start(cfg: Config) -> Instance {
+        Instance::with(cfg, None)
+    }
+
+    /// Like [`Instance::start`], with the registry the engine counts into: `Metrics::render` of
+    /// that `Arc` is exactly the body `/metrics` serves (`respond` calls nothing else), so a test
+    /// reads the scrape without a port to fight over.
+    pub fn start_with_metrics(cfg: Config, metrics: Arc<Metrics>) -> Instance {
+        Instance::with(cfg, Some(metrics))
+    }
+
+    fn with(cfg: Config, metrics: Option<Arc<Metrics>>) -> Instance {
         logs();
         let (tx, rx) = watch::channel(false);
         // The token comes from the config as it does in `main`, so a test that sets
@@ -230,7 +350,7 @@ impl Instance {
         let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
         let d = done.clone();
         let task = tokio::spawn(async move {
-            let r = lazy_wire_fire::engine::run(cfg, h, None, rx).await;
+            let r = lazy_wire_fire::engine::run(cfg, h, metrics, rx).await;
             *d.lock().unwrap() = Some(r);
         });
         Instance {
@@ -243,7 +363,17 @@ impl Instance {
 
     /// Starts an instance and waits until it streams the binlog.
     pub async fn ready(cfg: Config) -> Instance {
-        let i = Instance::start(cfg);
+        Instance::ready_inner(cfg, None).await
+    }
+
+    /// Like [`Instance::ready`], with the metrics registry the engine counts into (see
+    /// [`Instance::start_with_metrics`]).
+    pub async fn ready_with_metrics(cfg: Config, metrics: Arc<Metrics>) -> Instance {
+        Instance::ready_inner(cfg, Some(metrics)).await
+    }
+
+    async fn ready_inner(cfg: Config, metrics: Option<Arc<Metrics>>) -> Instance {
+        let i = Instance::with(cfg, metrics);
         let allowed = deadline(Duration::from_secs(20));
         let until = Instant::now() + allowed;
         while !i.health.is_ready() {
