@@ -44,6 +44,14 @@ pub mod rows;
 pub mod rule;
 pub mod secrets;
 pub mod sign;
+// The source seam is copied verbatim, and its per-flavor visibility fence (FenceState, FenceReport,
+// gtid_wait, CommitStep, commit_order, snapshot_position, snapshot_status) answers callers that live
+// in lazyview only: lazywf has no call site for it yet, so `pub(crate)` items here are never used
+// here. They stay, byte for byte, for the day a lazywf caller appears (the fence in `src/action.rs`
+// is the candidate); the allow is what keeps the copy unedited, and everything under
+// `src/source/**` is copy set, so it can never hide a lazywf-owned item. (Same arrangement as the
+// `dialect` seam above, and the `#![allow(dead_code)]` copy-set files write for themselves.)
+#[allow(dead_code)]
 pub mod source;
 pub mod sql;
 pub mod sqlwire;

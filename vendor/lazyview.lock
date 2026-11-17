@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 4b267fa3ee862dc5e9d57d02cdd8f03ae65ae892
+commit 549d84ec17a5adfd52ab0d5f1c54392a680c2c35
 glob src/access.rs
 glob src/access/**
 glob src/analyze.rs
@@ -55,10 +55,10 @@ file src/analyzer/tests/semi_joins.rs 2ebd81d513be1ad9916639f34e3c6bede77dd82bdb
 file src/analyzer/tests/virtuals.rs 2852246bd63a8ea428949fba5e3a5830aaaf6f67791695e3a35fafa61131f3b5
 file src/analyzer/tests_rename.rs 17fb34cb00df4716e525a4c5829bc4f48c2090f34191a69b7b75d4e803205c24
 file src/analyzer/union.rs 9acd5df87a46c597178cd7b8b167041e797f92684d746d48ac60a8b6ee2c79ab
-file src/binlog.rs 5216c4ec9986a8201b4322008c66f3e4fa91930d1e04a922c8f6c152928ea488
+file src/binlog.rs 0dc3338afbec14ffd9a3b38ece52fb3734745b3a854bee7b1d483a2b585af261
 file src/binlog/ca_tests.rs a43dc08bf0403326ea035549161ae743d53221c4ed3cd7839ff0e7167eb63ad3
 file src/binlog/connect.rs a4db951374bedfe72709bdbca4e4700d3c2c3d2a1388f5eb2b7858d3a674a386
-file src/binlog/probe.rs 3bf91640495ff73d35428656c18d9c97ab577ae4b1b06f5dc12ab079805e5d5f
+file src/binlog/probe.rs 85b184d48289f7a0d5001b4788e453ae904914cb0a9f99d297a459be0d26ab3a
 file src/binlog/stream.rs f8087313d508911a57e3252025773a43a09da4d2efdca86921f30229f2947860
 file src/binlog/tests.rs d91e3cb65e5de88f65d0cfe7e402d13c7cb416ed92b2af89e23310d32702a997
 file src/cascade.rs 7e90037f48f40a9100bd4fc25668c5bc33a82f1270889d4e40227da0479c5105
@@ -82,7 +82,7 @@ file src/fence.rs 28d5b0db4ff1d41d839d833037b07e0e60efaba64498b00dd2513a02afc81f
 file src/intset.rs 74132f56dd0e628df8be2f3b31430702f58a4cd4b90405aee5714037b9193bb1
 file src/pgoutput.rs 3ba4b836391ddf5dcc1d364e53aa633a9aa2d4ac8b6bc8e4b78371c600109ebd
 file src/pgoutput/tests.rs de670286a3c1519b38cbc453baf9ecc31f079e59cc7ccd47dfa79ff6951f5882
-file src/source/maria.rs 330d9bb58c38c0c338ff97ea8691807d96c526b8c58928be7b01f5a2260c7796
-file src/source/mod.rs 3da0e9a2c4e369a8c2e5f5fb727f6a0c8d568a373610fe3e645ffef328f84ba4
-file src/source/mysql.rs 2dbc1c66047848a7694292d11aac3f40ec27f33b7dde1daa23c89653302fe2ce
+file src/source/maria.rs d595e87a48b116cb9b5cc7be114353c00e90a1bf34ceccd546f64c9efcd17ca8
+file src/source/mod.rs b435e67fc267638c8d4568c76fc3cc2904e95cfbfc0f98e0c4727b605c97977d
+file src/source/mysql.rs 1af14e55e797a1fde4b4c67e523e7937682f19ca002cd6ca230bb8c5405c2611
 file src/source/percona.rs 84c142385d50f80afbfe458e910aaecba504d9834f2d54d336d717a804dd7ef7
