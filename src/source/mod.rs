@@ -214,6 +214,29 @@ impl Flavor {
         matches!(self, Flavor::MySql | Flavor::Percona)
     }
 
+    /// Whether the binlog position this flavor reports for a consistent snapshot
+    /// (`maria::snapshot_position`) is a watermark of *committed* transactions: waiting for it to
+    /// reach the position the engine read from the binlog then proves every transaction up to
+    /// there is visible to a new reader. The flavor answers, because that is what its server code
+    /// does with the position; the engine asks it instead of branching on product names.
+    ///
+    /// MariaDB's pair is a watermark. The MySQL family's is not: what its `binlog_snapshot_%`
+    /// status variables report is the raw binlog write position, which has already passed
+    /// transactions still in flight, and the snapshot taken in the same moment cannot read them
+    /// (measured on Percona Server 8.4: `Binlog_snapshot_position` had advanced past an in-flight
+    /// update whose row that snapshot still showed as the old value). Waiting on such a position
+    /// approves the read of stale rows, so a flavor that answers `false` is fenced by the GTID
+    /// wait when it has GTIDs and otherwise by the commit-order row (`mysql::commit_order`).
+    /// Oracle Community answers `false` and reports no pair at all, which rules the snapshot read
+    /// out by itself.
+    pub fn snapshot_position_is_watermark(self) -> bool {
+        match self {
+            Flavor::MariaDb => maria::snapshot_position_is_watermark(),
+            Flavor::MySql => mysql::snapshot_position_is_watermark(),
+            Flavor::Percona => percona::snapshot_position_is_watermark(),
+        }
+    }
+
     /// The capabilities of this flavor, detected once at connect: callers read a flag here
     /// instead of matching on the flavor or threading a `mariadb` bool through the call chain.
     pub fn detect(self) -> SourceCaps {
@@ -279,6 +302,21 @@ pub(crate) enum Step {
     /// the offset stops being trustworthy as a resume point inside a transaction from here on
     /// (an event with a real `log_pos` trusts it again).
     Advance { size: u64, exact: bool },
+}
+
+/// Why the source refuses an incremental plan that reads `referenced` columns of `table` (the
+/// per-flavor planning rule, asked once per plan by the engine), or `None`. `version` is the
+/// server's `VERSION()`. MariaDB's rule lives in [`maria::plan_refusal`].
+pub(crate) fn plan_refusal(
+    flavor: Flavor,
+    version: &str,
+    table: &crate::catalog::TableInfo,
+    referenced: &[bool],
+) -> Option<String> {
+    match flavor {
+        Flavor::MariaDb => maria::plan_refusal(version, table, referenced),
+        Flavor::MySql | Flavor::Percona => None,
+    }
 }
 
 /// The one place the per-flavor `log_pos = 0` position rule lives: `Tracker::advance` calls
