@@ -512,7 +512,7 @@ pub async fn send(
     expect: &Expect,
     pool: &mysql_async::Pool,
 ) -> Result<Sent> {
-    let items = items_of(client, rendered, &[])?;
+    let items = items_of(client, rendered, Keys::Once)?;
     if items.is_empty() {
         return Ok(Sent::Skipped);
     }
@@ -586,7 +586,7 @@ pub async fn send_items(
     expect: &Expect,
     pool: &mysql_async::Pool,
 ) -> Result<Vec<Item>> {
-    let items = items_of(client, rendered, keys)?;
+    let items = items_of(client, rendered, Keys::PerKey(keys))?;
     if items.is_empty() {
         return Ok(vec![Item::Ok; keys.len()]);
     }
@@ -596,7 +596,16 @@ pub async fn send_items(
     }
     let mut out_items = Vec::with_capacity(out.verdicts.len());
     for (i, v) in out.verdicts.iter().enumerate() {
-        let at = format!("item {i} (key `{}`) of {}", keys[i], client.url);
+        // An answer for an item that was never sent says nothing about any key, and only an
+        // answer positively about this message may refuse a key: this is at most a wait, and
+        // `keys` is never indexed past what the engine gave.
+        let Some(key) = keys.get(i) else {
+            out_items.push(Item::Transient(format!(
+                "item {i}: the server answered more items than were sent"
+            )));
+            continue;
+        };
+        let at = format!("item {i} (key `{key}`) of {}", client.url);
         out_items.push(match v {
             Verdict::Ack {
                 seq,
@@ -647,14 +656,25 @@ fn ack_row(uses: Uses, seq: u64, hash: u64, status: contract::Status, reason: &s
     )
 }
 
+/// The keys the documents are lined up against, for [`items_of`]: spelled as a type rather
+/// than as a possibly-empty slice so the `docs`-against-keys check cannot be skipped by a
+/// caller passing `&[]` for the wrong reason.
+enum Keys<'a> {
+    /// An action's items: document i is the item of key i.
+    PerKey(&'a [String]),
+    /// A `once` step: it has no keys, so the `docs` it rendered are its own business.
+    Once,
+}
+
 /// The rendered action's items: element i of the `docs` array becomes item i, its `doc` filled
-/// onto the target's item message field by field. `keys` is empty for a `once` step, which has no
-/// keys to line the items up against.
+/// onto the target's item message field by field. [`Keys::PerKey`] lines the items up against
+/// the engine's keys (their counts must agree, always); [`Keys::Once`] has no keys to line
+/// them up against.
 ///
-/// A body that is not the `docs` array, a document that does not fit the schema, and an item
-/// count that is not the key count are all refused: the template or the schema is wrong, and
-/// sending again would be wrong again.
-fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outbound>> {
+/// A body that is not the `docs` array, a document that does not fit the schema, and — for a
+/// `PerKey` flush — an item count that is not the key count are all refused: the template or
+/// the schema is wrong, and sending again would be wrong again.
+fn items_of(client: &Client, rendered: &str, keys: Keys<'_>) -> Result<Vec<Outbound>> {
     if rendered.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -666,14 +686,20 @@ fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outb
             client.url
         ))
     })?;
-    if !keys.is_empty() && docs.len() != keys.len() {
-        return Err(rejected(format!(
-            "the body of `{}` lists {} documents for {} keys (document i is the item of key i)",
-            client.url,
-            docs.len(),
-            keys.len()
-        )));
+    if let Keys::PerKey(keys) = keys {
+        if docs.len() != keys.len() {
+            return Err(rejected(format!(
+                "the body of `{}` lists {} documents for {} keys (document i is the item of key i)",
+                client.url,
+                docs.len(),
+                keys.len()
+            )));
+        }
     }
+    let key_of = |i: usize| match &keys {
+        Keys::PerKey(k) => k.get(i),
+        Keys::Once => None,
+    };
     let body_of = client.method.body.as_ref().ok_or_else(|| {
         rejected(format!(
             "`{}` has no `vars.item_type`, so a document has nothing to become",
@@ -685,7 +711,7 @@ fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outb
         let at = format!(
             "document {} of `{}`",
             i,
-            keys.get(i).map(String::as_str).unwrap_or("?")
+            key_of(i).map(String::as_str).unwrap_or("?")
         );
         let doc = d
             .as_object()
@@ -694,7 +720,7 @@ fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outb
             .get("key")
             .and_then(Value::as_str)
             .ok_or_else(|| rejected(format!("{at} has no `key` string")))?;
-        if let Some(want) = keys.get(i) {
+        if let Some(want) = key_of(i) {
             if key != want {
                 return Err(rejected(format!(
                     "{at}: its `key` is `{key}`, not the key `{want}` the engine gave"

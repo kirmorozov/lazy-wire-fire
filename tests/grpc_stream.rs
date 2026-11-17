@@ -254,6 +254,59 @@ async fn an_item_never_acknowledged_is_transient_never_a_strike() {
     server.stop();
 }
 
+/// The keys are what make the items: no keys is no flush — `Ok` with nothing, and not one
+/// stream opened — and documents with no keys behind them are refused before the wire,
+/// naming both counts. Neither reaches the server at all.
+#[tokio::test]
+async fn a_flush_is_judged_against_its_keys_before_the_wire() {
+    let server = Server::start(Policy::default()).await;
+    let def = target(server.endpoint(), &[]);
+    let (_, client) = grpc::Client::new(&def, &def.endpoints[0]).expect("loads");
+    let expect = Expect::new(None).unwrap();
+
+    // Nothing to send: an empty flush sends nothing — `Ok(vec![])` without a push, which
+    // the server's own record is what proves.
+    let items = grpc::send_items(&client, "[]", &[], &expect, &pool())
+        .await
+        .expect("an empty flush");
+    assert!(items.is_empty(), "{items:?}");
+
+    // Documents with no keys behind them: the template is wrong, and the flush is refused
+    // before the wire rather than judged item by item against keys that do not exist.
+    let e = grpc::send_items(&client, &rendered(&["a", "b"]), &[], &expect, &pool())
+        .await
+        .expect_err("documents need keys to be the items of");
+    assert!(is_rejected(&e), "{e:#}");
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("2 documents") && msg.contains("0 keys"),
+        "names both counts: {msg}"
+    );
+
+    assert_eq!(server.calls(), 0, "not one stream was opened");
+    assert!(server.seen().is_empty(), "not one item was pushed");
+    server.stop();
+}
+
+/// A server that took two items and said nothing about the third: what it took is taken —
+/// the answered ones are not refused, whatever else it was silent about — and what it left
+/// unanswered waits, which is the one answer that cannot lose a key.
+#[tokio::test]
+async fn two_answered_of_three_and_the_third_waits() {
+    let mut policy = Policy::default();
+    policy.silent = vec!["c".into()];
+    let (items, server) = flush_at(policy, &["a", "b", "c"], &[], 400).await;
+    assert_eq!(items.len(), 3, "one item per key");
+    assert_eq!(items[0], Item::Ok, "the server said yes to it");
+    assert_eq!(items[1], Item::Ok, "and to it");
+    assert!(
+        matches!(&items[2], Item::Transient(w) if w.contains("no acknowledgement")),
+        "what it said nothing about waits: {:?}",
+        items[2]
+    );
+    server.stop();
+}
+
 #[tokio::test]
 async fn a_stream_that_dies_mid_flight_costs_no_key_and_the_next_flush_reconnects() {
     let mut policy = Policy::default();
