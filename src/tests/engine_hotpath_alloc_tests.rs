@@ -102,13 +102,14 @@ fn state(rule: &Arc<Rule>) -> RuleState {
 
 const RULE: &str = "orders_sync";
 
-/// One rule's worth of the state `feed` borrows to build a row's keys.
+/// One rule's worth of the state `on_rows` borrows to build a row's keys.
 struct Hot {
     w: Watched,
     marks: HashMap<String, Marks>,
     rules: BTreeMap<String, RuleState>,
     scratch: KeyScratch,
     render_warnings: u64,
+    invalid_keys: u64,
     invalid: Vec<(String, u64, String)>,
 }
 
@@ -118,22 +119,26 @@ impl Hot {
         let rule = rule(key, changed, any_full);
         let mut rules = BTreeMap::new();
         rules.insert(RULE.to_string(), state(&rule));
+        let triggers = vec![(RULE.to_string(), rule, 0)];
+        let any_on = Engine::watched_kinds(&triggers);
         Hot {
             w: Watched {
                 layout: layout(),
                 table: "shop.orders".into(),
-                triggers: vec![(RULE.to_string(), rule, 0)],
+                triggers,
                 any_full,
+                any_on,
             },
             marks: HashMap::new(),
             rules,
             scratch: KeyScratch::default(),
             render_warnings: 0,
+            invalid_keys: 0,
             invalid: Vec::new(),
         }
     }
 
-    /// One row, exactly as `feed` hands it to `row_keys`.
+    /// One row, exactly as `on_rows` hands it to `row_keys`.
     fn feed(&mut self, kind: RowsKind, before: &Option<BinlogRow>, after: &Option<BinlogRow>) {
         let Hot {
             w,
@@ -141,6 +146,7 @@ impl Hot {
             rules,
             scratch,
             render_warnings,
+            invalid_keys,
             invalid,
         } = self;
         let mut ctx = RowCtx {
@@ -148,6 +154,7 @@ impl Hot {
             rules,
             scratch,
             render_warnings,
+            invalid_keys,
             invalid,
         };
         Engine::row_keys(w, kind, before, after, &mut ctx);
