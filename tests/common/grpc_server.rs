@@ -137,6 +137,8 @@ pub struct Policy {
     pub retry: Vec<String>,
     /// Keys it says nothing about: the deadline is what answers for them.
     pub silent: Vec<String>,
+    /// Keys it answers with no status at all: an acknowledgement that judges nothing.
+    pub unspecified: Vec<String>,
     /// Acknowledge every item in its own message rather than one `Acks` for the envelope.
     pub one_by_one: bool,
     /// Reset the stream after this many items, acknowledgements sent (0: never).
@@ -163,6 +165,7 @@ impl Default for Policy {
             refuse: Vec::new(),
             retry: Vec::new(),
             silent: Vec::new(),
+            unspecified: Vec::new(),
             one_by_one: false,
             reset_after: 0,
             wrong_hash: Vec::new(),
@@ -521,14 +524,16 @@ fn ack_of(policy: &Policy, item: &contract::Item) -> Option<contract::Ack> {
     if policy.silent.contains(&item.key) {
         return None;
     }
-    let (status, reason) =
-        if let Some((_, why)) = policy.refuse.iter().find(|(k, _)| *k == item.key) {
-            (contract::Status::Refused, why.clone())
-        } else if policy.retry.contains(&item.key) {
-            (contract::Status::Retry, format!("not now: {}", item.key))
-        } else {
-            (contract::Status::Ok, String::new())
-        };
+    let (status, reason) = if policy.unspecified.contains(&item.key) {
+        // An answer that says nothing: no status, so the item keeps its place.
+        (contract::Status::Unspecified, String::new())
+    } else if let Some((_, why)) = policy.refuse.iter().find(|(k, _)| *k == item.key) {
+        (contract::Status::Refused, why.clone())
+    } else if policy.retry.contains(&item.key) {
+        (contract::Status::Retry, format!("not now: {}", item.key))
+    } else {
+        (contract::Status::Ok, String::new())
+    };
     let hash = if policy.wrong_hash.contains(&item.seq) {
         item.hash ^ 0xffff_0000_ffff_0000
     } else {
