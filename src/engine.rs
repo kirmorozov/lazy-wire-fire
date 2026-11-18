@@ -2338,7 +2338,7 @@ impl Engine {
                     .changed_columns
                     .iter()
                     .any(|c| match w.layout.index(c) {
-                        Some(i) => w.layout.value(b, i) != w.layout.value(a, i),
+                        Some(i) => w.layout.changed(b, a, i),
                         None => true,
                     });
                 if !changed {

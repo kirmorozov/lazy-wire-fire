@@ -497,46 +497,52 @@ fn frac(us: u32, decimals: u8) -> String {
 
 /// A query value as JSON, using the column's type.
 pub fn to_json(v: My, col: Option<&Column>) -> Value {
+    to_json_ref(&v, col)
+}
+
+/// [`to_json`] of a borrowed value: the row images of the binlog keep their bytes, so a column
+/// value is built straight from them instead of cloning the whole `Vec<u8>` first. It is the same
+/// function — `to_json` is this one with a value it owns, and the crate's public entry.
+pub(crate) fn to_json_ref(v: &My, col: Option<&Column>) -> Value {
     let ty = col.map(|c| c.column_type());
     let decimals = col.map(|c| c.decimals()).unwrap_or(0);
     match v {
         My::NULL => Value::Null,
-        My::Int(i) => Value::from(i),
-        My::UInt(u) => Value::from(u),
+        My::Int(i) => Value::from(*i),
+        My::UInt(u) => Value::from(*u),
         My::Float(f) => {
-            serde_json::Number::from_f64(f64::from(f)).map_or(Value::Null, Value::Number)
+            serde_json::Number::from_f64(f64::from(*f)).map_or(Value::Null, Value::Number)
         }
-        My::Double(f) => serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number),
+        My::Double(f) => serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number),
         My::Date(y, m, d, h, i, s, us) => {
             if ty == Some(ColumnType::MYSQL_TYPE_DATE) || ty == Some(ColumnType::MYSQL_TYPE_NEWDATE)
             {
-                Value::String(format!("{y:04}-{}-{}", pad2(m), pad2(d)))
+                Value::String(format!("{y:04}-{}-{}", pad2(*m), pad2(*d)))
             } else {
                 Value::String(format!(
                     "{y:04}-{}-{} {}:{}:{}{}",
-                    pad2(m),
-                    pad2(d),
-                    pad2(h),
-                    pad2(i),
-                    pad2(s),
-                    frac(us, decimals)
+                    pad2(*m),
+                    pad2(*d),
+                    pad2(*h),
+                    pad2(*i),
+                    pad2(*s),
+                    frac(*us, decimals)
                 ))
             }
         }
         My::Time(neg, d, h, i, s, us) => Value::String(format!(
             "{}{}:{}:{}{}",
-            if neg { "-" } else { "" },
-            pad2(d * 24 + u32::from(h)),
-            pad2(i),
-            pad2(s),
-            frac(us, decimals)
+            if *neg { "-" } else { "" },
+            pad2(*d * 24 + u32::from(*h)),
+            pad2(*i),
+            pad2(*s),
+            frac(*us, decimals)
         )),
         My::Bytes(b) => {
-            let text = || String::from_utf8_lossy(&b).into_owned();
+            let text = || String::from_utf8_lossy(b).into_owned();
             match ty {
                 Some(ColumnType::MYSQL_TYPE_NEWDECIMAL | ColumnType::MYSQL_TYPE_DECIMAL) => {
-                    serde_json::from_str::<serde_json::Number>(&text())
-                        .map_or_else(|_| Value::String(text()), Value::Number)
+                    number_or_text(b, text)
                 }
                 Some(
                     ColumnType::MYSQL_TYPE_TINY
@@ -547,10 +553,9 @@ pub fn to_json(v: My, col: Option<&Column>) -> Value {
                     | ColumnType::MYSQL_TYPE_YEAR
                     | ColumnType::MYSQL_TYPE_FLOAT
                     | ColumnType::MYSQL_TYPE_DOUBLE,
-                ) => serde_json::from_str::<serde_json::Number>(&text())
-                    .map_or_else(|_| Value::String(text()), Value::Number),
+                ) => number_or_text(b, text),
                 Some(ColumnType::MYSQL_TYPE_JSON) => {
-                    serde_json::from_slice(&b).unwrap_or_else(|_| Value::String(text()))
+                    serde_json::from_slice(b).unwrap_or_else(|_| Value::String(text()))
                 }
                 Some(ColumnType::MYSQL_TYPE_BIT) => Value::from(
                     b.iter()
@@ -561,6 +566,15 @@ pub fn to_json(v: My, col: Option<&Column>) -> Value {
             }
         }
     }
+}
+
+/// Bytes that hold a number, as a number; anything else as the text those bytes lose to. Parsing
+/// the bytes answers exactly what parsing `text()` would: a string `serde_json` accepts as a
+/// number is all ASCII, so it is its own `from_utf8_lossy` text, and where the bytes are not
+/// valid UTF-8 neither parse can succeed.
+fn number_or_text(b: &[u8], text: impl FnOnce() -> String) -> Value {
+    serde_json::from_slice::<serde_json::Number>(b)
+        .map_or_else(|_| Value::String(text()), Value::Number)
 }
 
 /// A key as text (`_key` columns, snapshot keys): integers in decimal, bytes as UTF-8.
