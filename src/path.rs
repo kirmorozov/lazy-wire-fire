@@ -251,3 +251,7 @@ mod tests {
         assert_eq!(e, json!({"list": {"tags": [1]}, "tags": []}));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/path_set_tests.rs"]
+mod set_tests;

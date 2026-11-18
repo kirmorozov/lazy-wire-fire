@@ -66,6 +66,25 @@ impl Layout {
         convert(row.as_ref(i), self.kinds.get(i).unwrap_or(&ColKind::Plain))
     }
 
+    /// Whether the two images of a row differ in column `i`: the same answer as
+    /// `self.value(b, i) != self.value(a, i)`, without building either value when the two can be
+    /// shown to be equal.
+    ///
+    /// Only the equal case is skipped, and only where it is certain: `convert` is a function of the
+    /// value and the column's kind, so identical input cannot give a different output. Anything the
+    /// rule below does not cover — a `Jsonb`, two payloads that differ, one of the two missing — is
+    /// converted and compared exactly as before. Inferring *difference* from the payloads would be a
+    /// different matter (two `i64` can share an `Unsigned` mask, two byte strings can lose to the
+    /// same `from_utf8_lossy` text), so it is not tried.
+    pub fn changed(&self, b: &BinlogRow, a: &BinlogRow, i: usize) -> bool {
+        let kind = self.kinds.get(i).unwrap_or(&ColKind::Plain);
+        let (b, a) = (b.as_ref(i), a.as_ref(i));
+        if same_value(b, a) {
+            return false;
+        }
+        convert(b, kind) != convert(a, kind)
+    }
+
     /// The whole image as an object.
     pub fn object(&self, row: &BinlogRow) -> Value {
         let mut m = Map::with_capacity(self.names.len());
@@ -170,7 +189,48 @@ fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind) -> Value {
                 .take(8)
                 .fold(0u64, |acc, x| (acc << 8) | u64::from(*x)),
         ),
-        (_, other) => crate::docs::to_json(other.clone(), None),
+        (_, other) => crate::docs::to_json_ref(other, None),
+    }
+}
+
+/// Certain to render as the same JSON value. The missing column of an image is `None` and renders
+/// as `Value::Null`, as do `NULL` and a partial JSON update, which are therefore equal to it.
+fn same_value(a: Option<&BinlogValue<'_>>, b: Option<&BinlogValue<'_>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (None, Some(v)) | (Some(v), None) => is_null(v),
+        (Some(a), Some(b)) => match (a, b) {
+            // a partial JSON update carries no value: both sides are `Value::Null`
+            (BinlogValue::JsonDiff(_), BinlogValue::JsonDiff(_)) => true,
+            (BinlogValue::Value(a), BinlogValue::Value(b)) => same_my(a, b),
+            // a `Jsonb` is as much work to compare as to convert, and it is not the hot column
+            _ => false,
+        },
+    }
+}
+
+/// A value `convert` renders as `Value::Null`.
+fn is_null(v: &BinlogValue<'_>) -> bool {
+    matches!(v, BinlogValue::JsonDiff(_) | BinlogValue::Value(My::NULL))
+}
+
+/// Same variant, same payload. Floats compare by bits, which is finer than the text `Number` keeps,
+/// so two values here cannot render differently; `Date` and `Time` are their fields.
+fn same_my(a: &My, b: &My) -> bool {
+    match (a, b) {
+        (My::NULL, My::NULL) => true,
+        (My::Int(a), My::Int(b)) => a == b,
+        (My::UInt(a), My::UInt(b)) => a == b,
+        (My::Float(a), My::Float(b)) => a.to_bits() == b.to_bits(),
+        (My::Double(a), My::Double(b)) => a.to_bits() == b.to_bits(),
+        (My::Date(y1, m1, d1, h1, i1, s1, us1), My::Date(y2, m2, d2, h2, i2, s2, us2)) => {
+            (y1, m1, d1, h1, i1, s1, us1) == (y2, m2, d2, h2, i2, s2, us2)
+        }
+        (My::Time(n1, d1, h1, i1, s1, us1), My::Time(n2, d2, h2, i2, s2, us2)) => {
+            (n1, d1, h1, i1, s1, us1) == (n2, d2, h2, i2, s2, us2)
+        }
+        (My::Bytes(a), My::Bytes(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -282,6 +342,10 @@ impl Catalog {
 }
 
 #[cfg(test)]
+#[path = "tests/rows_convert_tests.rs"]
+mod convert_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -320,3 +384,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/rows_decode_tests.rs"]
+mod decode_tests;

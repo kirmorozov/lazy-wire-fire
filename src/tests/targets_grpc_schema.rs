@@ -411,6 +411,189 @@ fn fits_table() {
     }
 }
 
+// ——— the arms the order form does not reach: map keys of every type, text of
+// every numeric width, and what a field says it wants —————————————————————————
+
+/// A schema of the shapes the order form lacks: bool and unsigned map keys, a `float`,
+/// a `uint64`, an enum and `bytes` next to a plain bool.
+const WIDE: &str = r#"
+        syntax = "proto3";
+        package shapes.v1;
+        enum State {
+          STATE_UNSPECIFIED = 0;
+          STATE_NEW = 1;
+        }
+        message Wide {
+          map<bool, string> flags = 1;
+          map<uint32, string> codes = 2;
+          map<uint64, string> bigs = 3;
+          uint64 count = 4;
+          float rate = 5;
+          double amount = 6;
+          bool paid = 7;
+          string sku = 8;
+          State st = 9;
+          bytes blob = 10;
+        }
+        "#;
+
+fn wide() -> MessageDescriptor {
+    pool_of("wide.proto", WIDE)
+        .get_message_by_name("shapes.v1.Wide")
+        .expect("Wide")
+}
+
+#[test]
+fn map_keys_are_read_as_their_type_and_refused_as_wrong_ones() {
+    let m = build(
+        &wide(),
+        &doc(json!({
+            "flags": {"true": "yes", "false": "no"},
+            "codes": {"7": "a"},
+            "bigs": {"9": "b"},
+        })),
+    )
+    .expect("builds");
+    let Value::Map(flags) = get(&m, "flags") else {
+        panic!("flags is a map")
+    };
+    assert_eq!(
+        flags.get(&MapKey::Bool(true)).unwrap(),
+        &Value::String("yes".into())
+    );
+    assert_eq!(
+        flags.get(&MapKey::Bool(false)).unwrap(),
+        &Value::String("no".into())
+    );
+    let Value::Map(codes) = get(&m, "codes") else {
+        panic!("codes is a map")
+    };
+    assert_eq!(
+        codes.get(&MapKey::U32(7)).unwrap(),
+        &Value::String("a".into())
+    );
+    let Value::Map(bigs) = get(&m, "bigs") else {
+        panic!("bigs is a map")
+    };
+    assert_eq!(
+        bigs.get(&MapKey::U64(9)).unwrap(),
+        &Value::String("b".into())
+    );
+
+    // A key the type cannot hold, each naming the key and why.
+    let e = build(&wide(), &doc(json!({"flags": {"yes": "x"}})))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("flags[yes]") && e.contains("not `true` or `false`"),
+        "{e}"
+    );
+    let e = build(&wide(), &doc(json!({"codes": {"-1": "x"}})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("codes[-1]") && e.contains("non-negative"), "{e}");
+    let e = build(&wide(), &doc(json!({"codes": {"x": "y"}})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not a non-negative integer"), "{e}");
+    let e = build(&wide(), &doc(json!({"bigs": {"-2": "y"}})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("bigs[-2]") && e.contains("non-negative"), "{e}");
+}
+
+#[test]
+fn text_of_every_numeric_width_and_a_number_in_a_field_that_is_not_one() {
+    // Quoted numbers fill the numeric field of their width.
+    let m = build(
+        &wide(),
+        &doc(json!({"count": "42", "rate": "1.5", "amount": "2.25"})),
+    )
+    .expect("builds");
+    assert_eq!(get(&m, "count").as_u64(), Some(42));
+    assert_eq!(get(&m, "rate").as_f32(), Some(1.5));
+    assert_eq!(get(&m, "amount").as_f64(), Some(2.25));
+    // Text that is not a number of that width, per width.
+    for (field, value, want) in [
+        ("amount", "wide", "a `double` field"),
+        ("rate", "wide", "a `float` field"),
+        ("count", "wide", "a `uint64` field"),
+    ] {
+        let e = build(&wide(), &doc(json!({field: value})))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("which is not a number that fits"), "{e}");
+        assert!(e.contains(want), "{e}");
+    }
+    // A number in a field that is not one: the strict JSON mapping refuses it.
+    let e = build(&wide(), &doc(json!({"paid": 1})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is a number and `paid` is a bool field"), "{e}");
+    // And an unsigned field still refuses a fraction.
+    let e = build(&wide(), &doc(json!({"count": 1.5})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not a whole number"), "{e}");
+}
+
+#[test]
+fn a_field_names_what_it_wants_and_a_shape_names_itself() {
+    for (field, value, want) in [
+        ("blob", json!(true), "send base64 text"),
+        ("st", json!(true), "send the name or the number"),
+        ("paid", json!([]), "send true or false"),
+    ] {
+        let e = build(&wide(), &doc(json!({field: value})))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(want), "{field}={value}: {e}");
+    }
+    // What a JSON value is, in the error of the map that cannot hold it.
+    for (value, want) in [
+        (json!(null), "is null and `flags` is a map"),
+        (json!(true), "is a bool and `flags` is a map"),
+        (json!(5), "is a number and `flags` is a map"),
+    ] {
+        let e = build(&wide(), &doc(json!({"flags": value})))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(want), "{value}: {e}");
+    }
+}
+
+#[test]
+fn column_errors_name_every_column_type_and_its_fix() {
+    // A decimal column into an unsigned field: named by type, with the SQL fix.
+    let e = column_errors(&wide(), &[col("c", "count", ValueKind::Double)]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("decimal or floating-point column"), "{e:?}");
+    assert!(e[0].contains("uint64 field"), "{e:?}");
+    assert!(e[0].contains("CAST(col AS SIGNED)"), "{e:?}");
+    // A collect column into a float: named as a repeated mismatch.
+    let e = column_errors(&wide(), &[col("r", "rate", ValueKind::Array)]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(
+        e[0].contains("float field") && e[0].contains("collect column"),
+        "{e:?}"
+    );
+    // Text into a bool: the one hint that names true or false.
+    let e = column_errors(&wide(), &[col("p", "paid", ValueKind::Str)]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("a bool field wants true or false"), "{e:?}");
+    // A JSON object column into a plain string field: it wants a real object field.
+    let e = column_errors(&wide(), &[col("s", "sku", ValueKind::Object)]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(
+        e[0].contains("column with a path") && e[0].contains("wants a JSON column"),
+        "{e:?}"
+    );
+    // A binary column into a field that holds no object: it says to send text instead.
+    let e = column_errors(&wide(), &[col("b", "paid", ValueKind::Blob)]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("binary column holds no object"), "{e:?}");
+}
+
 /// The three arms that were `unreachable!` refuse now instead of panicking: a descriptor
 /// that disagrees with itself, a field that is not a map handed to the map route, and a
 /// non-number asked to parse text — each an `Err` naming the field and the kind, so a bad

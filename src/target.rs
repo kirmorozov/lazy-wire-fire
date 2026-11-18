@@ -1014,9 +1014,16 @@ impl Target {
         if req.header("host").is_none() {
             req.set_header("Host", host_header.to_string());
         }
+        // Read the raw `vars` entry, not `def_var`: a present-but-empty credential must render as
+        // the empty string, exactly as a literal empty password did before 0.3.0, and `def_var`
+        // reads empty as unset. Follows `TargetDef::from_row`'s provisional ruling (an empty
+        // credential is accepted for now) and is the only other line it touches: a field that is
+        // truly absent is still the `vars.{k} is missing` error.
         let get = |k: &str| -> Result<String> {
-            secrets::resolve(def_var(&self.def, k).ok_or_else(|| anyhow!("vars.{k} is missing"))?)
-                .with_context(|| format!("vars.{k}"))
+            match self.def.vars.get(k).and_then(Value::as_str) {
+                Some(v) => secrets::resolve(v).with_context(|| format!("vars.{k}")),
+                None => Err(anyhow!("vars.{k} is missing")),
+            }
         };
         crate::targets::http::authorize(&self.def, &mut req, &get)?;
         // The oauth token, after the kind's own credential so that a target can carry only one
@@ -1174,6 +1181,10 @@ mod dispatch_tests;
 #[cfg(test)]
 #[path = "tests/target_secret_endpoint_tests.rs"]
 mod secret_endpoint_tests;
+
+#[cfg(test)]
+#[path = "tests/target_outcome_classify_tests.rs"]
+mod outcome_classify_tests;
 
 // ---------------------------------------------------------------------------------------------
 // oauth: the plain http kinds carry `Authorization: Bearer <token>` (see `src/oauth.rs`).

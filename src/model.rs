@@ -489,8 +489,17 @@ impl TargetDef {
                 );
             }
         }
+        let secrets = kind.secret_ref_fields();
         let need = |k: &str| -> Result<()> {
-            if crate::target::var(&vars, k).is_none() {
+            // THE decision point, and the only one: an empty credential field is a deliberate empty
+            // credential (basic auth with an empty password), not a missing one, so it satisfies the
+            // need; `var` alone reports it unset. PROVISIONAL, owner's ruling of 2026-11-18 — allowed
+            // for now, "likely we might reject some time later" — so nothing else is built on it and
+            // `an_empty_credential_literal_is_accepted` pins today's behaviour as it is. Any other
+            // field is present only when it holds text.
+            let present = crate::target::var(&vars, k).is_some()
+                || (secrets.contains(&k) && vars.get(k).is_some_and(|v| v.as_str() == Some("")));
+            if !present {
                 bail!("kind {:?} needs `vars.{k}`", kind);
             }
             Ok(())
@@ -569,6 +578,9 @@ impl TargetDef {
         // 0.3.0: the password- and token-bearing `vars` fields hold the target's credential,
         // and a credential is never a literal in a SQL row — only an `env:` / `file:`
         // reference. The kind checks above catch most of these first, with the same refusal.
+        // An empty (or absent) value carries no secret and is not a credential to audit: `var`
+        // reads empty as unset, so the loop sees only a non-empty value, which must be a
+        // reference. A basic-auth empty password (`password: ""`) therefore loads (see `need`).
         for k in kind.secret_ref_fields() {
             if let Some(v) = crate::target::var(&vars, k) {
                 if !crate::secrets::is_reference(v) {

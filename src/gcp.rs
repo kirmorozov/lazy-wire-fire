@@ -284,3 +284,7 @@ mod tests {
         assert_eq!(got.unwrap(), "shared");
     }
 }
+
+#[cfg(test)]
+#[path = "tests/gcp_scrub_tests.rs"]
+mod scrub_tests;
