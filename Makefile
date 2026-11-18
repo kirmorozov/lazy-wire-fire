@@ -8,7 +8,7 @@ IMAGE ?= lazywf:dev
 BASE_IMAGES := docker.io/library/rust:1.100.0-slim-bookworm gcr.io/distroless/static-debian12:nonroot
 
 .PHONY: build release test test-roaring test-grpc lint servers servers-down test-e2e test-e2e-all test-e2e-search \
-	test-e2e-queues test-e2e-pgsrc test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
+	test-e2e-queues test-e2e-pgsrc test-chaos test-chaos-all test-matrix test-prerelease coverage coverage-unit coverage-e2e coverage-report \
 	docker-smoke docker-e2e image-digests
 
 build:
@@ -102,6 +102,17 @@ test-e2e-all:
 	$(COMPOSE) up -d --wait mysql84 mariadb1011 $(E2E_TARGETS); \
 	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS); \
 	LAZYWF_TEST_DSN=$(E2E_DSN_MARIADB) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS)
+
+# The chaos seeds (tests/chaos.rs): the engine as a child, in-process fault proxies between it
+# and the servers, faults gated on observed events. Children plus proxies: two test threads.
+# On the shared servers of this host run it through the shared runner (BIN=<chaos binary>
+# tmp/e2e-shared.sh), which holds the heavy-suite lock and cleans the lwf_* schemas.
+test-chaos:
+	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test chaos -- --test-threads=2
+
+# The same on both servers of the default set.
+test-chaos-all: test-chaos
+	LAZYWF_TEST_DSN=$(E2E_DSN_MARIADB) $(CARGO) test --test chaos -- --test-threads=2
 
 # The search re-sync against OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (compose profile
 # `search`), one engine at a time: three JVMs at once do not fit on a shared host. MySQL 8.4 comes up
