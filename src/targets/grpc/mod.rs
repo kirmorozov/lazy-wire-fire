@@ -512,7 +512,7 @@ pub async fn send(
     expect: &Expect,
     pool: &mysql_async::Pool,
 ) -> Result<Sent> {
-    let items = items_of(client, rendered, &[])?;
+    let items = items_of(client, rendered, Keys::Once)?;
     if items.is_empty() {
         return Ok(Sent::Skipped);
     }
@@ -549,7 +549,12 @@ pub async fn send(
                     )
                 }
                 contract::Status::Unspecified => {
-                    unreachable!("an ack with no status is never a verdict")
+                    // The reader filters an ack with no status before it can become a
+                    // verdict (stream.rs `answer`); should one ever be here, it says
+                    // nothing about the item, so it is a wait and never a refusal — and
+                    // the stream warns about such a server once, however chatty it gets.
+                    client.call.warn_no_status(&client.url);
+                    bail!("`{}`: the server acknowledged without a status", client.url)
                 }
             },
             Verdict::Lost(why) => bail!("`{}`: {why}", client.url),
@@ -586,7 +591,7 @@ pub async fn send_items(
     expect: &Expect,
     pool: &mysql_async::Pool,
 ) -> Result<Vec<Item>> {
-    let items = items_of(client, rendered, keys)?;
+    let items = items_of(client, rendered, Keys::PerKey(keys))?;
     if items.is_empty() {
         return Ok(vec![Item::Ok; keys.len()]);
     }
@@ -596,36 +601,62 @@ pub async fn send_items(
     }
     let mut out_items = Vec::with_capacity(out.verdicts.len());
     for (i, v) in out.verdicts.iter().enumerate() {
-        let at = format!("item {i} (key `{}`) of {}", keys[i], client.url);
+        // An answer for an item that was never sent says nothing about any key, and only an
+        // answer positively about this message may refuse a key: this is at most a wait, and
+        // `keys` is never indexed past what the engine gave.
+        let Some(key) = keys.get(i) else {
+            out_items.push(Item::Transient(format!(
+                "item {i}: the server answered more items than were sent"
+            )));
+            continue;
+        };
+        let at = format!("item {i} (key `{key}`) of {}", client.url);
         out_items.push(match v {
             Verdict::Ack {
                 seq,
                 hash,
-                status,
+                status: contract::Status::Ok,
                 reason,
-            } => match status {
-                contract::Status::Ok => match expect
-                    .row(pool, |u| ack_row(u, *seq, *hash, *status, reason))
-                    .await
-                    .with_context(|| at.clone())?
-                {
-                    Ok(()) => Item::Ok,
-                    Err(why) => Item::Rejected(format!("{at}: {why}")),
-                },
-                contract::Status::Refused => {
-                    Item::Rejected(format!("{at}: the server refused it: {reason}"))
-                }
-                contract::Status::Retry => {
-                    Item::Transient(format!("{at}: the server asked for it again: {reason}"))
-                }
-                contract::Status::Unspecified => {
-                    unreachable!("an ack with no status is never a verdict")
-                }
+            } => match expect
+                .row(pool, |u| {
+                    ack_row(u, *seq, *hash, contract::Status::Ok, reason)
+                })
+                .await
+                .with_context(|| at.clone())?
+            {
+                Ok(()) => Item::Ok,
+                Err(why) => Item::Rejected(format!("{at}: {why}")),
             },
-            Verdict::Lost(why) => Item::Transient(format!("{at}: {why}")),
+            other => item_verdict(client, &at, other),
         });
     }
     Ok(out_items)
+}
+
+/// What a verdict other than the server's `OK` says about its key: the refusal, the wait,
+/// or the nothing the server said. `OK` is the caller's, since the rule's `expect` has the
+/// last say on what it means. The ack with no status is the stream reader's filter kept
+/// honest in this module as well: it is a wait, never a refusal, and the stream warns
+/// about such a server once rather than once per answer.
+fn item_verdict(client: &Client, at: &str, v: &Verdict) -> Item {
+    match v {
+        Verdict::Ack { status, reason, .. } => match status {
+            // Not met from `send_items`, which answers `OK` itself: the honest answer for
+            // completeness, so no arm of this mapping can panic.
+            contract::Status::Ok => Item::Ok,
+            contract::Status::Refused => {
+                Item::Rejected(format!("{at}: the server refused it: {reason}"))
+            }
+            contract::Status::Retry => {
+                Item::Transient(format!("{at}: the server asked for it again: {reason}"))
+            }
+            contract::Status::Unspecified => {
+                client.call.warn_no_status(&client.url);
+                Item::Transient(format!("{at}: the server acknowledged without a status"))
+            }
+        },
+        Verdict::Lost(why) => Item::Transient(format!("{at}: {why}")),
+    }
 }
 
 /// The row `r` of one acknowledgement: `status` 200 and the acknowledgement as JSON for what the
@@ -647,14 +678,25 @@ fn ack_row(uses: Uses, seq: u64, hash: u64, status: contract::Status, reason: &s
     )
 }
 
+/// The keys the documents are lined up against, for [`items_of`]: spelled as a type rather
+/// than as a possibly-empty slice so the `docs`-against-keys check cannot be skipped by a
+/// caller passing `&[]` for the wrong reason.
+enum Keys<'a> {
+    /// An action's items: document i is the item of key i.
+    PerKey(&'a [String]),
+    /// A `once` step: it has no keys, so the `docs` it rendered are its own business.
+    Once,
+}
+
 /// The rendered action's items: element i of the `docs` array becomes item i, its `doc` filled
-/// onto the target's item message field by field. `keys` is empty for a `once` step, which has no
-/// keys to line the items up against.
+/// onto the target's item message field by field. [`Keys::PerKey`] lines the items up against
+/// the engine's keys (their counts must agree, always); [`Keys::Once`] has no keys to line
+/// them up against.
 ///
-/// A body that is not the `docs` array, a document that does not fit the schema, and an item
-/// count that is not the key count are all refused: the template or the schema is wrong, and
-/// sending again would be wrong again.
-fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outbound>> {
+/// A body that is not the `docs` array, a document that does not fit the schema, and — for a
+/// `PerKey` flush — an item count that is not the key count are all refused: the template or
+/// the schema is wrong, and sending again would be wrong again.
+fn items_of(client: &Client, rendered: &str, keys: Keys<'_>) -> Result<Vec<Outbound>> {
     if rendered.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -666,14 +708,20 @@ fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outb
             client.url
         ))
     })?;
-    if !keys.is_empty() && docs.len() != keys.len() {
-        return Err(rejected(format!(
-            "the body of `{}` lists {} documents for {} keys (document i is the item of key i)",
-            client.url,
-            docs.len(),
-            keys.len()
-        )));
+    if let Keys::PerKey(keys) = keys {
+        if docs.len() != keys.len() {
+            return Err(rejected(format!(
+                "the body of `{}` lists {} documents for {} keys (document i is the item of key i)",
+                client.url,
+                docs.len(),
+                keys.len()
+            )));
+        }
     }
+    let key_of = |i: usize| match &keys {
+        Keys::PerKey(k) => k.get(i),
+        Keys::Once => None,
+    };
     let body_of = client.method.body.as_ref().ok_or_else(|| {
         rejected(format!(
             "`{}` has no `vars.item_type`, so a document has nothing to become",
@@ -685,7 +733,7 @@ fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outb
         let at = format!(
             "document {} of `{}`",
             i,
-            keys.get(i).map(String::as_str).unwrap_or("?")
+            key_of(i).map(String::as_str).unwrap_or("?")
         );
         let doc = d
             .as_object()
@@ -694,7 +742,7 @@ fn items_of(client: &Client, rendered: &str, keys: &[String]) -> Result<Vec<Outb
             .get("key")
             .and_then(Value::as_str)
             .ok_or_else(|| rejected(format!("{at} has no `key` string")))?;
-        if let Some(want) = keys.get(i) {
+        if let Some(want) = key_of(i) {
             if key != want {
                 return Err(rejected(format!(
                     "{at}: its `key` is `{key}`, not the key `{want}` the engine gave"

@@ -226,24 +226,33 @@ fn dsn_host_is_the_host_as_written() {
     assert!(!is_loopback_dsn("mysql://app@localhost.example.com/shop"));
 }
 
-/// `LAZYWF_STATUS_TOKEN` gates `/status` when it is set; blank is the same as unset.
+/// `LAZYWF_HEALTH_TOKEN` gates `/status` and `/metrics` when it is set; blank is the same as
+/// unset. The value is kept for the two listeners and never shown.
 #[test]
-fn the_status_token_is_kept_but_never_shown() {
+fn the_health_token_is_kept_but_never_shown() {
     let c = cfg(&[
         ("LAZYWF_DSN", "mysql://app:pw@127.0.0.1:3306/shop"),
-        ("LAZYWF_STATUS_TOKEN", "s3cr3t-token"),
+        ("LAZYWF_HEALTH_TOKEN", "s3cr3t-token"),
     ])
     .unwrap();
-    assert_eq!(c.status_token.as_deref(), Some("s3cr3t-token"));
+    assert_eq!(c.health_token.as_deref(), Some("s3cr3t-token"));
     let shown = format!("{c:?}");
     assert!(!shown.contains("s3cr3t-token"), "{shown}");
-    assert!(shown.contains("status_token: Some(\"set\")"), "{shown}");
+    assert!(shown.contains("health_token: Some(\"set\")"), "{shown}");
     for blank in ["", "   "] {
         let c = cfg(&[
             ("LAZYWF_DSN", "mysql://app:pw@127.0.0.1:3306/shop"),
-            ("LAZYWF_STATUS_TOKEN", blank),
+            ("LAZYWF_HEALTH_TOKEN", blank),
         ])
         .unwrap();
-        assert_eq!(c.status_token, None, "{blank:?}");
+        assert_eq!(c.health_token, None, "{blank:?}");
     }
+    // The value is trimmed on its way in: a token copied from a file into a shell keeps its
+    // newline, and that newline is not part of the secret.
+    let c = cfg(&[
+        ("LAZYWF_DSN", "mysql://app:pw@127.0.0.1:3306/shop"),
+        ("LAZYWF_HEALTH_TOKEN", "  s3cr3t-token\n"),
+    ])
+    .unwrap();
+    assert_eq!(c.health_token.as_deref(), Some("s3cr3t-token"));
 }

@@ -49,7 +49,9 @@ query ([reference → security](reference.md#security)).
 | `http.bearer` | `vars.token` | `Authorization: Bearer <token>` |
 | `http.header` | `vars.header`, `vars.value` | `<vars.header>: <resolved value>` — one header |
 
-Each credential is a literal, `env:NAME` or `file:/path`; a file's trailing newline is dropped and
+The credential of each kind (`vars.password`, `vars.token`, `vars.value`) is **reference-only
+since 0.3.0** — `env:NAME` or `file:/path`, a literal is refused at load; `vars.username` and
+`vars.header` name things and may stay literals. A file's trailing newline is dropped and
 a reference is resolved on every request, so a rotated secret applies without a restart. `file:`
 must resolve inside `LAZYWF_SECRET_DIRS` (default `/run/secrets:/var/run/secrets`) and `env:`
 cannot name lazywf's own `LAZYWF_*` settings. **References are resolved in `vars` and, for these
@@ -88,10 +90,11 @@ which is what a per-document or per-message API wants. A rule sends its actions 
 burst drains as a queue of requests rather than in parallel; `timeout_ms` (per action and
 endpoint, default 10000) bounds each.
 
-**Pin the hosts.** A target's endpoint hosts must match `LAZYWF_ALLOWED_HOSTS` when it is set
-(exact names, `*.suffix`, IP literals or CIDR ranges, each optionally `:port`); an unmatched
-endpoint is a load error naming the host ([reference → security](reference.md#security)). Where
-the configuration tables cannot be admin-only, set it.
+**Pin the hosts.** Since 0.3.0 `LAZYWF_ALLOWED_HOSTS` is not optional: unset denies every host
+and each target fails at load with a refusal naming the setting. List the target's hosts (exact
+names, `*.suffix`, IP literals or CIDR ranges, each optionally `:port`); an unmatched endpoint
+is a load error naming the host ([reference → security](reference.md#security)). `*` allows any
+host — the explicit opt-out, the form for tables that are admin-only.
 
 **Keep the path in the template.** An endpoint's prefix (`http(s)://host:port[/prefix]`) is put
 before every path, with its trailing `/` stripped, so an endpoint of

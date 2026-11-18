@@ -380,6 +380,141 @@ fn the_items_are_judged_before_the_wire_and_the_wire_never_loses_one() {
     );
 }
 
+/// `PerKey` judges its documents against the keys it was given — always, including the
+/// empty-keys case that once let the verdict loop index `keys` out of range when `items_of`
+/// skipped the count check for an empty slice. The refusal names both counts; `Once` has no
+/// keys to judge against, so the same body is the step's own business.
+#[test]
+fn per_key_items_are_always_judged_against_their_keys() {
+    let (_s, ds) = write_descriptor_set();
+    let vars = format!(r#"{{"descriptor_set":"file:{ds}","item_type":"orders.v1.Item"}}"#);
+    let d = def(&vars, "grpc://h:9000/catalog.v1.Ingest/Push").unwrap();
+    let (_, client) = Client::new(&d, &d.endpoints[0]).unwrap();
+    let docs = r#"[{"key":"a","doc":{"id":1}},{"key":"b","doc":{"id":2}}]"#;
+
+    // No keys, two documents: refused, and the refusal says how many of each.
+    let e = items_of(&client, docs, Keys::PerKey(&[]))
+        .err()
+        .unwrap_or_else(|| panic!("accepted 2 documents for 0 keys"));
+    assert!(crate::target::is_rejected(&e), "{e:#}");
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("2 documents") && msg.contains("0 keys"),
+        "names both counts: {msg}"
+    );
+
+    // A real mismatch reads the same way.
+    let one = vec!["a".to_string()];
+    let msg = format!(
+        "{:#}",
+        items_of(&client, docs, Keys::PerKey(&one)).err().unwrap()
+    );
+    assert!(
+        msg.contains("2 documents") && msg.contains("1 keys"),
+        "names both counts: {msg}"
+    );
+
+    // `Once` is not judged against keys it does not have; `PerKey` with the keys it does
+    // have is good.
+    assert!(
+        items_of(&client, docs, Keys::Once).is_ok(),
+        "a once step has no keys"
+    );
+    let both = vec!["a".to_string(), "b".to_string()];
+    assert!(items_of(&client, docs, Keys::PerKey(&both)).is_ok());
+}
+
+/// What each verdict says about its key, spelled once beside the verdicts themselves:
+/// the refused stays refused, the retry and the lost wait, and the acknowledgement with
+/// no status — which the stream reader filters and this module maps anyway — is a wait
+/// with its own words, never a refusal, warned **once** per stream however chatty the
+/// server gets.
+#[test]
+fn a_no_status_verdict_waits_once_and_says_so() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the WARN events that pass while it is the default subscriber.
+    #[derive(Clone)]
+    struct CountWarn(std::sync::Arc<AtomicUsize>);
+    impl tracing::Subscriber for CountWarn {
+        fn enabled(&self, _: &tracing::metadata::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let (_s, ds) = write_descriptor_set();
+    let vars = format!(r#"{{"descriptor_set":"file:{ds}","item_type":"orders.v1.Item"}}"#);
+    let d = def(&vars, "grpc://h:9000/catalog.v1.Ingest/Push").unwrap();
+    let (_, client) = Client::new(&d, &d.endpoints[0]).unwrap();
+    let at = format!("item 0 (key `a`) of {}", client.url);
+    let no_status = Verdict::Ack {
+        seq: 1,
+        hash: 9,
+        status: contract::Status::Unspecified,
+        reason: String::new(),
+    };
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(CountWarn(std::sync::Arc::clone(&count)), || {
+        for _ in 0..3 {
+            assert_eq!(
+                item_verdict(&client, &at, &no_status),
+                Item::Transient(format!("{at}: the server acknowledged without a status")),
+                "an ack with no status never refuses a key"
+            );
+        }
+    });
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "one warn per stream, however chatty the server"
+    );
+
+    // The neighbours of the mapping, pinned beside it: a positive no still refuses, a
+    // retry and a loss wait, with the words the keys have always heard.
+    assert_eq!(
+        item_verdict(
+            &client,
+            &at,
+            &Verdict::Ack {
+                seq: 1,
+                hash: 9,
+                status: contract::Status::Refused,
+                reason: "no such sku".into()
+            }
+        ),
+        Item::Rejected(format!("{at}: the server refused it: no such sku"))
+    );
+    assert_eq!(
+        item_verdict(
+            &client,
+            &at,
+            &Verdict::Ack {
+                seq: 1,
+                hash: 9,
+                status: contract::Status::Retry,
+                reason: "not now".into()
+            }
+        ),
+        Item::Transient(format!("{at}: the server asked for it again: not now"))
+    );
+    assert_eq!(
+        item_verdict(&client, &at, &Verdict::Lost("the stream ended".into())),
+        Item::Transient(format!("{at}: the stream ended"))
+    );
+}
+
 /// The rule-load check: columns that do not fit the item message name the column, the
 /// field and the fix; a field no column fills is not an error.
 #[test]

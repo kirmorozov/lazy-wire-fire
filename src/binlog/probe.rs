@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::binlog::connect::value_str;
-use crate::source::{mysql::status_statements, server_errors, ACCESS_DENIED_CODES};
+use crate::source::{mysql::status_statements, server_errors, GtidState, ACCESS_DENIED_CODES};
 
 pub(super) fn show(v: &str) -> &str {
     if v.is_empty() {
@@ -107,36 +107,25 @@ pub async fn binlog_exists(conn: &mut Conn, file: &str) -> Result<bool> {
     Ok(rows.iter().any(|r| value_str(r.as_ref(0)) == file))
 }
 
-const ER_PARSE_ERROR: u16 = 1064;
-
-/// Transient: this connection, or the server, is going away — repeat an idempotent call.
-/// Classification is by server error code and `io::ErrorKind` only. The one documented exception
-/// is the TLS pre-handshake case, which has no code and stays in `engine::is_tls_error`.
-pub fn is_transient(e: &anyhow::Error) -> bool {
-    const TRANSIENT_CODES: [u16; 14] = [
-        1040, 1053, 1203, 1205, 1213, 1290, 1317, 1927, 1969, 2006, 2013, 3024, 3169, 4031,
-    ];
-    fn transient_io(io: &std::io::Error) -> bool {
-        matches!(
-            io.kind(),
-            std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::UnexpectedEof
-        )
-    }
-    server_errors(e).any(|se| TRANSIENT_CODES.contains(&se.code))
-        || e.chain().any(|c| {
-            (match c.downcast_ref::<mysql_async::Error>() {
-                Some(mysql_async::Error::Io(mysql_async::IoError::Io(io))) => transient_io(io),
-                Some(mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed)) => {
-                    true
-                }
-                _ => false,
-            }) || c.downcast_ref::<std::io::Error>().is_some_and(transient_io)
-        })
+/// The source's own GTID state, read once at connect for a resume (§ the resume-by-GTID plan):
+/// the `@@GLOBAL` variables MySQL/Percona (`gtid_mode`, `gtid_executed`, `gtid_purged`) and MariaDB
+/// (`gtid_binlog_state`, `gtid_purged`) report about what they have executed and purged. These are
+/// plain `SELECT @@GLOBAL.x` reads through the same retry probe preflight uses: a variable the
+/// server does not have (MariaDB has no `gtid_mode`, MySQL/Percona no `gtid_binlog_state`) comes
+/// back `None`, and any other failure is an error — never a silent empty set, which would turn a
+/// broken read into a false "this server covers me". Interpreting the text and asking the subset
+/// question is the flavor's job (see [`crate::source::gtid_covers`]); this is only the network edge
+/// that reads the server's words.
+pub async fn gtid_state(conn: &mut Conn) -> Result<GtidState> {
+    Ok(GtidState {
+        mode: crate::binlog::probe_var_retry(conn, "gtid_mode").await?,
+        executed: crate::binlog::probe_var_retry(conn, "gtid_executed").await?,
+        purged: crate::binlog::probe_var_retry(conn, "gtid_purged").await?,
+        binlog_state: crate::binlog::probe_var_retry(conn, "gtid_binlog_state").await?,
+    })
 }
+
+const ER_PARSE_ERROR: u16 = 1064;
 
 /// Adds a "how to fix" line to privilege errors of replication statements.
 pub(super) fn with_hint(err: anyhow::Error) -> anyhow::Error {

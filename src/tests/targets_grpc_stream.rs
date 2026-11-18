@@ -326,3 +326,16 @@ fn the_authorization_header_is_sensitive() {
     let shown = format!("{map:?}");
     assert!(!shown.contains("top-secret"), "{shown}");
 }
+
+/// The guard that keeps `reserve`'s arithmetic (`from + n - 1`, whose `debug_assert`
+/// lives there) honest: `push` answers an empty flush itself, before any dial — no
+/// stream, no window, no verdicts, and an instant answer even from an endpoint that
+/// could never be reached.
+#[tokio::test]
+async fn an_empty_flush_is_answered_before_the_stream() {
+    let shared = codec_ask(Some(Codec::Identity));
+    let call = Call::new(Arc::clone(&shared));
+    let out = call.push(&[]).await;
+    assert!(out.verdicts.is_empty(), "{:?}", out.verdicts);
+    assert!(out.refused.is_none(), "an empty flush is nothing's refusal");
+}

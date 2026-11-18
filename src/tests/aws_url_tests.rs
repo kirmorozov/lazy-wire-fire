@@ -231,3 +231,42 @@ fn config_region_reads_the_named_profile() {
         None
     );
 }
+
+#[test]
+fn percent_decode_walks_bytes_and_stays_lenient() {
+    // The shapes from the audit (report §3): the two `PANIC` rows must now
+    // return the escape kept as it is, the rest byte for byte as before.
+    assert_eq!(percent_decode("a%20b"), "a b");
+    assert_eq!(percent_decode("x%"), "x%");
+    assert_eq!(percent_decode("%zz"), "%zz");
+    // `%` then a three-byte character: `&s[1..3]` ends inside the `€` and
+    // used to panic; the pair is not two hex digits, so it stays.
+    assert_eq!(percent_decode("%\u{20AC}x"), "%\u{20AC}x");
+    // `%` then two two-byte characters: the slice was on boundaries but is
+    // no hex, so it stayed before and stays now.
+    assert_eq!(percent_decode("%\u{00E9}\u{00E9}"), "%\u{00E9}\u{00E9}");
+    assert_eq!(percent_decode("+a+b"), " a b");
+    // the audit's rendered form body, and the same character at the very end
+    assert_eq!(percent_decode("100%\u{20AC}"), "100%\u{20AC}");
+    // a real escape is still a real escape, even one whose bytes spell a character
+    assert_eq!(percent_decode("%E2%82%AC"), "\u{20AC}");
+    // in a path, `+` is a literal plus (`%2B` is still an escape)
+    assert_eq!(percent_decode_path("a+b"), "a+b");
+    assert_eq!(percent_decode_path("%2B"), "+");
+}
+
+#[test]
+fn canonical_target_re_encodes_a_raw_percent_before_a_character() {
+    // `?k=%<euro>&a=1` is what a template renders when a record holds a raw
+    // `%` before a character: the decode keeps it, the re-encode escapes the
+    // `%` itself, and the query is sorted like every other canonical target.
+    assert_eq!(
+        canonical_target("?k=%\u{20AC}&a=1"),
+        ("/".to_string(), "a=1&k=%25%E2%82%AC".to_string())
+    );
+    // unchanged next to it: a well-formed pair round-trips as before
+    assert_eq!(
+        canonical_target("/q?k=a%20b"),
+        ("/q".to_string(), "k=a%20b".to_string())
+    );
+}

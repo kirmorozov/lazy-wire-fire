@@ -410,3 +410,39 @@ fn fits_table() {
         assert!(fits(ValueKind::Unknown, f), "json into {f}");
     }
 }
+
+/// The three arms that were `unreachable!` refuse now instead of panicking: a descriptor
+/// that disagrees with itself, a field that is not a map handed to the map route, and a
+/// non-number asked to parse text — each an `Err` naming the field and the kind, so a bad
+/// descriptor is a load-time refusal or a transient, never a panic on the first send.
+#[test]
+fn the_arms_that_cannot_be_reached_refuse_now() {
+    let item = body();
+    let line_item = pool_of("line.proto", ORDER)
+        .get_message_by_name("orders.v1.Line")
+        .expect("Line");
+    let qty = line_item.get_field_by_name("qty").expect("qty");
+    let path = vec![".qty".to_string()];
+
+    // The arm `fill` cannot reach: prost-reflect's `try_set_field` only ever answers
+    // `InvalidType`, so `NotFound` is built directly — and the answer is a named refusal,
+    // not a panic, if a descriptor ever does disagree with its message.
+    let e = set_field_error(&item, &qty, &path, SetFieldError::NotFound).to_string();
+    assert!(
+        e.contains("qty") && e.contains("orders.v1.Item"),
+        "names the field and the message: {e}"
+    );
+
+    // A field that is no map, asked as one: refused naming the field and its kind.
+    let e = map_value(&qty, &Json::Object(JsonMap::new()), &path)
+        .expect_err("an int32 is no entry message");
+    let e = e.to_string();
+    assert!(e.contains("qty") && e.contains("int32"), "{e}");
+
+    // A field that is no number, asked to read a number from text.
+    let sku = item.get_field_by_name("sku").expect("sku");
+    let e = number_text("7", &sku, ".sku")
+        .expect_err("a string field holds no numbers")
+        .to_string();
+    assert!(e.contains("string") && e.contains("sku"), "{e}");
+}

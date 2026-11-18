@@ -35,7 +35,7 @@ use crate::health::Health;
 use crate::keyspace::{op_text, text_set, IdSets, KeySpaces};
 use crate::lock;
 use crate::metrics::{FlushOutcome, Metrics, PairHandle, RuleHandle};
-use crate::model::{self, RuleDef, StepKind, TargetDef, TriggerDef};
+use crate::model::{self, On, RuleDef, StepKind, TargetDef, TriggerDef};
 use crate::rows::{Catalog, Layout, LayoutMismatch};
 use crate::rule::{self, KeyTemplate, Rule};
 use crate::source::{self, Flavor, Item, Position, RowsKind};
@@ -402,6 +402,24 @@ struct Watched {
     /// be built as an object (computed once here: a row of a table with Simple keys only never
     /// pays for it).
     any_full: bool,
+    /// Some trigger of the table fires on this row kind (the union of the triggers' `on` flags,
+    /// computed once here beside `any_full`, see [`Engine::watched_kinds`]): a rows event of a
+    /// kind none of them watches marks nothing, so it is never even decoded (see
+    /// [`Engine::on_rows`]).
+    any_on: On,
+}
+
+impl Watched {
+    /// Does any trigger of this table fire on `kind`? If none does, the rows events of that
+    /// kind mark nothing (the `on` check in [`Engine::row_keys`] drops every row), so they are
+    /// skipped undecoded (see [`Engine::on_rows`]).
+    fn watches(&self, kind: RowsKind) -> bool {
+        match kind {
+            RowsKind::Insert => self.any_on.insert,
+            RowsKind::Update => self.any_on.update,
+            RowsKind::Delete => self.any_on.delete,
+        }
+    }
 }
 
 /// The text a row's Simple keys are built in, reused from row to row: building one key is a
@@ -422,12 +440,14 @@ impl KeyScratch {
 /// What building one row's keys touches in the engine, borrowed as pieces: `marks` the rules
 /// this transaction has marked so far, `rules` their buffers, `scratch` the string a key line is
 /// built in, `render_warnings` the Full keys that did not render, `invalid` the keys holding
-/// control characters (reported once the rows are done).
+/// control characters and `invalid_keys` how many were ever reported (the invalid ones are
+/// reported once the rows are done).
 struct RowCtx<'a> {
     marks: &'a mut HashMap<String, Marks>,
     rules: &'a mut BTreeMap<String, RuleState>,
     scratch: &'a mut KeyScratch,
     render_warnings: &'a mut u64,
+    invalid_keys: &'a mut u64,
     invalid: &'a mut Vec<(String, u64, String)>,
 }
 
@@ -499,6 +519,15 @@ pub struct Engine {
     /// Tables whose binlog layout does not match (reported once).
     mismatched: HashSet<(String, String)>,
     column_warnings: HashSet<(String, u64, String)>,
+    /// The server is a MariaDB 11.4 or newer, whose UPDATE and DELETE row images leave VIRTUAL
+    /// generated columns out (see `maria_skips_virtual`).
+    maria_skips_virtual: bool,
+    /// Per watched table, the index and name of its first VIRTUAL generated column (`None` when
+    /// it has none). Read once per table like the layout, and dropped with it: `on_statement` and
+    /// the mismatch path invalidate both, so a DDL that adds a VIRTUAL column is seen again.
+    virtual_first: HashMap<(String, String), Option<(usize, String)>>,
+    /// Triggers already reported as unreadable (see `refuse_virtual_reads`), warned about once.
+    virtual_refusals: HashSet<(String, u64)>,
     tx: mpsc::UnboundedSender<Done>,
     last_persist: Instant,
     clear_retry: Option<Instant>,
@@ -565,6 +594,82 @@ fn binlog_unusable(e: &anyhow::Error) -> bool {
         || (server_code(e) == Some(1236)
             && !source::is_duplicate_server_id(e)
             && position_unavailable(e))
+}
+
+/// Whether this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row images.
+///
+/// It stopped doing that at 11.4: 10.6.28 and 10.11.19 still write them, as do MySQL 8.0.46,
+/// 8.4.13, 9.7.4 and Percona 8.4.11. Such an image carries one value less than the table map
+/// names, and the reader pairs values with columns by position, so every column from the first
+/// VIRTUAL one on is read as its neighbour's value — a key built from the wrong value, with
+/// nothing logged. A version that cannot be read counts as unaffected: refusing on a parse
+/// failure would stop a working installation over a version string.
+// Temporary: remove this and `Engine::refuse_virtual_reads` when the vendored reader learns to
+// decode images whose values skip columns (lazyview issue #7); until then lazywf refuses the
+// triggers that would read them, which is visible on `/status` instead of silently wrong.
+fn maria_skips_virtual(version: &str) -> bool {
+    // A replication proxy reports the server it fronts as `5.5.5-<its version>`.
+    let v = version.strip_prefix("5.5.5-").unwrap_or(version);
+    let mut parts = v.split('.');
+    let num = |p: Option<&str>| p.and_then(|p| p.parse::<u32>().ok());
+    match (num(parts.next()), num(parts.next())) {
+        (Some(major), Some(minor)) => (major, minor) >= (11, 4),
+        _ => false,
+    }
+}
+
+/// What a trigger reads of a row image the server left short.
+#[derive(Debug, PartialEq, Eq)]
+enum VirtualRead {
+    /// A column standing at or after the table's first VIRTUAL generated column.
+    Col(String),
+    /// The whole row. A `KeyTemplate::Full` is any Handlebars template, so there is no telling
+    /// from the rule whether it names the shifted columns: it may read every column, so it is
+    /// refused for any table that has a VIRTUAL one.
+    Full,
+}
+
+/// The first thing `reads` takes from an image that skips its VIRTUAL columns: `reads` holds the
+/// columns the trigger names together with their index in the layout (columns the table does not
+/// have are left out — `check_columns` reports those), `full` says whether the trigger renders
+/// the whole row, and `from` is the index of the table's first VIRTUAL generated column. A rule
+/// that reads only columns before `from` reads values the image does carry, so it stays allowed.
+fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<VirtualRead> {
+    if full {
+        return Some(VirtualRead::Full);
+    }
+    reads
+        .iter()
+        .find(|(_, i)| *i >= from)
+        .map(|(c, _)| VirtualRead::Col((*c).to_string()))
+}
+
+/// The first VIRTUAL generated column of `rows`, which are the table's columns in
+/// `information_schema` order as (name, EXTRA): its index in that order (the order
+/// `rows::Catalog::load` builds a layout from) and its name.
+fn virtual_first_of(rows: &[(String, String)]) -> Option<(usize, String)> {
+    rows.iter()
+        .enumerate()
+        .find(|(_, (_, extra))| extra.to_ascii_uppercase().contains("VIRTUAL GENERATED"))
+        .map(|(i, (name, _))| (i, name.clone()))
+}
+
+/// The columns of one table, in `information_schema` order, as (name, EXTRA).
+async fn read_virtual_first(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<Option<(usize, String)>> {
+    // The `CAST`s keep the columns out of the binary charset, as in `rows::Catalog::load`.
+    let rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(EXTRA AS CHAR) \
+             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            (schema, table),
+        )
+        .await
+        .with_context(|| format!("reading the columns of `{schema}`.`{table}`"))?;
+    Ok(virtual_first_of(&rows))
 }
 
 async fn connect_wait(
@@ -750,6 +855,16 @@ pub async fn run(
         ),
         None => info!("no allow-list: target endpoints may use any host (tests only)"),
     }
+    // Whether the server's row images can come up short (see `maria_skips_virtual`). Read once:
+    // the server does not change underneath a running engine.
+    let skips_virtual = info.flavor == Flavor::MariaDb && maria_skips_virtual(&info.version);
+    if skips_virtual {
+        info!(
+            server = %info.version,
+            "this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row \
+             images: a trigger that reads a column from the first one on is refused"
+        );
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     let mut e = Engine {
         lock: lock_name,
@@ -797,6 +912,9 @@ pub async fn run(
         target_backoff: HashMap::new(),
         mismatched: HashSet::new(),
         column_warnings: HashSet::new(),
+        maria_skips_virtual: skips_virtual,
+        virtual_first: HashMap::new(),
+        virtual_refusals: HashSet::new(),
         tx,
         last_persist: Instant::now(),
         clear_retry: None,
@@ -1755,8 +1873,24 @@ impl Engine {
                         self.config_dirty.get_or_insert_with(Instant::now);
                     }
                     Some(Route::Watched(w)) => {
-                        let rows = reader.rows(table_id, &event)?;
-                        self.feed(&w, kind, &rows);
+                        let Engine {
+                            txn_marks,
+                            rules,
+                            key_scratch,
+                            render_warnings,
+                            invalid_keys,
+                            ..
+                        } = self;
+                        let mut invalid = Vec::new();
+                        let mut ctx = RowCtx {
+                            marks: txn_marks,
+                            rules,
+                            scratch: key_scratch,
+                            render_warnings,
+                            invalid_keys,
+                            invalid: &mut invalid,
+                        };
+                        Engine::on_rows(&w, kind, || reader.rows(table_id, &event), &mut ctx)?;
                     }
                     _ => {}
                 }
@@ -1871,18 +2005,23 @@ impl Engine {
                     .filter_map(|(n, i)| self.rules.get(n).map(|s| (n.clone(), s.rule.clone(), *i)))
                     .collect();
                 self.check_columns(&layout, schema, table, &triggers);
+                let triggers = self
+                    .refuse_virtual_reads(&key, &layout, schema, table, triggers)
+                    .await?;
                 let any_full = triggers.iter().any(|(_, rule, i)| {
                     matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
                 });
+                let any_on = Self::watched_kinds(&triggers);
                 Ok(Route::Watched(Arc::new(Watched {
                     layout,
                     table: format!("{schema}.{table}"),
                     triggers,
                     any_full,
+                    any_on,
                 })))
             }
             Err(e) if e.downcast_ref::<LayoutMismatch>().is_some() => {
-                self.catalog.invalidate(schema, table);
+                self.forget_columns(schema, table);
                 // Once per mismatch, not for every transaction read before the DDL.
                 if self.mismatched.insert(key) {
                     warn!("{e:#}");
@@ -1894,6 +2033,128 @@ impl Engine {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The index and name of the table's first VIRTUAL generated column, on a server that leaves
+    /// those columns out of its row images; `Ok(None)` everywhere else and for a table without
+    /// one. Read once per table, like the layout cache it lives and dies with.
+    ///
+    /// `key` is the table's identity as [`Engine::route`] knows it, so a cached answer costs no
+    /// allocation; `schema` and `table` are the names to ask the server about.
+    async fn first_virtual_column(
+        &mut self,
+        key: &(String, String),
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<(usize, String)>> {
+        if !self.maria_skips_virtual {
+            return Ok(None);
+        }
+        if let Some(found) = self.virtual_first.get(key) {
+            return Ok(found.clone());
+        }
+        // An image whose columns cannot be read is an image that must not be read: a server that
+        // will not answer them is an error, as it is for the layout read above, and the caller
+        // retries. A table that is really gone fails there too, not here.
+        let found = read_virtual_first(&mut self.control, schema, table).await?;
+        self.virtual_first.insert(key.clone(), found.clone());
+        Ok(found)
+    }
+
+    /// Drops what is cached about a table's columns, so both the layout and the position of its
+    /// first VIRTUAL column are read again: a DDL changed the table, or its layout did not match
+    /// the binlog.
+    fn forget_columns(&mut self, schema: &str, table: &str) {
+        self.catalog.invalidate(schema, table);
+        let key = self.norm(schema, table);
+        if table == "*" {
+            self.virtual_first.retain(|(s, _), _| *s != key.0);
+        } else {
+            self.virtual_first.remove(&key);
+        }
+    }
+
+    /// Refuses the triggers that would read what the row images do not carry, and returns those
+    /// that may keep running.
+    ///
+    /// On MariaDB 11.4+ an UPDATE or DELETE image holds one value less than the table map names
+    /// (the VIRTUAL generated columns are not written), and the reader pairs values with columns
+    /// by position, so the first VIRTUAL column and every column after it are read as their
+    /// neighbour's value. Such a trigger marks keys that do not describe the row, so it marks
+    /// nothing at all and carries the reason on `/status` the way an unknown column does.
+    /// Temporary, see [`maria_skips_virtual`].
+    async fn refuse_virtual_reads(
+        &mut self,
+        key: &(String, String),
+        layout: &Layout,
+        schema: &str,
+        table: &str,
+        triggers: Vec<(String, Arc<Rule>, usize)>,
+    ) -> Result<Vec<(String, Arc<Rule>, usize)>> {
+        let Some((from, virtual_col)) = self.first_virtual_column(key, schema, table).await? else {
+            return Ok(triggers);
+        };
+        let mut kept = Vec::with_capacity(triggers.len());
+        for (name, rule, ti) in triggers {
+            let t = &rule.triggers[ti];
+            // What the trigger reads of an image: the same columns `check_columns` looks at, and
+            // the whole row for a Full key.
+            let mut reads: Vec<(&str, usize)> = Vec::new();
+            for c in &t.def.changed_columns {
+                if let Some(i) = layout.index(c) {
+                    reads.push((c.as_str(), i));
+                }
+            }
+            if let Some(KeyTemplate::Simple(lines)) = &t.key {
+                for seg in lines.iter().flatten() {
+                    if let template::Seg::Col(c) = seg {
+                        if let Some(i) = layout.index(c) {
+                            reads.push((c, i));
+                        }
+                    }
+                }
+            }
+            if let Some(ks) = &t.keys_sql {
+                for c in &ks.columns {
+                    if let Some(i) = layout.index(c) {
+                        reads.push((c.as_str(), i));
+                    }
+                }
+            }
+            let full = matches!(t.key, Some(KeyTemplate::Full(_)));
+            let Some(read) = unreadable_read(&reads, full, from) else {
+                kept.push((name, rule, ti));
+                continue;
+            };
+            // Refused whether or not it was reported: what it would mark is wrong either way.
+            if self.virtual_refusals.insert((name.clone(), t.def.id)) {
+                let msg = match &read {
+                    VirtualRead::Col(c) => format!(
+                        "trigger {}: `{schema}`.`{table}` reads `{c}`; this MariaDB leaves the \
+                         VIRTUAL generated column `{virtual_col}` out of its UPDATE and DELETE \
+                         row images, and every column after it moves up a place, so lazywf \
+                         cannot read `{c}` and refuses the trigger (make `{virtual_col}` STORED, \
+                         or read only columns before it)",
+                        t.def.id
+                    ),
+                    VirtualRead::Full => format!(
+                        "trigger {}: `{schema}`.`{table}` uses a Handlebars key template, which \
+                         can read any column of the row, including the VIRTUAL generated column \
+                         `{virtual_col}` and the columns after it that this MariaDB's UPDATE \
+                         and DELETE row images shift; lazywf refuses the trigger (make \
+                         `{virtual_col}` STORED, or use a plain {{{{new.col}}}} key over columns \
+                         before it)",
+                        t.def.id
+                    ),
+                };
+                warn!(rule = %name, "{msg}");
+                if let Some(st) = self.rules.get_mut(&name) {
+                    st.last_error = Some((msg, crate::time::unix_now_ms()));
+                    st.dirty = true;
+                }
+            }
+        }
+        Ok(kept)
     }
 
     /// Reports (once) trigger columns the table does not have: such a trigger marks nothing.
@@ -1938,40 +2199,66 @@ impl Engine {
         }
     }
 
-    /// Marks the keys of these rows' images for every trigger on the table.
-    fn feed(
-        &mut self,
+    /// The row kinds any trigger of the table fires on: the union of their `on` flags,
+    /// computed once at route time (see [`Watched::watches`]).
+    fn watched_kinds(triggers: &[(String, Arc<Rule>, usize)]) -> On {
+        let mut on = On::default();
+        for (_, rule, i) in triggers {
+            let t = &rule.triggers[*i].def.on;
+            on.insert |= t.insert;
+            on.update |= t.update;
+            on.delete |= t.delete;
+        }
+        on
+    }
+
+    /// One `Rows` event of a watched table: decode its row images, mark every row's keys for
+    /// every trigger that is `on` for this kind, and report the invalid keys. When no trigger
+    /// of the table fires on this kind the event is passed over undecoded: every effect of the
+    /// per-row path — the transaction's marks, the rows' count, the warnings, the invalid-key
+    /// reports — sits behind the `on` check in `row_keys`, so nothing an unwatched kind does
+    /// today is lost by skipping it (the hot-path audit's finding 4; `skip_kinds_tests` proves
+    /// the skipped state identical to the decoded one, for a decodable and for an undecodable
+    /// image alike). The skip costs no safety either: `reader.rows` decodes against the
+    /// TABLE_MAP this transaction's `map_event` already stored and moves no position, its
+    /// errors are row-image-vs-table-map mismatches, and the next watched-kind event of this
+    /// table decodes against the same map, so a real layout mismatch still surfaces there;
+    /// the event's framing (header, size, payload) was checked in `reader.next()` before this
+    /// arm, and the server reports a corrupt event when it streams its own binlog. The client
+    /// does not verify the event's CRC32 to begin with — `Event::read` (mysql_common) only
+    /// stores the trailing checksum and `calc_checksum` runs on write alone — so the skip
+    /// forgoes no checksum. The decode comes in as a closure, so a test can see whether it
+    /// ran without a binlog reader.
+    fn on_rows(
         w: &Watched,
         kind: RowsKind,
-        rows: &[(Option<BinlogRow>, Option<BinlogRow>)],
-    ) {
-        // Borrowed as pieces, so one row's keys are built with no borrow of the whole engine
-        // (see `row_keys`).
-        let Engine {
-            txn_marks,
-            rules,
-            key_scratch,
-            render_warnings,
-            ..
-        } = self;
-        let mut invalid: Vec<(String, u64, String)> = Vec::new();
-        for (before, after) in rows {
-            let mut ctx = RowCtx {
-                marks: txn_marks,
-                rules,
-                scratch: key_scratch,
-                render_warnings,
-                invalid: &mut invalid,
-            };
-            Self::row_keys(w, kind, before, after, &mut ctx);
+        decode: impl FnOnce() -> Result<Vec<(Option<BinlogRow>, Option<BinlogRow>)>>,
+        ctx: &mut RowCtx<'_>,
+    ) -> Result<()> {
+        if !w.watches(kind) {
+            return Ok(());
         }
-        for (name, trigger, k) in invalid {
-            self.invalid_keys += 1;
+        let rows = decode()?;
+        // The pieces borrowed as one bag, re-borrowed per row, so a row's keys are built with
+        // no borrow of the whole engine (see `row_keys`).
+        for (before, after) in &rows {
+            let mut row = RowCtx {
+                marks: &mut *ctx.marks,
+                rules: &mut *ctx.rules,
+                scratch: &mut *ctx.scratch,
+                render_warnings: &mut *ctx.render_warnings,
+                invalid_keys: &mut *ctx.invalid_keys,
+                invalid: &mut *ctx.invalid,
+            };
+            Self::row_keys(w, kind, before, after, &mut row);
+        }
+        for (name, trigger, k) in std::mem::take(&mut *ctx.invalid) {
+            *ctx.invalid_keys += 1;
             let shown: String = k.escape_debug().take(120).collect();
-            if self.invalid_keys <= 10 || self.invalid_keys.is_multiple_of(1000) {
+            if *ctx.invalid_keys <= 10 || (*ctx.invalid_keys).is_multiple_of(1000) {
                 warn!(rule = %name, "trigger {trigger}: key \"{shown}\" holds control characters and is ignored");
             }
-            if let Some(st) = self.rules.get_mut(&name) {
+            if let Some(st) = ctx.rules.get_mut(&name) {
                 st.last_error = Some((
                     format!("trigger {trigger}: key \"{shown}\" holds control characters and is ignored"),
                     crate::time::unix_now_ms(),
@@ -1979,6 +2266,7 @@ impl Engine {
                 st.dirty = true;
             }
         }
+        Ok(())
     }
 
     /// One row of a watched table: every trigger that is `on` for this kind marks the row's
@@ -2015,6 +2303,7 @@ impl Engine {
             scratch,
             render_warnings,
             invalid,
+            ..
         } = ctx;
         for (name, rule, ti) in &w.triggers {
             let t = &rule.triggers[*ti];
@@ -2216,7 +2505,7 @@ impl Engine {
         }
         let mut reset: HashSet<String> = HashSet::new();
         for (s, t, effect) in crate::sql::ddl_tables(query, schema) {
-            self.catalog.invalidate(&s, &t);
+            self.forget_columns(&s, &t);
             if s == self.cfg.schema && (model::is_config_table(&t) || t == "*") {
                 self.config_dirty.get_or_insert_with(Instant::now);
             }
@@ -3117,3 +3406,7 @@ mod stream_verdict_tests;
 #[cfg(test)]
 #[path = "tests/engine_hotpath_alloc_tests.rs"]
 mod hotpath_alloc_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_skip_kinds_tests.rs"]
+mod skip_kinds_tests;

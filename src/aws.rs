@@ -235,7 +235,17 @@ pub(crate) fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            // The pair is read from the bytes, never as `&s[i + 1..i + 3]`: when `s` holds a
+            // multi-byte character right after the `%` (a rendered `"100%€"`), the end of that
+            // range sits inside the character and slicing the `&str` there panics. Two hex
+            // digits are ASCII, so `from_utf8` accepts exactly the pairs that can be escapes
+            // (the shape of `crate::targets::amqp::pct_decode`); anything else — the bytes of
+            // a character, an odd pair — is not an escape and stays as it is.
+            if let Some(v) = b
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 out.push(v);
                 i += 3;
                 continue;

@@ -34,10 +34,21 @@ broker with publisher confirms, below), `smtp` (an SMTP server, one mail per act
 
 A credential in `vars` is a literal or a reference: `env:NAME`, or `file:/path` (trailing newline
 dropped, read on every use so rotated secrets apply). References are recommended when other users
-can read the database. For the four plain http kinds an `endpoints` entry may be a reference too,
-and there it is the **whole** URL — for an incoming webhook the URL below the host *is* the
-credential: [secret http endpoints](#secret-http-endpoints). Every other kind refuses a reference
-endpoint at load: it takes its address in plain text and keeps its credentials in `vars`.
+can read the database. **Since 0.3.0 the fields whose value is the target's password, token or
+key accept a reference only** — a literal is refused at load, naming the field (the one table is
+`Kind::secret_ref_fields`, enforced in `TargetDef::from_row`): `vars.password` of `http.basic`,
+`redis`, `mysql`, `pgsql`, `amqp`, `smtp`, `kafka` and `rabbitmq-stream`, `vars.token` of
+`http.bearer` and `grpc`, `vars.value` of `http.header`, and `vars.key` with `vars.password` of
+`servicebus`; the AWS kinds take `vars.access_key_ref`, `vars.secret_key_ref` and
+`vars.session_token_ref` and `pubsub` `vars.credentials_ref` (these were references-only before
+0.3.0), and so are the oauth option's `vars.credentials_ref`, `vars.client_secret_ref` and
+`vars.signing_key_ref` ([OAuth access tokens](#oauth-access-tokens)). Names and identifiers are
+not secrets and a literal is fine for them (`vars.username`, `vars.header`, `vars.client_id`,
+`vars.key_name`); references work there too. For the four plain http kinds an `endpoints` entry
+may be a reference too, and there it is the **whole** URL — for an incoming webhook the URL
+below the host *is* the credential: [secret http endpoints](#secret-http-endpoints). Every other
+kind refuses a reference endpoint at load: it takes its address in plain text and keeps its
+credentials in `vars`.
 
 **`http.s3`**: `vars.bucket`, `vars.region`, optional `vars.endpoint` (MinIO, R2, …),
 `vars.path_style` (default false: virtual-hosted, `bucket.host`), `vars.access_key_ref`,
@@ -96,14 +107,14 @@ the emulator, below). Credentials: `vars.credentials_ref`, a reference to a serv
 `topics.publish` request, rendered by the template: [below](#pubsub-targets).
 
 **`amqp`**: the endpoint is `amqp(s)://host[:port][/vhost]` (default ports 5672 / 5671; the
-vhost is the path, `/` the default vhost), without credentials: `vars.username` and
-`vars.password`, references or literals (as `redis` takes them), resolved on each connect. One
-message per action with a publisher confirm: [below](#amqp-targets).
+vhost is the path, `/` the default vhost), without credentials: `vars.username` (a reference or
+a literal) and `vars.password` (a reference only — the target's credential), resolved on each
+connect. One message per action with a publisher confirm: [below](#amqp-targets).
 
 **`smtp`**: the endpoint is `smtp(s)://host[:port]` (default ports 587 / 465), without
-credentials: `vars.username` and `vars.password`, references or literals (as `redis` and `amqp`
-take them), resolved on each connect, or no credentials at all for an anonymous session. One
-mail per action, the server's reply the answer: [below](#smtp-targets).
+credentials: `vars.username` (a reference or a literal) and `vars.password` (a reference only —
+the target's credential), resolved on each connect, or no credentials at all for an anonymous
+session. One mail per action, the server's reply the answer: [below](#smtp-targets).
 
 **`kafka`**: the endpoint is one broker set and the topic it writes to, as
 `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` (default ports 9092 / 9093; `kafkas://`
@@ -828,10 +839,11 @@ own.
   accepted mails reuse the session. The whole send is bounded by the target's `timeout_ms`;
   different endpoints of the target run in parallel.
 * **Credentials.** The session authenticates with `vars.username` and `vars.password`, which go
-  together or not at all and are resolved on every connect. Each is a literal or a reference to
-  where the value really lives — `env:NAME` for an environment variable, `file:/path` for a file
-  under `LAZYWF_SECRET_DIRS` — and a reference is what to use when others can read the target
-  table ([above](#targets)). The auth itself is PLAIN, then LOGIN, whichever the server offers
+  together or not at all and are resolved on every connect. `vars.username` is a literal or a
+  reference to where the value really lives — `env:NAME` for an environment variable, `file:/path`
+  for a file under `LAZYWF_SECRET_DIRS`; `vars.password` is the target's credential and so a
+  reference only (a literal is refused at load): the same two forms, no literal ([above](#targets)).
+  The auth itself is PLAIN, then LOGIN, whichever the server offers
   first; without credentials the mail goes anonymously, when the server takes it. They never go
   in the endpoint: a `user:password@` in the URL is a load error, as are a path, a query, a
   fragment and an IPv6 literal.
@@ -1329,6 +1341,24 @@ the old image and with the new one. `keys_sql` runs at flush time, once per dist
 parameters, after the changes are visible. It reads the current state: for a delete, rows already
 gone are not found (have a trigger on that table too).
 
+On MariaDB 11.4 and newer an `UPDATE` or `DELETE` row image leaves `VIRTUAL` generated columns out
+(the server's own behaviour) while the table map still names them, and the reader pairs an image's
+values with the columns by position: such a column and every column after it would read as its
+neighbour's value, so a trigger reading one would mark keys that do not describe the row. lazywf
+refuses those triggers instead — the ones reading a column at or after the table's first `VIRTUAL`
+one (in `changed_columns`, in the key or as a `keys_sql` parameter) and, on a table that has such a
+column, the ones whose key is a Handlebars template, since that key may name any column of the row.
+The other triggers of the table keep running; a refused one marks nothing, is warned about once,
+and the rule carries the reason as its `last_error` (so on `/status` and in `lazy_wire_fire_status`):
+
+- a column at or after the first `VIRTUAL` one: `trigger <id>: \`<schema>\`.\`<table>\` reads \`<column>\`; this MariaDB leaves the VIRTUAL generated column \`<virtual>\` out of its UPDATE and DELETE row images, and every column after it moves up a place, so lazywf cannot read \`<column>\` and refuses the trigger (make \`<virtual>\` STORED, or read only columns before it)`
+- a Handlebars key template on a table that has such a column, where the whole row is unreadable: `trigger <id>: \`<schema>\`.\`<table>\` uses a Handlebars key template, which can read any column of the row, including the VIRTUAL generated column \`<virtual>\` and the columns after it that this MariaDB's UPDATE and DELETE row images shift; lazywf refuses the trigger (make \`<virtual>\` STORED, or use a plain {{new.col}} key over columns before it)`
+
+Both name what is read and the way out: make the column `STORED`, or read only columns before it.
+MySQL, Percona and MariaDB before 11.4 write those columns into their images and refuse nothing; on
+every server a `STORED` generated column, and every column standing before the first `VIRTUAL` one,
+are read as usual.
+
 ### Foreign key cascades
 
 Whether lazywf sees the changes a foreign key's `ON DELETE CASCADE` (or `ON UPDATE CASCADE`,
@@ -1548,7 +1578,10 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
 | `server_identity` | `*` only: the server the positions belong to |
 | `updated_at` | written when the position moves, and at least every 30 s |
 
-`/status` is the same per rule (its `rules` map), plus what the table does not hold:
+`/status` is the same per rule (its `rules` map), plus what the table does not hold; with
+`LAZYWF_HEALTH_TOKEN` set it answers only to a request whose `Authorization: Bearer <token>` header
+matches (constant-time compare, 401 with `WWW-Authenticate: Bearer` otherwise), while `/livez`,
+`/readyz` and the index never ask for it:
 
 | field | meaning |
 |---|---|
@@ -1562,6 +1595,33 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
 
 The counters are in memory only: they start at 0 at each start and are not written to
 `lazy_wire_fire_status`, which keeps only what a restart needs.
+
+### Prometheus metrics
+
+With `LAZYWF_METRICS_ADDR=host:port` set, `GET /metrics` answers on that **own listener**
+(separate from the health one) in the Prometheus text exposition format. Opt-in: unset or `off`
+means the endpoint does not exist at all — no listener, no counters, no cost; a malformed
+`host:port` is a startup error. The exposition is rendered by hand and the hot-path state is
+plain atomics.
+
+| signal | type | labels |
+|---|---|---|
+| `lazywf_build_info` | gauge (always 1) | `version` |
+| `lazywf_binlog_lag_seconds` | gauge | — (the status table's stream lag, seconds) |
+| `lazywf_pending_keys` | gauge | `rule` |
+| `lazywf_flush_total` | counter | `rule`, `target`, `outcome` (`success`: expect met, `retry`: transient, kept pending, `refused`: permanent refusal) |
+| `lazywf_dropped_keys_total` | counter | `rule`, `target` (keys dropped after the fifth refusal) |
+| `lazywf_flush_duration_seconds` | histogram | `rule` (the flush's wall time) |
+
+The only label values are names from the loaded config: a rule name, that rule's target names,
+the three outcomes, and the crate version. **Counts never carry keys or row data**: no key value,
+refusal reason, endpoint URL or error string can become a label value, and no runtime path can
+grow the series — the registry is populated only when a rule loads or changes target, and
+flushes, retries and drops touch nothing but the pre-resolved atomic handles. `/metrics` is gated
+by the same token `/status` is — **one setting, both listeners**: with `LAZYWF_HEALTH_TOKEN` set
+it answers only to a request whose `Authorization: Bearer <token>` header matches (constant-time
+compare, 401 with `WWW-Authenticate: Bearer` otherwise, the index open either way), and unset it
+answers anyone, as it always did. Neither listener has **TLS**: expose them internally.
 
 ## Security
 
@@ -1579,6 +1639,22 @@ rows go through the helper of the place they land in**:
 
 What the tool enforces on its own:
 
+* **The source connection is encrypted by default** (0.3.0): unset `LAZYWF_TLS` means `required`
+  unless the source DSN host is loopback (a loopback address, `localhost`, or a `socket=` DSN
+  connects in plaintext); `LAZYWF_TLS_CA` implies `verify-full`; an explicit `LAZYWF_TLS=disabled`
+  to a non-loopback host still connects and logs one loud WARN per start.
+* **A target credential is never a literal** (0.3.0): the password-, token- and key-bearing
+  `vars` fields accept `env:` / `file:` references only and a literal is refused at load
+  ([Targets](#targets)).
+* **The health endpoints can be token-gated**: with `LAZYWF_HEALTH_TOKEN` set (or
+  `LAZYWF_HEALTH_TOKEN_FILE`, the path of a file holding it) `/status` on the health listener and
+  `/metrics` on the metrics one answer 401 with `WWW-Authenticate: Bearer` unless the request
+  carries `Authorization: Bearer <token>` (compared in constant time); `/livez`, `/readyz`, the two
+  index pages and `lazywf healthcheck` never ask for it, and unset or blank leaves both open as
+  before. The value is taken literally and the `_FILE` path is a plain path — no `env:` / `file:`
+  grammar — and both variables set, or an unreadable or empty token file, refuses startup naming
+  the variable and never the value
+  ([Status](#status), [Prometheus metrics](#prometheus-metrics)).
 * **Keys are one line of text.** A key with a control character (from a key template, `keys_sql`,
   the snapshot or a stray listing) is ignored and reported in `last_error`; a key template is
   rendered line by line, so a newline in a value cannot mark extra keys.
@@ -1623,13 +1699,20 @@ What it cannot enforce, so treat the tool's tables as **admin-only**:
   tables is recommended ([server setup](server-setup.md#query-account)) — and sends the result
   anywhere a target points;
 * a writer of `lazy_wire_fire_target` chooses where requests (with the credentials of that target)
-  go, including internal addresses — unless `LAZYWF_ALLOWED_HOSTS` pins the endpoint hosts.
+  go, including internal addresses — this is exactly what `LAZYWF_ALLOWED_HOSTS` answers: since
+  0.3.0 an unset list denies every host, so a target row reaches only a listed host (or any host
+  under the explicit `*`).
 
-Where the tables cannot be kept admin-only, `LAZYWF_ALLOWED_HOSTS` pins the endpoint hosts a
-target may connect to: a comma-separated list of patterns, each an exact host name
-(case-insensitive), a `*.` suffix (the subdomains of the name, not the name itself), an IP
+Since 0.3.0 `LAZYWF_ALLOWED_HOSTS` is an opt-out, not an opt-in: **unset (or blank) denies every
+target host** — each target fails at load with a refusal naming the setting, its rule keeps its
+position and its pending keys. Like every `LAZYWF_*` setting it is read at start, and that is the
+one list every reload applies when it builds targets, so widening it takes a restart, after which
+the pending keys are delivered. It pins
+the endpoint hosts a target may connect to: a comma-separated list of patterns, each an exact host
+name (case-insensitive), a `*.` suffix (the subdomains of the name, not the name itself), an IP
 literal, or a CIDR range, with an optional `:port` (an IPv6 pattern with a port in brackets,
-`[2001:db8::1]:443`). Unset or blank: no restriction.
+`[2001:db8::1]:443`). `*` allows any host — the pre-0.3.0 unset behaviour, the operator's explicit
+opt-out (`*:443` is refused as invalid).
 
 Every endpoint's effective host and port — the name lazywf connects to, after a `?endpoint=`
 override, the derived AWS and Google service hosts, and the S3 virtual-hosted bucket host (the
@@ -1641,8 +1724,10 @@ never matches `127.0.0.1`. An unmatched endpoint is a target load error that nam
 the setting; it shows in the rule's `last_error`, and the check runs when a target is loaded —
 at start, and on a config reload whose target row changed (an unchanged target keeps its checked
 load). Not covered: the AWS and Google credential calls (lazywf does not take them from the
-target table) and redirects (the HTTP client does not follow them). At start the log says whether
-the list is set and its pattern count.
+target table) and redirects (the HTTP client does not follow them). At start the log names the
+mode: a WARN that an unset list denies every target and each one will fail at load (naming both
+the setting and its opt-outs), an INFO for `*` (any host, the operator's explicit opt-out), or an
+INFO for an explicit list with its pattern count.
 
 ## Examples
 

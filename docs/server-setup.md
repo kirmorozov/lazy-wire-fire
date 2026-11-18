@@ -23,16 +23,18 @@ Before reading, a flush waits until the transaction that marked its keys is visi
 sessions. It takes the first of these that the server can answer:
 
 - with GTIDs (MySQL / Percona): `WAIT_FOR_EXECUTED_GTID_SET`, exact;
-- on MariaDB and Percona where it reports one: the consistent-snapshot binlog position, exact;
-- on MySQL / Percona with neither: the [commit fence](#commit-fence), exact when commits are in
-  binlog order;
+- on MariaDB, where the server reports one: the consistent-snapshot binlog position, exact (the
+  MySQL family's pair is the binlog write position, not a committed-transaction watermark, so
+  waiting on it would prove nothing);
+- on the MySQL family (MySQL and Percona) with neither: the [commit fence](#commit-fence), exact
+  when commits are in binlog order;
 - otherwise: `LAZYWF_VISIBILITY_DELAY_MS`.
 
 ### Commit fence
 
-On a server without GTIDs and without a consistent-snapshot position (Oracle MySQL without
-GTIDs), a flush writes one row of lazywf's own table `lazy_wire_fire_fence` (in the DSN's schema;
-the probe creates it when it is missing) on the source connection. With `binlog_order_commits=ON`
+On a MySQL-family server (MySQL and Percona) without GTIDs, a flush writes one row of lazywf's own
+table `lazy_wire_fire_fence` (in the DSN's schema; the probe creates it when it is missing) on the
+source connection. With `binlog_order_commits=ON`
 — the server default; on Aurora, the enhanced binlog counts whatever the variable says — the
 server commits transactions in binlog order, so the write returns only after every transaction
 up to the flush's boundary is visible. One write per flush boundary: flushes at the same boundary
@@ -178,6 +180,8 @@ admin rights), and the startup checks below are unit-tested.
 * **Failover.** lazywf compares the server identity (MySQL `@@server_uuid`, MariaDB
   `@@server_id` and `@@gtid_domain_id`) with the one it saved. If a failover changes it, that
   counts as another server: continuity is lost, and rules with reset steps re-sync.
-* **TLS.** RDS and Aurora certificates come from Amazon's own CA: set `LAZYWF_TLS=verify-full`
-  and `LAZYWF_TLS_CA` to the RDS certificate bundle (`global-bundle.pem` from AWS's trust store).
-  Aurora MySQL 8.4 enforces TLS by default.
+* **TLS.** Since 0.3.0 the connection to a remote host is encrypted by default (unset
+  `LAZYWF_TLS` means `required`). For RDS and Aurora make it full verification: their
+  certificates come from Amazon's own CA, so set `LAZYWF_TLS=verify-full` and `LAZYWF_TLS_CA`
+  to the RDS certificate bundle (`global-bundle.pem` from AWS's trust store; `LAZYWF_TLS_CA`
+  alone already implies `verify-full`). Aurora MySQL 8.4 enforces TLS by default.

@@ -38,8 +38,12 @@ UPDATE, DELETE, CREATE` on its own schema, and `REPLICATION SLAVE, REPLICATION C
 [server setup](docs/server-setup.md).
 
 ```sh
-LAZYWF_DSN=mysql://lazywf:secret@db:3306/app lazywf
+LAZYWF_DSN=mysql://lazywf:secret@db:3306/app LAZYWF_ALLOWED_HOSTS=opensearch lazywf
 ```
+
+Since 0.3.0 an unset `LAZYWF_ALLOWED_HOSTS` denies every target host, so the run lists the one
+host the search target below points at (`opensearch`); a target to an unlisted host fails at
+load with a refusal naming the setting. Upgrading? [Upgrading to 0.3.0](#upgrading-to-030).
 
 On macOS or Windows, run that inside Docker or WSL 2: [Platforms](#platforms).
 
@@ -115,7 +119,7 @@ Example: `LAZYWF_DSN=mysql://lazywf:secret@host.docker.internal:3306/app`.
 
 | guarantee | how |
 |---|---|
-| after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, the commit fence on MySQL / Percona with neither, else `LAZYWF_VISIBILITY_DELAY_MS`; [server setup](docs/server-setup.md#binlog-settings)) |
+| after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET` on the MySQL family with GTIDs, the consistent-snapshot position on MariaDB, the commit fence on the MySQL family (MySQL and Percona) without GTIDs, else `LAZYWF_VISIBILITY_DELAY_MS`; [server setup](docs/server-setup.md#binlog-settings)) |
 | dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `item_42`) keep their prefix's integers in a hash set by default (about 19 bytes per key at a million dense ids); with `--features roaring` they are 64-bit roaring bitmaps (a million consecutive ids under 300 KB, but sparse ids cost more) — [Development](#development) |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
@@ -137,10 +141,12 @@ Environment variables:
 | `LAZYWF_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_DATABASE` | —, `3306`, `root`, —, — | instead of the DSN (values used verbatim) |
 | `LAZYWF_BINLOG_USER`, `LAZYWF_BINLOG_PASSWORD` (or `LAZYWF_BINLOG_DSN`) | the DSN's | replication account for the binlog stream |
 | `LAZYWF_QUERY_USER`, `LAZYWF_QUERY_PASSWORD` (or `LAZYWF_QUERY_DSN`) | the DSN's | account that runs the SQL the configuration defines; unset: the main account runs it. A SELECT-only account on the source tables the rules read is recommended ([server setup](docs/server-setup.md#query-account)) |
-| `LAZYWF_TLS`, `LAZYWF_TLS_CA` | `disabled`, — | `required`, `verify-ca`, `verify-full`; extra CA file |
+| `LAZYWF_TLS`, `LAZYWF_TLS_CA` | auto, — | `disabled`, `required`, `verify-ca`, `verify-full`; extra CA file (implies `verify-full`). Unset: `required` for a non-loopback source host, plaintext on loopback or a local socket; an explicit `disabled` to a remote host works and logs one loud WARN |
 | `LAZYWF_INSTANCE` | `default` | instance name: status rows and the instance lock (one active copy per schema and name; a second one stands by) |
 | `LAZYWF_SERVER_ID` | random | replica server id |
 | `LAZYWF_HEALTH_ADDR` | `127.0.0.1:8081` | `/livez`, `/readyz`, `/status`; `off` disables |
+| `LAZYWF_HEALTH_TOKEN` (or `LAZYWF_HEALTH_TOKEN_FILE`) | — | the one token for both listeners: when set, `/status` on the health listener and `GET /metrics` on the metrics one answer only to `Authorization: Bearer <token>` (compared in constant time), a miss being 401 with `WWW-Authenticate: Bearer`; `_FILE` holds the **path** of a file whose trimmed contents are the token, so both set at once, an unreadable file, and a file with no token in it are startup errors naming the variable and never the value; unlike a target's `vars`, the value is literal and the path plain — no `env:` / `file:` grammar. Unset or blank leaves both endpoints open, as before. `/livez`, `/readyz`, the two index pages and `lazywf healthcheck` never ask for it, so container health never needs it. It replaces `LAZYWF_STATUS_TOKEN`, which is not read at all ([Upgrading to 0.3.0](#upgrading-to-030)) |
+| `LAZYWF_METRICS_ADDR` | — (off) | `host:port` to serve Prometheus `GET /metrics` on its own listener (separate from the health one); unset or `off`: off entirely, malformed: startup error; `LAZYWF_HEALTH_TOKEN` gates it the way it gates `/status`, and neither listener has TLS — expose them internally ([Prometheus metrics](docs/reference.md#prometheus-metrics)) |
 | `LAZYWF_HEARTBEAT_MS` | `5000` | binlog heartbeat (a silent connection is dropped after 3×) |
 | `LAZYWF_VISIBILITY_DELAY_MS` | `20` | the last-resort visibility fence, when GTIDs, a consistent-snapshot position and the commit fence are all unavailable ([server setup](docs/server-setup.md#binlog-settings)) |
 | `LAZYWF_POOL_SIZE` | `16` | query connections (selects run concurrently) |
@@ -150,10 +156,34 @@ Environment variables:
 | `LAZYWF_MAX_BACKOFF_MS` | `60000` | longest retry wait |
 | `LAZYWF_STOP_GRACE_MS` | `10000` | on SIGTERM, how long running actions may finish |
 | `LAZYWF_SECRET_DIRS` | `/run/secrets:/var/run/secrets` | where `file:` secret references may point |
-| `LAZYWF_ALLOWED_HOSTS` | — | opt-in: the endpoint hosts a target may connect to (exact names, `*.` suffixes, IP literals or CIDR ranges, each optionally with a port); unset: no restriction ([security](docs/reference.md#security)) |
+| `LAZYWF_ALLOWED_HOSTS` | deny-all | the endpoint hosts a target may connect to (exact names, `*.` suffixes, IP literals or CIDR ranges, each optionally with a port); unset: every target host is denied and each target fails at load naming the setting; `*` allows any host (the pre-0.3 behaviour) ([security](docs/reference.md#security)) |
 | `RUST_LOG`, `LAZYWF_LOG_FORMAT` | `info`, `text` | log level, `json` |
 
 Rules, triggers and targets: [docs/reference.md](docs/reference.md).
+
+## Upgrading to 0.3.0
+
+0.3.0 hardens four defaults. What each one changes, what you meet if you do nothing, and the
+opt-out:
+
+| since 0.3.0 | if you do nothing | opt-out |
+|---|---|---|
+| TLS to the source is the default | unset `LAZYWF_TLS` means `required` unless the DSN host is loopback (a `127.0.0.0/8` or `::1` address, `localhost`, an empty host, or a `socket=` DSN): a server without TLS refuses the connection and the engine does not start | `LAZYWF_TLS=disabled` reaches a remote host in plaintext as before and logs one loud WARN at start; `LAZYWF_TLS_CA` implies `verify-full` |
+| deny-all target egress | unset `LAZYWF_ALLOWED_HOSTS` denies every target host: each target fails at load with a refusal naming the setting (the rule keeps its position and pending keys), and the start log says so at WARN | list the hosts, or `LAZYWF_ALLOWED_HOSTS=*` to allow any host (the pre-0.3 behaviour, not recommended) |
+| credentials by reference | a literal in a password-, token- or key-bearing `vars` field is refused at load ("must be a reference … never a literal") | none: the value moves to `env:NAME` or `file:/path` (the [field list](docs/reference.md#targets); names like `vars.username` stay literals) |
+| the health endpoints can require a token | nothing: unset `LAZYWF_HEALTH_TOKEN` leaves `/status` and `/metrics` open as before | set `LAZYWF_HEALTH_TOKEN` (or `LAZYWF_HEALTH_TOKEN_FILE`) and `/status` and `/metrics` both need `Authorization: Bearer <token>` (401 with `WWW-Authenticate: Bearer` without); `/livez`, `/readyz`, the two index pages and `lazywf healthcheck` stay open |
+
+`LAZYWF_HEALTH_TOKEN` is new in 0.3.0 under this name: the pre-release builds that first gated
+`/status` called it `LAZYWF_STATUS_TOKEN`, and the current code reads neither that name nor the
+`X-Lazywf-Token` header — no alias, no fallback. A run that still sets only the old name therefore
+has open endpoints, the state they were in before any token existed, so rename the variable; 0.2.x
+had no health token at all, so nothing earlier is affected.
+
+A refused target stays pending. Once its credential becomes a reference, the next config reload
+re-reads the target rows and delivers the pending keys without a restart. `LAZYWF_ALLOWED_HOSTS`,
+like every other `LAZYWF_*` setting, is read only at start, and that is the one list every reload
+applies when it builds targets — widening it takes a restart, after which the rule resumes from
+its confirmed position.
 
 ## Undelivered keys
 
@@ -182,11 +212,19 @@ triggers. To filter for dropped keys in a log pipeline, match the top-level `tar
 
 * SIGTERM stops gracefully: running actions finish (up to `LAZYWF_STOP_GRACE_MS`), positions are
   saved, exit 0. A non-zero exit means a real failure (bad configuration, lost instance lock,
-  missing privileges).
+  missing privileges), and two of them name themselves as they happen: a SIGTERM handler that
+  cannot be registered is a startup failure — the log line
+  `configuration error: registering the SIGTERM handler: <reason>` and exit 2, the code a bad
+  configuration gets, because an engine that cannot be told to stop must not run — and a panicked
+  engine task prints `lazywf: the engine task panicked; see the message above` on stderr before
+  exit 1. Every other exit code is unchanged.
 * `/livez`: the main loop turns. `/readyz`: this instance is active and streaming. `/status`:
   per rule the position, lag, pending keys, reset state, counters and errors (JSON,
-  [the fields](docs/reference.md#status)). `lazywf healthcheck` probes `/livez` for container
-  health checks.
+  [the fields](docs/reference.md#status)); with `LAZYWF_HEALTH_TOKEN` set it answers 401 with
+  `WWW-Authenticate: Bearer` unless the request carries `Authorization: Bearer <token>`
+  (`/livez` and `/readyz` never ask for it, and `/metrics` on its own listener takes the same
+  token). `lazywf healthcheck` probes `/livez` for container health checks, so a health token
+  never breaks container health.
 * `SELECT * FROM lazy_wire_fire_status`: positions, lag, `reset_state`, `last_error`.
 * `UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = …` re-runs a rule's reset
   steps; the tool sets it back to 0 when they succeeded.
@@ -201,7 +239,15 @@ instance name, SIGTERM to stop.
 Inside a container, the default health address `127.0.0.1:8081` is the container's own loopback.
 To query `/status` from the host: run with host networking (port 8081 free), or set
 `LAZYWF_HEALTH_ADDR=0.0.0.0:8081` and publish `-p 127.0.0.1:8081:8081`.
-`docker exec <name> /lazywf healthcheck` needs neither.
+`docker exec <name> /lazywf healthcheck` needs neither. With a health token the pattern on top of
+that is `-e LAZYWF_HEALTH_TOKEN=…`, or
+`-e LAZYWF_HEALTH_TOKEN_FILE=/run/secrets/lazywf_health_token` for a mounted file (the path is
+plain and the value literal: no `env:` / `file:` grammar here). The health port stays published to
+loopback only, and the token is handed to the readers that send
+`-H 'Authorization: Bearer <token>'` (curl, or a reverse proxy in front that adds the header); the
+same token gates `/metrics` on its own port the same way, and the image's `HEALTHCHECK` runs
+`lazywf healthcheck` inside the container against `/livez`, so container health never needs the
+token.
 
 ## Image
 
@@ -265,9 +311,18 @@ MySQL and Percona publish no pre-release in a registry (MySQL early access ships
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
 its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
 RDS for MySQL's default parameter group, so it also tests the commit fence.
-On Oracle MySQL without GTIDs the visibility fence is the commit fence — one write to lazywf's
-own table, exact when commits are in binlog order, with a `LAZYWF_VISIBILITY_DELAY_MS` fallback
-([server setup](docs/server-setup.md#binlog-settings)).
+On a MySQL-family server without GTIDs (Oracle MySQL and Percona Server) the visibility fence is
+the commit fence — one write to lazywf's own table, exact when commits are in binlog order, with a
+`LAZYWF_VISIBILITY_DELAY_MS` fallback ([server setup](docs/server-setup.md#binlog-settings)).
+MariaDB 11.4 and newer leave `VIRTUAL` generated columns out of their `UPDATE` and `DELETE` row
+images — the server's own behaviour — while the table map still names them, and the reader pairs
+an image's values with the columns by position, so such a column and every column after it would
+read as its neighbour's value. A trigger that reads one of them (`changed_columns`, the key or a
+`keys_sql` parameter) is therefore refused, and so is one whose key is a Handlebars template, which
+may name any column; the rule carries the reason as its `last_error`. Columns before the first
+`VIRTUAL` column and `STORED` generated columns are unaffected, as are MySQL, Percona and MariaDB
+before 11.4, whose images carry those columns. The restriction lifts when the reader learns to
+decode the short images ([reference → Triggers](docs/reference.md#triggers)).
 Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
 2026-12-31.
 
@@ -279,23 +334,23 @@ contracts are in [docs/reference.md](docs/reference.md#targets); the images are 
 
 | target | `kind` | endpoint | one action is | per-key answer | stray cleanup | credentials | tested against |
 |---|---|---|---|---|---|---|---|
-| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]`, or, for these four kinds, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](docs/reference.md#secret-http-endpoints)) | one HTTP request, optionally signed ([webhook signing](docs/reference.md#webhook-signing)) | for the action | allowed | the auth variants' `vars`: a literal, or an `env:` / `file:` reference; the plain four kinds can also carry an OAuth 2.0 access token, `vars.oauth` ([OAuth access tokens](docs/reference.md#oauth-access-tokens)); the signing secret `vars.sign_secret_ref`: a reference only | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
+| HTTP endpoint: webhooks, Elasticsearch / OpenSearch, Varnish | `http` (also `https`, or empty), and the auth variants `http.basic`, `http.bearer`, `http.header` ([targets](docs/reference.md#targets)) | `http(s)://host:port[/prefix]`, or, for these four kinds, one `env:` / `file:` reference whose value is the whole URL ([secret http endpoints](docs/reference.md#secret-http-endpoints)) | one HTTP request, optionally signed ([webhook signing](docs/reference.md#webhook-signing)) | for the action | allowed | the auth variants' credential `vars` (`vars.password`, `vars.token`, `vars.value`): a reference only, `env:` / `file:`; the names (`vars.username`, `vars.header`) a literal or a reference; the plain four kinds can also carry an OAuth 2.0 access token, `vars.oauth` ([OAuth access tokens](docs/reference.md#oauth-access-tokens)); the signing secret `vars.sign_secret_ref`: a reference only | OpenSearch 2.19, Elasticsearch 7.17 / 8.17 (security on), Varnish 7.6 — CI |
 | S3 API | `http.s3` ([targets](docs/reference.md#targets)) | the service URL, optional (derived from `vars` when empty) | one signed S3 request | for the action | allowed | `access_key_ref` / `secret_key_ref` (references only; optional `session_token_ref`), else the [AWS default chain](docs/reference.md#aws-credentials) | versitygw 1.10 — CI |
-| Redis / Valkey, Streams included | `redis` ([targets](docs/reference.md#targets)) | `host:port/db` (or `redis://` / `rediss://`) | one Redis command | for the action | allowed | `vars.password`, optional `vars.username` for ACLs: a literal or a reference | Redis 7.4, Valkey 8.1 — CI |
-| MySQL / MariaDB | `mysql` (also `mariadb`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | MySQL 8.4 — CI |
-| PostgreSQL | `pgsql` (also `postgres`, `postgresql`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username`, `vars.password`: a literal or a reference | PostgreSQL 17 — CI |
+| Redis / Valkey, Streams included | `redis` ([targets](docs/reference.md#targets)) | `host:port/db` (or `redis://` / `rediss://`) | one Redis command | for the action | allowed | `vars.password` (a reference only), optional `vars.username` for ACLs (a literal or a reference) | Redis 7.4, Valkey 8.1 — CI |
+| MySQL / MariaDB | `mysql` (also `mariadb`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username` (a literal or a reference), `vars.password` (a reference only) | MySQL 8.4 — CI |
+| PostgreSQL | `pgsql` (also `postgres`, `postgresql`) ([SQL targets](docs/reference.md#sql-targets)) | `host:port/database` | one SQL statement | for the action | allowed | `vars.username` (a literal or a reference), `vars.password` (a reference only) | PostgreSQL 17 — CI |
 | Amazon SQS | `sqs` ([SQS targets](docs/reference.md#sqs-targets)) | `aws-sqs://[<region>/]<account-id>/<queue-name>` | one `SendMessageBatch` | per entry, per key | refused at load (append-only; a purging `once` step too) | as `http.s3`; never in the URL | ElasticMQ 1.6 — CI (release gate) |
 | Amazon Kinesis Data Streams | `kinesis` ([Kinesis targets](docs/reference.md#kinesis-targets)) | `aws-kinesis://[<region>/]<stream-name>` | one `PutRecords` | per record, per key | refused at load (append-only; a stream-deleting `once` step too) | as `http.s3`; never in the URL | kinesis-mock 0.2 — CI (release gate) |
 | AWS Lambda | `lambda` ([Lambda targets](docs/reference.md#lambda-targets)) | `aws-lambda://[<region>/]<function-name>[:<qualifier>]` (`?invocation=sync\|event`) | one `Invoke` | per item: the result's `batchItemFailures` | refused at load (a function cannot list its invocations) | as `http.s3`; never in the URL | a stand-in Invoke service — CI |
 | Amazon EventBridge | `eventbridge` ([EventBridge targets](docs/reference.md#eventbridge-targets)) | `aws-eventbridge://[<region>/]<event-bus-name-or-arn>` | one `PutEvents` | per entry, per key | refused at load (append-only; a bus-deleting `once` step too) | as `http.s3`; never in the URL | moto 5.2.5 — CI (release gate) |
 | Amazon SNS | `sns` ([SNS targets](docs/reference.md#sns-targets)) | `aws-sns://[<region>/]<account-id>/<topic-name>` | one `PublishBatch` | per entry, per key | refused at load (append-only; a topic-deleting `once` step too) | as `http.s3`; never in the URL | moto 5.2.5 — CI (release gate) |
-| AMQP 0-9-1 broker | `amqp` ([AMQP targets](docs/reference.md#amqp-targets)) | `amqp(s)://host[:port][/vhost]` | one confirmed publish | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | RabbitMQ 4.3 — CI (release gate) |
-| SMTP server | `smtp` ([SMTP targets](docs/reference.md#smtp-targets)) | `smtp(s)://host[:port]` (587 / 465 by default) | one mail | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username`, `vars.password`: a literal or a reference; never in the URL | Mailpit 1.33 — CI (release gate) |
+| AMQP 0-9-1 broker | `amqp` ([AMQP targets](docs/reference.md#amqp-targets)) | `amqp(s)://host[:port][/vhost]` | one confirmed publish | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username` (a literal or a reference), `vars.password` (a reference only); never in the URL | RabbitMQ 4.3 — CI (release gate) |
+| SMTP server | `smtp` ([SMTP targets](docs/reference.md#smtp-targets)) | `smtp(s)://host[:port]` (587 / 465 by default) | one mail | for the action (one message per action: `fire_per = key`) | refused at load (append-only) | `vars.username` (a literal or a reference), `vars.password` (a reference only); never in the URL | Mailpit 1.33 — CI (release gate) |
 | Google Cloud Pub/Sub | `pubsub` ([Pub/Sub targets](docs/reference.md#pubsub-targets)) | `gc-pubsub://<project>/<topic>` | one `topics.publish` | for the action | refused at load (append-only; publish-only reset steps) | `vars.credentials_ref` (reference only), else Application Default Credentials; never in the URL | the Pub/Sub emulator — CI (release gate) |
 | Kafka-protocol broker (Apache Kafka, Redpanda, MSK, Event Hubs) | `kafka` ([Kafka targets](docs/reference.md#kafka-targets)) | `kafka(s)://<broker>[:port][,<broker>[:port]…]/<topic>` | one produce of a batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.sasl` (`plain`, `scram-sha-256`, `scram-sha-512`) with `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | Redpanda 26.1.20 — CI (release gate) |
 | RabbitMQ stream (native stream protocol, super streams included) | `rabbitmq-stream` ([RabbitMQ stream targets](docs/reference.md#rabbitmq-stream-targets)) | `rabbitmq-stream://<host>[:port]/[<vhost>/]<stream>`, or `rabbitmq-stream+tls://…` for TLS (5552 / 5551) | one publish batch of records | per record, per key | refused at load (append-only; a listing is refused too) | `vars.username` (a literal or a reference) and `vars.password` (a reference only); never in the URL | RabbitMQ 4.3 with the stream plugin — CI (release gate) |
 | Azure Service Bus (queues, topics) | `servicebus` ([Service Bus targets](docs/reference.md#service-bus-targets)) | `sb://<namespace>.servicebus.windows.net/<queue-or-topic>` (a local broker: `sb://<host>:<port>/<address>`) | one batch of messages over AMQP 1.0, TLS on 5671, a disposition awaited per message | per message, per key | refused at load (append-only; a listing is refused too) | `vars.key_name` with `vars.key` (a reference only) for a SAS token over `$cbs`, or `vars.username` with `vars.password` (a reference only) for SASL PLAIN on a broker without CBS; no Entra ID; never in the URL | RabbitMQ 4.3 answering AMQP 1.0 on its 5672 (SASL PLAIN; no local broker has a `$cbs` node) — CI (release gate) |
-| gRPC server (bidirectional streaming, per-item acks) | `grpc` ([gRPC targets](docs/reference.md#grpc-targets)) | `grpc(s)://<host>[:port]/<package.Service>/<Method>` (default ports 80 / 443) | one `Envelope` of items written onto one long-lived bidirectional stream per endpoint | per item, per key: an acknowledgement matched by sequence number and verified by hash | refused at load (append-only; a listing is refused too) | `vars.token` as a bearer credential (a reference only, `env:` / `file:`); the schema is `vars.descriptor_set` (a `file:` reference) with `vars.item_type`; never in the URL | the suite's own in-process gRPC server (`cargo test --test grpc_stream`; not wired into the Makefile or CI — CI exercises the kind only through the `log_secrets` bearer-token flow) |
+| gRPC server (bidirectional streaming, per-item acks) | `grpc` ([gRPC targets](docs/reference.md#grpc-targets)) | `grpc(s)://<host>[:port]/<package.Service>/<Method>` (default ports 80 / 443) | one `Envelope` of items written onto one long-lived bidirectional stream per endpoint | per item, per key: an acknowledgement matched by sequence number and verified by hash | refused at load (append-only; a listing is refused too) | `vars.token` as a bearer credential (a reference only, `env:` / `file:`); the schema is `vars.descriptor_set` (a `file:` reference) with `vars.item_type`; never in the URL | the suite's own in-process gRPC server (`make test-grpc` — CI: the unit job) |
 
 The append-only kinds and `lambda` refuse a stray cleanup at load, and `sqs` / `kinesis` /
 `eventbridge` / `sns` / `pubsub` refuse purge-like or non-publishing reset steps; no other kind
@@ -305,12 +360,14 @@ refuses one.
 
 ```sh
 make test                      # unit tests
+make test-grpc                 # the grpc streaming suite alone (the kind's client against an in-process h2 server; `make test` runs it too)
 make servers                   # MySQL 8.4, MariaDB 10.11, Redis, Valkey, PostgreSQL, S3 (docker)
 make test-e2e                  # integration tests on MySQL 8.4; test-e2e-all: MySQL 8.4 and MariaDB 10.11
 make test-matrix               # every other blocking line of "Supported servers", one at a time
 make test-prerelease           # the advisory MariaDB 13.1 RC and 13.2 preview
 make test-e2e-search           # OpenSearch, Elasticsearch 7 and 8, one at a time
 make test-e2e-queues           # SQS, Kinesis, AMQP, Service Bus, RabbitMQ Streams, Pub/Sub, SMTP, Kafka, EventBridge and SNS against their emulators (the sqs, kinesis, amqp, pubsub, smtp, kafka, eventbridge and sns compose profiles; the servicebus flows ride the amqp profile's RabbitMQ, whose listener answers AMQP 1.0 too, and the rabbitmq-stream flows its stream plugin on port 5552)
+make test-e2e-pgsrc            # the pgoutput source tests (`pg_*`) against the opt-in `pgsrc` service: a PostgreSQL 17 with wal_level=logical, its own container (not started by `make servers`) — the engine cannot read a PostgreSQL source yet; CI's postgres-src job is advisory
 make coverage                  # unit tests + e2e under cargo-llvm-cov 0.9.1 into tmp/coverage (informational, not a gate)
 docker buildx build -t lazywf:dev --load .   # static musl binary on distroless
 make docker-smoke docker-e2e   # the loaded lazywf:dev: no shell, uid 65532; a row fires through Redis
@@ -327,10 +384,13 @@ On macOS the test servers (`make servers`) need Docker. On Windows, develop insi
 Docker for the test servers.
 
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
-lint, unit tests, the integration suite on the default servers (Varnish included), on every other
-server (one runner each, pre-releases advisory), with the search engines, with the queue
+lint, unit tests (with the grpc streaming suite: `make test` runs `make test-grpc`), the
+integration suite on the default servers (Varnish included), on every other server (one runner
+each, pre-releases advisory), with the search engines, with the queue
 emulators (SQS, Kinesis, AMQP, Service Bus, RabbitMQ Streams, Pub/Sub, SMTP, Kafka (Redpanda),
-EventBridge (moto) and SNS (moto)), and the image for both platforms. Two jobs run on narrower
+EventBridge (moto) and SNS (moto)), with the PostgreSQL source tests (`make test-e2e-pgsrc` in
+the advisory `postgres-src` job: the pgoutput `pg_*` tests against a logical-decoding
+PostgreSQL 17 — the engine cannot read a PG source yet), and the image for both platforms. Two jobs run on narrower
 triggers: the `coverage (informational)` job (pull requests and pushes to `main`; the table in the
 job summary, the lcov and HTML in the `coverage` artifact for 14 days) and the weekly
 `lazyview drift (advisory)` job (`scripts/sync-lazyview.sh --drift`, a warning per drifted file,
@@ -350,6 +410,8 @@ One is not used by the engine: the view planner (`src/analyze.rs`, `src/analyzer
 `src/access.rs`, `src/catalog.rs`), which startup only asks to refuse lazywf's own tables as view
 sources (`analyze::set_reserved`, `src/engine.rs` and `src/main.rs`). The weekly `lazyview drift
 (advisory)` job above warns when lazyview's `main` moves a locked file or adds one the copy set
-should gain.
+should gain. A vendored test can follow the host's cargo feature choices; a fix for that belongs
+in lazyview, not in the copies (the set stays byte-for-byte): lazyview's `json_canonical` was
+made feature-independent at exactly such a case.
 
 License: MIT.

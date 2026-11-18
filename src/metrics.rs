@@ -1,5 +1,11 @@
 //! Prometheus exposition endpoint: `GET /metrics` on its own address (`LAZYWF_METRICS_ADDR`).
 //!
+//! The endpoint says what a scrape may learn: the same token as `/status`
+//! (`LAZYWF_HEALTH_TOKEN`, checked by [`crate::health::bearer_ok`]), so a scrape that reaches
+//! outside the machine must carry it as `Authorization: Bearer <token>` and a miss is a 401 with
+//! `WWW-Authenticate: Bearer`. Unset, the listener stays open — the loopback default it shipped
+//! with.
+//!
 //! The production-readiness blocker is that "did it deliver" is only a WARN log, invisible to
 //! monitoring. This is the small, bounded signal set that answers it: five metrics over the
 //! flush path, the dedup buffer and the binlog lag. Everything is `std::sync::atomic`; there is
@@ -380,7 +386,41 @@ fn flush_duration(out: &mut String, rules: &BTreeMap<String, Arc<RuleHandle>>) {
     }
 }
 
-async fn handle(mut s: TcpStream, m: Arc<Metrics>) {
+/// The answer to one request on the metrics listener. `authorization` is the `Authorization`
+/// header the request carried and `token` the gate's value (`None`: the listener is open, as it
+/// was before the token existed). `/metrics` is the gated path; the index and the unknown paths
+/// answer as they always did, and a refusal is the token gate's plain 401.
+fn respond(
+    m: &Metrics,
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+    token: Option<&str>,
+) -> (u16, String, &'static str) {
+    if !matches!(method, "GET" | "HEAD") {
+        return (405, "method not allowed\n".into(), "text/plain");
+    }
+    match path {
+        "/metrics" => {
+            if let Some(want) = token {
+                // Constant-time, and the same rule `/status` follows: one setting, one shape of
+                // a valid credential, over both listeners.
+                if !crate::health::bearer_ok(authorization, want) {
+                    return (401, "unauthorized\n".into(), "text/plain");
+                }
+            }
+            (200, m.render(), "text/plain; version=0.0.4")
+        }
+        "/" => (
+            200,
+            "lazywf metrics endpoint: /metrics\n".into(),
+            "text/plain",
+        ),
+        _ => (404, "not found\n".into(), "text/plain"),
+    }
+}
+
+async fn handle(mut s: TcpStream, m: Arc<Metrics>, token: Option<String>) {
     // The same bounded read as the health endpoint: a cap and a timeout, so a slow or hostile
     // client cannot grow the buffer or hold the task.
     let mut buf = Vec::with_capacity(1024);
@@ -408,26 +448,27 @@ async fn handle(mut s: TcpStream, m: Arc<Metrics>) {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/");
-    let (status, body, ctype) = if !matches!(method, "GET" | "HEAD") {
-        (405, "method not allowed\n".into(), "text/plain")
-    } else if path == "/metrics" {
-        (200, m.render(), "text/plain; version=0.0.4")
-    } else if path == "/" {
-        (
-            200,
-            "lazywf metrics endpoint: /metrics\n".into(),
-            "text/plain",
-        )
-    } else {
-        (404, "not found\n".into(), "text/plain")
-    };
+    let authorization = crate::health::header_value(&buf, crate::health::AUTHORIZATION_HEADER);
+    let (status, body, ctype) =
+        respond(&m, method, path, authorization.as_deref(), token.as_deref());
     let reason = match status {
         200 => "OK",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Service Unavailable",
     };
-    let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    // A 401 here is only ever the token gate, and a bearer challenge is what such a refusal owes
+    // the client — the same answer `/status` gives.
+    let challenge = if status == 401 {
+        "WWW-Authenticate: Bearer\r\n"
+    } else {
+        ""
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{challenge}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
     let _ = s.write_all(head.as_bytes()).await;
     if method != "HEAD" {
         let _ = s.write_all(body.as_bytes()).await;
@@ -436,7 +477,9 @@ async fn handle(mut s: TcpStream, m: Arc<Metrics>) {
 }
 
 /// Serves `/metrics` until the process ends; a bind failure is logged and retried (like health).
-pub async fn serve(addr: SocketAddr, m: Arc<Metrics>) {
+/// `token` is `LAZYWF_HEALTH_TOKEN` — the same token that gates `/status`: set, it admits only a
+/// request carrying `Authorization: Bearer <token>`; unset, the listener stays open.
+pub async fn serve(addr: SocketAddr, m: Arc<Metrics>, token: Option<String>) {
     let listener = loop {
         match TcpListener::bind(addr).await {
             Ok(l) => break l,
@@ -446,10 +489,27 @@ pub async fn serve(addr: SocketAddr, m: Arc<Metrics>) {
             }
         }
     };
-    tracing::info!("metrics endpoint on http://{addr} (/metrics)");
+    // The gate the log promises must be the gate the listener applies, so both read the token
+    // through the same normalization.
+    let token = crate::health::token_of(token);
+    let needs = if token.is_some() {
+        ", /metrics needs Authorization: Bearer"
+    } else {
+        ""
+    };
+    tracing::info!("metrics endpoint on http://{addr} (/metrics{needs})");
+    serve_listener(listener, m, token).await;
+}
+
+/// The accept loop of [`serve`], over a listener someone else bound: the tests scrape a port of
+/// the kernel's choosing instead of racing to grab a free one.
+pub(crate) async fn serve_listener(listener: TcpListener, m: Arc<Metrics>, token: Option<String>) {
+    // Stored by the health module's one rule (trimmed, blank is no token at all), so neither
+    // listener can gate on a value nobody meant to set.
+    let token = crate::health::token_of(token);
     loop {
         if let Ok((s, _)) = listener.accept().await {
-            tokio::spawn(handle(s, m.clone()));
+            tokio::spawn(handle(s, m.clone(), token.clone()));
         }
     }
 }
@@ -488,7 +548,11 @@ mod tests {
         let want = [
             "# HELP lazywf_build_info Build info of this lazywf instance (always 1).",
             "# TYPE lazywf_build_info gauge",
-            concat!("lazywf_build_info{version=\"", env!("CARGO_PKG_VERSION"), "\"} 1"),
+            concat!(
+                "lazywf_build_info{version=\"",
+                env!("CARGO_PKG_VERSION"),
+                "\"} 1"
+            ),
             "# HELP lazywf_binlog_lag_seconds How far behind the binlog the reader is, in seconds (the status table's stream lag).",
             "# TYPE lazywf_binlog_lag_seconds gauge",
             "lazywf_binlog_lag_seconds 0",
@@ -613,5 +677,173 @@ mod tests {
         m.rule("we\"ird\\x").observe_flush(Duration::from_micros(1));
         let t = m.render();
         assert!(t.contains("rule=\"we\\\"ird\\\\x\""), "{t}");
+    }
+
+    /// The token, as the operator's variable would hold it after `Config` trimmed it.
+    const TOKEN: &str = "s3cr3t-token";
+
+    fn gated() -> (Arc<Metrics>, Option<String>) {
+        let m = Arc::new(Metrics::default());
+        m.rule("orders").set_pending(5);
+        (m, Some(TOKEN.to_string()))
+    }
+
+    /// `LAZYWF_HEALTH_TOKEN` set: `/metrics` answers only to the bearer token, and a refusal says
+    /// no more than `unauthorized` (the exposition, and the token, appear in neither). The index
+    /// and the unknown paths are not gated: they name nothing a scraper needs a secret for.
+    #[test]
+    fn the_token_gates_the_exposition() {
+        let (m, token) = gated();
+        for given in [
+            None,
+            Some(""),
+            Some("Bearer"),
+            Some("Bearer s3cr3t-toke"),
+            Some("Bearer s3cr3t-token!"),
+            Some("Basic s3cr3t-token"),
+            // what a reader of the old `/status` header would send: the value alone is not a
+            // credential on either listener
+            Some("s3cr3t-token"),
+        ] {
+            let (code, body, ctype) = respond(&m, "GET", "/metrics", given, token.as_deref());
+            assert_eq!(code, 401, "given {given:?}");
+            assert_eq!(body, "unauthorized\n", "given {given:?}");
+            assert_eq!(ctype, "text/plain", "given {given:?}");
+        }
+        let (code, body, ctype) = respond(
+            &m,
+            "GET",
+            "/metrics",
+            Some("Bearer s3cr3t-token"),
+            token.as_deref(),
+        );
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/plain; version=0.0.4");
+        assert!(body.contains("lazywf_build_info"), "{body}");
+        assert!(
+            body.contains("lazywf_pending_keys{rule=\"orders\"} 5"),
+            "{body}"
+        );
+        // A POST is not a scrape whether or not it carries the token.
+        assert_eq!(
+            respond(
+                &m,
+                "POST",
+                "/metrics",
+                Some("Bearer s3cr3t-token"),
+                token.as_deref()
+            )
+            .0,
+            405
+        );
+        // Ungated paths, and an unset token: as they were before the token existed.
+        assert_eq!(respond(&m, "GET", "/", None, token.as_deref()).0, 200);
+        assert_eq!(respond(&m, "GET", "/nope", None, token.as_deref()).0, 404);
+        assert_eq!(respond(&m, "GET", "/metrics", None, None).0, 200);
+    }
+
+    /// The same gate with the credential padded the way a token file pads it: the trim happened on
+    /// both sides, so a scrape of a file-sourced token still gets its exposition.
+    #[test]
+    fn a_padded_file_token_still_opens_the_exposition() {
+        let (m, _) = gated();
+        let token = Some(" s3cr3t-token\n".to_string());
+        assert_eq!(
+            respond(
+                &m,
+                "GET",
+                "/metrics",
+                Some("Bearer s3cr3t-token"),
+                token.as_deref()
+            )
+            .0,
+            200
+        );
+    }
+
+    /// Serves `m` (gated by `token`) on a port of the kernel's choosing.
+    async fn serving(m: Arc<Metrics>, token: Option<String>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_listener(listener, m, token));
+        addr
+    }
+
+    async fn get(addr: SocketAddr, request: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn code(answer: &str) -> u16 {
+        answer.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    /// A Prometheus-style scrape over a real socket: with the bearer token it gets the exposition
+    /// (`Accept`, `User-Agent` and the scrape timeout are what Prometheus 2.x itself sends),
+    /// without it a 401 that carries `WWW-Authenticate: Bearer` and no metrics at all.
+    #[tokio::test]
+    async fn a_scrape_with_the_bearer_token_reads_the_exposition() {
+        let (m, token) = gated();
+        let addr = serving(m.clone(), token.clone()).await;
+        let head = "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:9090\r\nUser-Agent: Prometheus/2.53.1\r\n\
+                    Accept: application/openmetrics-text; version=0.0.1,text/plain;version=0.0.4;q=0.5,*/*;q=0.1\r\n\
+                    Accept-Encoding: gzip\r\nX-Prometheus-Scrape-Timeout-Seconds: 10\r\n";
+        let r = get(addr, &format!("{head}\r\n")).await;
+        assert_eq!(code(&r), 401, "an anonymous scrape must be refused: {r}");
+        assert!(r.contains("WWW-Authenticate: Bearer"), "{r}");
+        assert!(!r.contains("lazywf_"), "a refusal exposes metrics: {r}");
+
+        // The retired header, from a reader of the old `/status` docs: on this listener it is an
+        // ordinary header, and so an ordinary refusal.
+        let r = get(addr, &format!("{head}X-Lazywf-Token: {TOKEN}\r\n\r\n")).await;
+        assert_eq!(
+            code(&r),
+            401,
+            "the retired X-Lazywf-Token header opens nothing: {r}"
+        );
+        assert!(r.contains("WWW-Authenticate: Bearer"), "{r}");
+        assert!(!r.contains("lazywf_"), "a refusal exposes metrics: {r}");
+
+        let r = get(
+            addr,
+            &format!("{head}Authorization: Bearer {TOKEN}\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(code(&r), 200);
+        assert!(r.contains("Content-Type: text/plain; version=0.0.4"), "{r}");
+        assert!(r.contains("lazywf_build_info{version="), "{r}");
+        assert!(r.contains("lazywf_pending_keys{rule=\"orders\"} 5"), "{r}");
+
+        // HEAD of a gated path: the challenge, and no body.
+        let r = get(addr, "HEAD /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(code(&r), 401, "{r}");
+        assert!(
+            r.ends_with("\r\n\r\n"),
+            "a HEAD answer stops after the head: {r:?}"
+        );
+    }
+
+    /// Without the setting the listener stays open, as it was before the token existed.
+    #[tokio::test]
+    async fn an_ungated_listener_scrapes_without_a_header() {
+        let (m, _) = gated();
+        let addr = serving(m.clone(), None).await;
+        let r = get(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(code(&r), 200);
+        assert!(r.contains("lazywf_build_info{version="), "{r}");
+    }
+
+    /// A token of nothing but spaces gates nothing, as `/status` does: the listener serves the
+    /// exposition to an anonymous scrape rather than locking everyone out with a value nobody
+    /// meant (`health::token_of`, the rule both listeners store the token through).
+    #[tokio::test]
+    async fn a_blank_token_gates_nothing() {
+        let (m, _) = gated();
+        let addr = serving(m.clone(), Some("   ".to_string())).await;
+        let r = get(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(code(&r), 200, "a blank token leaves the listener open: {r}");
     }
 }

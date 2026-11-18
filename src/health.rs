@@ -2,10 +2,15 @@
 //!
 //! * `/livez`: 200 while the main loop is turning (it beats at least every few seconds);
 //! * `/readyz`: 200 while this instance is active and streaming the binlog;
-//! * `/status`: what each rule is doing. With `LAZYWF_STATUS_TOKEN` set it also requires the
-//!   `X-Lazywf-Token` header to match (constant-time); without the header it answers 401.
+//! * `/status`: what each rule is doing. With `LAZYWF_HEALTH_TOKEN` set it also requires the
+//!   `Authorization: Bearer <token>` header to match (constant-time); without it, 401 with
+//!   `WWW-Authenticate: Bearer`. The same token gates `/metrics` on its own listener
+//!   ([`crate::metrics`]), which is why the parser here is shared.
 //!   The two probes never ask for the token: liveness checks must not need secrets, and the
 //!   container health check runs `lazywf healthcheck` without any environment of its own.
+//!
+//! Both lazywf listeners read a request head with [`header_value`] and open a gated endpoint with
+//! [`bearer_ok`], so the shape of a valid credential lives in exactly one place.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -15,8 +20,10 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// The header `/status` must carry when `LAZYWF_STATUS_TOKEN` is set.
-pub const STATUS_TOKEN_HEADER: &str = "X-Lazywf-Token";
+/// The header the token gate reads. HTTP names are case-insensitive, so a request carries it as
+/// `Authorization`, `authorization` or `AUTHORIZATION` alike. The metrics listener gates with the
+/// same header and the same token, so it reads it through this name too.
+pub(crate) const AUTHORIZATION_HEADER: &str = "Authorization";
 
 /// The loop must beat within this long for `/livez`.
 pub const STALL: Duration = Duration::from_secs(60);
@@ -26,9 +33,9 @@ struct Inner {
     streaming: bool,
     beat: Instant,
     status: Value,
-    /// `LAZYWF_STATUS_TOKEN`, trimmed and never blank; `None` when unset: `/status` stays
-    /// open (the loopback default).
-    status_token: Option<String>,
+    /// `LAZYWF_HEALTH_TOKEN`, trimmed and never blank; `None` when unset: both gated endpoints
+    /// stay open (the loopback default).
+    health_token: Option<String>,
 }
 
 pub struct Health {
@@ -42,19 +49,18 @@ impl Default for Health {
 }
 
 impl Health {
-    /// `/status` requires the token unless it is `None`.
-    pub fn new(status_token: Option<String>) -> Health {
+    /// `/status` (and `/metrics`, which is given the same token) requires it unless it is `None`.
+    pub fn new(health_token: Option<String>) -> Health {
         Health {
             inner: Mutex::new(Inner {
                 phase: "starting",
                 streaming: false,
                 beat: Instant::now(),
                 status: json!({}),
-                // Trimmed on store: a copied env token carries the trailing newline, while
-                // `header_value` trims the header — the two must meet on the same bytes.
-                status_token: status_token
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty()),
+                // Trimmed and blank-checked on store, the way the metrics listener stores it too:
+                // a copied env token carries the trailing newline, while `bearer_ok` trims the
+                // credential it reads — the two must meet on the same bytes.
+                health_token: token_of(health_token),
             }),
         }
     }
@@ -92,11 +98,11 @@ impl Health {
         self.with(|i| i.status = status);
     }
 
-    /// The answer to one request. `token` is the `X-Lazywf-Token` header the request carried:
-    /// with `LAZYWF_STATUS_TOKEN` set, `/status` is served only when it matches in constant
-    /// time; without the token (unset), `/status` answers as it always did. The probes ignore
-    /// it.
-    fn respond(&self, path: &str, token: Option<&str>) -> (u16, String, &'static str) {
+    /// The answer to one request. `authorization` is the `Authorization` header the request
+    /// carried: with `LAZYWF_HEALTH_TOKEN` set, `/status` is served only when it is
+    /// `Bearer <token>` and matches in constant time; without the token (unset), `/status` answers
+    /// as it always did. The probes ignore it.
+    fn respond(&self, path: &str, authorization: Option<&str>) -> (u16, String, &'static str) {
         self.with(|i| {
             let live = i.beat.elapsed() < STALL;
             match path {
@@ -133,9 +139,9 @@ impl Health {
                     }
                 }
                 "/status" => {
-                    if let Some(want) = &i.status_token {
+                    if let Some(want) = &i.health_token {
                         // Constant-time: the header is a secret presented over the network.
-                        if !token.is_some_and(|t| crate::secrets::ct_eq(t, want)) {
+                        if !bearer_ok(authorization, want) {
                             return (401, "unauthorized\n".into(), "text/plain");
                         }
                     }
@@ -183,7 +189,7 @@ async fn handle(mut s: TcpStream, h: Arc<Health>) {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/");
-    let token = header_value(&buf, STATUS_TOKEN_HEADER);
+    let token = header_value(&buf, AUTHORIZATION_HEADER);
     let (status, body, ctype) = if matches!(method, "GET" | "HEAD") {
         h.respond(path, token.as_deref())
     } else {
@@ -196,7 +202,17 @@ async fn handle(mut s: TcpStream, h: Arc<Health>) {
         405 => "Method Not Allowed",
         _ => "Service Unavailable",
     };
-    let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    // A 401 here is only ever the token gate, and a bearer challenge is what such a refusal owes
+    // the client (the same answer lazyview's health server gives).
+    let challenge = if status == 401 {
+        "WWW-Authenticate: Bearer\r\n"
+    } else {
+        ""
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{challenge}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
     let _ = s.write_all(head.as_bytes()).await;
     if method != "HEAD" {
         let _ = s.write_all(body.as_bytes()).await;
@@ -205,8 +221,9 @@ async fn handle(mut s: TcpStream, h: Arc<Health>) {
 }
 
 /// The value of one header of a request head (first occurrence, trimmed), or `None`. Split
-/// on `\n` and trimmed of `\r`: the reader above accepts both line endings.
-fn header_value(buf: &[u8], name: &str) -> Option<String> {
+/// on `\n` and trimmed of `\r`: the reader above accepts both line endings. Shared with
+/// [`crate::metrics`], the other listener that reads a request head by hand.
+pub(crate) fn header_value(buf: &[u8], name: &str) -> Option<String> {
     let head = String::from_utf8_lossy(buf);
     head.split('\n').skip(1).find_map(|line| {
         let (k, v) = line.split_once(':')?;
@@ -214,6 +231,40 @@ fn header_value(buf: &[u8], name: &str) -> Option<String> {
             .eq_ignore_ascii_case(name)
             .then(|| v.trim().to_string())
     })
+}
+
+/// The one gate both listeners ask about: `/status` here, `/metrics` in
+/// [`crate::metrics::serve_listener`].
+///
+/// True when `header` is exactly `Bearer <token>` for `want`, compared in constant time: the
+/// header is a secret presented over the network, so neither its length nor its first difference
+/// may come back early. The scheme word is case-insensitive (HTTP allows it) and both sides are
+/// trimmed — the token a file handed over keeps its newline until here, and a header can pad its
+/// credential the same way, so the whitespace around a token is never part of the secret.
+/// Anything else — no header, a bare `Bearer`, another scheme, a prefix of the token, the token
+/// plus a word — is refused.
+pub(crate) fn bearer_ok(header: Option<&str>, want: &str) -> bool {
+    // An empty token authorizes nothing — not even an empty credential. `token_of` makes it
+    // unreachable from either listener, and the gate does not rely on that.
+    if want.trim().is_empty() {
+        return false;
+    }
+    let Some((scheme, credential)) = header
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .and_then(|h| h.split_once(char::is_whitespace))
+    else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer") && crate::secrets::ct_eq(credential.trim(), want.trim())
+}
+
+/// `LAZYWF_HEALTH_TOKEN` as both listeners store it: trimmed, and no token at all when it is
+/// blank — an endpoint stays open rather than gating on a value nobody meant to set.
+pub(crate) fn token_of(token: Option<String>) -> Option<String> {
+    token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Serves until the process ends; a bind failure is logged and retried.
@@ -227,13 +278,19 @@ pub async fn serve(addr: SocketAddr, h: Arc<Health>) {
             }
         }
     };
-    let token = h.with(|i| i.status_token.is_some());
+    let token = h.with(|i| i.health_token.is_some());
     let needs = if token {
-        ", /status requires X-Lazywf-Token"
+        ", /status needs Authorization: Bearer"
     } else {
         ""
     };
     tracing::info!("health endpoint on http://{addr} (/livez, /readyz, /status{needs})");
+    serve_listener(listener, h).await;
+}
+
+/// The accept loop of [`serve`], over a listener someone else bound: the tests serve on a port
+/// of the kernel's choosing instead of racing to grab a free one.
+pub(crate) async fn serve_listener(listener: TcpListener, h: Arc<Health>) {
     loop {
         if let Ok((s, _)) = listener.accept().await {
             tokio::spawn(handle(s, h.clone()));
@@ -268,8 +325,12 @@ mod tests {
         h.respond(path, None)
     }
 
-    fn answer_with(h: &Health, path: &str, token: Option<&str>) -> (u16, String, &'static str) {
-        h.respond(path, token)
+    fn answer_with(
+        h: &Health,
+        path: &str,
+        authorization: Option<&str>,
+    ) -> (u16, String, &'static str) {
+        h.respond(path, authorization)
     }
 
     fn stall(h: &Health) {
@@ -361,22 +422,33 @@ mod tests {
         );
     }
 
-    /// `LAZYWF_STATUS_TOKEN`: `/status` requires the header, the probes never do.
+    /// `LAZYWF_HEALTH_TOKEN`: `/status` requires the bearer token, the probes never do.
     #[test]
-    fn status_token_gates_only_status() {
+    fn health_token_gates_only_status() {
         let h = Health::new(Some("s3cret".into()));
         h.set_status(json!({"rules": {"orders": "ok"}}));
         h.set_phase("streaming");
         h.set_streaming(true);
-        // No header, a too-short prefix, a same-length near-miss, an empty header: all 401
-        // with the same body (the refusal gives nothing away).
-        for given in [None, Some("s3cre"), Some("s3crex"), Some("")] {
+        // No header, an empty header, a bare scheme, another scheme, the bare token, a too-short
+        // prefix, a same-length near-miss, the token with a word after it: all 401 with the same
+        // body (the refusal gives nothing away).
+        for given in [
+            None,
+            Some(""),
+            Some("Bearer"),
+            Some("Bearer "),
+            Some("s3cret"),
+            Some("Basic s3cret"),
+            Some("Bearer s3cre"),
+            Some("Bearer s3crex"),
+            Some("Bearer s3cret extra"),
+        ] {
             let (code, body, ctype) = answer_with(&h, "/status", given);
             assert_eq!(code, 401, "given {given:?}");
             assert_eq!(body, "unauthorized\n", "given {given:?}");
             assert_eq!(ctype, "text/plain", "given {given:?}");
         }
-        let (code, body, _) = answer_with(&h, "/status", Some("s3cret"));
+        let (code, body, _) = answer_with(&h, "/status", Some("Bearer s3cret"));
         assert_eq!(code, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["rules"], json!({"orders": "ok"}));
@@ -388,15 +460,51 @@ mod tests {
         assert_eq!(answer_with(&h, "/nope", None).0, 404);
     }
 
-    /// A token copied from an env file arrives padded (`s3cret\n`): the stored token is
-    /// trimmed on store so it still meets the header `header_value` delivers (which trims
-    /// its own value, as its test shows).
+    /// The shape of a valid credential: the scheme word is HTTP-case-insensitive, the credential
+    /// is trimmed (the newline a token file ends with is not part of the token), and nothing else
+    /// opens — not a prefix of the token, not another scheme, not the token without a scheme.
+    #[test]
+    fn bearer_ok_accepts_only_a_bearer_credential() {
+        let ok = |h: Option<&str>| bearer_ok(h, "s3cret");
+        assert!(ok(Some("Bearer s3cret")));
+        assert!(
+            ok(Some("bearer s3cret")),
+            "the scheme word is case-insensitive"
+        );
+        assert!(ok(Some("BEARER   s3cret  ")), "the credential is trimmed");
+        assert!(!ok(None), "no header is no credential");
+        assert!(!ok(Some("")), "an empty header");
+        assert!(!ok(Some("s3cret")), "the scheme is required");
+        assert!(!ok(Some("Basic s3cret")), "only Bearer");
+        assert!(!ok(Some("Bearer")), "a scheme without a credential");
+        assert!(!ok(Some("Bearer ")), "an empty credential");
+        assert!(
+            !ok(Some("Bearer s3cre")),
+            "a prefix of the token is not the token"
+        );
+        assert!(!ok(Some("Bearer s3cret!")));
+        assert!(!ok(Some("Bearer s3cret x")), "the credential is one word");
+        assert!(!ok(Some("s3cret Bearer")), "the scheme comes first");
+        // An empty token authorizes nothing, not even an empty credential: `token_of` never lets
+        // one reach a listener, and the gate does not rely on that.
+        assert!(!bearer_ok(Some("Bearer "), ""));
+        assert!(!bearer_ok(Some("Bearer x"), ""));
+    }
+
+    /// A token copied from an env file arrives padded (` s3cret\n`), and a header can carry its
+    /// credential padded too: the stored token is trimmed on store and `bearer_ok` trims the
+    /// credential, so the two meet on the same bytes.
     #[test]
     fn a_padded_token_still_matches_a_clean_header() {
         let h = Health::new(Some(" s3cret\n".into()));
         h.set_status(json!({}));
-        assert_eq!(answer_with(&h, "/status", Some("s3cret")).0, 200);
-        assert_eq!(answer_with(&h, "/status", Some("s3cret2")).0, 401);
+        assert_eq!(answer_with(&h, "/status", Some("Bearer s3cret")).0, 200);
+        assert_eq!(
+            answer_with(&h, "/status", Some("Bearer   s3cret \r")).0,
+            200,
+            "the file's newline and the header's padding are both trim, not content"
+        );
+        assert_eq!(answer_with(&h, "/status", Some("Bearer s3cret2")).0, 401);
     }
 
     #[test]
@@ -406,23 +514,97 @@ mod tests {
         assert_eq!(answer_with(&h, "/status", None).0, 200);
         // Without the setting the behaviour is unchanged, header or not.
         let h = Health::default();
-        assert_eq!(answer_with(&h, "/status", Some("anything")).0, 200);
+        assert_eq!(answer_with(&h, "/status", Some("Bearer anything")).0, 200);
     }
 
     #[test]
-    fn the_token_header_is_read_case_insensitively_from_both_line_endings() {
-        let buf = b"GET /status HTTP/1.1\r\nHost: x\r\nx-lazywf-token: abc \r\n\r\n";
+    fn the_authorization_header_is_read_case_insensitively_from_both_line_endings() {
+        let buf = b"GET /status HTTP/1.1\r\nHost: x\r\nauthorization: Bearer abc \r\n\r\n";
         assert_eq!(
-            header_value(buf, STATUS_TOKEN_HEADER).as_deref(),
-            Some("abc")
+            header_value(buf, AUTHORIZATION_HEADER).as_deref(),
+            Some("Bearer abc")
         );
-        let buf = b"GET /status HTTP/1.1\nHost: x\nX-Lazywf-Token:abc\n\n";
+        let buf = b"GET /status HTTP/1.1\nHost: x\nAUTHORIZATION:Bearer abc\n\n";
         assert_eq!(
-            header_value(buf, STATUS_TOKEN_HEADER).as_deref(),
-            Some("abc")
+            header_value(buf, AUTHORIZATION_HEADER).as_deref(),
+            Some("Bearer abc")
         );
         let buf = b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n";
-        assert_eq!(header_value(buf, STATUS_TOKEN_HEADER), None);
+        assert_eq!(header_value(buf, AUTHORIZATION_HEADER), None);
+        // The retired `X-Lazywf-Token` is an ordinary header now: it answers nothing.
+        let buf = b"GET /status HTTP/1.1\r\nHost: x\r\nX-Lazywf-Token: abc\r\n\r\n";
+        assert_eq!(header_value(buf, AUTHORIZATION_HEADER), None);
+    }
+
+    /// Serves `h` on a port of the kernel's choosing: the two tests below speak HTTP to it the
+    /// way a monitoring agent and a container health check do.
+    async fn serving(h: Arc<Health>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_listener(listener, h));
+        addr
+    }
+
+    /// One request over a real socket, answered as written (`"HTTP/1.1 401 ...\r\n..."`).
+    async fn get(addr: SocketAddr, request: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn code(answer: &str) -> u16 {
+        answer.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    /// The gate on the wire: every refusal is a 401 that carries `WWW-Authenticate: Bearer` and
+    /// never repeats the token — including the one that still sends the retired
+    /// `X-Lazywf-Token` header. The probes, the index and `lazywf healthcheck` need no header.
+    #[tokio::test]
+    async fn status_answers_only_to_the_bearer_token() {
+        let h = Arc::new(Health::new(Some("s3cret".into())));
+        h.set_status(json!({"rules": {"orders": "ok"}}));
+        h.set_phase("streaming");
+        h.set_streaming(true);
+        let addr = serving(h.clone()).await;
+
+        for head in [
+            "GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /status HTTP/1.1\r\nHost: x\r\nX-Lazywf-Token: s3cret\r\n\r\n",
+            "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: s3cret\r\n\r\n",
+            "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Basic s3cret\r\n\r\n",
+            "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret2\r\n\r\n",
+        ] {
+            let r = get(addr, head).await;
+            assert_eq!(code(&r), 401, "{head}");
+            assert!(r.contains("WWW-Authenticate: Bearer"), "{head}: {r}");
+            assert!(!r.contains("s3cret"), "the refusal repeats the token: {r}");
+        }
+
+        let r = get(
+            addr,
+            "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code(&r), 200, "{r}");
+        assert!(
+            r.contains("application/json") && r.contains("\"orders\""),
+            "{r}"
+        );
+
+        for path in ["/livez", "/readyz", "/"] {
+            let r = get(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")).await;
+            assert_eq!(code(&r), 200, "{path} must stay open");
+        }
+        assert_eq!(
+            code(&get(addr, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n").await),
+            404
+        );
+        assert!(
+            probe(addr, "/livez").await,
+            "lazywf healthcheck never needs the token"
+        );
     }
 }
 
