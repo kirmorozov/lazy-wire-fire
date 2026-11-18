@@ -201,4 +201,35 @@ fn unknown_status_is_retry() {
     assert_eq!(Status::from_wire(0), Status::Unspecified);
     assert_eq!(Status::from_wire(3), Status::Retry);
     assert_eq!(Status::from_wire(7), Status::Retry);
+    assert_eq!(Status::from_wire(-1), Status::Retry);
+    assert_eq!(Status::from_wire(i32::MAX), Status::Retry);
+    // The numbers the `.proto` declares are read back as their own variants.
+    assert_eq!(Status::from_wire(1), Status::Ok);
+    assert_eq!(Status::from_wire(2), Status::Refused);
+}
+
+/// The word an acknowledgement carries is the one the `.proto` declares for that number, so a
+/// rule's `expect` can say `r.body->>'$.status' = 'REFUSED'` and mean the status the server
+/// sent — the same word on both sides of the wire.
+#[test]
+fn status_names_are_the_words_the_proto_declares() {
+    assert_eq!(Status::Unspecified.wire_name(), "STATUS_UNSPECIFIED");
+    assert_eq!(Status::Ok.wire_name(), "OK");
+    assert_eq!(Status::Refused.wire_name(), "REFUSED");
+    assert_eq!(Status::Retry.wire_name(), "RETRY");
+    let pool = DescriptorPool::decode(DESCRIPTOR).expect("decodes");
+    let st = pool
+        .get_enum_by_name("lazywf.v1.Ack.Status")
+        .expect("lazywf.v1.Ack.Status");
+    for n in [0, 1, 2, 3] {
+        let declared = st
+            .values()
+            .find(|v| v.number() == n)
+            .unwrap_or_else(|| panic!("the .proto declares no status {n}"))
+            .name()
+            .to_string();
+        assert_eq!(Status::from_wire(n).wire_name(), declared, "number {n}");
+    }
+    // An invented number answers with `RETRY`'s word, the one that keeps the key.
+    assert_eq!(Status::from_wire(9).wire_name(), Status::Retry.wire_name());
 }

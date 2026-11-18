@@ -320,3 +320,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/rows_decode_tests.rs"]
+mod decode_tests;

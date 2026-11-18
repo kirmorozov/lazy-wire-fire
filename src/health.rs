@@ -607,3 +607,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/health_serve_tests.rs"]
+mod serve_tests;
