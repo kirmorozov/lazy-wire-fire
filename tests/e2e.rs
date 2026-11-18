@@ -9486,27 +9486,28 @@ async fn statement_format_dml_is_counted_and_warned() {
         },
     )
     .await;
-    assert_eq!(
-        warned.len(),
-        2,
-        "one line per table: the limit is per table and per interval, so a table that logged \
-         twice is a bug:\n{}",
-        warned.join("\n")
-    );
-    let mut tables: Vec<&str> = warned
+    // What the interval owes — one line per table per 60 s — is the unit tests' job
+    // (`the_statement_dml_lines_are_rate_limited_per_table` and its neighbours), because a live
+    // suite cannot pin it down: the tests run several engines over one process and one server, and
+    // the WARN is for every table the stream carries and not only the watched ones, so every engine
+    // alive at that moment reports the same statement from its own rate limit — and one that
+    // started between my two statements on `orders` owes the second of them, at its own position.
+    // What is provable across engines is the shape of the lines: the two tables, each named with
+    // the kind it was, and nothing of the statement in any of them.
+    let field = |line: &str, name: &str| -> &str {
+        line.split(&format!("{name}="))
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("")
+    };
+    let kinds: std::collections::BTreeSet<(&str, &str)> = warned
         .iter()
-        .map(|l| {
-            l.split("table=")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .unwrap_or("")
-        })
+        .map(|l| (field(l, "kind"), field(l, "table")))
         .collect();
-    tables.sort_unstable();
     assert_eq!(
-        tables,
-        vec!["customers", "orders"],
-        "one line per table, each naming it:\n{}",
+        kinds,
+        std::collections::BTreeSet::from([("UPDATE", "orders"), ("INSERT", "customers")]),
+        "one line per table, each naming its kind and its table, and nothing else:\n{}",
         warned.join("\n")
     );
     for line in &warned {
@@ -9515,13 +9516,13 @@ async fn statement_format_dml_is_counted_and_warned() {
             line.contains(&format!("schema={}", db.schema)),
             "the schema missing: {line}"
         );
-        let at = line
-            .split("at=")
-            .nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .unwrap_or("");
+        let at = field(line, "at");
         assert!(at.contains(':'), "the binlog position missing: {line}");
-        assert!(line.contains("count="), "the folded count missing: {line}");
+        let count = field(line, "count");
+        assert!(
+            count.parse::<u64>().is_ok_and(|c| c >= 1),
+            "the folded count missing or not a count: {line}"
+        );
         assert!(
             !line.contains("twstmark") && !line.contains("Bobmark"),
             "a row value reached the log: {line}"
@@ -9532,19 +9533,5 @@ async fn statement_format_dml_is_counted_and_warned() {
             "the statement text reached the log: {line}"
         );
     }
-    assert!(
-        warned
-            .iter()
-            .any(|l| l.contains("kind=UPDATE") && l.contains("table=orders")),
-        "no UPDATE line for orders:\n{}",
-        warned.join("\n")
-    );
-    assert!(
-        warned
-            .iter()
-            .any(|l| l.contains("kind=INSERT") && l.contains("table=customers")),
-        "no INSERT line for customers:\n{}",
-        warned.join("\n")
-    );
     inst.stop().await;
 }
