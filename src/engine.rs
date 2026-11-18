@@ -1361,6 +1361,12 @@ impl Engine {
                 } else {
                     info!(rule = %name, "rule removed");
                     self.saved.remove(&name);
+                    // A removed rule must leave no series behind: its handles are gone from
+                    // `self.rules` above, so drop its rule entry and its (rule, *) pair entries too.
+                    // A disabled rule keeps them: it can come back and reuses the same handles.
+                    if let Some(reg) = &self.metrics {
+                        reg.remove_rule(&name);
+                    }
                     if let Err(e) =
                         status::delete(&mut self.control, &self.cfg.instance, &name).await
                     {
@@ -1513,12 +1519,20 @@ impl Engine {
     fn update_rule(&mut self, name: &str, rule: Arc<Rule>) {
         let pos = self.rule_pos(&self.rules[name]);
         let settled = self.settled.clone();
+        // The target the rule pointed at before this reload: when a reload moves it to another
+        // target, the old (rule, target) pair would otherwise keep exporting beside the new one.
+        let old_target = self.rules.get(name).map(|s| s.rule.def.target.clone());
         // Re-resolve the (rule, target) handle: a reload may move the rule to another target. The
         // pair set stays bounded by the loaded config (only config names reach `pair`).
         let new_pair = self
             .metrics
             .as_ref()
             .map(|reg| reg.pair(name, &rule.def.target));
+        if let (Some(reg), Some(old)) = (&self.metrics, old_target.as_deref()) {
+            if old != rule.def.target {
+                reg.remove_pair(name, old);
+            }
+        }
         let st = self.rules.get_mut(name).expect("present");
         let changed = st.rule.fingerprint != rule.fingerprint || st.rule.error != rule.error;
         st.rule = rule.clone();

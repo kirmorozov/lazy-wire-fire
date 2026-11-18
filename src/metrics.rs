@@ -31,7 +31,10 @@
 //! ([`crate::engine`]'s `add_rule` / `update_rule`). Those names come from the rule and target
 //! tables, so the entry count is bounded by config size, which is bounded by rows. The flush and
 //! drop sites never name a rule or target to the registry — they use the pre-resolved handle —
-//! so an unknown name cannot create an entry.
+//! so an unknown name cannot create an entry. Removal keeps it exactly the loaded set and not its
+//! history: [`Metrics::remove_rule`] (called when the engine removes a rule) and
+//! [`Metrics::remove_pair`] (when a reload moves a rule to another target) drop the entries a
+//! removed or moved rule would otherwise leave exporting until the process restarts.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -217,6 +220,25 @@ impl Metrics {
                 .entry((rule.to_string(), target.to_string()))
                 .or_insert_with(|| Arc::new(PairHandle::new())),
         )
+    }
+
+    /// Drops `rule`'s `{rule}`-entry and every `(rule, *)` pair entry. Called from the config
+    /// reload when the engine removes a rule, so its series stop being exported at once instead
+    /// of lingering (and counting toward cardinality) until the process restarts. A flush already
+    /// in flight keeps incrementing the `Arc` it resolved, but the registry no longer renders it.
+    pub fn remove_rule(&self, rule: &str) {
+        let mut r = self.inner.lock().expect("metrics");
+        r.rules.remove(rule);
+        r.pairs.retain(|(rl, _), _| rl != rule);
+    }
+
+    /// Drops one `(rule, target)` pair entry, leaving the rule entry and its other pairs. Called
+    /// from the config reload when a reload moves a rule to another target: the old target's pair
+    /// is no longer produced (the new one was resolved by [`Metrics::pair`]), so only the old key
+    /// goes. Keeps the pair set exactly the loaded `{rule,target}` set, not its history.
+    pub fn remove_pair(&self, rule: &str, target: &str) {
+        let mut r = self.inner.lock().expect("metrics");
+        r.pairs.remove(&(rule.to_string(), target.to_string()));
     }
 
     /// Publishes the instance binlog lag (seconds) — the same source as the status table's lag.
@@ -659,6 +681,84 @@ mod tests {
             .observe_flush(Duration::from_millis(3));
         // ...but the hot path itself (handle mutators) never opened a "no-such-target" pair.
         assert_eq!(m.entry_count(), (3, 2));
+    }
+
+    /// The engine's removal path (`remove_rule`) must leave no series carrying the rule's name:
+    /// neither its `{rule}` entry nor any of its `{rule,target}` pairs survives it.
+    #[test]
+    fn a_removed_rule_leaves_no_series_behind() {
+        let m = Metrics::default();
+        m.rule("orders").set_pending(3);
+        m.pair("orders", "search").flush(FlushOutcome::Success);
+        m.pair("orders", "archive").flush(FlushOutcome::Success);
+        assert_eq!(m.entry_count(), (1, 2));
+        assert!(
+            m.render().contains("rule=\"orders\""),
+            "present before removal"
+        );
+        m.remove_rule("orders");
+        assert_eq!(
+            m.entry_count(),
+            (0, 0),
+            "the rule entry and both its pairs go"
+        );
+        let t = m.render();
+        assert!(!t.contains("orders"), "removed rule still renders:\n{t}");
+        // Idempotent: a second removal (a reload seen twice) cannot panic or underflow.
+        m.remove_rule("orders");
+        assert_eq!(m.entry_count(), (0, 0));
+    }
+
+    /// A rename, as the reload does it: drop the old entry, resolve the new one. Only the new name
+    /// exports afterwards.
+    #[test]
+    fn a_renamed_rule_exports_only_the_new_name() {
+        let m = Metrics::default();
+        m.rule("orders-old").set_pending(3);
+        m.pair("orders-old", "search").flush(FlushOutcome::Success);
+        // The reload that renames: the old rule is no longer in the compiled set, the new one is.
+        m.remove_rule("orders-old");
+        m.rule("orders-new").set_pending(3);
+        m.pair("orders-new", "search").flush(FlushOutcome::Success);
+        let t = m.render();
+        assert!(t.contains("rule=\"orders-new\""), "new name missing:\n{t}");
+        assert!(!t.contains("orders-old"), "old name still present:\n{t}");
+        assert_eq!(m.entry_count(), (1, 1));
+    }
+
+    /// A move to another target (`remove_pair`): only the old `(rule, target)` pair leaves; the
+    /// rule entry, its other pairs, and every other rule are untouched.
+    #[test]
+    fn moving_a_rule_drops_only_the_old_pair() {
+        let m = Metrics::default();
+        m.rule("orders").set_pending(1);
+        m.rule("items").set_pending(1);
+        m.pair("orders", "search").flush(FlushOutcome::Success);
+        m.pair("orders", "archive").flush(FlushOutcome::Success);
+        m.pair("items", "index").flush(FlushOutcome::Success);
+        assert_eq!(m.entry_count(), (2, 3));
+        m.remove_pair("orders", "search");
+        assert_eq!(m.entry_count(), (2, 2), "only the old target's pair goes");
+        let t = m.render();
+        assert!(
+            !t.contains("rule=\"orders\",target=\"search\""),
+            "old pair still renders:\n{t}"
+        );
+        assert!(
+            t.contains("rule=\"orders\",target=\"archive\""),
+            "the rule's other pair must survive:\n{t}"
+        );
+        assert!(
+            t.contains("rule=\"orders\""),
+            "the rule entry must survive a move:\n{t}"
+        );
+        assert!(
+            t.contains("rule=\"items\",target=\"index\""),
+            "another rule untouched:\n{t}"
+        );
+        // Removing a pair the rule no longer holds is a no-op.
+        m.remove_pair("orders", "search");
+        assert_eq!(m.entry_count(), (2, 2));
     }
 
     #[test]
