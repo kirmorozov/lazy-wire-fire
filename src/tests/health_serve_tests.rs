@@ -1,14 +1,29 @@
 //! The health endpoint on the wire: what `serve` and `handle` actually put on the socket (the
 //! status line, the headers, the exact body), `HEAD` without a body, `405` for anything but
-//! GET and HEAD, and what `probe` (the container health check) accepts as live.
+//! GET and HEAD, the bearer challenge a refused `/status` owes, and what `probe` (the container
+//! health check) accepts as live. The answers themselves — which status for which path, what
+//! `bearer_ok` accepts — are the module's own tests; these check the bytes around them.
 
 use super::*;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// The head `handle` writes for one answer, built from what the body is meant to be.
+/// The challenge `handle` adds to a `401`: the gate is a bearer one, so the refusal names it.
+const CHALLENGE: &str = "WWW-Authenticate: Bearer\r\n";
+
+/// The head `handle` writes for one answer, built from what the body is meant to be: the status
+/// line, the content type, `extra` (the challenge, on a `401` only), the length of exactly this
+/// body, and the close.
+fn resp_head_with(status: u16, reason: &str, ctype: &str, extra: &str, body: &[u8]) -> String {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+}
+
+/// The head of an answer that carries no challenge: every answer but the `401`.
 fn resp_head(status: u16, reason: &str, ctype: &str, body: &[u8]) -> String {
-    format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+    resp_head_with(status, reason, ctype, "", body)
 }
 
 /// Live, streaming, ready, with a status document.
@@ -25,22 +40,43 @@ fn ready(token: Option<&str>) -> Arc<Health> {
 const STATUS_BODY: &str = "{\n  \"rules\": {\n    \"orders\": \"ok\"\n  },\n  \
                            \"phase\": \"streaming\",\n  \"streaming\": true\n}\n";
 const INDEX_BODY: &str = "lazywf health endpoint: /livez /readyz /status\n";
+const OK: &[u8] = b"ok\n";
+const NOT_FOUND: &[u8] = b"not found\n";
+const UNAUTHORIZED: &[u8] = b"unauthorized\n";
+const NOT_ALLOWED: &[u8] = b"method not allowed\n";
 
-/// Serves one endpoint on a free loopback port and returns its address and its task; the port
-/// comes from a listener that is dropped at once so the endpoint under test can take it, and
-/// the connect loop waits for that bind.
+/// Serves one endpoint over [`serve_listener`] on a port of the kernel's choosing — the accept
+/// loop is the same one `serve` runs once it has bound, and this way the test never races for a
+/// number. Returns its address and its task.
 async fn endpoint(h: Arc<Health>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let spare = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
-    let addr = spare.local_addr().expect("its address");
-    drop(spare);
-    let task = tokio::spawn(serve(addr, h));
-    for _ in 0..200 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return (addr, task);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a free port");
+    let addr = listener.local_addr().expect("its address");
+    (addr, tokio::spawn(serve_listener(listener, h)))
+}
+
+/// The same through the public [`serve`], which binds the address itself: the entry point the
+/// process actually starts. The number comes from a listener dropped at once, so a competitor
+/// that takes it in the gap leaves `serve` in its retry sleep — then the try is abandoned and
+/// another number taken.
+async fn served(h: Arc<Health>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    for _ in 0..5 {
+        let spare = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port");
+        let addr = spare.local_addr().expect("its address");
+        drop(spare);
+        let task = tokio::spawn(serve(addr, h.clone()));
+        for _ in 0..200 {
+            if TcpStream::connect(addr).await.is_ok() {
+                return (addr, task);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        task.abort();
     }
-    panic!("the health endpoint never listened on {addr}");
+    panic!("the health endpoint never listened on a port of its own")
 }
 
 /// Sends `request` as written and returns the whole answer.
@@ -66,6 +102,18 @@ fn get(path: &str) -> Vec<u8> {
     format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").into_bytes()
 }
 
+/// A request of `method` with the credential `authorization` (sent verbatim, so a missing or
+/// oddly-cased header is what it says it is).
+fn with_authorization(method: &str, path: &str, authorization: Option<&str>) -> Vec<u8> {
+    match authorization {
+        Some(value) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\n{AUTHORIZATION_HEADER}: {value}\r\n\r\n"
+        )
+        .into_bytes(),
+        None => get(path),
+    }
+}
+
 /// The probes answer plain text, with the length the body really has, and no keep-alive.
 #[tokio::test]
 async fn the_probes_answer_with_exact_bytes() {
@@ -75,8 +123,8 @@ async fn the_probes_answer_with_exact_bytes() {
         assert_eq!(
             (head.as_str(), body.as_slice()),
             (
-                resp_head(200, "OK", "text/plain", b"ok\n").as_str(),
-                b"ok\n".as_slice()
+                resp_head(200, "OK", "text/plain", OK).as_str(),
+                OK,
             ),
             "{path}"
         );
@@ -115,8 +163,8 @@ async fn an_unknown_path_is_not_found() {
         assert_eq!(
             (head.as_str(), body.as_slice()),
             (
-                resp_head(404, "Not Found", "text/plain", b"not found\n").as_str(),
-                b"not found\n".as_slice()
+                resp_head(404, "Not Found", "text/plain", NOT_FOUND).as_str(),
+                NOT_FOUND,
             ),
             "{path}"
         );
@@ -148,28 +196,39 @@ async fn head_sends_the_head_and_no_body() {
     }
     // A `HEAD` for an unknown path is a 404 head with no body.
     let (head, body) = request(addr, b"HEAD /nope HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    assert_eq!(head, resp_head(404, "Not Found", "text/plain", NOT_FOUND));
+    assert!(body.is_empty());
+    // A `HEAD` refused by the token gate keeps the challenge too, still with no body.
+    let (gated, gated_task) = endpoint(ready(Some("s3cret"))).await;
+    let (head, body) = request(
+        gated,
+        &with_authorization("HEAD", "/status", Some("Bearer nope")),
+    )
+    .await;
     assert_eq!(
         head,
-        resp_head(404, "Not Found", "text/plain", b"not found\n")
+        resp_head_with(
+            401,
+            "Unauthorized",
+            "text/plain",
+            CHALLENGE,
+            UNAUTHORIZED
+        )
     );
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "a HEAD sent a body");
     task.abort();
+    gated_task.abort();
 }
 
 /// Only `GET` and `HEAD` are answered; everything else — and a request line with no method at
 /// all — is the same `405`. The method is not case-folded, and the second word is the path
-/// whatever it says.
+/// whatever it says. A `405` is not the token gate, so it carries no challenge.
 #[tokio::test]
 async fn anything_but_get_and_head_is_refused() {
     let (addr, task) = endpoint(ready(None)).await;
     let refused = (
-        resp_head(
-            405,
-            "Method Not Allowed",
-            "text/plain",
-            b"method not allowed\n",
-        ),
-        b"method not allowed\n".to_vec(),
+        resp_head(405, "Method Not Allowed", "text/plain", NOT_ALLOWED),
+        NOT_ALLOWED.to_vec(),
     );
     for c in [
         "POST /livez HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi",
@@ -194,42 +253,60 @@ async fn anything_but_get_and_head_is_refused() {
     assert_eq!(
         request(addr, b"GET nonsense HTTP/1.1\r\n\r\n").await,
         (
-            resp_head(404, "Not Found", "text/plain", b"not found\n"),
-            b"not found\n".to_vec()
+            resp_head(404, "Not Found", "text/plain", NOT_FOUND),
+            NOT_FOUND.to_vec()
         )
     );
+    // A refused method asks for the token and is refused for the method anyway: the gate is
+    // never reached, so no challenge comes back.
+    let (gated, gated_task) = endpoint(ready(Some("s3cret"))).await;
+    assert_eq!(
+        request(gated, b"POST /status HTTP/1.1\r\nHost: x\r\n\r\n").await,
+        refused,
+        "a 405 is not the gate"
+    );
     task.abort();
+    gated_task.abort();
 }
 
-/// The `/status` token as the network presents it: no header, a prefix, a same-length near
-/// miss and an empty header all answer the one `401`; the header is read case-insensitively and
-/// trimmed; the probes never ask for it.
+/// The `/status` gate as the network presents it: everything but `Bearer <token>` in the
+/// `Authorization` header answers the one `401`, with the bearer challenge on it; the header is
+/// read case-insensitively and trimmed; another header never opens it; the probes never ask.
 #[tokio::test]
-async fn the_status_token_is_checked_on_the_wire() {
+async fn the_status_gate_is_checked_on_the_wire() {
     let (addr, task) = endpoint(ready(Some("s3cret"))).await;
     let refused = (
-        resp_head(401, "Unauthorized", "text/plain", b"unauthorized\n"),
-        b"unauthorized\n".to_vec(),
+        resp_head_with(401, "Unauthorized", "text/plain", CHALLENGE, UNAUTHORIZED),
+        UNAUTHORIZED.to_vec(),
     );
     assert_eq!(request(addr, &get("/status")).await, refused);
-    for token in ["s3cre", "s3crex", ""] {
+    for given in [
+        "s3cret",          // the scheme is required
+        "Bearer",          // and so is the credential
+        "Bearer ",         // an empty credential
+        "Bearer s3cre",    // a prefix of the token
+        "Bearer s3crex",   // a same-length near miss
+        "Bearer s3cret!",  // one byte more
+        "Basic s3cret",    // another scheme
+        "",                // an empty header
+    ] {
         assert_eq!(
             request(
                 addr,
-                format!(
-                    "GET /status HTTP/1.1\r\nHost: x\r\n{STATUS_TOKEN_HEADER}: {token}\r\n\r\n"
-                )
-                .as_bytes(),
+                format!("GET /status HTTP/1.1\r\nHost: x\r\n{AUTHORIZATION_HEADER}: {given}\r\n\r\n")
+                    .as_bytes(),
             )
             .await,
             refused,
-            "{token:?}"
+            "{given:?}"
         );
     }
+    // The header name is HTTP-case-insensitive, the scheme word too, and the padding around the
+    // credential is not part of the secret.
     for (name, value) in [
-        (STATUS_TOKEN_HEADER, "s3cret"),
-        ("x-lazywf-token", "  s3cret  "),
-        ("X-LAZYWF-TOKEN", "s3cret"),
+        (AUTHORIZATION_HEADER, "Bearer s3cret"),
+        ("authorization", "bearer s3cret"),
+        ("AUTHORIZATION", "Bearer   s3cret  "),
     ] {
         let (head, body) = request(
             addr,
@@ -243,16 +320,17 @@ async fn the_status_token_is_checked_on_the_wire() {
         );
         assert_eq!(String::from_utf8(body).expect("utf-8"), STATUS_BODY);
     }
-    // A header of another name is not the token.
+    // A header of another name is not the credential, whatever it holds.
     assert_eq!(
         request(
             addr,
-            b"GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: s3cret\r\n\r\n"
+            b"GET /status HTTP/1.1\r\nHost: x\r\nX-Lazywf-Token: Bearer s3cret\r\n\r\n"
         )
         .await,
-        refused
+        refused,
+        "only Authorization opens the gate"
     );
-    // The probes and the index answer without it, and a token on a probe changes nothing.
+    // The probes and the index answer without it, and a credential on a probe changes nothing.
     for (path, want) in [
         ("/livez", "HTTP/1.1 200 OK\r\n"),
         ("/readyz", "HTTP/1.1 200 OK\r\n"),
@@ -261,7 +339,7 @@ async fn the_status_token_is_checked_on_the_wire() {
     ] {
         let (head, _) = request(
             addr,
-            format!("GET {path} HTTP/1.1\r\nHost: x\r\n{STATUS_TOKEN_HEADER}: whatever\r\n\r\n")
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\n{AUTHORIZATION_HEADER}: whatever\r\n\r\n")
                 .as_bytes(),
         )
         .await;
@@ -279,14 +357,15 @@ async fn a_request_head_of_bare_newlines_is_read() {
     let (head, body) = request(addr, b"GET /livez HTTP/1.1\nHost: x\n\n").await;
     assert_eq!(
         (head.as_str(), body.as_slice()),
-        (
-            resp_head(200, "OK", "text/plain", b"ok\n").as_str(),
-            b"ok\n".as_slice()
-        )
+        (resp_head(200, "OK", "text/plain", OK).as_str(), OK)
     );
-    // With the token set, the same bare-`\n` head carries its header.
+    // With the token set, the same bare-`\n` head carries its credential.
     let (gated, gated_task) = endpoint(ready(Some("s3cret"))).await;
-    let (head, body) = request(gated, b"GET /status HTTP/1.1\nX-Lazywf-Token: s3cret\n\n").await;
+    let (head, body) = request(
+        gated,
+        b"GET /status HTTP/1.1\nAuthorization: Bearer s3cret\n\n",
+    )
+    .await;
     assert_eq!(
         head,
         resp_head(200, "OK", "application/json", STATUS_BODY.as_bytes())
@@ -294,7 +373,7 @@ async fn a_request_head_of_bare_newlines_is_read() {
     assert_eq!(body, STATUS_BODY.as_bytes());
     // Too big to be a request head: dropped without an answer.
     let mut big = b"GET /livez HTTP/1.1\r\nX-Pad: ".to_vec();
-    big.extend(std::iter::repeat(b'x').take(9000));
+    big.extend(std::iter::repeat_n(b'x', 9000));
     assert!(
         ask(addr, &big).await.is_empty(),
         "no answer to an oversized head"
@@ -305,12 +384,14 @@ async fn a_request_head_of_bare_newlines_is_read() {
 
 /// `probe` is what `lazywf healthcheck` asks: only a `200` on that path is alive. A stalled
 /// loop, an unknown path, a token-gated `/status` and a port nobody listens on are all not.
+/// Served through [`serve`] itself, the way the process runs it.
 #[tokio::test]
 async fn probe_accepts_only_a_live_200() {
     let h = ready(None);
-    let (addr, task) = endpoint(h.clone()).await;
+    let (addr, task) = served(h.clone()).await;
     assert!(probe(addr, "/livez").await, "a live loop");
     assert!(probe(addr, "/readyz").await, "a streaming instance");
+    assert!(probe(addr, "/").await, "the index answers 200 too");
 
     // Stalled: both probes answer 503, so the container is not alive.
     h.with(|i| {
