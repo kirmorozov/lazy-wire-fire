@@ -392,3 +392,46 @@ async fn a_reference_endpoint_is_for_the_http_kinds_only() {
         );
     }
 }
+
+/// An empty credential is a credential, not a missing one: it loads (the model tests cover that,
+/// under the same provisional ruling) and it goes on the wire as the empty value it names, the
+/// same bytes a literal empty password produced before 0.3.0. Only a field absent from `vars` is
+/// the missing-field error.
+#[tokio::test]
+async fn an_empty_credential_goes_on_the_wire_as_empty() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    let (addr, got) = serve(200, "ok").await;
+    for (kind, vars, header) in [
+        (
+            "http.basic",
+            r#"{"username":"u","password":""}"#,
+            // base64("u:") — an empty password, not a missing one.
+            "Authorization: Basic dTo=\r\n",
+        ),
+        (
+            "http.bearer",
+            r#"{"token":""}"#,
+            "Authorization: Bearer \r\n",
+        ),
+        (
+            "http.header",
+            r#"{"header":"X-Api-Key","value":""}"#,
+            "X-Api-Key: \r\n",
+        ),
+    ] {
+        let t = load(kind, &format!("http://{addr}/hook"), vars, "").unwrap();
+        t.send(0, "POST /hook HTTP/1.1\n\nx").await.unwrap();
+        let sent = got.lock().unwrap().remove(0);
+        assert!(
+            sent.starts_with("POST /hook HTTP/1.1\r\n"),
+            "{kind}: {sent}"
+        );
+        assert!(
+            sent.contains(header),
+            "{kind}: the empty credential did not reach the wire: {sent}"
+        );
+        // Once, exactly: nothing else claims that header.
+        assert_eq!(sent.matches(header).count(), 1, "{kind}: {sent}");
+        assert!(sent.ends_with("\r\n\r\nx"), "{kind}: {sent}");
+    }
+}

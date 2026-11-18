@@ -262,3 +262,54 @@ fn what_identifies_a_credential_is_not_one() {
         "{e}"
     );
 }
+
+/// An empty credential carries no secret, so — unlike every other literal — it is not refused:
+/// basic auth with an empty password (and an empty bearer token or header value) loads. A
+/// whitespace value is a real (whitespace) secret and is still refused as a literal, with the
+/// same message as any other literal.
+///
+/// PROVISIONAL (the owner's ruling of 2026-11-18): this pins the behaviour as it is today, it does
+/// not argue for it. Allowing the empty literal may be rejected later; if it is, the three `is_ok`
+/// asserts become refusal asserts with the whitespace message and `need` in `TargetDef::from_row`
+/// goes back to `var(&vars, k).is_some()`.
+#[test]
+fn an_empty_credential_literal_is_accepted() {
+    for (kind, endpoint, base, field) in [
+        (
+            "http.basic",
+            "https://api.example.test:8443/hook",
+            r#"{"username":"u","password":"env:LWF_TEST_PW"}"#,
+            "password",
+        ),
+        (
+            "http.bearer",
+            "https://api.example.test:8443/hook",
+            r#"{"token":"env:LWF_TEST_PW"}"#,
+            "token",
+        ),
+        (
+            "http.header",
+            "https://api.example.test:8443/hook",
+            r#"{"header":"X-Api-Key","value":"env:LWF_TEST_PW"}"#,
+            "value",
+        ),
+    ] {
+        assert!(
+            TargetDef::from_row(&raw(kind, endpoint, &with(base, field, ""))).is_ok(),
+            "{kind}: an empty `{field}` was refused"
+        );
+        // Whitespace is a secret value, not an empty one: still refused as a literal.
+        let e = format!(
+            "{:#}",
+            TargetDef::from_row(&raw(kind, endpoint, &with(base, field, " ")))
+                .err()
+                .unwrap_or_else(|| panic!("{kind}: a whitespace `{field}` was accepted"))
+        );
+        assert!(
+            e.contains(&format!("`vars.{field}`"))
+                && e.contains("must be a reference")
+                && e.contains("env:NAME"),
+            "{kind} whitespace {field}: {e}"
+        );
+    }
+}
