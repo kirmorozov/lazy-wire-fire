@@ -63,22 +63,20 @@ servers-down:
 E2E_DSN ?= mysql://root:root@127.0.0.1:34184
 E2E_DSN_MARIADB ?= mysql://root:root@127.0.0.1:34111
 E2E_THREADS ?= 4
-# The target services of the default profile a run talks to besides the server under test (the same
-# set tmp/e2e-shared.sh calls TARGETS, which runs this suite per run from a worker's own binary).
+# The target services of the default profile a run talks to besides the server under test.
 E2E_TARGETS := redis valkey postgres s3
 
-# Owner rule (2026-11-16, and tmp/e2e-shared.sh): a test server is a composition for the run, not a
-# container that stays up for days. Every target below brings up exactly the services its run talks
-# to and removes them again with `rm -sfv` per service, so a run leaves no container and no volume
-# behind. Never `down`: `down` deletes the project network, and with `-v` the named volumes, so the
-# next run has to create both again instead of finding them as this file declares them — dropping
-# them is `make servers-down`'s job, where an operator asks for it. Nothing hangs on the network
-# either: lazywf reaches every service through its published 127.0.0.1 port, and lazyview's toxiproxy
-# (lvs-toxiproxy) is on docker's own bridge, not on lazywf-test_default (checked on the host: that
-# network has no containers, and no test resolves a service name).
-# These targets own the compose project `lazywf-test` for the length of a run, so on this host they
-# run ONE AT A TIME: two `make test-e2e` runs side by side tear down each other's servers. Take the
-# same heavy-suite lock tmp/e2e-shared.sh takes (lazyview's tmp/out/heavy-suite.lock) around a run.
+# Owner rule (2026-11-16): a test server is a composition for the run, not a container that stays up
+# for days. `test-e2e`, `test-e2e-all`, `test-e2e-search`, `test-e2e-queues`, `test-e2e-pgsrc` and
+# `test-matrix` (`test-prerelease` delegates to it) each bring up exactly the services their own run
+# talks to and remove them again with `rm -sfv` per service, so a run leaves no container behind;
+# `test-chaos` brings nothing up and is not one of them. `rm -sfv` names this run's services and
+# leaves the rest alone, where `down` would take the whole `lazywf-test` project away — including the
+# standing `make servers` set another session may be using — so dropping everything stays
+# `make servers-down`'s job, where an operator asks for it.
+# These targets own the compose project `lazywf-test` for the length of a run, so on a shared host run
+# them ONE AT A TIME: two runs side by side tear down each other's servers. Take whatever host-wide
+# lock your harness already uses for docker around a run.
 # The removal sits in a trap on EXIT, with INT and TERM made to exit through it, so a run that fails
 # or is killed cleans up too. KEEP_SERVERS=1 leaves the services to the caller: CI pre-starts its
 # services, reads `docker compose logs` after a failed run, and tears the set down itself.
@@ -185,8 +183,8 @@ test-e2e-pgsrc:
 	LAZYWF_TEST_PG=1 LAZYWF_TEST_PG_DSN="$(E2E_PG_DSN)" $(CARGO) test --test e2e pg_ -- --test-threads=$(E2E_THREADS)
 
 # The integration tests on every other required line (README "Supported servers"), one server
-# at a time (service:port; the target services of `make servers` come up with it). MariaDB 10.6 goes
-# after 2026-12-31, when RDS for MariaDB 10.6 standard support ends.
+# at a time (service:port; the target services of $(E2E_TARGETS) come up with the run and go with it).
+# MariaDB 10.6 goes after 2026-12-31, when RDS for MariaDB 10.6 standard support ends.
 # A server that fails its run is removed too: the test line's own `||` does it before exiting, and
 # the trap covers a failure of the `up` itself (it removes every server of $(MATRIX), which compose
 # answers with an empty removal for the ones already gone).
