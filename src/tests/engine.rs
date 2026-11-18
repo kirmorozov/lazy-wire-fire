@@ -311,15 +311,19 @@ fn queries_hold_their_position_and_ride_the_flush() {
         sql: "SELECT 1".into(),
         params: vec![],
     };
-    b.add_query(q.clone(), &p(20));
+    b.add_query(q.id(), q.clone(), &p(20));
     assert_eq!(b.pending_keys(), 0, "a query is not a key");
     assert!(!b.is_empty(), "but it holds the position like one");
     assert_eq!(b.core.pinned(), Some(&p(20)));
     assert!(b.core.begin());
     let taken = b.core.take(0, usize::MAX).expect("the item");
     assert_eq!(taken.items.len(), 1);
-    let out = b.take_query_payloads(&taken.items);
-    assert_eq!(out, vec![q.clone()], "the payload rides the flush");
+    let out = b.take_query_payloads(taken.items);
+    assert_eq!(
+        out,
+        vec![("1:SELECT 1:[]".to_string(), q.clone())],
+        "the payload rides the flush, keyed by the same id"
+    );
     assert!(b.queries.is_empty());
     b.core.done(Vec::new(), Vec::new());
     assert!(
@@ -327,7 +331,7 @@ fn queries_hold_their_position_and_ride_the_flush() {
         "a flushed query releases the floor"
     );
     // A failed flush puts payload and item back (the `keep_queries` retry).
-    b.put_back_queries(vec![q]);
+    b.put_back_queries(vec![("1:SELECT 1:[]".to_string(), q)]);
     b.core.item(key::Item::User("1:SELECT 1:[]".into()), &p(20));
     assert!(!b.is_empty());
     assert_eq!(b.core.pinned(), Some(&p(20)));

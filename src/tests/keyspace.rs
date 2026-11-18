@@ -331,39 +331,6 @@ fn a_text_set_holds_the_keys_as_the_core_holds_them() {
     assert_eq!(got, vec!["item_1".to_string(), "sku-x".to_string()]);
 }
 
-/// A counting allocator: while `ON`, every live heap byte is tallied (a `#[test]`-only
-/// global allocator; the shipping binary is unaffected).
-mod measure {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-
-    static LIVE: AtomicIsize = AtomicIsize::new(0);
-    pub static ON: AtomicBool = AtomicBool::new(false);
-
-    pub fn live() -> isize {
-        LIVE.load(Ordering::Relaxed)
-    }
-
-    struct Counting;
-
-    // SAFETY: delegates every allocation to `System` and only tallies sizes.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let p = System.alloc(layout);
-            if ON.load(Ordering::Relaxed) && !p.is_null() {
-                LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-            }
-            p
-        }
-
-        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-            if ON.load(Ordering::Relaxed) {
-                LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-            }
-            System.dealloc(p, layout);
-        }
-    }
-
-    #[global_allocator]
-    static COUNTING: Counting = Counting;
-}
+// The counting allocator lives in the dedicated `crate::alloc_measure` module; the tests
+// above use it as `measure`.
+use crate::alloc_measure as measure;
