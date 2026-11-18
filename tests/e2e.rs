@@ -1768,6 +1768,494 @@ async fn online_schema_change_keeps_continuity() {
     inst.stop().await;
 }
 
+/// What the binlog really carries for `table` and what lazywf's layout makes of it: the table
+/// map's column count and optional metadata names (only with `binlog_row_metadata=FULL`), the
+/// number of values in each row image, and the named object the engine's own [`Catalog`] would
+/// name them with. `writes` runs between reading the start position and connecting the reader, so
+/// the events it produces are the ones read back — no timing involved. Every line is one
+/// `println!` of the test output, so the servers of the matrix can be compared from the job log.
+async fn wire_facts<F, Fut>(db: &Db, table: &str, events: usize, writes: F) -> Vec<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use lazy_wire_fire::rows::Catalog;
+    use lazy_wire_fire::source::Item;
+
+    let mut out = Vec::new();
+    let mut control = db.conn().await;
+    let info = lazy_wire_fire::binlog::server_info(&mut control)
+        .await
+        .unwrap();
+    let meta: Option<String> = control
+        .query_first("SELECT @@GLOBAL.binlog_row_metadata")
+        .await
+        .unwrap();
+    let from = lazy_wire_fire::binlog::current_position(&mut control)
+        .await
+        .unwrap();
+    let listed: Vec<(String,)> = control
+        .exec(
+            "SELECT CAST(COLUMN_NAME AS CHAR) FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            (db.schema.clone(), table.to_string()),
+        )
+        .await
+        .unwrap();
+    control.disconnect().await.ok();
+    let listed = listed
+        .into_iter()
+        .map(|(n,)| n)
+        .collect::<Vec<_>>()
+        .join(",");
+    out.push(format!(
+        "{:?} {} binlog_row_metadata={} information_schema=[{}]",
+        info.flavor,
+        info.version,
+        meta.as_deref().unwrap_or("?"),
+        listed,
+    ));
+
+    // The start position is the one read above, so the writes happen after it and their events
+    // are streamed back from the file: no timing involved.
+    let mut reader = lazy_wire_fire::binlog::BinlogReader::connect(
+        lazy_wire_fire::binlog::replica_opts(&db.dsn).unwrap(),
+        test_server_id(),
+        info.flavor,
+        &from,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    writes().await;
+    let mut catalog = Catalog::default();
+    let until = std::time::Instant::now() + deadline(Duration::from_secs(30));
+    let mut seen = 0;
+    while seen < events && std::time::Instant::now() < until {
+        let item = match tokio::time::timeout(Duration::from_secs(10), reader.next()).await {
+            Ok(Ok(Some(i))) => i,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("reading the binlog of `{table}`: {e:#}"),
+            Err(_) => break, // an idle stretch: the events we want were committed already
+        };
+        let (kind, table_id, event) = match item {
+            Item::Rows {
+                table_id,
+                kind,
+                event,
+            } => (kind, table_id, event),
+            _ => continue,
+        };
+        let Some(tme) = reader.table_map(table_id) else {
+            continue;
+        };
+        if tme.database_name().as_ref() != db.schema || tme.table_name().as_ref() != table {
+            continue; // another session's table on this shared server
+        }
+        seen += 1;
+        let rows = reader.rows(table_id, &event).unwrap();
+        let (before, after) = rows[0].clone();
+        let image = after.as_ref().or(before.as_ref());
+        let names = lazy_wire_fire::rows::table_map_names(tme);
+        let mut control = db.conn().await;
+        let layout = catalog
+            .layout(&mut control, &db.schema, table, Some(tme))
+            .await;
+        control.disconnect().await.ok();
+        out.push(format!(
+            "{kind:?}: table map {} columns, metadata names [{}], row image {} value(s), \
+             layout {}",
+            tme.columns_count(),
+            names.unwrap_or_default().join(","),
+            image.map(|r| r.len()).unwrap_or(0),
+            match &layout {
+                Ok(l) => format!("[{}]", l.names.join(",")),
+                Err(e) => format!("ERROR {e:#}"),
+            },
+        ));
+        if let Ok(l) = &layout {
+            for (what, row) in [("before", &before), ("after", &after)] {
+                if let Some(r) = row {
+                    out.push(format!("{kind:?} {what}: {}", l.object(r)));
+                }
+            }
+        }
+    }
+    reader.close().await.unwrap();
+    out
+}
+
+/// A `VIRTUAL` generated column is stored nowhere, and MariaDB 11.4+ leaves it out of the UPDATE
+/// and DELETE row images while the table map and `information_schema` still list it (the vendored
+/// reader learning to decode those images is lazyview #7). lazywf names an image's values by
+/// position, so on such a server the VIRTUAL column and every column after it would be read as
+/// their neighbour's value — a key built from the wrong value, with nothing logged. So:
+///
+/// * on a server whose images carry the column (MariaDB before 11.4, MySQL, Percona — which of the
+///   two worlds a run is in comes from the printed facts, not from the version), the rule reads
+///   the value it asked for and marks its keys;
+/// * on a server that leaves it out, the trigger that would read it is refused, with the reason on
+///   `/status`, and marks nothing at all;
+/// * a rule that reads only columns standing BEFORE the first VIRTUAL column is allowed on every
+///   server, because those values are in the image everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn virtual_generated_column_between_real_columns() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "vcol").await;
+    db.exec(
+        "CREATE TABLE items (id INT PRIMARY KEY, price INT, price_x2 INT AS (price * 2) VIRTUAL, \
+         name VARCHAR(50), stock INT)",
+    )
+    .await;
+    // The same shape with the VIRTUAL column last: everything a rule reads stands before it.
+    db.exec(
+        "CREATE TABLE kept (id INT PRIMARY KEY, name VARCHAR(50), stock INT, \
+         note VARCHAR(60) AS (CONCAT(name, '/', stock)) VIRTUAL)",
+    )
+    .await;
+    // And the same shape read through a Handlebars key, which takes the whole row at once and so
+    // cannot be checked column by column.
+    db.exec(
+        "CREATE TABLE wide (id INT PRIMARY KEY, name VARCHAR(50), stock INT, \
+         note VARCHAR(60) AS (CONCAT(name, '/', stock)) VIRTUAL)",
+    )
+    .await;
+    tables(&db).await;
+
+    /// The keys of every action the mock has seen, from the header the template renders.
+    fn keys(m: &Mock) -> std::collections::BTreeSet<String> {
+        m.requests()
+            .iter()
+            .filter_map(|r| r.header("x-keys"))
+            .flat_map(|k| k.split('|').map(str::to_string))
+            .collect()
+    }
+    async fn keys_until(
+        m: &Mock,
+        want: &[&str],
+        what: &'static str,
+    ) -> std::collections::BTreeSet<String> {
+        let wanted: std::collections::BTreeSet<String> =
+            want.iter().map(|k| k.to_string()).collect();
+        wait_for(Duration::from_secs(15), what, || async {
+            let got = keys(m);
+            wanted.iter().all(|k| got.contains(k)).then_some(got)
+        })
+        .await
+    }
+
+    // The wire first: what the server writes and what the engine's catalog would name it with.
+    // Row 1 belongs to the probe; the rules below work on rows 2 and 3.
+    let facts = wire_facts(&db, "items", 3, || async {
+        db.exec("INSERT INTO items (id, price, name, stock) VALUES (1, 5, 'thing', 3)")
+            .await;
+        db.exec("UPDATE items SET stock = 9 WHERE id = 1").await;
+        db.exec("DELETE FROM items WHERE id = 1").await;
+    })
+    .await;
+    for line in &facts {
+        println!("vcol {line}");
+    }
+    let kept_facts = wire_facts(&db, "kept", 3, || async {
+        db.exec("INSERT INTO kept (id, name, stock) VALUES (1, 'probe', 1)")
+            .await;
+        db.exec("UPDATE kept SET stock = 2 WHERE id = 1").await;
+        db.exec("DELETE FROM kept WHERE id = 1").await;
+    })
+    .await;
+    for line in &kept_facts {
+        println!("vcol {line}");
+    }
+
+    let images: Vec<&String> = facts.iter().filter(|l| l.contains("value(s)")).collect();
+    assert_eq!(
+        images.len(),
+        3,
+        "the wire facts, one line per row event:\n{}",
+        facts.join("\n")
+    );
+    // Whatever an image carries, the table map names all five columns and the layout the engine
+    // reads is the table `information_schema` describes: that is why the count check below cannot
+    // see a short image, and why the reads have to be refused by name instead.
+    for line in &images {
+        for want in [
+            "table map 5 columns",
+            "layout [id,price,price_x2,name,stock]",
+        ] {
+            assert!(
+                line.contains(want),
+                "no `{want}` in {line}\nthe wire facts:\n{}",
+                facts.join("\n")
+            );
+        }
+    }
+    // An INSERT image carries the VIRTUAL column on every server; only UPDATE and DELETE run short.
+    assert!(
+        images
+            .iter()
+            .any(|l| l.starts_with("Insert") && l.contains("row image 5 value(s)")),
+        "the insert image does not carry the VIRTUAL column:\n{}",
+        facts.join("\n")
+    );
+    // Which of the two worlds this server is in, from its own wire rather than its version string.
+    let short = images
+        .iter()
+        .any(|l| l.starts_with("Update") && !l.contains("row image 5 value(s)"));
+    if short {
+        // The two symptoms the refusal answers: a value the image ran out of, and a real column's
+        // value sitting on the VIRTUAL column's name.
+        for want in [r#""price_x2":"thing""#, r#""stock":null"#] {
+            assert!(
+                facts
+                    .iter()
+                    .any(|l| l.contains("Update after") && l.contains(want)),
+                "the update's after-image does not show {want}\nthe wire facts:\n{}",
+                facts.join("\n")
+            );
+        }
+    } else {
+        for line in &images {
+            assert!(
+                line.contains("row image 5 value(s)"),
+                "this server writes the VIRTUAL column, so no image is short: {line}\n{}",
+                facts.join("\n")
+            );
+        }
+        // And the names the catalog gives the values are their own: the VIRTUAL column holds what the
+        // server computed, the real columns around it hold what was written.
+        for want in [
+            r#""id":1"#,
+            r#""price":5"#,
+            r#""price_x2":10"#,
+            r#""name":"thing""#,
+            r#""stock":9"#,
+        ] {
+            assert!(
+                facts
+                    .iter()
+                    .any(|l| l.contains("Update after") && l.contains(want)),
+                "the update's after-image does not name {want}\nthe wire facts:\n{}",
+                facts.join("\n")
+            );
+        }
+    }
+    // The table whose reads all stand before the VIRTUAL column: four columns named, and the image
+    // holds the three the rule reads on every server.
+    for line in kept_facts
+        .iter()
+        .filter(|l| l.contains("value(s)") && l.contains("table map"))
+    {
+        assert!(
+            line.contains("table map 4 columns") && line.contains("layout [id,name,stock,note]"),
+            "the kept table's facts: {line}\n{}",
+            kept_facts.join("\n")
+        );
+    }
+
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES \
+         ('items', 'hook', 'PURGE /keys HTTP/1.1\nHost: {{endpoint.host}}\nX-Keys: \
+          {{#each keys}}{{this}}{{#unless @last}}|{{/unless}}{{/each}}\n', 200)",
+    )
+    .await;
+    // A key from a column after the virtual one, and a `changed_columns` trigger on another
+    // column after it.
+    db.trigger("items", "items", Some("{{new.name}}"), None)
+        .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) \
+         VALUES ('items', 'items', 'update', 'stock', 's_{{new.id}}')",
+        (),
+    )
+    .await;
+    // The rule that reads only columns before the VIRTUAL column of its table.
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES \
+         ('kept', 'hook', 'PURGE /keys HTTP/1.1\nHost: {{endpoint.host}}\nX-Keys: \
+          {{#each keys}}{{this}}{{#unless @last}}|{{/unless}}{{/each}}\n', 200)",
+    )
+    .await;
+    db.trigger("kept", "kept", Some("k_{{new.name}}"), None)
+        .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_trigger (rule, source_table, `on`, changed_columns, `key`) \
+         VALUES ('kept', 'kept', 'update', 'stock', 'n_{{new.id}}')",
+        (),
+    )
+    .await;
+    // A Handlebars key: a template of its own per line, rendered from the whole row.
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES \
+         ('tpl', 'hook', 'PURGE /keys HTTP/1.1\nHost: {{endpoint.host}}\nX-Keys: \
+          {{#each keys}}{{this}}{{#unless @last}}|{{/unless}}{{/each}}\n', 200)",
+    )
+    .await;
+    db.trigger(
+        "tpl",
+        "wide",
+        Some("{{#if new.name}}t_{{new.id}}{{else}}t_0{{/if}}"),
+        None,
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // The status row, so a later failure's log already carries what the rule itself says.
+    println!("vcol status at start: {:?}", db.status("items").await);
+
+    // Rows 2 and 3 of both tables (the probes' row 1 is deleted).
+    mock.clear();
+    db.exec(
+        "INSERT INTO items (id, price, name, stock) VALUES (2, 7, 'gadget', 4), (3, 1, 'bolt', 8)",
+    )
+    .await;
+    db.exec("INSERT INTO kept (id, name, stock) VALUES (2, 'alpha', 5), (3, 'beta', 6)")
+        .await;
+    db.exec("INSERT INTO wide (id, name, stock) VALUES (2, 'gamma', 7), (3, 'delta', 9)")
+        .await;
+
+    // The rule that reads nothing past the VIRTUAL column marks its keys on every server: those
+    // values are in the image wherever the run happens.
+    let got = keys_until(&mock, &["k_alpha", "k_beta"], "the kept rule's names").await;
+    assert!(
+        !got.contains("5") && !got.contains("6"),
+        "the stock values reached the keys: {got:?}"
+    );
+    if short {
+        // The other rule reads `name` and `stock`, both behind the VIRTUAL column: refused, and
+        // nothing of it reaches the target — neither the right key nor the wrong one.
+        assert!(
+            !got.contains("gadget")
+                && !got.contains("bolt")
+                && !got.iter().any(|k| k.starts_with("s_")),
+            "a refused trigger marked {got:?}"
+        );
+    } else {
+        let got = keys_until(&mock, &["gadget", "bolt"], "the names of both rows").await;
+        assert!(
+            !got.contains("4") && !got.contains("8"),
+            "the stock values reached the keys: {got:?}"
+        );
+    }
+
+    // `stock` changes: the `changed_columns` trigger marks its key, on the columns before the
+    // VIRTUAL one; the rule behind it stays refused or silent.
+    inst.quiet().await;
+    mock.clear();
+    db.exec("UPDATE items SET stock = 12 WHERE id = 2").await;
+    db.exec("UPDATE kept SET stock = 12 WHERE id = 2").await;
+    db.exec("UPDATE wide SET stock = 12 WHERE id = 2").await;
+    let got = keys_until(&mock, &["n_2"], "the stock change of the kept row").await;
+    if short {
+        assert!(
+            !got.iter().any(|k| k.starts_with("s_")),
+            "a refused trigger marked {got:?}"
+        );
+    } else {
+        keys_until(&mock, &["s_2"], "the stock change of row 2").await;
+    }
+    // The Handlebars key reads the whole row, so on a server that runs short there is no telling
+    // which of its values the template wanted: the rule is refused for the VIRTUAL column, and
+    // marks nothing. Elsewhere it renders like any other key.
+    if short {
+        inst.quiet().await;
+        assert!(
+            !keys(&mock).iter().any(|k| k.starts_with("t_")),
+            "the refused Handlebars rule marked {:?}",
+            keys(&mock)
+        );
+    } else {
+        keys_until(&mock, &["t_2"], "the Handlebars key of the changed row").await;
+    }
+
+    // `stock` unchanged: that trigger marks nothing (the other one does, which is how we know the
+    // update was read at all).
+    inst.quiet().await;
+    mock.clear();
+    db.exec("UPDATE items SET price = 8 WHERE id = 3").await;
+    db.exec("UPDATE kept SET name = 'beta2' WHERE id = 3").await;
+    if short {
+        inst.quiet().await;
+        let got = keys(&mock);
+        assert!(
+            !got.iter().any(|k| k.starts_with("s_") || k == "bolt"),
+            "a refused trigger marked {got:?}"
+        );
+    } else {
+        keys_until(&mock, &["bolt"], "the price change of row 3").await;
+        assert!(
+            !keys(&mock).iter().any(|k| k.starts_with("s_")),
+            "stock did not change, yet the trigger fired: {:?}",
+            keys(&mock)
+        );
+    }
+
+    // The rule keeps its continuity either way; what differs is whether it reports a refusal.
+    let status = wait_for(Duration::from_secs(15), "the status position", || async {
+        let s = db.status("items").await?;
+        (!s.0.is_empty() && s.1 > 0).then_some(s)
+    })
+    .await;
+    let (_, _, reset, err) = status;
+    assert!(
+        reset.starts_with("missing: first start"),
+        "the rule lost continuity: {reset}"
+    );
+    if short {
+        let err = err.expect("the refused trigger reports why it marks nothing");
+        println!("vcol last_error: {err}");
+        for want in [
+            "VIRTUAL generated column `price_x2`",
+            "UPDATE and DELETE row images",
+            "refuses the trigger",
+        ] {
+            assert!(err.contains(want), "the refusal says {err:?}, not `{want}`");
+        }
+        assert!(
+            err.contains("reads `name`") || err.contains("reads `stock`"),
+            "the refusal does not name the column it cannot read: {err}"
+        );
+    } else {
+        assert!(err.is_none(), "the rule reports {err:?} (reset {reset:?})");
+    }
+    // The rule that reads the columns before the VIRTUAL one never carries a refusal, on any
+    // server.
+    let kept = db.status("kept").await.expect("the kept rule's status row");
+    assert!(
+        kept.3.is_none(),
+        "the rule that reads before the VIRTUAL column reports {:?}",
+        kept.3
+    );
+    // The Handlebars rule: refused where the images run short, silent and marking where they do.
+    let tpl = wait_for(
+        Duration::from_secs(15),
+        "the Handlebars rule's position",
+        || async {
+            let s = db.status("tpl").await?;
+            (!s.0.is_empty() && s.1 > 0).then_some(s)
+        },
+    )
+    .await;
+    if short {
+        let err = tpl
+            .3
+            .expect("the Handlebars rule says why it marks nothing");
+        println!("vcol handlebars last_error: {err}");
+        for want in [
+            "Handlebars key template",
+            "VIRTUAL generated column `note`",
+            "STORED",
+        ] {
+            assert!(err.contains(want), "the refusal says {err:?}, not `{want}`");
+        }
+    } else {
+        assert!(tpl.3.is_none(), "the Handlebars rule reports {:?}", tpl.3);
+    }
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batches_split_and_go_to_every_endpoint() {
     let root = need_db!();

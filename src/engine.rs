@@ -519,6 +519,15 @@ pub struct Engine {
     /// Tables whose binlog layout does not match (reported once).
     mismatched: HashSet<(String, String)>,
     column_warnings: HashSet<(String, u64, String)>,
+    /// The server is a MariaDB 11.4 or newer, whose UPDATE and DELETE row images leave VIRTUAL
+    /// generated columns out (see `maria_skips_virtual`).
+    maria_skips_virtual: bool,
+    /// Per watched table, the index and name of its first VIRTUAL generated column (`None` when
+    /// it has none). Read once per table like the layout, and dropped with it: `on_statement` and
+    /// the mismatch path invalidate both, so a DDL that adds a VIRTUAL column is seen again.
+    virtual_first: HashMap<(String, String), Option<(usize, String)>>,
+    /// Triggers already reported as unreadable (see `refuse_virtual_reads`), warned about once.
+    virtual_refusals: HashSet<(String, u64)>,
     tx: mpsc::UnboundedSender<Done>,
     last_persist: Instant,
     clear_retry: Option<Instant>,
@@ -585,6 +594,82 @@ fn binlog_unusable(e: &anyhow::Error) -> bool {
         || (server_code(e) == Some(1236)
             && !source::is_duplicate_server_id(e)
             && position_unavailable(e))
+}
+
+/// Whether this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row images.
+///
+/// It stopped doing that at 11.4: 10.6.28 and 10.11.19 still write them, as do MySQL 8.0.46,
+/// 8.4.13, 9.7.4 and Percona 8.4.11. Such an image carries one value less than the table map
+/// names, and the reader pairs values with columns by position, so every column from the first
+/// VIRTUAL one on is read as its neighbour's value — a key built from the wrong value, with
+/// nothing logged. A version that cannot be read counts as unaffected: refusing on a parse
+/// failure would stop a working installation over a version string.
+// Temporary: remove this and `Engine::refuse_virtual_reads` when the vendored reader learns to
+// decode images whose values skip columns (lazyview issue #7); until then lazywf refuses the
+// triggers that would read them, which is visible on `/status` instead of silently wrong.
+fn maria_skips_virtual(version: &str) -> bool {
+    // A replication proxy reports the server it fronts as `5.5.5-<its version>`.
+    let v = version.strip_prefix("5.5.5-").unwrap_or(version);
+    let mut parts = v.split('.');
+    let num = |p: Option<&str>| p.and_then(|p| p.parse::<u32>().ok());
+    match (num(parts.next()), num(parts.next())) {
+        (Some(major), Some(minor)) => (major, minor) >= (11, 4),
+        _ => false,
+    }
+}
+
+/// What a trigger reads of a row image the server left short.
+#[derive(Debug, PartialEq, Eq)]
+enum VirtualRead {
+    /// A column standing at or after the table's first VIRTUAL generated column.
+    Col(String),
+    /// The whole row. A `KeyTemplate::Full` is any Handlebars template, so there is no telling
+    /// from the rule whether it names the shifted columns: it may read every column, so it is
+    /// refused for any table that has a VIRTUAL one.
+    Full,
+}
+
+/// The first thing `reads` takes from an image that skips its VIRTUAL columns: `reads` holds the
+/// columns the trigger names together with their index in the layout (columns the table does not
+/// have are left out — `check_columns` reports those), `full` says whether the trigger renders
+/// the whole row, and `from` is the index of the table's first VIRTUAL generated column. A rule
+/// that reads only columns before `from` reads values the image does carry, so it stays allowed.
+fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<VirtualRead> {
+    if full {
+        return Some(VirtualRead::Full);
+    }
+    reads
+        .iter()
+        .find(|(_, i)| *i >= from)
+        .map(|(c, _)| VirtualRead::Col((*c).to_string()))
+}
+
+/// The first VIRTUAL generated column of `rows`, which are the table's columns in
+/// `information_schema` order as (name, EXTRA): its index in that order (the order
+/// `rows::Catalog::load` builds a layout from) and its name.
+fn virtual_first_of(rows: &[(String, String)]) -> Option<(usize, String)> {
+    rows.iter()
+        .enumerate()
+        .find(|(_, (_, extra))| extra.to_ascii_uppercase().contains("VIRTUAL GENERATED"))
+        .map(|(i, (name, _))| (i, name.clone()))
+}
+
+/// The columns of one table, in `information_schema` order, as (name, EXTRA).
+async fn read_virtual_first(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<Option<(usize, String)>> {
+    // The `CAST`s keep the columns out of the binary charset, as in `rows::Catalog::load`.
+    let rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT CAST(COLUMN_NAME AS CHAR), CAST(EXTRA AS CHAR) \
+             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            (schema, table),
+        )
+        .await
+        .with_context(|| format!("reading the columns of `{schema}`.`{table}`"))?;
+    Ok(virtual_first_of(&rows))
 }
 
 async fn connect_wait(
@@ -770,6 +855,16 @@ pub async fn run(
         ),
         None => info!("no allow-list: target endpoints may use any host (tests only)"),
     }
+    // Whether the server's row images can come up short (see `maria_skips_virtual`). Read once:
+    // the server does not change underneath a running engine.
+    let skips_virtual = info.flavor == Flavor::MariaDb && maria_skips_virtual(&info.version);
+    if skips_virtual {
+        info!(
+            server = %info.version,
+            "this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row \
+             images: a trigger that reads a column from the first one on is refused"
+        );
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     let mut e = Engine {
         lock: lock_name,
@@ -817,6 +912,9 @@ pub async fn run(
         target_backoff: HashMap::new(),
         mismatched: HashSet::new(),
         column_warnings: HashSet::new(),
+        maria_skips_virtual: skips_virtual,
+        virtual_first: HashMap::new(),
+        virtual_refusals: HashSet::new(),
         tx,
         last_persist: Instant::now(),
         clear_retry: None,
@@ -1907,6 +2005,9 @@ impl Engine {
                     .filter_map(|(n, i)| self.rules.get(n).map(|s| (n.clone(), s.rule.clone(), *i)))
                     .collect();
                 self.check_columns(&layout, schema, table, &triggers);
+                let triggers = self
+                    .refuse_virtual_reads(&key, &layout, schema, table, triggers)
+                    .await?;
                 let any_full = triggers.iter().any(|(_, rule, i)| {
                     matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
                 });
@@ -1920,7 +2021,7 @@ impl Engine {
                 })))
             }
             Err(e) if e.downcast_ref::<LayoutMismatch>().is_some() => {
-                self.catalog.invalidate(schema, table);
+                self.forget_columns(schema, table);
                 // Once per mismatch, not for every transaction read before the DDL.
                 if self.mismatched.insert(key) {
                     warn!("{e:#}");
@@ -1932,6 +2033,128 @@ impl Engine {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The index and name of the table's first VIRTUAL generated column, on a server that leaves
+    /// those columns out of its row images; `Ok(None)` everywhere else and for a table without
+    /// one. Read once per table, like the layout cache it lives and dies with.
+    ///
+    /// `key` is the table's identity as [`Engine::route`] knows it, so a cached answer costs no
+    /// allocation; `schema` and `table` are the names to ask the server about.
+    async fn first_virtual_column(
+        &mut self,
+        key: &(String, String),
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<(usize, String)>> {
+        if !self.maria_skips_virtual {
+            return Ok(None);
+        }
+        if let Some(found) = self.virtual_first.get(key) {
+            return Ok(found.clone());
+        }
+        // An image whose columns cannot be read is an image that must not be read: a server that
+        // will not answer them is an error, as it is for the layout read above, and the caller
+        // retries. A table that is really gone fails there too, not here.
+        let found = read_virtual_first(&mut self.control, schema, table).await?;
+        self.virtual_first.insert(key.clone(), found.clone());
+        Ok(found)
+    }
+
+    /// Drops what is cached about a table's columns, so both the layout and the position of its
+    /// first VIRTUAL column are read again: a DDL changed the table, or its layout did not match
+    /// the binlog.
+    fn forget_columns(&mut self, schema: &str, table: &str) {
+        self.catalog.invalidate(schema, table);
+        let key = self.norm(schema, table);
+        if table == "*" {
+            self.virtual_first.retain(|(s, _), _| *s != key.0);
+        } else {
+            self.virtual_first.remove(&key);
+        }
+    }
+
+    /// Refuses the triggers that would read what the row images do not carry, and returns those
+    /// that may keep running.
+    ///
+    /// On MariaDB 11.4+ an UPDATE or DELETE image holds one value less than the table map names
+    /// (the VIRTUAL generated columns are not written), and the reader pairs values with columns
+    /// by position, so the first VIRTUAL column and every column after it are read as their
+    /// neighbour's value. Such a trigger marks keys that do not describe the row, so it marks
+    /// nothing at all and carries the reason on `/status` the way an unknown column does.
+    /// Temporary, see [`maria_skips_virtual`].
+    async fn refuse_virtual_reads(
+        &mut self,
+        key: &(String, String),
+        layout: &Layout,
+        schema: &str,
+        table: &str,
+        triggers: Vec<(String, Arc<Rule>, usize)>,
+    ) -> Result<Vec<(String, Arc<Rule>, usize)>> {
+        let Some((from, virtual_col)) = self.first_virtual_column(key, schema, table).await? else {
+            return Ok(triggers);
+        };
+        let mut kept = Vec::with_capacity(triggers.len());
+        for (name, rule, ti) in triggers {
+            let t = &rule.triggers[ti];
+            // What the trigger reads of an image: the same columns `check_columns` looks at, and
+            // the whole row for a Full key.
+            let mut reads: Vec<(&str, usize)> = Vec::new();
+            for c in &t.def.changed_columns {
+                if let Some(i) = layout.index(c) {
+                    reads.push((c.as_str(), i));
+                }
+            }
+            if let Some(KeyTemplate::Simple(lines)) = &t.key {
+                for seg in lines.iter().flatten() {
+                    if let template::Seg::Col(c) = seg {
+                        if let Some(i) = layout.index(c) {
+                            reads.push((c, i));
+                        }
+                    }
+                }
+            }
+            if let Some(ks) = &t.keys_sql {
+                for c in &ks.columns {
+                    if let Some(i) = layout.index(c) {
+                        reads.push((c.as_str(), i));
+                    }
+                }
+            }
+            let full = matches!(t.key, Some(KeyTemplate::Full(_)));
+            let Some(read) = unreadable_read(&reads, full, from) else {
+                kept.push((name, rule, ti));
+                continue;
+            };
+            // Refused whether or not it was reported: what it would mark is wrong either way.
+            if self.virtual_refusals.insert((name.clone(), t.def.id)) {
+                let msg = match &read {
+                    VirtualRead::Col(c) => format!(
+                        "trigger {}: `{schema}`.`{table}` reads `{c}`; this MariaDB leaves the \
+                         VIRTUAL generated column `{virtual_col}` out of its UPDATE and DELETE \
+                         row images, and every column after it moves up a place, so lazywf \
+                         cannot read `{c}` and refuses the trigger (make `{virtual_col}` STORED, \
+                         or read only columns before it)",
+                        t.def.id
+                    ),
+                    VirtualRead::Full => format!(
+                        "trigger {}: `{schema}`.`{table}` uses a Handlebars key template, which \
+                         can read any column of the row, including the VIRTUAL generated column \
+                         `{virtual_col}` and the columns after it that this MariaDB's UPDATE \
+                         and DELETE row images shift; lazywf refuses the trigger (make \
+                         `{virtual_col}` STORED, or use a plain {{{{new.col}}}} key over columns \
+                         before it)",
+                        t.def.id
+                    ),
+                };
+                warn!(rule = %name, "{msg}");
+                if let Some(st) = self.rules.get_mut(&name) {
+                    st.last_error = Some((msg, crate::time::unix_now_ms()));
+                    st.dirty = true;
+                }
+            }
+        }
+        Ok(kept)
     }
 
     /// Reports (once) trigger columns the table does not have: such a trigger marks nothing.
@@ -2282,7 +2505,7 @@ impl Engine {
         }
         let mut reset: HashSet<String> = HashSet::new();
         for (s, t, effect) in crate::sql::ddl_tables(query, schema) {
-            self.catalog.invalidate(&s, &t);
+            self.forget_columns(&s, &t);
             if s == self.cfg.schema && (model::is_config_table(&t) || t == "*") {
                 self.config_dirty.get_or_insert_with(Instant::now);
             }
