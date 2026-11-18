@@ -302,3 +302,80 @@ fn a_full_key_row_still_gets_its_object() {
     assert_eq!(hot.render_warnings, 0);
     assert_eq!(hot.rows(), Some(1));
 }
+
+/// What one text column costs as a value, the way the row path takes it: the borrowed conversion
+/// pays for the `String` it builds, where the owned one (`to_json(v.clone(), None)`, what
+/// `Layout::value` did before the borrow) paid for that and for the `Vec<u8>` it came out of.
+fn text_value_cost() -> usize {
+    let v = My::Bytes(b"sku-1".to_vec());
+    let (_, n) = alloc_measure::count(|| std::hint::black_box(crate::docs::to_json_ref(&v, None)));
+    n
+}
+
+/// The same value through the owned conversion, for the number the tests above compare against.
+fn owned_text_value_cost() -> usize {
+    let v = My::Bytes(b"sku-1".to_vec());
+    let (_, n) =
+        alloc_measure::count(|| std::hint::black_box(crate::docs::to_json(v.clone(), None)));
+    n
+}
+
+#[test]
+fn a_text_column_value_is_built_from_its_bytes() {
+    // finding 2, the conversion half: a watched `VARCHAR` used to clone its buffer to convert it.
+    let (borrowed, owned) = (text_value_cost(), owned_text_value_cost());
+    assert_eq!(
+        value_cost(),
+        borrowed,
+        "a borrowed text value is its String"
+    );
+    assert_eq!(
+        owned,
+        borrowed + 1,
+        "the owned conversion no longer pays for the `Vec` clone too"
+    );
+}
+
+#[test]
+fn an_unchanged_watched_text_column_costs_the_row_nothing() {
+    // finding 2, the comparison half: `sku` is what the trigger watches and both images hold the
+    // same bytes, so the row is refused without converting either of them.
+    let mut hot = Hot::new(simple_id(), &["sku"], false);
+    let (before, after) = (row(7, "sku-1", 3), row(7, "sku-1", 4));
+    hot.feed(RowsKind::Update, &before, &after);
+    assert_eq!(
+        hot.rows(),
+        None,
+        "an unchanged watched column must not mark"
+    );
+    assert_eq!(hot.keys(), "");
+    let ((), n) = alloc_measure::count(|| {
+        for _ in 0..20 {
+            hot.feed(RowsKind::Update, &before, &after);
+        }
+    });
+    assert_eq!(
+        n, 0,
+        "a row whose watched text column is the same allocated {n}"
+    );
+    assert_eq!(hot.rows(), None);
+}
+
+#[test]
+fn a_changed_watched_text_column_costs_one_value_per_image() {
+    // the same trigger, and `sku` does change: two values for the check (one per image) plus the
+    // two the key always costs.
+    let mut hot = Hot::new(simple_id(), &["sku"], false);
+    let (before, after) = (row(7, "sku-1", 3), row(7, "sku-2", 3));
+    hot.feed(RowsKind::Update, &before, &after);
+    assert_eq!(hot.rows(), Some(1));
+    assert_eq!(hot.keys(), "o-7");
+    let ((), n) = alloc_measure::count(|| hot.feed(RowsKind::Update, &before, &after));
+    assert_eq!(
+        n,
+        2 * text_value_cost() + 2 * value_cost(),
+        "a row with a changed text column cost {n}, not one value per image and per key"
+    );
+    assert_eq!(hot.rows(), Some(2));
+    assert_eq!(hot.keys(), "o-7");
+}
