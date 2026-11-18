@@ -119,7 +119,7 @@ Example: `LAZYWF_DSN=mysql://lazywf:secret@host.docker.internal:3306/app`.
 
 | guarantee | how |
 |---|---|
-| after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET`, the consistent-snapshot position on MariaDB / Percona, the commit fence on the MySQL family (MySQL and Percona) with neither, else `LAZYWF_VISIBILITY_DELAY_MS`; [server setup](docs/server-setup.md#binlog-settings)) |
+| after the commit | marks of a transaction apply at its commit (XA: at `XA COMMIT`, never on rollback); before reading, a flush waits until the transaction is visible (`WAIT_FOR_EXECUTED_GTID_SET` on the MySQL family with GTIDs, the consistent-snapshot position on MariaDB, the commit fence on the MySQL family (MySQL and Percona) without GTIDs, else `LAZYWF_VISIBILITY_DELAY_MS`; [server setup](docs/server-setup.md#binlog-settings)) |
 | dedupe and debounce | keys are collected per rule in memory and fired once per key when nothing was marked for `debounce_ms`. Keys that are an integer or a prefix and an integer (`42`, `item_42`) keep their prefix's integers in a hash set by default (about 19 bytes per key at a million dense ids); with `--features roaring` they are 64-bit roaring bitmaps (a million consecutive ids under 300 KB, but sparse ids cost more) — [Development](#development) |
 | bounded delay | no key waits more than `max_delay_ms` after its first change, even while it keeps changing |
 | latest state wins | selects run at flush time. A key marked again while its action is in flight fires again afterwards. Each rule has one lane (one flush or reset batch at a time), so the last read is the last sent |
@@ -145,8 +145,8 @@ Environment variables:
 | `LAZYWF_INSTANCE` | `default` | instance name: status rows and the instance lock (one active copy per schema and name; a second one stands by) |
 | `LAZYWF_SERVER_ID` | random | replica server id |
 | `LAZYWF_HEALTH_ADDR` | `127.0.0.1:8081` | `/livez`, `/readyz`, `/status`; `off` disables |
-| `LAZYWF_STATUS_TOKEN` | — | when set, `/status` requires the `X-Lazywf-Token` header (compared in constant time); `/livez` and `/readyz` stay open, so `lazywf healthcheck` and the container health check never need it |
-| `LAZYWF_METRICS_ADDR` | — (off) | `host:port` to serve Prometheus `GET /metrics` on its own listener (separate from the health one); unset or `off`: off entirely, malformed: startup error; no auth — expose it internally ([Prometheus metrics](docs/reference.md#prometheus-metrics)) |
+| `LAZYWF_HEALTH_TOKEN` (or `LAZYWF_HEALTH_TOKEN_FILE`) | — | the one token for both listeners: when set, `/status` on the health listener and `GET /metrics` on the metrics one answer only to `Authorization: Bearer <token>` (compared in constant time), a miss being 401 with `WWW-Authenticate: Bearer`; `_FILE` holds the **path** of a file whose trimmed contents are the token, so both set at once, an unreadable file, and a file with no token in it are startup errors naming the variable and never the value; unlike a target's `vars`, the value is literal and the path plain — no `env:` / `file:` grammar. Unset or blank leaves both endpoints open, as before. `/livez`, `/readyz`, the two index pages and `lazywf healthcheck` never ask for it, so container health never needs it. It replaces `LAZYWF_STATUS_TOKEN`, which is not read at all ([Upgrading to 0.3.0](#upgrading-to-030)) |
+| `LAZYWF_METRICS_ADDR` | — (off) | `host:port` to serve Prometheus `GET /metrics` on its own listener (separate from the health one); unset or `off`: off entirely, malformed: startup error; `LAZYWF_HEALTH_TOKEN` gates it the way it gates `/status`, and neither listener has TLS — expose them internally ([Prometheus metrics](docs/reference.md#prometheus-metrics)) |
 | `LAZYWF_HEARTBEAT_MS` | `5000` | binlog heartbeat (a silent connection is dropped after 3×) |
 | `LAZYWF_VISIBILITY_DELAY_MS` | `20` | the last-resort visibility fence, when GTIDs, a consistent-snapshot position and the commit fence are all unavailable ([server setup](docs/server-setup.md#binlog-settings)) |
 | `LAZYWF_POOL_SIZE` | `16` | query connections (selects run concurrently) |
@@ -171,7 +171,13 @@ opt-out:
 | TLS to the source is the default | unset `LAZYWF_TLS` means `required` unless the DSN host is loopback (a `127.0.0.0/8` or `::1` address, `localhost`, an empty host, or a `socket=` DSN): a server without TLS refuses the connection and the engine does not start | `LAZYWF_TLS=disabled` reaches a remote host in plaintext as before and logs one loud WARN at start; `LAZYWF_TLS_CA` implies `verify-full` |
 | deny-all target egress | unset `LAZYWF_ALLOWED_HOSTS` denies every target host: each target fails at load with a refusal naming the setting (the rule keeps its position and pending keys), and the start log says so at WARN | list the hosts, or `LAZYWF_ALLOWED_HOSTS=*` to allow any host (the pre-0.3 behaviour, not recommended) |
 | credentials by reference | a literal in a password-, token- or key-bearing `vars` field is refused at load ("must be a reference … never a literal") | none: the value moves to `env:NAME` or `file:/path` (the [field list](docs/reference.md#targets); names like `vars.username` stay literals) |
-| `/status` can require a token | nothing: unset `LAZYWF_STATUS_TOKEN` leaves `/status` open as before | set it and `/status` needs the `X-Lazywf-Token` header (401 without); `/livez`, `/readyz` and `lazywf healthcheck` stay open |
+| the health endpoints can require a token | nothing: unset `LAZYWF_HEALTH_TOKEN` leaves `/status` and `/metrics` open as before | set `LAZYWF_HEALTH_TOKEN` (or `LAZYWF_HEALTH_TOKEN_FILE`) and `/status` and `/metrics` both need `Authorization: Bearer <token>` (401 with `WWW-Authenticate: Bearer` without); `/livez`, `/readyz`, the two index pages and `lazywf healthcheck` stay open |
+
+`LAZYWF_HEALTH_TOKEN` is new in 0.3.0 under this name: the pre-release builds that first gated
+`/status` called it `LAZYWF_STATUS_TOKEN`, and the current code reads neither that name nor the
+`X-Lazywf-Token` header — no alias, no fallback. A run that still sets only the old name therefore
+has open endpoints, the state they were in before any token existed, so rename the variable; 0.2.x
+had no health token at all, so nothing earlier is affected.
 
 A refused target stays pending. Once its credential becomes a reference, the next config reload
 re-reads the target rows and delivers the pending keys without a restart. `LAZYWF_ALLOWED_HOSTS`,
@@ -206,13 +212,19 @@ triggers. To filter for dropped keys in a log pipeline, match the top-level `tar
 
 * SIGTERM stops gracefully: running actions finish (up to `LAZYWF_STOP_GRACE_MS`), positions are
   saved, exit 0. A non-zero exit means a real failure (bad configuration, lost instance lock,
-  missing privileges).
+  missing privileges), and two of them name themselves as they happen: a SIGTERM handler that
+  cannot be registered is a startup failure — the log line
+  `configuration error: registering the SIGTERM handler: <reason>` and exit 2, the code a bad
+  configuration gets, because an engine that cannot be told to stop must not run — and a panicked
+  engine task prints `lazywf: the engine task panicked; see the message above` on stderr before
+  exit 1. Every other exit code is unchanged.
 * `/livez`: the main loop turns. `/readyz`: this instance is active and streaming. `/status`:
   per rule the position, lag, pending keys, reset state, counters and errors (JSON,
-  [the fields](docs/reference.md#status)); with `LAZYWF_STATUS_TOKEN` set it answers 401 unless
-  the request carries the `X-Lazywf-Token` header (`/livez` and `/readyz` never ask for it).
-  `lazywf healthcheck` probes `/livez` for container health checks, so a status token never
-  breaks container health.
+  [the fields](docs/reference.md#status)); with `LAZYWF_HEALTH_TOKEN` set it answers 401 with
+  `WWW-Authenticate: Bearer` unless the request carries `Authorization: Bearer <token>`
+  (`/livez` and `/readyz` never ask for it, and `/metrics` on its own listener takes the same
+  token). `lazywf healthcheck` probes `/livez` for container health checks, so a health token
+  never breaks container health.
 * `SELECT * FROM lazy_wire_fire_status`: positions, lag, `reset_state`, `last_error`.
 * `UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = …` re-runs a rule's reset
   steps; the tool sets it back to 0 when they succeeded.
@@ -227,11 +239,15 @@ instance name, SIGTERM to stop.
 Inside a container, the default health address `127.0.0.1:8081` is the container's own loopback.
 To query `/status` from the host: run with host networking (port 8081 free), or set
 `LAZYWF_HEALTH_ADDR=0.0.0.0:8081` and publish `-p 127.0.0.1:8081:8081`.
-`docker exec <name> /lazywf healthcheck` needs neither. With a status token the pattern on top
-of that is `-e LAZYWF_STATUS_TOKEN=…`, the health port still published to loopback only, and
-the token handed to the readers that send `X-Lazywf-Token` (curl, or a reverse proxy in front
-that adds the header); the image's `HEALTHCHECK` runs `lazywf healthcheck` inside the container
-against `/livez`, so container health never needs the token.
+`docker exec <name> /lazywf healthcheck` needs neither. With a health token the pattern on top of
+that is `-e LAZYWF_HEALTH_TOKEN=…`, or
+`-e LAZYWF_HEALTH_TOKEN_FILE=/run/secrets/lazywf_health_token` for a mounted file (the path is
+plain and the value literal: no `env:` / `file:` grammar here). The health port stays published to
+loopback only, and the token is handed to the readers that send
+`-H 'Authorization: Bearer <token>'` (curl, or a reverse proxy in front that adds the header); the
+same token gates `/metrics` on its own port the same way, and the image's `HEALTHCHECK` runs
+`lazywf healthcheck` inside the container against `/livez`, so container health never needs the
+token.
 
 ## Image
 
@@ -295,9 +311,18 @@ MySQL and Percona publish no pre-release in a registry (MySQL early access ships
 only), so they have no advisory job. An advisory job that fails shows as a warning in the run and
 its summary, and blocks nothing. MySQL and Percona run with GTIDs on, except MySQL 8.0: off, as in
 RDS for MySQL's default parameter group, so it also tests the commit fence.
-On Oracle MySQL without GTIDs the visibility fence is the commit fence — one write to lazywf's
-own table, exact when commits are in binlog order, with a `LAZYWF_VISIBILITY_DELAY_MS` fallback
-([server setup](docs/server-setup.md#binlog-settings)).
+On a MySQL-family server without GTIDs (Oracle MySQL and Percona Server) the visibility fence is
+the commit fence — one write to lazywf's own table, exact when commits are in binlog order, with a
+`LAZYWF_VISIBILITY_DELAY_MS` fallback ([server setup](docs/server-setup.md#binlog-settings)).
+MariaDB 11.4 and newer leave `VIRTUAL` generated columns out of their `UPDATE` and `DELETE` row
+images — the server's own behaviour — while the table map still names them, and the reader pairs
+an image's values with the columns by position, so such a column and every column after it would
+read as its neighbour's value. A trigger that reads one of them (`changed_columns`, the key or a
+`keys_sql` parameter) is therefore refused, and so is one whose key is a Handlebars template, which
+may name any column; the rule carries the reason as its `last_error`. Columns before the first
+`VIRTUAL` column and `STORED` generated columns are unaffected, as are MySQL, Percona and MariaDB
+before 11.4, whose images carry those columns. The restriction lifts when the reader learns to
+decode the short images ([reference → Triggers](docs/reference.md#triggers)).
 Dropped as end of life: Percona Server 8.0 (no RDS edition). MariaDB 10.6 leaves the matrix after
 2026-12-31.
 

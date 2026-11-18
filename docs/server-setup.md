@@ -23,16 +23,18 @@ Before reading, a flush waits until the transaction that marked its keys is visi
 sessions. It takes the first of these that the server can answer:
 
 - with GTIDs (MySQL / Percona): `WAIT_FOR_EXECUTED_GTID_SET`, exact;
-- on MariaDB and Percona where it reports one: the consistent-snapshot binlog position, exact;
+- on MariaDB, where the server reports one: the consistent-snapshot binlog position, exact (the
+  MySQL family's pair is the binlog write position, not a committed-transaction watermark, so
+  waiting on it would prove nothing);
 - on the MySQL family (MySQL and Percona) with neither: the [commit fence](#commit-fence), exact
   when commits are in binlog order;
 - otherwise: `LAZYWF_VISIBILITY_DELAY_MS`.
 
 ### Commit fence
 
-On a server without GTIDs and without a consistent-snapshot position (Oracle MySQL without
-GTIDs), a flush writes one row of lazywf's own table `lazy_wire_fire_fence` (in the DSN's schema;
-the probe creates it when it is missing) on the source connection. With `binlog_order_commits=ON`
+On a MySQL-family server (MySQL and Percona) without GTIDs, a flush writes one row of lazywf's own
+table `lazy_wire_fire_fence` (in the DSN's schema; the probe creates it when it is missing) on the
+source connection. With `binlog_order_commits=ON`
 — the server default; on Aurora, the enhanced binlog counts whatever the variable says — the
 server commits transactions in binlog order, so the write returns only after every transaction
 up to the flush's boundary is visible. One write per flush boundary: flushes at the same boundary

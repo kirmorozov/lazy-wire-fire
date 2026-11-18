@@ -1341,6 +1341,24 @@ the old image and with the new one. `keys_sql` runs at flush time, once per dist
 parameters, after the changes are visible. It reads the current state: for a delete, rows already
 gone are not found (have a trigger on that table too).
 
+On MariaDB 11.4 and newer an `UPDATE` or `DELETE` row image leaves `VIRTUAL` generated columns out
+(the server's own behaviour) while the table map still names them, and the reader pairs an image's
+values with the columns by position: such a column and every column after it would read as its
+neighbour's value, so a trigger reading one would mark keys that do not describe the row. lazywf
+refuses those triggers instead — the ones reading a column at or after the table's first `VIRTUAL`
+one (in `changed_columns`, in the key or as a `keys_sql` parameter) and, on a table that has such a
+column, the ones whose key is a Handlebars template, since that key may name any column of the row.
+The other triggers of the table keep running; a refused one marks nothing, is warned about once,
+and the rule carries the reason as its `last_error` (so on `/status` and in `lazy_wire_fire_status`):
+
+- a column at or after the first `VIRTUAL` one: `trigger <id>: \`<schema>\`.\`<table>\` reads \`<column>\`; this MariaDB leaves the VIRTUAL generated column \`<virtual>\` out of its UPDATE and DELETE row images, and every column after it moves up a place, so lazywf cannot read \`<column>\` and refuses the trigger (make \`<virtual>\` STORED, or read only columns before it)`
+- a Handlebars key template on a table that has such a column, where the whole row is unreadable: `trigger <id>: \`<schema>\`.\`<table>\` uses a Handlebars key template, which can read any column of the row, including the VIRTUAL generated column \`<virtual>\` and the columns after it that this MariaDB's UPDATE and DELETE row images shift; lazywf refuses the trigger (make \`<virtual>\` STORED, or use a plain {{new.col}} key over columns before it)`
+
+Both name what is read and the way out: make the column `STORED`, or read only columns before it.
+MySQL, Percona and MariaDB before 11.4 write those columns into their images and refuse nothing; on
+every server a `STORED` generated column, and every column standing before the first `VIRTUAL` one,
+are read as usual.
+
 ### Foreign key cascades
 
 Whether lazywf sees the changes a foreign key's `ON DELETE CASCADE` (or `ON UPDATE CASCADE`,
@@ -1561,8 +1579,9 @@ as a WARN and shown as `stream_error` on `/status` until the stream delivers eve
 | `updated_at` | written when the position moves, and at least every 30 s |
 
 `/status` is the same per rule (its `rules` map), plus what the table does not hold; with
-`LAZYWF_STATUS_TOKEN` set it answers only to a request whose `X-Lazywf-Token` header matches
-(constant-time compare, 401 without), while `/livez` and `/readyz` never ask for it:
+`LAZYWF_HEALTH_TOKEN` set it answers only to a request whose `Authorization: Bearer <token>` header
+matches (constant-time compare, 401 with `WWW-Authenticate: Bearer` otherwise), while `/livez`,
+`/readyz` and the index never ask for it:
 
 | field | meaning |
 |---|---|
@@ -1598,8 +1617,11 @@ The only label values are names from the loaded config: a rule name, that rule's
 the three outcomes, and the crate version. **Counts never carry keys or row data**: no key value,
 refusal reason, endpoint URL or error string can become a label value, and no runtime path can
 grow the series — the registry is populated only when a rule loads or changes target, and
-flushes, retries and drops touch nothing but the pre-resolved atomic handles. The
-endpoint has **no auth and no TLS**, the posture of `/livez`: expose it internally.
+flushes, retries and drops touch nothing but the pre-resolved atomic handles. `/metrics` is gated
+by the same token `/status` is — **one setting, both listeners**: with `LAZYWF_HEALTH_TOKEN` set
+it answers only to a request whose `Authorization: Bearer <token>` header matches (constant-time
+compare, 401 with `WWW-Authenticate: Bearer` otherwise, the index open either way), and unset it
+answers anyone, as it always did. Neither listener has **TLS**: expose them internally.
 
 ## Security
 
@@ -1624,9 +1646,15 @@ What the tool enforces on its own:
 * **A target credential is never a literal** (0.3.0): the password-, token- and key-bearing
   `vars` fields accept `env:` / `file:` references only and a literal is refused at load
   ([Targets](#targets)).
-* **`/status` can be token-gated**: with `LAZYWF_STATUS_TOKEN` set it answers 401 unless the
-  request carries the `X-Lazywf-Token` header (compared in constant time); `/livez` and
-  `/readyz` never ask for it ([Status](#status)).
+* **The health endpoints can be token-gated**: with `LAZYWF_HEALTH_TOKEN` set (or
+  `LAZYWF_HEALTH_TOKEN_FILE`, the path of a file holding it) `/status` on the health listener and
+  `/metrics` on the metrics one answer 401 with `WWW-Authenticate: Bearer` unless the request
+  carries `Authorization: Bearer <token>` (compared in constant time); `/livez`, `/readyz`, the two
+  index pages and `lazywf healthcheck` never ask for it, and unset or blank leaves both open as
+  before. The value is taken literally and the `_FILE` path is a plain path — no `env:` / `file:`
+  grammar — and both variables set, or an unreadable or empty token file, refuses startup naming
+  the variable and never the value
+  ([Status](#status), [Prometheus metrics](#prometheus-metrics)).
 * **Keys are one line of text.** A key with a control character (from a key template, `keys_sql`,
   the snapshot or a stray listing) is ignored and reported in `last_error`; a key template is
   rendered line by line, so a newline in a value cannot mark extra keys.
