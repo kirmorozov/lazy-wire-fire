@@ -210,15 +210,25 @@ pub fn config(db: &Db, extra: &[(&str, &str)]) -> Config {
 /// Engine logs on the test output (`RUST_LOG`, default `info`), with the lines at `WARN` and above
 /// kept for [`warnings`].
 pub fn logs() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
             .unwrap_or_else(|_| "info".into());
-        // `try_init`: a test binary that installs its own subscriber first keeps it.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(Tee::new())
-            .try_init();
+        // Two layers over one registry: the formatter, for whoever reads the test output, and
+        // [`Capture`], for the tests. Installing is the one step that must not fail quietly: a
+        // subscriber that is not there means `warnings` stays empty, which from a test looks
+        // exactly like a WARN that was never logged.
+        let sub = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_filter(filter),
+            )
+            .with(Capture);
+        if let Err(e) = tracing::subscriber::set_global_default(sub) {
+            eprintln!("the test subscriber was not installed: {e} (warnings() stays empty)");
+        }
     });
 }
 
@@ -235,17 +245,22 @@ fn captured() -> Arc<Mutex<VecDeque<String>>> {
         .clone()
 }
 
-/// The `WARN`-and-above lines the engines of this test binary logged, oldest first, with the
-/// colour gone (the subscriber paints field names and separators, so a line that reads
-/// `table=<red>orders` on the terminal is `table\x1b[0m\x1b[2m=orders` in bytes: what a test
-/// matches is the plain text). The suite runs the engine in-process, so a test that expects a
-/// WARN reads its own line here — and filters by what makes a line its own, which for every
-/// engine test is its own schema.
+/// The `WARN`-and-above lines the engines of this test binary logged, oldest first, as plain text
+/// (the level, the target, the message and `name=value` for every field — what a test matches).
+/// The suite runs the engine in-process, so a test that expects a WARN reads its own line here —
+/// and filters by what makes a line its own, which for every engine test is its own schema.
 pub fn warnings() -> Vec<String> {
-    captured().lock().unwrap().iter().cloned().collect()
+    captured()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
-/// The colour codes of one rendered line, dropped: `ESC [ … m` sequences are markup, not text.
+/// The colour codes of one line, dropped: `ESC [ … m` sequences are markup, not text. The line
+/// [`Capture`] assembles carries none of its own, but a value that came from the binlog (a table
+/// name is source-stated text) is whatever the source said, so markup goes whatever its origin.
 fn plain(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
@@ -264,67 +279,76 @@ fn plain(line: &str) -> String {
     out
 }
 
-/// The subscriber's writer: every line goes to the test writer, as `with_test_writer` sends it,
-/// and every complete line at `WARN` or above is kept (uncoloured) for [`warnings`]. The
-/// subscriber makes one writer per event, so `buf` holds the pieces of one line. The writer has
-/// to be `Clone` and `TestWriter` is not, so the one instance goes behind a lock the lines are
-/// written through.
-#[derive(Clone)]
-struct Tee {
-    test: Arc<Mutex<tracing_subscriber::fmt::TestWriter>>,
-    keep: Arc<Mutex<VecDeque<String>>>,
-    buf: Vec<u8>,
-}
+/// The harness's own `Layer`: it keeps the text of every `WARN` and `ERROR` event for
+/// [`warnings`].
+///
+/// It reads the event rather than the bytes the formatter writes. Which writer a line reaches, and
+/// where the formatter puts its line breaks and its colour, is the formatter's business — a test
+/// must not fail because of either. So the level comes from the event's metadata (a `WARN` is kept
+/// because it *is* one, not because three bytes appear in a rendered string) and the text is
+/// assembled here, one event at a time.
+#[derive(Default)]
+struct Capture;
 
-impl Tee {
-    fn new() -> Tee {
-        Tee {
-            test: Arc::new(Mutex::new(tracing_subscriber::fmt::TestWriter::new())),
-            keep: captured(),
-            buf: Vec::new(),
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Capture {
+    fn on_event(&self, ev: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let meta = ev.metadata();
+        // `Level` orders from `ERROR` down, so everything below `WARN` is not the test's business.
+        if *meta.level() < tracing::Level::WARN {
+            return;
         }
-    }
-
-    /// A panic in a logged line must not poison the queue for every test after it.
-    fn test(&self) -> std::sync::MutexGuard<'_, tracing_subscriber::fmt::TestWriter> {
-        self.test.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl std::io::Write for Tee {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        let mut test = self.test();
-        std::io::Write::write_all(&mut *test, b)?;
-        drop(test);
-        self.buf.extend_from_slice(b);
-        while let Some(i) = self.buf.iter().position(|&c| c == b'\n') {
-            let raw: Vec<u8> = self.buf.drain(..=i).collect();
-            let line = plain(String::from_utf8_lossy(&raw).trim_end());
-            if line.contains("WARN") || line.contains("ERROR") {
-                let mut q = self.keep.lock().unwrap();
-                if q.len() >= MAX_LOGGED {
-                    q.pop_front();
-                }
-                q.push_back(line);
-            }
+        let mut fields = Vec::new();
+        let mut message = None;
+        ev.record(&mut Collect {
+            fields: &mut fields,
+            message: &mut message,
+        });
+        let mut line = format!("{} {}", meta.level(), meta.target());
+        if let Some(m) = message {
+            line.push_str(": ");
+            line.push_str(&m);
         }
-        Ok(b.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut test = self.test();
-        std::io::Write::flush(&mut *test)
+        for (name, value) in fields {
+            line.push(' ');
+            line.push_str(&name);
+            line.push('=');
+            line.push_str(&value);
+        }
+        // The lock of a logged line must not be able to take the engine down with it.
+        let keep = captured();
+        let mut q = keep.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= MAX_LOGGED {
+            q.pop_front();
+        }
+        q.push_back(plain(&line));
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Tee {
-    type Writer = Tee;
-    fn make_writer(&'a self) -> Tee {
-        Tee {
-            test: self.test.clone(),
-            keep: self.keep.clone(),
-            buf: Vec::new(),
+/// The fields of one event, as the plain format renders them: a string as it is (no quotes, so
+/// `table=orders` reads as it is written), anything else through `Debug` — which is what a `%`-
+/// displayed value prints. The message is a field too (`message`), and it goes to the front.
+struct Collect<'a> {
+    fields: &'a mut Vec<(String, String)>,
+    message: &'a mut Option<String>,
+}
+
+impl Collect<'_> {
+    fn put(&mut self, f: &tracing::field::Field, value: String) {
+        if f.name() == "message" {
+            *self.message = Some(value);
+        } else {
+            self.fields.push((f.name().to_string(), value));
         }
+    }
+}
+
+impl tracing::field::Visit for Collect<'_> {
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        self.put(f, v.to_string());
+    }
+
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        self.put(f, format!("{v:?}"));
     }
 }
 

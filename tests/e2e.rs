@@ -9466,19 +9466,33 @@ async fn statement_format_dml_is_counted_and_warned() {
         mock.requests().iter().map(|r| &r.body).collect::<Vec<_>>()
     );
 
-    // One WARN line per table, no more, and nothing of the statement in any of them.
+    // One WARN line per table, no more, and nothing of the statement in any of them. The wait is
+    // on the two lines having arrived — a loaded box is slow, not absent — and "exactly one each"
+    // is what the rate limit owes, so that is asserted once they are there. The count of what the
+    // capture holds at all goes into the wording of the wait: a suite that times out here has to
+    // say whether it saw no lines or lines it could not match.
+    let captured = warnings().len();
     let warned = wait_for(
         Duration::from_secs(10),
-        "one WARN line per table",
+        &format!("one WARN line per table ({captured} lines were captured at the start)"),
         || async {
             let w: Vec<String> = warnings()
                 .into_iter()
                 .filter(|l| l.contains(&db.schema) && l.contains("statement format"))
                 .collect();
-            (w.len() == 2).then_some(w)
+            (w.iter().any(|l| l.contains("table=orders"))
+                && w.iter().any(|l| l.contains("table=customers")))
+            .then_some(w)
         },
     )
     .await;
+    assert_eq!(
+        warned.len(),
+        2,
+        "one line per table: the limit is per table and per interval, so a table that logged \
+         twice is a bug:\n{}",
+        warned.join("\n")
+    );
     let mut tables: Vec<&str> = warned
         .iter()
         .map(|l| {
