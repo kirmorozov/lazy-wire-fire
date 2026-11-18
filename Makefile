@@ -69,16 +69,25 @@ E2E_TARGETS := redis valkey postgres s3
 
 # Owner rule (2026-11-16, and tmp/e2e-shared.sh): a test server is a composition for the run, not a
 # container that stays up for days. Every target below brings up exactly the services its run talks
-# to and removes them again with `rm -sfv` per service — never `down`, so the run leaves no container
-# and no volume behind and the project network (lazyview's toxiproxy attaches to it) stays. The
-# removal is in a trap on EXIT, so a failed or killed run cleans up too. KEEP_SERVERS=1 leaves them
-# to the caller: CI pre-starts its services, reads `docker compose logs` after a failed run, and
-# tears the whole set down with `make servers-down`.
+# to and removes them again with `rm -sfv` per service, so a run leaves no container and no volume
+# behind. Never `down`: `down` deletes the project network, and with `-v` the named volumes, so the
+# next run has to create both again instead of finding them as this file declares them — dropping
+# them is `make servers-down`'s job, where an operator asks for it. Nothing hangs on the network
+# either: lazywf reaches every service through its published 127.0.0.1 port, and lazyview's toxiproxy
+# (lvs-toxiproxy) is on docker's own bridge, not on lazywf-test_default (checked on the host: that
+# network has no containers, and no test resolves a service name).
+# These targets own the compose project `lazywf-test` for the length of a run, so on this host they
+# run ONE AT A TIME: two `make test-e2e` runs side by side tear down each other's servers. Take the
+# same heavy-suite lock tmp/e2e-shared.sh takes (lazyview's tmp/out/heavy-suite.lock) around a run.
+# The removal sits in a trap on EXIT, with INT and TERM made to exit through it, so a run that fails
+# or is killed cleans up too. KEEP_SERVERS=1 leaves the services to the caller: CI pre-starts its
+# services, reads `docker compose logs` after a failed run, and tears the set down itself.
 #
 # Integration tests against MySQL 8.4 (GTIDs on) and the target services.
 test-e2e:
 	@set -e; \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 $(E2E_TARGETS) >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait mysql84 $(E2E_TARGETS); \
 	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS)
 
@@ -89,6 +98,7 @@ test-e2e:
 test-e2e-all:
 	@set -e; \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 mariadb1011 $(E2E_TARGETS) >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait mysql84 mariadb1011 $(E2E_TARGETS); \
 	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS); \
 	LAZYWF_TEST_DSN=$(E2E_DSN_MARIADB) $(CARGO) test --test e2e -- --test-threads=$(E2E_THREADS)
@@ -101,6 +111,7 @@ E2E_DB := LAZYWF_TEST_DSN=$(E2E_DSN)
 test-e2e-search:
 	@set -e; \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile search rm -sfv mysql84 opensearch es7 es8 >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
 	$(COMPOSE) --profile search up -d --wait mysql84 opensearch; \
 	$(E2E_DB) LAZYWF_TEST_OPENSEARCH=http://127.0.0.1:34200 $(CARGO) test --test e2e search_opensearch; \
 	$(COMPOSE) --profile search rm -sfv opensearch; \
@@ -124,8 +135,10 @@ QUEUE_PROFILES := --profile sqs --profile kinesis --profile amqp --profile pubsu
 QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka moto
 QUEUE_SERVERS := mysql84 s3 redis $(QUEUE_SERVICES)
 test-e2e-queues:
-	$(COMPOSE) $(QUEUE_PROFILES) up -d --wait $(QUEUE_SERVERS); rc=$$?; \
-	if [ $$rc -eq 0 ]; then \
+	@set -e; rc=0; \
+	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) $(QUEUE_PROFILES) rm -sfv $(QUEUE_SERVERS) >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
+	$(COMPOSE) $(QUEUE_PROFILES) up -d --wait $(QUEUE_SERVERS); \
 	  $(E2E_DB) LAZYWF_TEST_SQS=http://127.0.0.1:34561 $(CARGO) test --test e2e sqs_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_KINESIS=http://127.0.0.1:34562 $(CARGO) test --test e2e kinesis_ || rc=1; \
 	  $(E2E_DB) LAZYWF_TEST_AMQP=127.0.0.1:34560 $(CARGO) test --test e2e amqp_ || rc=1; \
@@ -144,8 +157,7 @@ test-e2e-queues:
 	    LAZYWF_TEST_KAFKA=127.0.0.1:34564 LAZYWF_TEST_KAFKA_ADMIN=http://127.0.0.1:34567 \
 	    LAZYWF_TEST_SERVICEBUS=127.0.0.1:34610 \
 	    $(CARGO) test --test log_secrets -- --test-threads=$(E2E_THREADS) || rc=1; \
-	fi; \
-	[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) $(QUEUE_PROFILES) rm -sfv $(QUEUE_SERVERS); exit $$rc
+	exit $$rc
 
 # The pgoutput source tests against the `pgsrc` compose service (a PostgreSQL with
 # wal_level=logical, the same image as the sink). Opt-in like the queue kinds: the engine cannot
@@ -155,11 +167,11 @@ test-e2e-queues:
 # skip) and drive the publisher through SQL only — the replication-protocol client is not here.
 E2E_PG_DSN ?= host=127.0.0.1 port=34532 user=lwfsrc password=lwfsrcpw dbname=lwfsrc
 test-e2e-pgsrc:
-	$(COMPOSE) --profile pgsrc up -d --wait pgsrc; rc=$$?; \
-	if [ $$rc -eq 0 ]; then \
-	  LAZYWF_TEST_PG=1 LAZYWF_TEST_PG_DSN="$(E2E_PG_DSN)" $(CARGO) test --test e2e pg_ -- --test-threads=$(E2E_THREADS) || rc=1; \
-	fi; \
-	[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile pgsrc rm -sfv pgsrc; exit $$rc
+	@set -e; \
+	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile pgsrc rm -sfv pgsrc >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
+	$(COMPOSE) --profile pgsrc up -d --wait pgsrc; \
+	LAZYWF_TEST_PG=1 LAZYWF_TEST_PG_DSN="$(E2E_PG_DSN)" $(CARGO) test --test e2e pg_ -- --test-threads=$(E2E_THREADS)
 
 # The integration tests on every other required line (README "Supported servers"), one server
 # at a time (service:port; the target services of `make servers` come up with it). MariaDB 10.6 goes
@@ -174,6 +186,7 @@ MATRIX_SERVICES := $(foreach sp,$(MATRIX),$(firstword $(subst :, ,$(sp))))
 test-matrix:
 	@set -e; \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile matrix --profile prerelease rm -sfv $(MATRIX_SERVICES) $(E2E_TARGETS) >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait $(E2E_TARGETS); \
 	for sp in $(MATRIX); do s=$${sp%%:*}; p=$${sp##*:}; \
 	  echo "=== $$s"; $(COMPOSE) --profile matrix --profile prerelease up -d --wait $$s; \
