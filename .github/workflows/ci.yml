@@ -125,6 +125,9 @@ jobs:
       # Varnish (host network) besides the default services; its test runs when this is set.
       COMPOSE_PROFILES: varnish
       LAZYWF_TEST_VARNISH: http://127.0.0.1:34681
+      # The make targets of this job keep the services they started: the job pre-starts them, reads
+      # `docker compose logs` after a failed run, and ends with `make servers-down` (Makefile).
+      KEEP_SERVERS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -214,6 +217,10 @@ jobs:
       SERVICES: redis valkey postgres s3 ${{ matrix.service }}
       MATRIX: ${{ matrix.service }}:${{ matrix.port }}
       TITLE: "Integration: ${{ matrix.title }} (${{ matrix.tier }})"
+      # `make test-matrix` keeps the servers it started (the one under test and the target services):
+      # the job pre-starts them, reads their logs after a failed run, and ends with
+      # `make servers-down` (Makefile).
+      KEEP_SERVERS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -279,6 +286,10 @@ jobs:
     name: search (OpenSearch 2.19, Elasticsearch 7.17, 8.17)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    # `make test-e2e-search` keeps the engines it started: the job pre-starts MySQL 8.4, reads the
+    # engines' logs after a failed run, and ends with `make servers-down` (Makefile).
+    env:
+      KEEP_SERVERS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -337,6 +348,10 @@ jobs:
     name: queues (ElasticMQ, kinesis-mock, RabbitMQ, Pub/Sub emulator, Mailpit, Redpanda, moto)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # `make test-e2e-queues` keeps the emulators and the MySQL 8.4 / S3 / Redis it started: the job
+    # pre-starts them, reads their logs after a failed run, and ends with `make servers-down`.
+    env:
+      KEEP_SERVERS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -399,6 +414,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: true
+    # `make test-e2e-pgsrc` keeps `pgsrc`: the job reads its logs after a failed run, reads the
+    # server version from it, and ends with `make servers-down`.
+    env:
+      KEEP_SERVERS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
