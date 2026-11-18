@@ -49,9 +49,7 @@ const NOT_ALLOWED: &[u8] = b"method not allowed\n";
 /// loop is the same one `serve` runs once it has bound, and this way the test never races for a
 /// number. Returns its address and its task.
 async fn endpoint(h: Arc<Health>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a free port");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
     let addr = listener.local_addr().expect("its address");
     (addr, tokio::spawn(serve_listener(listener, h)))
 }
@@ -62,9 +60,7 @@ async fn endpoint(h: Arc<Health>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
 /// another number taken.
 async fn served(h: Arc<Health>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     for _ in 0..5 {
-        let spare = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a free port");
+        let spare = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
         let addr = spare.local_addr().expect("its address");
         drop(spare);
         let task = tokio::spawn(serve(addr, h.clone()));
@@ -122,10 +118,7 @@ async fn the_probes_answer_with_exact_bytes() {
         let (head, body) = request(addr, &get(path)).await;
         assert_eq!(
             (head.as_str(), body.as_slice()),
-            (
-                resp_head(200, "OK", "text/plain", OK).as_str(),
-                OK,
-            ),
+            (resp_head(200, "OK", "text/plain", OK).as_str(), OK,),
             "{path}"
         );
     }
@@ -207,13 +200,7 @@ async fn head_sends_the_head_and_no_body() {
     .await;
     assert_eq!(
         head,
-        resp_head_with(
-            401,
-            "Unauthorized",
-            "text/plain",
-            CHALLENGE,
-            UNAUTHORIZED
-        )
+        resp_head_with(401, "Unauthorized", "text/plain", CHALLENGE, UNAUTHORIZED)
     );
     assert!(body.is_empty(), "a HEAD sent a body");
     task.abort();
@@ -281,20 +268,22 @@ async fn the_status_gate_is_checked_on_the_wire() {
     );
     assert_eq!(request(addr, &get("/status")).await, refused);
     for given in [
-        "s3cret",          // the scheme is required
-        "Bearer",          // and so is the credential
-        "Bearer ",         // an empty credential
-        "Bearer s3cre",    // a prefix of the token
-        "Bearer s3crex",   // a same-length near miss
-        "Bearer s3cret!",  // one byte more
-        "Basic s3cret",    // another scheme
-        "",                // an empty header
+        "s3cret",         // the scheme is required
+        "Bearer",         // and so is the credential
+        "Bearer ",        // an empty credential
+        "Bearer s3cre",   // a prefix of the token
+        "Bearer s3crex",  // a same-length near miss
+        "Bearer s3cret!", // one byte more
+        "Basic s3cret",   // another scheme
+        "",               // an empty header
     ] {
         assert_eq!(
             request(
                 addr,
-                format!("GET /status HTTP/1.1\r\nHost: x\r\n{AUTHORIZATION_HEADER}: {given}\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET /status HTTP/1.1\r\nHost: x\r\n{AUTHORIZATION_HEADER}: {given}\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await,
             refused,
