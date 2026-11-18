@@ -232,3 +232,26 @@ fn the_largest_message_is_the_topics_and_can_be_raised() {
     assert!(check_vars(&Map::new()).is_ok());
     assert!(check_vars(&vars("2000000")).is_err());
 }
+
+#[test]
+fn an_entry_line_must_name_a_field_and_a_number() {
+    // A member line with no field part: the entry cannot be read at all.
+    let e = entries_ok(
+        b"Action=PublishBatch&PublishBatchRequestEntries.member.foo=1",
+        1,
+        false,
+    )
+    .unwrap_err();
+    assert!(e.contains("names no field of an entry"), "{e}");
+    // A member number that is not a number.
+    let e = entries_ok(
+        b"Action=PublishBatch&PublishBatchRequestEntries.member.x.Id=1",
+        1,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        e.contains("numbered `PublishBatchRequestEntries.member.<n>`"),
+        "{e}"
+    );
+}

@@ -280,3 +280,65 @@ fn eventbridge_refuses_stray_and_bus_delete_resets() {
     )];
     assert!(kind_errors(&d, &eb(), &[]).is_empty());
 }
+
+// ——— `sns`: one PublishBatch, sized by the topic's MaximumMessageSize ——————————
+
+const TOPIC: &str = "aws-sns://eu-west-1/123456789012/orders";
+const FIFO_TOPIC: &str = "aws-sns://eu-west-1/123456789012/orders.fifo";
+
+#[test]
+fn sns_needs_a_batch_key_count_and_sizes_bytes_by_the_topic_limit() {
+    let sns = |vars: &str| target("sns", TOPIC, vars);
+    // One action is one PublishBatch: the engine splits by bytes, never by count, so
+    // the entry count has to be stated when the rule loads.
+    let mut d = def();
+    d.batch_max_keys = None;
+    let e = kind_errors(&d, &sns("{}"), &[]);
+    assert!(
+        e.iter()
+            .any(|m| m.contains("kind sns needs `batch_max_keys`")),
+        "{e:?}"
+    );
+    d.batch_max_keys = Some(11);
+    let e = kind_errors(&d, &sns("{}"), &[]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("over 10"), "{e:?}");
+    d.batch_max_keys = Some(10);
+    assert!(kind_errors(&d, &sns("{}"), &[]).is_empty());
+    // The same number bounds one message and the batch: the topic's MaximumMessageSize,
+    // 256 KiB by default and at most 1 MiB, which `vars.maximum_message_size` states.
+    d.batch_max_bytes = Some(262_144);
+    assert!(kind_errors(&d, &sns("{}"), &[]).is_empty());
+    d.batch_max_bytes = Some(262_145);
+    let e = kind_errors(&d, &sns("{}"), &[]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("over 262144 bytes"), "{e:?}");
+    d.batch_max_bytes = Some(524_288);
+    let e = kind_errors(&d, &sns(r#"{"maximum_message_size":262144}"#), &[]);
+    assert_eq!(e.len(), 1, "the target still says 256 KiB: {e:?}");
+    assert!(
+        kind_errors(&d, &sns(r#"{"maximum_message_size":1048576}"#), &[]).is_empty(),
+        "a 1 MiB topic takes a 512 KiB batch"
+    );
+    // One key per action has no batch to size.
+    d.fire_per = FirePer::Key;
+    d.batch_max_keys = None;
+    d.batch_max_bytes = None;
+    assert!(kind_errors(&d, &sns("{}"), &[]).is_empty());
+}
+
+#[test]
+fn a_fifo_topic_needs_a_version_column_for_its_deduplication_id() {
+    let d = def();
+    let e = kind_errors(&d, &target("sns", FIFO_TOPIC, "{}"), &cols(&["id"]));
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("MessageDeduplicationId"), "{e:?}");
+    assert!(kind_errors(
+        &d,
+        &target("sns", FIFO_TOPIC, "{}"),
+        &cols(&["id", "version"])
+    )
+    .is_empty());
+    // A standard topic needs no version.
+    assert!(kind_errors(&d, &target("sns", TOPIC, "{}"), &cols(&["id"])).is_empty());
+}
