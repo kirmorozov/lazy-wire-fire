@@ -196,6 +196,47 @@ pub(crate) fn position_rule(header: BinlogEventHeader) -> Step {
     }
 }
 
+/// The MariaDB arm of [`crate::source::plan_refusal`] (issue #7): from MariaDB 11.4 on, the
+/// UPDATE and DELETE row images leave VIRTUAL generated columns out and the row reader finds
+/// columns by table position, so a REAL column positioned after a VIRTUAL one would be read
+/// from the wrong place: a plan that reads one is refused until #7 is fixed. The two cases
+/// the row images do carry are not refused: the VIRTUAL column itself (the planner treats it
+/// as an expression over real columns) and STORED columns (the server writes them into the
+/// images).
+pub(crate) fn plan_refusal(
+    version: &str,
+    table: &TableInfo,
+    referenced: &[bool],
+) -> Option<String> {
+    if !at_least_11_4(version) {
+        return None;
+    }
+    let first_virtual = table
+        .columns
+        .iter()
+        .position(|c| c.generated.as_ref().is_some_and(|g| !g.stored))?;
+    let read = (first_virtual + 1..table.columns.len()).find(|&i| {
+        table.columns[i].generated.is_none() && referenced.get(i).copied().unwrap_or(false)
+    })?;
+    Some(format!(
+        "view reads column `{}` of `{}`.`{}`, a real column after its VIRTUAL generated column `{}`, which MariaDB {version} leaves out of the row images (issue #7): the view is refused until #7 is fixed",
+        table.columns[read].name, table.schema, table.name, table.columns[first_virtual].name
+    ))
+}
+
+/// Whether a `VERSION()` string is MariaDB 11.4 or later (`11.4.2-MariaDB`, `10.11.14-MariaDB`;
+/// the `5.5.5-` replication prefix is skipped).
+fn at_least_11_4(version: &str) -> bool {
+    let v = version.strip_prefix("5.5.5-").unwrap_or(version);
+    let mut parts = v
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    (major, minor) >= (11, 4)
+}
+
 // ---- The catalog loader (F6): MariaDB's answer to the five `information_schema` reads. The
 // reads themselves are shared with `mysql.rs` (called into, never copied); MariaDB's own are
 // how the rows are answered: plain-SQL generation expressions, and the default collation of a
@@ -204,11 +245,22 @@ pub(crate) fn position_rule(header: BinlogEventHeader) -> Step {
 /// The MariaDB table metadata: the shared `information_schema` reads, with
 /// [`unescape_generation_expression`] as the generated-expression spelling and
 /// [`default_collation`] as the collation probe.
+/// MariaDB's answer to `Flavor::snapshot_position_is_watermark`: `true`. The pair names the point
+/// of the binlog stream the snapshot reads as of, so everything at or before it is committed and
+/// readable by that snapshot — waiting for it to reach the position already read from the binlog
+/// is an exact fence (`visibility_snapshot_fence_exact` proves it under the widened commit
+/// window). The MySQL family reports the raw write position instead, which is no watermark
+/// (`mysql::snapshot_position_is_watermark`).
+pub(crate) fn snapshot_position_is_watermark() -> bool {
+    true
+}
+
 /// The position the source session's consistent snapshot includes: one transaction read at
 /// REPEATABLE READ, committed whatever the status read did. `fail_first`/`try_no` are the
 /// engine's snapshot-failure test hook (decision 4): a transient, non-connection failure.
-/// MariaDB's and Percona Server's fence ([`crate::source::fence`]); `Ok(None)`: the server
-/// reports no position, so it rules itself out (e.g. MySQL Community).
+/// The fence of the flavors whose `Flavor::snapshot_position_is_watermark` answers `true`
+/// (MariaDB, [`snapshot_position_is_watermark`] below); `Ok(None)`: the server reports no
+/// position, so it rules itself out (e.g. MySQL Community).
 pub(crate) async fn snapshot_position(
     conn: &mut Conn,
     fail_first: Option<usize>,
@@ -327,9 +379,62 @@ pub(crate) fn cursor_key(p: &crate::source::Position) -> (u64, u64) {
     crate::source::mysql::position_key(p)
 }
 
-/// The text is the MySQL family's (`file:pos`): a call into `mysql.rs`, never a copy.
-pub(crate) fn parse(text: &str) -> Option<crate::source::Position> {
+/// The text is the MySQL family's (`file:pos` and the optional `[g=…]`): a call into `mysql.rs`
+/// for the split, never a copy. The set inside `[g=…]` is returned verbatim and read back by
+/// MariaDB's own [`parse_gtid_set`].
+pub(crate) fn parse(text: &str) -> Option<(crate::source::Position, Option<String>)> {
     crate::source::mysql::parse(text)
+}
+
+/// MariaDB's gtid-list grammar: comma-separated `domain-server-seq` (a high-water mark: every
+/// transaction `1..=seq` for that `domain-server` pair, because MariaDB numbers them sequentially
+/// per pair and `gtid_binlog_state` reports the last one written) or `domain-server-seq1-seq2` (an
+/// explicit window `seq1..=seq2`, the shape `mariadb-binlog -j` / `SET @slave_connect_state` take).
+/// The key is the `domain-server` pair. A token that is not a well-formed list entry is dropped,
+/// never guessed. This is MariaDB's quirk: the MySQL family reads a bare number as one gno
+/// ([`mysql::parse_gtid_set`]), MariaDB reads it as a prefix from 1.
+pub(crate) fn parse_gtid_set(text: &str) -> mysql::GtidSet {
+    let mut set = mysql::GtidSet::new();
+    for tok in text.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let mut f = tok.split('-');
+        let (Some(dom), Some(server), Some(seq)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let (Ok(d), Ok(s)) = (dom.trim().parse::<u32>(), server.trim().parse::<u32>()) else {
+            continue;
+        };
+        let (lo, hi) = match (
+            seq.trim().parse::<u64>(),
+            f.next().map(|r| r.trim().parse::<u64>()),
+        ) {
+            // a single `seq` is the high-water mark: transactions 1..=seq.
+            (Ok(a), None) => (1, a),
+            // `seq1-seq2` is the explicit window seq1..=seq2.
+            (Ok(a), Some(Ok(b))) => (a, b),
+            _ => continue,
+        };
+        let entry = set.entry(format!("{d}-{s}")).or_default();
+        mysql::merge_interval(entry, lo, hi);
+    }
+    set
+}
+
+/// The MariaDB subset question for [`crate::source::gtid_covers`]: does this node's
+/// `@@GLOBAL.gtid_binlog_state` include `saved`? Compared in flavor code over the parsed lists
+/// (MariaDB has no server-side subset function to hand the question to), reusing the shared
+/// interval rule through `mysql.rs`. A cursor with no set covers trivially.
+pub(crate) async fn gtid_covers(conn: &mut Conn, saved: Option<&str>) -> Result<bool> {
+    let Some(saved) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(true);
+    };
+    let saved = parse_gtid_set(saved);
+    let st = crate::binlog::gtid_state(conn).await?;
+    let state = st.binlog_state.unwrap_or_default();
+    Ok(mysql::gtid_subset(&saved, &parse_gtid_set(&state)))
 }
 
 /// The 4-byte header floor is the shared one too.

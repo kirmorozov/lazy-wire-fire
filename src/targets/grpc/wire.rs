@@ -48,7 +48,10 @@ impl Codec {
             return Ok((false, body.to_vec()));
         }
         let packed = match self {
-            Codec::Identity => unreachable!("handled above"),
+            // Folded rather than `unreachable!`: the early return above covers identity
+            // and small bodies today, and a future caller change should meet the bytes
+            // themselves, not a panic.
+            Codec::Identity => return Ok((false, body.to_vec())),
             Codec::Gzip => {
                 use std::io::Write as _;
                 let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));

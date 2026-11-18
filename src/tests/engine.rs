@@ -500,3 +500,133 @@ fn the_statement_dml_line_carries_no_statement() {
         "the statement text reached the log: {text}"
     );
 }
+
+/// The versions that stopped writing VIRTUAL generated columns into UPDATE and DELETE row images
+/// are the ones lazywf refuses reads for — and only those: 10.6 and 10.11 (tested on 10.6.28 and
+/// 10.11.19) and the MySQL family (tested on 8.0.46, 8.4.13, 9.7.4, Percona 8.4.11) send them.
+#[test]
+fn maria_skips_virtual_reads_the_version() {
+    let skipped = [
+        "11.4.0-MariaDB",
+        "11.4.13-MariaDB-1:11.4.13+maria~ubu2404",
+        "11.8.9-MariaDB-1:11.8.9+maria~ubu2410",
+        "12.3.3-MariaDB",
+        "13.2.0-preview",
+        "11.4",
+        // A replication proxy shadows the version it fronts with the old one.
+        "5.5.5-11.4.13-MariaDB-1:11.4.13+maria~ubu2404",
+        "5.5.5-13.0.2-MariaDB",
+    ];
+    for v in skipped {
+        assert!(maria_skips_virtual(v), "{v} writes no VIRTUAL columns");
+    }
+    let writes = [
+        "10.6.28-MariaDB-1:10.6.28+maria~ubu2204",
+        "10.11.19-MariaDB-1:10.11.19+maria~ubu2404",
+        "5.5.5-10.11.19-MariaDB-log",
+        "11.3.2-MariaDB",
+        "11",
+        "8.4.13",
+        "9.7.4",
+        "",
+        "MariaDB",
+        "11.x.1",
+        "unknown",
+    ];
+    for v in writes {
+        assert!(!maria_skips_virtual(v), "{v} writes them");
+    }
+}
+
+/// A rule is refused for the column it reads that the image shifted out — the VIRTUAL one itself
+/// and everything after it — and left alone when it reads only columns before it. A STORED column
+/// after a VIRTUAL one is refused too: the image skips the VIRTUAL one, so the STORED value moves
+/// up a place as well.
+#[test]
+fn unreadable_read_refuses_reads_past_the_virtual_column() {
+    // id, price, price_x2 (VIRTUAL), name, stock
+    let all = [
+        ("id", 0usize),
+        ("price", 1),
+        ("price_x2", 2),
+        ("name", 3),
+        ("stock", 4),
+    ];
+    assert_eq!(
+        unreadable_read(&all, false, 2),
+        Some(VirtualRead::Col("price_x2".into())),
+        "the VIRTUAL column itself is the first read that cannot be carried"
+    );
+    assert_eq!(
+        unreadable_read(&[("id", 0), ("price", 1)], false, 2),
+        None,
+        "columns before it are read as themselves"
+    );
+    assert_eq!(
+        unreadable_read(&[("id", 0), ("price_stored", 3)], false, 2),
+        Some(VirtualRead::Col("price_stored".into())),
+        "a STORED column after a VIRTUAL one is shifted too"
+    );
+    assert_eq!(
+        unreadable_read(&[], false, 0),
+        None,
+        "a trigger that reads no column marks nothing wrong"
+    );
+    assert_eq!(
+        unreadable_read(&[("id", 0)], true, 4),
+        Some(VirtualRead::Full),
+        "a Full key renders the whole row, so a table with a VIRTUAL column is refused outright"
+    );
+    assert_eq!(
+        unreadable_read(&[("stock", 4), ("name", 3)], false, 3),
+        Some(VirtualRead::Col("stock".into())),
+        "the first unreadable read of the rule is the one reported"
+    );
+}
+
+/// The VIRTUAL generated column of a table, in the order the layout is built in: `information_schema`
+/// says which columns are generated VIRTUAL, and the first of them is where the row image runs short.
+#[test]
+fn virtual_first_of_finds_the_generated_column() {
+    let rows = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        virtual_first_of(&rows(&[
+            ("id", ""),
+            ("price", "STATIC"),
+            ("price_x2", "VIRTUAL GENERATED"),
+            ("name", "on update CURRENT_TIMESTAMP"),
+            ("stock", ""),
+        ])),
+        Some((2, "price_x2".to_string())),
+        "the first VIRTUAL column, by its position among all columns"
+    );
+    assert_eq!(
+        virtual_first_of(&rows(&[("id", ""), ("price_stored", "STORED GENERATED")])),
+        None,
+        "a STORED column is in the image, so nothing is refused"
+    );
+    assert_eq!(
+        virtual_first_of(&rows(&[
+            ("a", "STORED GENERATED"),
+            ("b", "VIRTUAL GENERATED"),
+            ("c", "VIRTUAL GENERATED"),
+        ])),
+        Some((1, "b".to_string())),
+        "with two of them, the first decides"
+    );
+    assert_eq!(
+        virtual_first_of(&rows(&[])),
+        None,
+        "a table with no columns"
+    );
+    assert_eq!(
+        virtual_first_of(&rows(&[("id", ""), ("n", "virtual generated")])),
+        Some((1, "n".to_string())),
+        "the wording is matched whatever its case"
+    );
+}

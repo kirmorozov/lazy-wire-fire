@@ -62,7 +62,15 @@ pub(crate) async fn send(
             c.exec(&sql, timeout).await?,
             format!("{}/{}", c.addr.host, c.addr.db),
         ),
-        _ => unreachable!(),
+        // `Target::new` only gives a `mysql`/`pgsql` target these two; any other transport
+        // here is a wiring mistake, and it must become a refusal naming itself rather than
+        // a panic on the send task.
+        other => {
+            return Err(rejected(format!(
+                "this target's transport is {} and not a mysql/pgsql endpoint",
+                transport_name(other)
+            )))
+        }
     };
     expect
         .row(pool, |u| Row::affected(u, affected))
@@ -91,6 +99,33 @@ pub(crate) async fn fetch(
                 .ok_or_else(|| anyhow!("the list template rendered nothing"))?;
             Ok(Row::json(uses, &c.rows(&sql, timeout).await?))
         }
-        _ => unreachable!(),
+        // The same refusal as in [`send`]: not this target's transport, and it says so.
+        other => Err(rejected(format!(
+            "this target's transport is {} and not a mysql/pgsql endpoint",
+            transport_name(other)
+        ))),
     }
 }
+
+/// The transport's own name, for refusals like the two above: a future `Transport`
+/// variant must become a refusal naming itself, not a `unreachable!` on the send task.
+fn transport_name(transport: &Transport) -> &'static str {
+    match transport {
+        Transport::Http { .. } => "http",
+        Transport::HttpSecret { .. } => "http secret",
+        Transport::Redis(_) => "redis",
+        Transport::Amqp(_) => "amqp",
+        Transport::Smtp(_) => "smtp",
+        Transport::MySql(_) => "mysql",
+        Transport::Pg(_) => "pgsql",
+        Transport::PubSub(_) => "pubsub",
+        Transport::Kafka(_) => "kafka",
+        Transport::RabbitMqStream(_) => "rabbitmq stream",
+        Transport::Grpc(_) => "grpc",
+        Transport::ServiceBus(_) => "servicebus",
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/targets_sql.rs"]
+mod tests;

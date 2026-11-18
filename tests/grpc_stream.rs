@@ -307,6 +307,28 @@ async fn two_answered_of_three_and_the_third_waits() {
     server.stop();
 }
 
+/// A server that acknowledges with no status has judged nothing: the stream ignores the
+/// answer (the item keeps its place), the deadline answers for it, and the key is
+/// transient — never refused. The module maps such a verdict itself as well, so the
+/// invariant lives where the verdict is read (its one-WARN half is unit-tested).
+#[tokio::test]
+async fn an_acknowledgement_without_a_status_judges_nothing() {
+    let mut policy = Policy::default();
+    policy.unspecified = vec!["a".into()];
+    let (items, server) = flush_at(policy, &["a", "b"], &[], 400).await;
+    assert!(
+        matches!(&items[0], Item::Transient(w) if w.contains("no acknowledgement")),
+        "an answer with no status cannot refuse a key: {:?}",
+        items[0]
+    );
+    assert_eq!(
+        items[1],
+        Item::Ok,
+        "the honest answer beside it still counts"
+    );
+    server.stop();
+}
+
 #[tokio::test]
 async fn a_stream_that_dies_mid_flight_costs_no_key_and_the_next_flush_reconnects() {
     let mut policy = Policy::default();

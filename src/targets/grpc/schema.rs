@@ -173,14 +173,32 @@ fn fill(
         let p = extend(path, name);
         let field = field_of(body, name).ok_or_else(|| unknown_field(body, &p))?;
         let v = to_value(&field, value, &p)?;
-        msg.try_set_field(&field, v).map_err(|e| match e {
-            SetFieldError::InvalidType { .. } => {
-                anyhow!("`{}` is not a {} value", p.join(""), kind_name(&field))
-            }
-            SetFieldError::NotFound => unreachable!("the field was just found on this message"),
-        })?;
+        msg.try_set_field(&field, v)
+            .map_err(|e| set_field_error(body, &field, &p, e))?;
     }
     Ok(())
+}
+
+/// Why a value of the right shape still did not land. A wrong type is the document's
+/// fault. `NotFound` should be impossible — the field was read off this very descriptor a
+/// line above — but a descriptor that disagrees with itself is refused like any other
+/// unusable schema, naming the field, rather than panicking on the first send.
+fn set_field_error(
+    body: &MessageDescriptor,
+    field: &FieldDescriptor,
+    path: &[String],
+    e: SetFieldError,
+) -> anyhow::Error {
+    match e {
+        SetFieldError::InvalidType { .. } => {
+            anyhow!("`{}` is not a {} value", path.join(""), kind_name(field))
+        }
+        SetFieldError::NotFound => anyhow!(
+            "`{}` is not a field of `{}` (its descriptor named it, the message does not hold it)",
+            path.join(""),
+            body.full_name()
+        ),
+    }
 }
 
 /// A field by its proto name or by its lowerCamelCase JSON name, which is what protobuf's own
@@ -252,7 +270,14 @@ fn to_value(field: &FieldDescriptor, value: &Json, path: &[String]) -> Result<Va
 fn map_value(field: &FieldDescriptor, value: &Json, path: &[String]) -> Result<Value> {
     let entry = match field.kind() {
         Kind::Message(m) => m,
-        _ => unreachable!("a map field's kind is its entry message"),
+        // The caller only routes here when the descriptor says map, which means the kind
+        // is the entry message; a descriptor that says otherwise is refused naming both.
+        _ => bail!(
+            "the descriptor's map field `{}` (`{}`) has kind `{}`, not an entry message",
+            path.join(""),
+            field.name(),
+            kind_name(field)
+        ),
     };
     let not_a_map = || anyhow!("`{}` is not a map field", path.join(""));
     let key_field = entry.get_field_by_name("key").ok_or_else(not_a_map)?;
@@ -413,7 +438,9 @@ fn number_text(text: &str, field: &FieldDescriptor, here: &str) -> Result<Value>
             text.parse::<i64>().map(Value::I64).map_err(|_| bad())?
         }
         Kind::Uint64 | Kind::Fixed64 => text.parse::<u64>().map(Value::U64).map_err(|_| bad())?,
-        _ => unreachable!("only number fields get here"),
+        // Only numbers are routed here; a descriptor that does not agree is refused
+        // naming the kind, like any other value the field cannot hold.
+        _ => return Err(bad()),
     })
 }
 
