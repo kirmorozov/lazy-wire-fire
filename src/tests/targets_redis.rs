@@ -100,3 +100,358 @@ fn encoding() {
         Some("ERR x")
     );
 }
+
+// ——— the verdict an answer earns, against a server of flesh and TCP ——————————
+//
+// `send` and `fetch` decide from the reply: an error reply whose code is on the
+// transient list waits, any other error reply is refused by this key, silence is
+// transient, and an empty render for a listing bails before a byte goes out.
+
+/// Reads what the client sends (one command) and answers with `reply`, then closes.
+async fn serve_reply(reply: &'static str) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        let mut chunk = [0u8; 1024];
+        loop {
+            // One command arrives; the read window is so the server does not answer
+            // while the client is still writing the command bytes.
+            match tokio::time::timeout(std::time::Duration::from_millis(30), s.read(&mut chunk))
+                .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    if !chunk[..n].is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = s.write_all(reply.as_bytes()).await;
+        let _ = s.flush().await;
+        let _ = s.shutdown().await;
+    });
+    addr
+}
+
+/// Accepts and reads, but never answers: the client's own timeout is the verdict.
+async fn serve_silence() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        let mut chunk = [0u8; 1024];
+        loop {
+            match s.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    });
+    addr
+}
+
+/// A db-0 client without credentials: no AUTH and no SELECT on connect, so the
+/// server sees exactly one command.
+fn client_on(addr: std::net::SocketAddr) -> Client {
+    Client::new(
+        RedisAddr::parse(&format!("redis://{addr}/0")).unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn pool() -> mysql_async::Pool {
+    mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x")
+}
+
+#[tokio::test]
+async fn an_error_reply_waits_or_is_refused_by_its_code() {
+    let cases = [
+        (
+            "-LOADING Redis is loading the dataset in memory\r\n",
+            "LOADING",
+            false,
+        ),
+        (
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+            "WRONGTYPE",
+            true,
+        ),
+        ("-CLUSTERDOWN The cluster is down\r\n", "CLUSTERDOWN", false),
+    ];
+    for (reply, code, refused) in cases {
+        let addr = serve_reply(reply).await;
+        let client = client_on(addr);
+        let expect = Expect::new(None).unwrap();
+        let e = send(
+            &client,
+            "GET k",
+            std::time::Duration::from_secs(2),
+            &expect,
+            &pool(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{e:#}");
+        assert_eq!(crate::target::is_rejected(&e), refused, "`{code}`: {msg}");
+        assert!(msg.contains(code), "{msg}");
+        assert!(msg.contains("GET on"), "{msg}");
+    }
+}
+
+#[tokio::test]
+async fn no_reply_within_the_timeout_waits() {
+    let addr = serve_silence().await;
+    let client = client_on(addr);
+    let expect = Expect::new(None).unwrap();
+    let e = send(
+        &client,
+        "GET k",
+        std::time::Duration::from_millis(150),
+        &expect,
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(
+        !crate::target::is_rejected(&e),
+        "silence says not now: {msg}"
+    );
+    assert!(msg.contains("no reply within"), "{msg}");
+}
+
+#[tokio::test]
+async fn an_ok_reply_sends_and_a_fetch_reads_the_reply() {
+    let addr = serve_reply("+OK\r\n").await;
+    let client = client_on(addr);
+    let expect = Expect::new(None).unwrap();
+    assert_eq!(
+        send(
+            &client,
+            "SET k v",
+            std::time::Duration::from_secs(2),
+            &expect,
+            &pool()
+        )
+        .await
+        .unwrap(),
+        Sent::Ok
+    );
+    // A listing reads its reply as the row; a render of nothing bails before a byte.
+    let addr = serve_reply("$2\r\n17\r\n").await;
+    let client = client_on(addr);
+    let uses = Uses {
+        body: true,
+        ..Default::default()
+    };
+    let row = fetch(&client, "GET k", std::time::Duration::from_secs(2), uses)
+        .await
+        .unwrap();
+    let _ = row;
+    let client = client_on(addr);
+    let e = fetch(&client, "   ", std::time::Duration::from_secs(2), uses)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:#}").contains("the list template rendered nothing"),
+        "{e:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_denied_by_the_server_fails_the_step() {
+    let addr =
+        serve_reply("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await;
+    let client = client_on(addr);
+    let uses = Uses {
+        body: true,
+        ..Default::default()
+    };
+    let e = fetch(&client, "GET k", std::time::Duration::from_secs(2), uses)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("WRONGTYPE"), "{e:#}");
+}
+
+/// Answers the commands it is sent one by one from `replies` (so a connect handshake
+/// of `AUTH` and `SELECT` can be served before the real command).
+async fn serve_replies(replies: &'static [&'static str]) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        for reply in replies {
+            let mut chunk = [0u8; 1024];
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(30), s.read(&mut chunk))
+                    .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => {
+                        if !chunk[..n].is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if s.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = s.flush().await;
+        }
+        let _ = s.shutdown().await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn the_connect_handshake_sends_auth_and_select_in_order() {
+    // Credentials and a database: `AUTH user pw`, then `SELECT 2`, then the command.
+    let addr = serve_replies(&["+OK\r\n", "+OK\r\n", "$2\r\n17\r\n"]).await;
+    let client = Client::new(
+        RedisAddr::parse(&format!("redis://{addr}/2")).unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        Some("keeper".into()),
+        Some("s3cret".into()),
+    )
+    .unwrap();
+    let expect = Expect::new(None).unwrap();
+    assert_eq!(
+        send(
+            &client,
+            "GET k",
+            std::time::Duration::from_secs(2),
+            &expect,
+            &pool()
+        )
+        .await
+        .unwrap(),
+        Sent::Ok
+    );
+}
+
+#[tokio::test]
+async fn a_handshake_the_server_refuses_names_the_step_that_died() {
+    // `AUTH` refused: the connect fails, naming AUTH (a credential being rotated is
+    // waited out, not a key being refused: transient).
+    let addr = serve_replies(&["-WRONGPASS invalid username-password pair\r\n"]).await;
+    let client = Client::new(
+        RedisAddr::parse(&format!("redis://{addr}/0")).unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        None,
+        Some("s3cret".into()),
+    )
+    .unwrap();
+    let expect = Expect::new(None).unwrap();
+    let e = send(
+        &client,
+        "GET k",
+        std::time::Duration::from_secs(2),
+        &expect,
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(msg.contains("AUTH failed: WRONGPASS"), "{msg}");
+    assert!(!crate::target::is_rejected(&e), "{msg}");
+    // `SELECT` refused (db 9 of a five-database server): naming SELECT.
+    let addr = serve_replies(&["-ERR DB index is out of range\r\n"]).await;
+    let client = Client::new(
+        RedisAddr::parse(&format!("redis://{addr}/9")).unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        None,
+        None,
+    )
+    .unwrap();
+    let e = send(
+        &client,
+        "GET k",
+        std::time::Duration::from_secs(2),
+        &expect,
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("SELECT 9 failed"), "{e:#}");
+}
+
+#[tokio::test]
+async fn array_replies_are_read_well_and_malformed_ones_wait() {
+    // Shape: the command of the client is one line; the server answers it and closes.
+    for (reply, want_ok, want) in [
+        ("*0\r\n", true, ""),                             // empty array
+        ("*-1\r\n", true, ""),                            // nil array
+        ("$-1\r\n", true, ""),                            // nil bulk
+        ("*2\r\n$1\r\na\r\n*1\r\n$1\r\nb\r\n", true, ""), // nested array
+        ("*abc\r\n", false, "bad array length"),
+        ("$x\r\n", false, "bad bulk length"),
+        ("*10000001\r\n", false, "too large"),
+    ] {
+        let addr = serve_reply(reply).await;
+        let client = client_on(addr);
+        let expect = Expect::new(None).unwrap();
+        let got = send(
+            &client,
+            "GET k",
+            std::time::Duration::from_secs(2),
+            &expect,
+            &pool(),
+        )
+        .await;
+        match (want_ok, got) {
+            (true, Ok(sent)) => assert_eq!(sent, Sent::Ok, "reply {reply:?}"),
+            (true, Err(e)) => panic!("reply {reply:?} read as an error: {e:#}"),
+            (false, Ok(sent)) => panic!("reply {reply:?} read as {sent:?}"),
+            (false, Err(e)) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains(want), "reply {reply:?}: {msg}");
+                assert!(!crate::target::is_rejected(&e), "reply {reply:?}: {msg}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_connection_hung_up_mid_reply_waits() {
+    // The server takes the command and closes without a byte of answer: the reply
+    // cannot be read, which says nothing about the key — transient.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        let mut chunk = [0u8; 1024];
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(30), s.read(&mut chunk)).await;
+        drop(s);
+    });
+    let client = client_on(addr);
+    let expect = Expect::new(None).unwrap();
+    let e = send(
+        &client,
+        "GET k",
+        std::time::Duration::from_secs(2),
+        &expect,
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !crate::target::is_rejected(&e),
+        "a hung-up connection is not a refusal: {e:#}"
+    );
+    assert!(format!("{e:#}").contains("GET on"), "{e:#}");
+}

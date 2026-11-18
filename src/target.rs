@@ -1175,6 +1175,10 @@ mod dispatch_tests;
 #[path = "tests/target_secret_endpoint_tests.rs"]
 mod secret_endpoint_tests;
 
+#[cfg(test)]
+#[path = "tests/target_outcome_classify_tests.rs"]
+mod outcome_classify_tests;
+
 // ---------------------------------------------------------------------------------------------
 // oauth: the plain http kinds carry `Authorization: Bearer <token>` (see `src/oauth.rs`).
 
