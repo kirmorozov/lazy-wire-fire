@@ -2,8 +2,10 @@
 //! the in-process gRPC server of [`grpc_server`].
 #![allow(dead_code)]
 
+pub mod fault;
 pub mod grpc_server;
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -44,20 +46,40 @@ pub struct Db {
     pub dsn: String,
 }
 
+/// `Conn::disconnect` waits for the peer to close the socket. On a loaded box that never has to
+/// come back, and a harness that hangs on it explains nothing (observed: the suite sitting on a
+/// finished statement's disconnect). Every disconnect the harness does on its own connections is
+/// bounded: after the grace period the socket is simply dropped, which for a test connection is
+/// the same outcome.
+pub async fn quit(c: Conn) {
+    if tokio::time::timeout(Duration::from_secs(15), c.disconnect())
+        .await
+        .is_err()
+    {
+        eprintln!("harness> disconnect did not complete in 15 s; dropping the socket");
+    }
+}
+
 impl Db {
     /// A fresh, empty schema `lwf_<name>`.
     pub async fn fresh(root: &str, name: &str) -> Db {
         let schema = format!("lwf_{name}");
-        let mut c = Conn::new(Opts::from_url(&format!("{root}/?prefer_socket=false")).unwrap())
-            .await
-            .unwrap();
+        let mut c = match tokio::time::timeout(
+            Duration::from_secs(20),
+            Conn::new(Opts::from_url(&format!("{root}/?prefer_socket=false")).unwrap()),
+        )
+        .await
+        {
+            Ok(c) => c.unwrap(),
+            Err(_) => panic!("{root}: the server did not answer a new connection in 20 s"),
+        };
         c.query_drop(format!("DROP DATABASE IF EXISTS `{schema}`"))
             .await
             .unwrap();
         c.query_drop(format!("CREATE DATABASE `{schema}`"))
             .await
             .unwrap();
-        c.disconnect().await.ok();
+        quit(c).await;
         Db {
             dsn: format!("{root}/{schema}?prefer_socket=false"),
             schema,
@@ -65,7 +87,14 @@ impl Db {
     }
 
     pub async fn conn(&self) -> Conn {
-        Conn::new(Opts::from_url(&self.dsn).unwrap()).await.unwrap()
+        let opts = Opts::from_url(&self.dsn).unwrap();
+        match tokio::time::timeout(Duration::from_secs(10), Conn::new(opts)).await {
+            Ok(c) => c.unwrap(),
+            Err(_) => panic!(
+                "{}: no answer from the server within 10 s (new connection)",
+                self.dsn
+            ),
+        }
     }
 
     pub async fn exec(&self, sql: &str) {
@@ -73,7 +102,7 @@ impl Db {
         c.query_drop(sql)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
-        c.disconnect().await.ok();
+        quit(c).await;
     }
 
     pub async fn exec_params(&self, sql: &str, params: impl Into<mysql_async::Params> + Send) {
@@ -81,13 +110,13 @@ impl Db {
         c.exec_drop(sql, params)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
-        c.disconnect().await.ok();
+        quit(c).await;
     }
 
     pub async fn query<T: FromRow + Send + 'static>(&self, sql: &str) -> Vec<T> {
         let mut c = self.conn().await;
         let r = c.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
-        c.disconnect().await.ok();
+        quit(c).await;
         r
     }
 
@@ -138,7 +167,7 @@ impl Db {
             )
             .await
             .unwrap();
-        c.disconnect().await.ok();
+        quit(c).await;
         r
     }
 }
@@ -147,7 +176,7 @@ impl Db {
 pub async fn tables(db: &Db) {
     let mut c = db.conn().await;
     lazy_wire_fire::model::ensure(&mut c).await.unwrap();
-    c.disconnect().await.ok();
+    quit(c).await;
 }
 
 pub struct Instance {
@@ -404,10 +433,28 @@ fn yaml_to_json(v: &yaml_serde::Value) -> serde_json::Value {
 type Handler = Box<dyn Fn(&Req) -> (u16, String) + Send>;
 type HeaderFn = Box<dyn Fn(&Req) -> Vec<(String, String)> + Send>;
 
+/// The chaos fault modes of the mock (design §1 P4, §3). Every firing registers itself in
+/// the harness fault log, like the proxy commands: a held or cut answer is a fault event,
+/// never a delivery.
+enum MockFault {
+    Live,
+    /// Answer `n` requests, then accept and never answer (the mid-flush anchor of P1).
+    HoldAfter {
+        n: usize,
+        answered: usize,
+    },
+}
+
 struct MockState {
     reqs: Vec<Req>,
     handler: Handler,
     headers: HeaderFn,
+    fault: MockFault,
+    /// Full 2xx answers only (P4's delivery record): when the mock answered, and which keys
+    /// (`{{join keys ","}}` bodies split on the documented separator) that answer carried.
+    deliveries: Vec<(Instant, BTreeSet<String>)>,
+    fault_log: Option<fault::FaultLog>,
+    tag: String,
 }
 
 /// An HTTP server that records requests and answers with a replaceable handler.
@@ -430,83 +477,158 @@ impl Mock {
             reqs: Vec::new(),
             handler: Box::new(|_| (200, "{}".into())),
             headers: Box::new(|_| Vec::new()),
+            fault: MockFault::Live,
+            deliveries: Vec::new(),
+            fault_log: None,
+            tag: "mock".into(),
         }));
         let st = state.clone();
         tokio::spawn(async move {
+            // A transient accept error (EMFILE under an fd storm, a lost child mid-handshake)
+            // must not retire the mock: a mock that stopped accepting looks exactly like a
+            // target that stopped answering.
+            let mut accept_errs = 0u64;
             loop {
-                let Ok((mut s, _)) = listener.accept().await else {
-                    return;
-                };
-                let st = st.clone();
-                tokio::spawn(async move {
-                    let mut buf: Vec<u8> = Vec::new();
-                    loop {
-                        let head_end = loop {
-                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                break i + 4;
-                            }
-                            let mut chunk = [0u8; 8192];
-                            match s.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        };
-                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-                        let mut lines = head.split("\r\n");
-                        let first = lines.next().unwrap_or("");
-                        let mut parts = first.split_whitespace();
-                        let method = parts.next().unwrap_or("").to_string();
-                        let path = parts.next().unwrap_or("").to_string();
-                        let headers: Vec<(String, String)> = lines
-                            .filter_map(|l| {
-                                l.split_once(':')
-                                    .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
-                            })
-                            .collect();
-                        let len: usize = headers
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                            .and_then(|(_, v)| v.parse().ok())
-                            .unwrap_or(0);
-                        while buf.len() < head_end + len {
-                            let mut chunk = [0u8; 8192];
-                            match s.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-                        let body =
-                            String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string();
-                        buf.drain(..head_end + len);
-                        // Stamped here, before the handler and before the state lock: the instant
-                        // the request is *here*, not the instant a test asks about it.
-                        let arrived = Instant::now();
-                        let req = Req {
-                            method,
-                            path,
-                            headers,
-                            body,
-                            arrived,
-                        };
-                        let (status, body, extra) = {
-                            let mut g = st.lock().unwrap();
-                            let (status, body) = (g.handler)(&req);
-                            let extra: String = (g.headers)(&req)
-                                .into_iter()
-                                .map(|(k, v)| format!("{k}: {v}\r\n"))
-                                .collect();
-                            g.reqs.push(req);
-                            (status, body, extra)
-                        };
-                        let resp = format!(
+                match listener.accept().await {
+                    Ok((mut s, _)) => {
+                        let st = st.clone();
+                        tokio::spawn(async move {
+                            let mut buf: Vec<u8> = Vec::new();
+                            loop {
+                                let head_end = loop {
+                                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                        break i + 4;
+                                    }
+                                    let mut chunk = [0u8; 8192];
+                                    match s.read(&mut chunk).await {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                    }
+                                };
+                                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                                let mut lines = head.split("\r\n");
+                                let first = lines.next().unwrap_or("");
+                                let mut parts = first.split_whitespace();
+                                let method = parts.next().unwrap_or("").to_string();
+                                let path = parts.next().unwrap_or("").to_string();
+                                let headers: Vec<(String, String)> = lines
+                                    .filter_map(|l| {
+                                        l.split_once(':').map(|(a, b)| {
+                                            (a.trim().to_string(), b.trim().to_string())
+                                        })
+                                    })
+                                    .collect();
+                                let len: usize = headers
+                                    .iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                    .and_then(|(_, v)| v.parse().ok())
+                                    .unwrap_or(0);
+                                while buf.len() < head_end + len {
+                                    let mut chunk = [0u8; 8192];
+                                    match s.read(&mut chunk).await {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                    }
+                                }
+                                let body = String::from_utf8_lossy(&buf[head_end..head_end + len])
+                                    .to_string();
+                                buf.drain(..head_end + len);
+                                // Stamped here, before the handler and before the state lock: the instant
+                                // the request is *here*, not the instant a test asks about it.
+                                let arrived = Instant::now();
+                                let req = Req {
+                                    method,
+                                    path,
+                                    headers,
+                                    body,
+                                    arrived,
+                                };
+                                // The fault modes gate the answer. A request that arrives once
+                                // hold_after is spent is accepted and frozen (never answered); when the
+                                // mock heals, the held connection is reset — an answer that lands after
+                                // the engine timed out is not a delivery, it is a lie (design §1 P4).
+                                let mut held_logged = false;
+                                loop {
+                                    let hold = {
+                                        let mut g = st.lock().unwrap();
+                                        match &mut g.fault {
+                                            MockFault::HoldAfter { n, answered }
+                                                if *answered >= *n =>
+                                            {
+                                                true
+                                            }
+                                            MockFault::HoldAfter { answered, .. } => {
+                                                *answered += 1;
+                                                false
+                                            }
+                                            MockFault::Live => false,
+                                        }
+                                    };
+                                    if !hold {
+                                        break;
+                                    }
+                                    if !held_logged {
+                                        held_logged = true;
+                                        // ONE lock, one scope: a second `st.lock()` while this guard is
+                                        // alive self-deadlocks the non-reentrant mutex, parks a runtime
+                                        // worker holding it, and then every task that touches the mock
+                                        // parks too (which is how the whole suite once froze silently).
+                                        let mut g = st.lock().unwrap();
+                                        if let Some(l) = &g.fault_log {
+                                            l.add(format!(
+                                                "mock {} hold_after fired: {} {} held",
+                                                g.tag, req.method, req.path
+                                            ));
+                                        }
+                                        g.reqs.push(req.clone());
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                if held_logged {
+                                    // Reset the held connection on heal: the request was neither
+                                    // answered nor delivered (#[allow]: linger-0 never blocks).
+                                    #[allow(deprecated)]
+                                    let _ = s.set_linger(Some(Duration::ZERO));
+                                    return;
+                                }
+                                let keys: BTreeSet<String> = req
+                                    .body
+                                    .split(',')
+                                    .map(|k| k.trim().to_string())
+                                    .filter(|k| !k.is_empty())
+                                    .collect();
+                                let (status, body, extra) = {
+                                    let mut g = st.lock().unwrap();
+                                    let (status, body) = (g.handler)(&req);
+                                    let extra: String = (g.headers)(&req)
+                                        .into_iter()
+                                        .map(|(k, v)| format!("{k}: {v}\r\n"))
+                                        .collect();
+                                    g.reqs.push(req);
+                                    (status, body, extra)
+                                };
+                                let resp = format!(
                             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
                             body.len()
                         );
-                        if s.write_all(resp.as_bytes()).await.is_err() {
-                            return;
-                        }
+                                if s.write_all(resp.as_bytes()).await.is_err() {
+                                    return;
+                                }
+                                if (200..300).contains(&status) {
+                                    // A delivery: the request the mock answered 2xx *in full*.
+                                    st.lock().unwrap().deliveries.push((Instant::now(), keys));
+                                }
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        accept_errs += 1;
+                        if accept_errs <= 5 || accept_errs.is_multiple_of(100) {
+                            eprintln!("mock> accept error #{accept_errs}: {e}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
             }
         });
         Mock { addr, state }
@@ -544,7 +666,59 @@ impl Mock {
     }
 
     pub fn clear(&self) {
-        self.state.lock().unwrap().reqs.clear();
+        let mut g = self.state.lock().unwrap();
+        g.reqs.clear();
+        g.deliveries.clear();
+    }
+
+    /// Register this mock's fault firings in a harness fault log (P4's windowing).
+    pub fn set_fault_log(&self, log: fault::FaultLog) {
+        self.state.lock().unwrap().fault_log = Some(log);
+    }
+
+    /// Name this mock in fault-log lines ("t1-down").
+    pub fn tag(&self, tag: &str) {
+        self.state.lock().unwrap().tag = tag.to_string();
+    }
+
+    /// Answer the first `n` still-unanswered requests with the current handler, then accept
+    /// and freeze (the mid-flush anchor). Each frozen request registers a fault event.
+    pub fn hold_after(&self, n: usize) {
+        let mut g = self.state.lock().unwrap();
+        g.fault = MockFault::HoldAfter { n, answered: 0 };
+        if let Some(l) = &g.fault_log {
+            l.add(format!("mock {} hold_after({n}) armed", g.tag));
+        }
+    }
+
+    /// Clear the fault mode. Held requests get an RST, never a late answer.
+    pub fn heal(&self) {
+        let mut g = self.state.lock().unwrap();
+        g.fault = MockFault::Live;
+        if let Some(l) = &g.fault_log {
+            l.add(format!("mock {} heal() (held requests reset)", g.tag));
+        }
+    }
+
+    /// The keys carried by requests the mock answered 2xx in full, `{{join keys ","}}` split
+    /// on the separator. Fault answers (held, 5xx, cut) never contribute (design §1 P4).
+    pub fn keys_received(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for (_, keys) in &self.state.lock().unwrap().deliveries {
+            out.extend(keys.iter().cloned());
+        }
+        out
+    }
+
+    /// Every full-2xx answer as (instant, keys) — the P4 record.
+    pub fn deliveries(&self) -> Vec<(Instant, BTreeSet<String>)> {
+        self.state.lock().unwrap().deliveries.clone()
+    }
+
+    /// Exact delivery counts are *reported*, never asserted (dedupe/debounce are timing-
+    /// sensitive by design); this is the reporting input.
+    pub fn delivery_count(&self) -> usize {
+        self.state.lock().unwrap().deliveries.len()
     }
 }
 
@@ -568,7 +742,7 @@ pub fn db_rtt() -> Option<Duration> {
                     let url = format!("{dsn}/?prefer_socket=false");
                     let mut c = mysql_async::Conn::new(Opts::from_url(&url)?).await?;
                     let _: Vec<i8> = c.query("SELECT 1").await?;
-                    c.disconnect().await.ok();
+                    quit(c).await;
                     worst = worst.max(t.elapsed());
                 }
                 Ok::<_, mysql_async::Error>(worst)
