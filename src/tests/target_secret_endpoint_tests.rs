@@ -419,7 +419,10 @@ async fn an_empty_credential_goes_on_the_wire_as_empty() {
             "X-Api-Key: \r\n",
         ),
     ] {
-        let t = load(kind, &format!("http://{addr}/hook"), vars, "").unwrap();
+        // No base path on the endpoint: the request line is then the rendered target itself
+        // (the base path in front of it is `the_endpoint_s_path_and_query_are_the_request_line`'s
+        // subject, not this test's).
+        let t = load(kind, &format!("http://{addr}"), vars, "").unwrap();
         t.send(0, "POST /hook HTTP/1.1\n\nx").await.unwrap();
         let sent = got.lock().unwrap().remove(0);
         assert!(

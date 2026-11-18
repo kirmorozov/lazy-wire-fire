@@ -312,4 +312,23 @@ fn an_empty_credential_literal_is_accepted() {
             "{kind} whitespace {field}: {e}"
         );
     }
+    // How far that acceptance reaches: the kinds whose load check asks through `need` —
+    // `http.basic`, `http.bearer`, `http.header`. A queue kind with the same field name, whose own
+    // check requires the credential as text, still refuses an empty one; the refusal is
+    // `crate::targets::amqp::check`'s own wording and not `need`'s, which is the proof that the
+    // change never reached it.
+    let e = format!(
+        "{:#}",
+        TargetDef::from_row(&raw(
+            "amqp",
+            "amqp://mq.example.test:5672/",
+            r#"{"username":"guest","password":""}"#
+        ))
+        .err()
+        .unwrap_or_else(|| panic!("amqp: an empty `password` was accepted"))
+    );
+    assert!(
+        e.contains("kind amqp needs `vars.password`"),
+        "amqp empty password: {e}"
+    );
 }
