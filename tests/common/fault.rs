@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::*;
@@ -75,6 +75,18 @@ impl FaultLog {
             .any(|(_, m)| m.contains(needle))
     }
 
+    /// How many events contain `needle`. Where `has` would be satisfied by an earlier round's
+    /// identical line, a seed gates on the count *growing*: the transition it waits for is one
+    /// this step caused.
+    pub fn count(&self, needle: &str) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, m)| m.contains(needle))
+            .count()
+    }
+
     /// Whether any event falls strictly between `a` and `b` (P4's window test).
     pub fn has_between(&self, a: Instant, b: Instant) -> bool {
         self.events
@@ -91,6 +103,16 @@ pub struct ProxyStat {
     pub mode: String,
     pub conns: u64,
     pub bytes: u64,
+    /// server→client bytes only: the size of what the server actually sent, which is what a
+    /// binlog group costs on the wire.
+    pub bytes_s2c: u64,
+    /// Dump connections reset by `flap` so far.
+    pub flap_cuts: u64,
+    /// Times `cut_after_bytes` has fired (it is a one-shot, so 0 or 1).
+    pub byte_cuts: u64,
+    /// How many server→client bytes had flowed past the arming point when the last
+    /// `cut_after_bytes` fired (`0` before one has).
+    pub bytes_at_cut: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -99,15 +121,20 @@ enum Kind {
     CutAll,
     Stall,
     Refuse,
+    /// S3: every accepted connection is reset, until `flap_left` of them have been.
+    Flap,
 }
 
 #[derive(Clone, Copy)]
 struct Mode {
     kind: Kind,
-    /// Per connection, server→client: RST once this many bytes have been relayed.
+    /// Per connection, server→client: RST once this many bytes have been relayed *since the
+    /// command was armed* (see `Core::cut_arm`), then the mode clears itself.
     cut_after_bytes: Option<u64>,
     /// Per direction, per relayed chunk.
     latency_ms: u64,
+    /// `Kind::Flap`: connections still to reset before the proxy goes live by itself.
+    flap_left: u64,
 }
 
 struct Core {
@@ -116,8 +143,22 @@ struct Core {
     mode: Mutex<Mode>,
     /// Bumped by `cut_all`; relay tasks born before it hard-close themselves.
     gen: AtomicU64,
+    /// Bumped by `cut_after_bytes`: a relay task catches up to it by taking its own server→client
+    /// count as the baseline, so the byte bound is the distance *from the moment it was armed* —
+    /// the only meaning on an established dump connection that has already carried a handshake,
+    /// heartbeats and other schemas' events.
+    cut_arm: AtomicU64,
     conns: AtomicU64,
     bytes: AtomicU64,
+    bytes_s2c: AtomicU64,
+    flap_cuts: AtomicU64,
+    byte_cuts: AtomicU64,
+    /// How far past its arming point the last `cut_after_bytes` had relayed when it fired: the
+    /// seed's proof of *where* in a group the reset landed, counted by the proxy.
+    last_cut_at: AtomicU64,
+    /// When each connection was accepted, in order: the spacing of the engine's reconnect
+    /// attempts measured at the wire instead of guessed from the clock (`accept_marks`).
+    accepts: Mutex<Vec<Instant>>,
     log: Option<FaultLog>,
 }
 
@@ -141,10 +182,17 @@ impl FaultProxy {
                 kind: Kind::Live,
                 cut_after_bytes: None,
                 latency_ms: 0,
+                flap_left: 0,
             }),
             gen: AtomicU64::new(0),
+            cut_arm: AtomicU64::new(0),
             conns: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            bytes_s2c: AtomicU64::new(0),
+            flap_cuts: AtomicU64::new(0),
+            byte_cuts: AtomicU64::new(0),
+            last_cut_at: AtomicU64::new(0),
+            accepts: Mutex::new(Vec::new()),
             log,
         });
         let c = core.clone();
@@ -171,9 +219,41 @@ impl FaultProxy {
                     }
                 };
                 c.conns.fetch_add(1, Ordering::Relaxed);
-                match c.mode.lock().unwrap().kind {
+                c.accepts.lock().unwrap().push(Instant::now());
+                // The kind is *copied* out: a guard alive across the match would make the `Flap`
+                // arm's own `lock()` self-deadlock the non-reentrant mutex (the trap the mock's
+                // held-request comment warns about).
+                let kind = c.mode.lock().unwrap().kind;
+                match kind {
                     // "port dead": answer the connect with an RST (the client sees a dead port).
                     Kind::CutAll | Kind::Refuse => hard_close(cli),
+                    // The flapping dump port: reset this connection and count it; when the last
+                    // one of the storm has been reset the mode ends by itself, so the next
+                    // connect is relayed ("cut every accepted connection 6 times, then let it
+                    // through", design §2 S3 — counted by the proxy, never guessed by the test).
+                    Kind::Flap => {
+                        let (n, done) = {
+                            let mut m = c.mode.lock().unwrap();
+                            m.flap_left = m.flap_left.saturating_sub(1);
+                            let done = m.flap_left == 0;
+                            if done {
+                                m.kind = Kind::Live;
+                            }
+                            (c.flap_cuts.fetch_add(1, Ordering::Relaxed) + 1, done)
+                        };
+                        hard_close(cli);
+                        if let Some(l) = &c.log {
+                            l.add(format!(
+                                "proxy {} flap: dump connection #{n} reset{}",
+                                c.label,
+                                if done {
+                                    " (storm over, live again)"
+                                } else {
+                                    ""
+                                }
+                            ));
+                        }
+                    }
                     Kind::Stall => {
                         // Accept and freeze: nothing is relayed (the MySQL handshake never
                         // completes); when the stall clears the connection starts relaying.
@@ -208,8 +288,25 @@ impl FaultProxy {
         self.core.conns.load(Ordering::Relaxed)
     }
 
+    /// The instants this proxy accepted a connection, in order, starting one connection *before*
+    /// `from` (so the first gap of a caller's `windows(2)` walk is the distance from the last
+    /// pre-fault connection to the first faulted one). `from` is a `conns()` snapshot taken before
+    /// the fault was injected: the returned spacing is the engine's own reconnect cadence, not the
+    /// warm-up's.
+    pub fn accept_marks(&self, from: u64) -> Vec<Instant> {
+        let v = self.core.accepts.lock().unwrap();
+        let at = (from as usize).min(v.len());
+        v[at.saturating_sub(1)..].to_vec()
+    }
+
     pub fn bytes(&self) -> u64 {
         self.core.bytes.load(Ordering::Relaxed)
+    }
+
+    /// What the server has sent through this proxy — the size of the binlog traffic, which is
+    /// what S4 calibrates and verifies its cut point against.
+    pub fn bytes_s2c(&self) -> u64 {
+        self.core.bytes_s2c.load(Ordering::Relaxed)
     }
 
     fn set(&self, what: &str, f: impl FnOnce(&mut Mode)) {
@@ -225,11 +322,30 @@ impl FaultProxy {
         self.set("cut_all", |m| m.kind = Kind::CutAll);
     }
 
-    /// Per connection, server→client: RST at the first sample past `n` relayed bytes.
+    /// Server→client: RST the connection at the first sample past `n` bytes relayed **since this
+    /// command was armed**, then clear the bound (one shot: the engine's re-read of the partial
+    /// group must be able to come through — design §2 S4 re-reads from the boundary, it does not
+    /// cut forever). Measured from arming, not from connection start, is what makes the bound
+    /// mean "half of this group" on a dump connection that is already carrying a handshake,
+    /// heartbeats and other schemas' events.
     pub fn cut_after_bytes(&self, n: u64) {
+        self.core.cut_arm.fetch_add(1, Ordering::Relaxed);
         self.set(&format!("cut_after_bytes({n})"), |m| {
             m.cut_after_bytes = Some(n);
             m.kind = Kind::Live;
+        });
+    }
+
+    /// The storm of design §2 S3: reset every connection this proxy accepts until `cuts` of them
+    /// have been reset (the established one is reset at once too), then go live by itself. The
+    /// count is the proxy's, so the test gates on observed cuts and never on the clock.
+    pub fn flap(&self, cuts: u64) {
+        self.core.gen.fetch_add(1, Ordering::Relaxed);
+        self.set(&format!("flap({cuts})"), |m| {
+            m.kind = Kind::Flap;
+            m.flap_left = cuts;
+            m.cut_after_bytes = None;
+            m.latency_ms = 0;
         });
     }
 
@@ -259,6 +375,7 @@ impl FaultProxy {
             m.kind = Kind::Live;
             m.cut_after_bytes = None;
             m.latency_ms = 0;
+            m.flap_left = 0;
         });
     }
 
@@ -273,10 +390,15 @@ impl FaultProxy {
                 Kind::CutAll => "cut_all",
                 Kind::Stall => "stall",
                 Kind::Refuse => "refuse",
+                Kind::Flap => "flap",
             }
             .to_string(),
             conns: self.conns(),
             bytes: self.bytes(),
+            bytes_s2c: self.core.bytes_s2c.load(Ordering::Relaxed),
+            flap_cuts: self.core.flap_cuts.load(Ordering::Relaxed),
+            byte_cuts: self.core.byte_cuts.load(Ordering::Relaxed),
+            bytes_at_cut: self.core.last_cut_at.load(Ordering::Relaxed),
         }
     }
 
@@ -331,6 +453,22 @@ async fn relay(cli: TcpStream, core: Arc<Core>, my_gen: u64) {
     let mut buf_s2c = [0u8; 16384];
     // server→client bytes relayed on *this* connection, for the cut_after_bytes gate.
     let mut s2c: u64 = 0;
+    // The cut bound is the distance from the moment it was armed: the task catches up to
+    // `core.cut_arm` by taking its own count as the baseline (0 for a connection born after the
+    // command, which is what "from connection start" used to mean).
+    let mut my_cut_arm = core.cut_arm.load(Ordering::Relaxed);
+    let mut cut_base: u64 = 0;
+    // Bytes already taken off a socket when a stall was armed, held back until it clears. They are
+    // here because of where the mode is read: once per iteration, *before* the `select!` — so a
+    // chunk `read` had already returned (up to 16 KB, which is a whole transaction's group) would
+    // still be delivered after `stall(true)`, and a seed that arms the stall immediately before a
+    // write would watch that write arrive anyway. It is not hypothetical: on MariaDB the phase-2
+    // group of S2 was read, applied and delivered 0.7 s after the stall was armed, which is the
+    // proxy relaying one in-flight chunk (evidence/probe-s2-mariadb.log). Counters still count at
+    // read time, so `bytes_s2c` keeps meaning "what the server sent"; only *delivery* is held, and
+    // it is held in order and flushed before anything newer.
+    let mut held_s2c: Vec<u8> = Vec::new();
+    let mut held_c2s: Vec<u8> = Vec::new();
     loop {
         let mode = *core.mode.lock().unwrap();
         if mode.kind == Kind::CutAll
@@ -345,30 +483,71 @@ async fn relay(cli: TcpStream, core: Arc<Core>, my_gen: u64) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
+        if !held_s2c.is_empty() || !held_c2s.is_empty() {
+            if cli.write_all(&held_s2c).await.is_err() {
+                return;
+            }
+            held_s2c.clear();
+            if up.write_all(&held_c2s).await.is_err() {
+                return;
+            }
+            held_c2s.clear();
+        }
+        if core.cut_arm.load(Ordering::Relaxed) > my_cut_arm {
+            my_cut_arm = core.cut_arm.load(Ordering::Relaxed);
+            cut_base = s2c;
+        }
         tokio::select! {
             r = cli.read(&mut buf_c2s) => match r {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
+                    core.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    // Re-read the mode *after* the read: a chunk that crossed while the stall was
+                    // being armed is held, not delivered (see `held_s2c`).
+                    if core.mode.lock().unwrap().kind == Kind::Stall {
+                        held_c2s.extend_from_slice(&buf_c2s[..n]);
+                        continue;
+                    }
                     if mode.latency_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(mode.latency_ms)).await;
                     }
                     if up.write_all(&buf_c2s[..n]).await.is_err() {
                         return;
                     }
-                    core.bytes.fetch_add(n as u64, Ordering::Relaxed);
                 }
             },
             r = up.read(&mut buf_s2c) => match r {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
                     core.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    core.bytes_s2c.fetch_add(n as u64, Ordering::Relaxed);
                     s2c += n as u64;
                     if let Some(bound) = mode.cut_after_bytes {
-                        if s2c >= bound {
+                        if s2c - cut_base >= bound {
+                            // One shot: the bound is cleared here, so the re-read of the partial
+                            // group (which is the whole point of S4) comes through.
+                            core.mode.lock().unwrap().cut_after_bytes = None;
+                            let fired = core.byte_cuts.fetch_add(1, Ordering::Relaxed) + 1;
+                            core.last_cut_at
+                                .store(s2c - cut_base, Ordering::Relaxed);
+                            if let Some(l) = &core.log {
+                                l.add(format!(
+                                    "proxy {} cut_after_bytes fired: connection #{fired} reset at \
+                                     {} bytes past the arming point",
+                                    core.label,
+                                    s2c - cut_base
+                                ));
+                            }
                             hard_close(cli);
                             hard_close(up);
                             return;
                         }
+                    }
+                    // The same re-check as the other direction: the stall is a fact about what the
+                    // engine may *see*, so nothing that arrived after it was armed is delivered.
+                    if core.mode.lock().unwrap().kind == Kind::Stall {
+                        held_s2c.extend_from_slice(&buf_s2c[..n]);
+                        continue;
                     }
                     if mode.latency_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(mode.latency_ms)).await;
@@ -392,6 +571,49 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// Lock descriptors inherited from the runner's shell (`exec 9>heavy-suite.lock; flock 9`) are the
+/// one kind of descriptor that is not close-on-exec: Rust sets `CLOEXEC` on everything it opens
+/// itself, so the proxies' and the mock's listeners never reach a child, but bash's do. A stray
+/// engine child then held an open reference to the file the suite lock is taken on, and since an
+/// advisory lock is held as long as *any* descriptor of that open file description stays open, a
+/// leaked child blocked every later run on the heavy-suite lock (observed 2026-11-19: a run hung
+/// 12 minutes with the lock's only remaining holder a `lazywf` from a test that had already failed).
+///
+/// They are marked close-on-exec rather than closed: the parent must keep its own reference (the
+/// lock lives on the shared open file description), and closing descriptors by number is what made
+/// the child abort with Rust's "owned file descriptor already closed" IO-safety check.
+fn close_inherited_lock_fds() {
+    // Declared here rather than pulled from `libc`: the test harness must not need a dependency.
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return; // nowhere to look: nothing is claimed, nothing is changed
+    };
+    for entry in entries.flatten() {
+        let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if fd <= 2 {
+            continue; // stdio belongs to the child's log
+        }
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue; // closed under us
+        };
+        if !target.to_string_lossy().ends_with(".lock") {
+            continue;
+        }
+        // SAFETY: `fcntl(F_SETFD)` on one of this process's own descriptors, with the two
+        // constants the ABI defines for it; the return value is not needed (a descriptor that
+        // refuses `F_SETFD` simply stays as it was, which is the pre-fix behavior).
+        unsafe {
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+    }
 }
 
 /// The engine as a real child process (design §3): one honest code path for every scenario,
@@ -445,6 +667,7 @@ impl Lazy {
     }
 
     fn spawn(&mut self) {
+        close_inherited_lock_fds();
         let port = free_port();
         self.vars
             .retain(|(k, _)| k != "LAZYWF_HEALTH_ADDR" && k != "LAZYWF_SERVER_ID");
@@ -468,6 +691,8 @@ impl Lazy {
             file.try_clone().expect("clone log file"),
         ))
         .stderr(std::process::Stdio::from(file));
+        // No descriptor of ours may survive into the child (see `close_inherited_lock_fds`).
+        close_inherited_lock_fds();
         let child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("spawn lazywf for {}: {e}", self.name));
@@ -548,12 +773,37 @@ impl Lazy {
         panic!("no /status answer from the lazywf child {}", self.name);
     }
 
-    /// SIGKILL through `Child::kill`; the fault log records the window opener.
+    /// SIGKILL through `Child::kill`; the fault log records the window opener. Only ever this
+    /// harness's own child, whose pid the log line names so a reviewer can see which process the
+    /// seed was allowed to stop.
     pub fn kill(&self) {
+        let pid = self.pid();
         self.hard_stop();
         if let Some(l) = &self.log {
-            l.add(format!("child {} killed (SIGKILL)", self.name));
+            l.add(format!("child {pid} ({}) killed (SIGKILL)", self.name));
         }
+    }
+
+    /// The pid of the child this harness spawned (`0` once it is gone).
+    pub fn pid(&self) -> u32 {
+        self.child.lock().unwrap().as_ref().map_or(0, |c| c.id())
+    }
+
+    /// The child's peak resident set (`VmHWM` of `/proc/<pid>/status`, in KiB): the memory a
+    /// chaos load is allowed to take. `-1` when the process is already gone (the peak of a
+    /// killed child cannot be read afterwards, so a seed takes this before it kills).
+    pub fn peak_rss_kib(&self) -> i64 {
+        let pid = self.pid();
+        if pid == 0 {
+            return -1;
+        }
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return -1;
+        };
+        text.lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse().ok())
+            .unwrap_or(-1)
     }
 
     fn hard_stop(&self) {
@@ -617,6 +867,12 @@ impl Lazy {
             .collect()
     }
 
+    /// Everything the child has written so far. A seed that asks several questions of the log
+    /// reads it once with this, instead of once per question.
+    pub fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
     fn tail(&self, n: usize) -> Vec<String> {
         let all = std::fs::read_to_string(&self.log_path).unwrap_or_default();
         all.lines()
@@ -627,6 +883,33 @@ impl Lazy {
             .rev()
             .map(String::from)
             .collect()
+    }
+}
+
+/// A seed that panics — which is exactly what a failing chaos test does — must not leave the
+/// engine running. A stray child holds the schema's `GET_LOCK`, keeps a binlog dump connection
+/// open on a server every tenant shares, keeps appending to a log file another run will reuse, and
+/// (before the descriptors were closed at exec, see `spawn`) kept the runner's flock alive. So the
+/// child goes with its handle, reaped through the same path `kill` uses; a child the seed already
+/// stopped or killed reports an exit status here and is left alone — no signal is ever sent to a
+/// process that is not running.
+impl Drop for Lazy {
+    fn drop(&mut self) {
+        let running = self
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_or(false, |c| c.try_wait().ok().flatten().is_none());
+        if running {
+            self.hard_stop();
+            if let Some(l) = &self.log {
+                l.add(format!(
+                    "child {} killed on drop: the seed left it running",
+                    self.name
+                ));
+            }
+        }
     }
 }
 
@@ -685,14 +968,111 @@ struct Phase {
     open: bool,
 }
 
+/// A declared floor for one rule's position while a set of keys is still unconfirmed. P6 says a
+/// position never goes backwards — but an XA's marks arrive at its `XA COMMIT` and are pinned at
+/// the transaction's *own start* (`apply(marks, &pos, &xa.start)` in `src/engine.rs`), which moves
+/// the saved position back on purpose; without this the sampler would call the designed behavior a
+/// violation. Built only by [`Sampler::allow_xa_pin`], so the floor is a position the server
+/// confirms a branch begins at, never one a seed picks. The exemption is bounded on both sides so
+/// it cannot hide a real regression: it applies only while `keys` are undelivered, and a position
+/// *below* `floor` is still a violation (`h1_sampler_pin_floor_still_bites` proves that still
+/// fires).
+struct Pin {
+    rule: String,
+    name: String,
+    floor: (String, u64),
+    keys: BTreeSet<String>,
+    mock: Mock,
+}
+
+/// The floor an XA puts on a rule's position — and the only thing that can produce one. The floor
+/// is not an argument a seed chooses: building an `XaPin` asks the *server* where the branch's
+/// group begins (`SHOW BINLOG EVENTS`, walked by what closes a group — the same read e2e's
+/// `xa_group_start` does) and it refuses to exist for a transaction the binlog does not contain.
+/// That is what scopes the sampler's P6 exemption to the XA case by construction: no XA the server
+/// confirms, no pin, no exemption — see `Sampler::allow_xa_pin`.
+pub struct XaPin {
+    xid: String,
+    pos: (String, u64),
+}
+
+impl XaPin {
+    /// Reads branch `xid`'s group start from the binlog, starting at `from` — a snapshot taken
+    /// before `XA START`, which is only a lower bound because another session can commit in
+    /// between (this suite runs two threads against one server, and the engine's own status writes
+    /// land there too).
+    pub async fn read(db: &Db, from: &(String, u64), xid: &str) -> XaPin {
+        let hex: String = xid.bytes().map(|b| format!("{b:02x}")).collect();
+        let needle_hex = format!("X'{hex}'").to_uppercase();
+        let needle_prepare = format!("XA PREPARE '{xid}'").to_uppercase();
+        let needle_start = format!("XA START '{xid}'").to_uppercase();
+        let mut c = db.conn().await;
+        let rows: Vec<mysql_async::Row> = c
+            .query(format!(
+                "SHOW BINLOG EVENTS IN '{}' FROM {} LIMIT 10000",
+                from.0.replace('\'', "''"),
+                from.1
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("SHOW BINLOG EVENTS from {from:?} for '{xid}': {e}"));
+        super::quit(c).await;
+        // Walk by what *closes* a group (the same on both servers) rather than by what opens one
+        // (which is not): what the engine pins is the boundary it was holding when the branch's
+        // events arrived.
+        let mut group = from.1;
+        for row in rows {
+            let kind: String = row.get(2).expect("Event_type");
+            let info: String = row.get(5).unwrap_or_default();
+            let up = info.to_uppercase();
+            let ours = up.contains(&needle_hex)
+                || up.contains(&needle_prepare)
+                || up.contains(&needle_start);
+            if ours {
+                return XaPin {
+                    xid: xid.to_string(),
+                    pos: (from.0.clone(), group),
+                };
+            }
+            if kind == "Xid"
+                || kind.eq_ignore_ascii_case("XA_prepare")
+                || (kind == "Query" && !up.starts_with("BEGIN"))
+            {
+                group = row.get(4).expect("End_log_pos");
+            }
+        }
+        panic!(
+            "no XA PREPARE/START of '{xid}' in {} after {from:?}: a floor needs a transaction the \
+             server actually has, so a pin cannot be claimed for one that is not in the binlog",
+            from.0
+        );
+    }
+
+    /// The position the rule's marks are pinned at: the boundary just before the branch's group.
+    pub fn pos(&self) -> &(String, u64) {
+        &self.pos
+    }
+
+    pub fn xid(&self) -> &str {
+        &self.xid
+    }
+}
+
 struct Shared {
     dsn: String,
     fault_log: FaultLog,
     phases: Mutex<Vec<Phase>>,
+    pins: Mutex<Vec<Pin>>,
+    /// The P6 regressions the sampler let through because a declared pin explained them, so a run
+    /// reports them instead of silently passing (and a seed can name them in its own summary).
+    backslides: Mutex<Vec<String>>,
     logs: Mutex<Vec<PathBuf>>,
     proxies: Mutex<Vec<FaultProxy>>,
     last_pos: Mutex<BTreeMap<String, (String, u64)>>,
     violation: Mutex<Option<String>>,
+    /// Completed passes of [`sample`], so a seed that wants to change state the sampler reads (h1
+    /// forges a status row) can wait for the sampler to have *seen* the previous state instead of
+    /// sleeping and hoping: a forge before the first sample is a forge nobody observed.
+    samples: AtomicU64,
 }
 
 /// The property kernel (design §3): a 100 ms sampler over (a) the status table
@@ -715,10 +1095,13 @@ impl Sampler {
             dsn: db.dsn.clone(),
             fault_log,
             phases: Mutex::new(Vec::new()),
+            pins: Mutex::new(Vec::new()),
+            backslides: Mutex::new(Vec::new()),
             logs: Mutex::new(Vec::new()),
             proxies: Mutex::new(Vec::new()),
             last_pos: Mutex::new(BTreeMap::new()),
             violation: Mutex::new(None),
+            samples: AtomicU64::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let sp = shared.clone();
@@ -730,6 +1113,7 @@ impl Sampler {
             let mut conn: Option<mysql_async::Conn> = None;
             while !st.load(Ordering::Relaxed) {
                 sample(&sp, &mut conn).await;
+                sp.samples.fetch_add(1, Ordering::Relaxed);
                 if sp.violation.lock().unwrap().is_some() {
                     break;
                 }
@@ -766,6 +1150,63 @@ impl Sampler {
             mock: mock.clone(),
             open: true,
         });
+    }
+
+    /// Declare the legitimate floor an XA puts on `rule`'s position while `keys` are still
+    /// undelivered: the position may move back *to* the branch's own start, and not below it,
+    /// because the marks held since `XA PREPARE` are applied when the `COMMIT` is read and pinned at
+    /// the transaction's start (`apply(marks, &pos, &xa.start)` in src/engine.rs).
+    ///
+    /// Two things keep this a narrowing of P6 rather than a mute. The floor cannot be chosen — it
+    /// comes from an [`XaPin`], whose only constructor reads the branch out of the server's binlog,
+    /// so there is no way to exempt a position without an XA behind it; and the exemption is spent
+    /// as soon as `keys` reach the target. Below the floor P6 still fires, which
+    /// `h1_sampler_pin_floor_still_bites` tests, and every regression this accepts is written to the
+    /// fault log, listed by [`Sampler::backslides`] and printed by the seed that declared it.
+    pub fn allow_xa_pin(
+        &self,
+        rule: &str,
+        label: &str,
+        pin: &XaPin,
+        keys: BTreeSet<String>,
+        mock: &Mock,
+    ) {
+        let name = format!(
+            "{label}: the marks of '{}' at {}:{}",
+            pin.xid(),
+            pin.pos().0,
+            pin.pos().1
+        );
+        self.shared.fault_log.add(format!(
+            "sampler: rule {rule} may fall back to {:?} while {name} is unconfirmed",
+            pin.pos()
+        ));
+        self.shared.pins.lock().unwrap().push(Pin {
+            rule: rule.to_string(),
+            name,
+            floor: pin.pos().clone(),
+            keys,
+            mock: mock.clone(),
+        });
+    }
+
+    /// The regressions the sampler accepted because a declared pin explained them (for the seed's
+    /// own report: an accepted regression is something that happened, not a non-event).
+    pub fn backslides(&self) -> Vec<String> {
+        self.shared.backslides.lock().unwrap().clone()
+    }
+
+    /// The violation the sampler recorded, if it recorded one. `check` panics, which is right for a
+    /// seed; a seed that is *testing the sampler* (h1) needs to read the verdict and say what it
+    /// was waiting for, so this is the non-panicking view of the same field.
+    pub fn violation(&self) -> Option<String> {
+        self.shared.violation.lock().unwrap().clone()
+    }
+
+    /// How many passes the sampler has completed. A seed that forges state for the sampler to
+    /// react to waits on this first: the alternative is a sleep, which the harness does not do.
+    pub fn samples(&self) -> u64 {
+        self.shared.samples.load(Ordering::Relaxed)
     }
 
     pub fn add_log(&self, path: &Path) {
@@ -995,14 +1436,60 @@ async fn sample(sp: &Arc<Shared>, conn: &mut Option<mysql_async::Conn>) {
         bad
     };
     if let Some((rule, prev, cur)) = regressed {
-        return violate(
-            sp,
-            format!(
-                "P6: rule {rule} position regressed {}:{} -> {}:{}",
-                prev.0, prev.1, cur.0, cur.1
-            ),
-        )
-        .await;
+        // Three claims, not two. A regression that lands ON OR ABOVE a declared pin's floor is the
+        // designed XA pin: an XA's marks arrive at its COMMIT and are pinned at the transaction's
+        // own start (`apply(marks, &pos, &xa.start)` in src/engine.rs), which is the behavior S5
+        // exists to prove. A regression that lands BELOW the floor is a violation the pin does not
+        // excuse — the floor has to be able to fail, or it is not a floor. And a regression no
+        // open pin covers at all is the plain lost-work case.
+        let verdict =
+            {
+                let pins = sp.pins.lock().unwrap();
+                // Only a pin whose keys are still unconfirmed excuses anything: once the keys are at
+                // the target the marks have been applied and the exemption is over.
+                let declared = pins.iter().find(|pin| {
+                    pin.rule == rule
+                        && !pin
+                            .keys
+                            .iter()
+                            .all(|k| pin.mock.keys_received().contains(k))
+                });
+                match declared {
+                    Some(pin) if cur >= pin.floor => Ok(pin.name.clone()),
+                    Some(pin) => {
+                        Err(format!(
+                    "P6: rule {rule} position went back {}:{} -> {}:{}, BELOW the floor {}:{} \
+                     declared for {name} — a pin excuses a position falling TO its floor, not \
+                     past it",
+                    prev.0, prev.1, cur.0, cur.1, pin.floor.0, pin.floor.1, name = pin.name
+                ))
+                    }
+                    None => Err(format!(
+                    "P6: rule {rule} position regressed {}:{} -> {}:{} (no declared pin explains \
+                     it: a position that goes back without an XA pin behind it lost work)",
+                    prev.0, prev.1, cur.0, cur.1
+                )),
+                }
+            };
+        match verdict {
+            Ok(name) => {
+                // Rebaseline: the pin IS the position now, so the next sample compares against it.
+                // Without this the same accepted regression is reported on every sample and turns
+                // into a violation the moment the pin's keys are delivered.
+                sp.last_pos
+                    .lock()
+                    .unwrap()
+                    .insert(rule.clone(), cur.clone());
+                let line = format!(
+                    "P6 accepted: rule {rule} position went back {}:{} -> {}:{} (the floor of \
+                     {name}, the pin's keys were still unconfirmed)",
+                    prev.0, prev.1, cur.0, cur.1
+                );
+                sp.backslides.lock().unwrap().push(line.clone());
+                sp.fault_log.add(line);
+            }
+            Err(msg) => return violate(sp, msg).await,
+        }
     }
 
     // P4 (every phase, open or closed): no second delivery of one expected key without a
@@ -1150,6 +1637,222 @@ async fn context(sp: &Arc<Shared>) -> String {
         }
     }
     out
+}
+
+// --------------------------------------------------------------------------- XA hygiene
+//
+// Design §4: a prepared XA abandoned by a panicking chaos test holds locks and blocks the binlog
+// purge for every tenant of a shared server, so S5 defends against it three ways: an xid unique
+// per run, this module's `XaGuard` (commits or rolls back on every path, Drop included), and a
+// suite-start `XA RECOVER` sweep of leftover `lwf_*` xids. The sweep is aware of the xids this
+// process has under its own guard, so it can never roll back a transaction another running seed
+// is holding open on purpose.
+
+fn live_xids() -> &'static Mutex<BTreeSet<String>> {
+    static LIVE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// A connection to the server root (no schema): `XA RECOVER`/`XA ROLLBACK` belong to no schema.
+async fn root_conn(root: &str) -> mysql_async::Conn {
+    let opts = mysql_async::Opts::from_url(&format!("{root}/?prefer_socket=false"))
+        .unwrap_or_else(|e| panic!("parse the root dsn of {root} for the XA sweep: {e}"));
+    match tokio::time::timeout(Duration::from_secs(20), mysql_async::Conn::new(opts)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => panic!("connect to {root} for the XA sweep: {e}"),
+        Err(_) => panic!("{root}: no answer to a new connection in 20 s (XA sweep)"),
+    }
+}
+
+/// One prepared branch `XA RECOVER` shows: `name` is what the sweep reports (the `data` column,
+/// the printable gtrid+bqual), while a rollback has to name the two parts separately — the joined
+/// string of the data column is not an xid `XA ROLLBACK` takes back.
+#[derive(Debug, Clone)]
+pub struct XaLeft {
+    pub name: String,
+    pub gtrid: String,
+    pub bqual: String,
+}
+
+fn sql_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn text(v: &[u8]) -> String {
+    String::from_utf8_lossy(v).into_owned()
+}
+
+/// The prepared-but-unfinished `lwf_*` transactions of one server. No answer, or no right to ask,
+/// is reported as none: nothing is claimed about transactions that cannot be seen.
+pub async fn xa_recover_lwf(root: &str) -> Vec<XaLeft> {
+    let mut c = root_conn(root).await;
+    let rows: Vec<mysql_async::Row> = match tokio::time::timeout(
+        Duration::from_secs(20),
+        // CONVERT XID: the binary gtrid/bqual come back in printable form, so the name the sweep
+        // reports and the strings it rolls back are the ones the server showed.
+        c.query::<mysql_async::Row, _>("XA RECOVER CONVERT XID"),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        _ => Vec::new(),
+    };
+    let out = rows
+        .into_iter()
+        .filter_map(|row| {
+            let gtrid = text(&row.get_opt::<Vec<u8>, _>(1)?.ok()?);
+            let bqual = text(&row.get_opt::<Vec<u8>, _>(2)?.ok()?);
+            let name = row
+                .get_opt::<Vec<u8>, _>(3)
+                .and_then(|v| v.ok())
+                .map(|v| text(&v))
+                .unwrap_or_else(|| format!("{gtrid},{bqual}"));
+            (name.starts_with("lwf_") || gtrid.starts_with("lwf_")).then_some(XaLeft {
+                name,
+                gtrid,
+                bqual,
+            })
+        })
+        .collect();
+    super::quit(c).await;
+    out
+}
+
+/// Roll one branch back; the error of a branch that is not (or no longer) there is the expected
+/// answer, so it is not a failure. The two-argument form goes first, because the data column's
+/// joined string is not an xid a rollback takes; the single-string form is the fallback.
+async fn xa_rollback(root: &str, xa: &XaLeft) {
+    let mut c = root_conn(root).await;
+    for q in [
+        format!(
+            "XA ROLLBACK '{}','{}'",
+            sql_quote(&xa.gtrid),
+            sql_quote(&xa.bqual)
+        ),
+        format!("XA ROLLBACK '{}'", sql_quote(&xa.name)),
+    ] {
+        let r = tokio::time::timeout(Duration::from_secs(20), c.query_drop(q)).await;
+        if matches!(r, Ok(Ok(()))) {
+            break;
+        }
+    }
+    super::quit(c).await;
+}
+
+/// The suite-start sweep, once per test-binary run (the runner holds the heavy-suite lock
+/// around the whole binary, so no other lazywf suite writes here while it runs). Every `lwf_*`
+/// xid that no guard of this process owns is rolled back, and the list it leaves behind is what
+/// the seed asserts on: a leftover the sweep should have removed fails the seed, which is what
+/// keeps the sweep from being a `let _ =` line nobody checks.
+pub async fn sweep_xa_once(root: &str, log: &FaultLog) -> Vec<String> {
+    if SWEPT.get().is_none() {
+        let mine = live_xids().lock().unwrap().clone();
+        let found = xa_recover_lwf(root).await;
+        let mut swept = 0usize;
+        for xa in found
+            .iter()
+            .filter(|x| !mine.contains(&x.gtrid) && !mine.contains(&x.name))
+        {
+            xa_rollback(root, xa).await;
+            swept += 1;
+        }
+        if swept > 0 {
+            log.add(format!(
+                "XA sweep: rolled back {swept} leftover lwf_* transaction(s)"
+            ));
+        }
+        let _ = SWEPT.set(());
+    }
+    let mine = live_xids().lock().unwrap().clone();
+    xa_recover_lwf(root)
+        .await
+        .into_iter()
+        .filter(|x| !mine.contains(&x.gtrid) && !mine.contains(&x.name))
+        .map(|x| x.name)
+        .collect()
+}
+
+/// Whether this process has run the suite-start sweep. `S5` asserts it: a seed that skipped the
+/// sweep would leave another tenant's binlog purge pinned, and that must be a failure, not a line
+/// of code somebody deleted.
+pub fn sweep_ran() -> bool {
+    SWEPT.get().is_some()
+}
+
+static SWEPT: OnceLock<()> = OnceLock::new();
+
+/// One XA transaction of a chaos seed: a name unique to this run, registered live (so the sweep
+/// leaves it alone) and rolled back on every path out of the test, a panic included.
+pub struct XaGuard {
+    xid: String,
+    root: String,
+    finished: AtomicBool,
+    log: Option<FaultLog>,
+}
+
+impl XaGuard {
+    /// Takes the xid into protection *before* `XA START` runs: a seed that panics between the two
+    /// still leaves nothing behind.
+    pub fn new(root: &str, xid: &str, log: Option<FaultLog>) -> XaGuard {
+        live_xids().lock().unwrap().insert(xid.to_string());
+        XaGuard {
+            xid: xid.to_string(),
+            root: root.to_string(),
+            finished: AtomicBool::new(false),
+            log,
+        }
+    }
+
+    pub fn xid(&self) -> &str {
+        &self.xid
+    }
+
+    /// The seed finished with the branch itself (`XA COMMIT` or an explicit `XA ROLLBACK`): the
+    /// guard still tries the rollback, which answers `ER_XAER_NOTA` and is ignored.
+    pub fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for XaGuard {
+    fn drop(&mut self) {
+        let xid = self.xid.clone();
+        let root = self.root.clone();
+        let finished = self.finished.load(Ordering::Relaxed);
+        live_xids().lock().unwrap().remove(&xid);
+        if let Some(l) = &self.log {
+            l.add(format!(
+                "XA guard: {xid} released ({})",
+                if finished {
+                    "finished by the seed, safety-net rollback"
+                } else {
+                    "unfinished: rolled back"
+                }
+            ));
+        }
+        // Drop cannot await, so the cleanup runs on a thread with a runtime of its own (the same
+        // shape `common::db_rtt` uses). Every statement on it is bounded, so a sick server slows
+        // the test's end; it cannot hang it forever.
+        let for_thread = xid.clone();
+        let h = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                let mut c = root_conn(&root).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    c.query_drop(format!("XA ROLLBACK '{for_thread}'")),
+                )
+                .await;
+                super::quit(c).await;
+                Ok::<_, mysql_async::Error>(())
+            })
+        });
+        if let Err(e) = h.join() {
+            eprintln!("XA guard: the rollback of {xid} did not complete cleanly: {e:?}");
+        }
+    }
 }
 
 // --------------------------------------------------------------------------- drain
