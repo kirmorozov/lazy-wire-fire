@@ -773,6 +773,16 @@ async fn s2_source_stall() {
     let (pinned_f, pinned_p, _, _) = db.status("o").await.expect("row after phase 1");
     let server_before = binlog_end(&db).await;
     binp.stall(true);
+    // The two references for "nothing moved while deaf", both taken AFTER arming: the engine's saved
+    // position may still be settling phase 1 for a moment (bytes the proxy had already handed over
+    // before the stall became real), so the position is reported rather than pinned, and what is
+    // pinned is the proxy's own delivered counter — the only measurement that can say "the engine
+    // was allowed to see nothing" without racing the engine's pipeline.
+    let (ref_f, ref_p, _, _) = db
+        .status("o")
+        .await
+        .expect("status row at the moment of arming");
+    let delivered_at_arm = binp.delivered_s2c();
     log.add("phase 2 written while the dump role is stalled");
 
     // The outage's load: a phase whose commit the deaf stream cannot deliver.
@@ -799,6 +809,46 @@ async fn s2_source_stall() {
         stream_lag_max = stream_lag_max.max(s["stream_lag_ms"].as_u64().unwrap_or(0));
         sleep_ms(200).await;
     }
+
+    // The outage was an outage, measured where the stall is actually implemented. The two halves
+    // fail differently, so both are asserted:
+    //
+    // * the proxy handed the engine nothing between arming and here. This is the only one of the
+    //   two that can be stated exactly. The engine's own saved position cannot be pinned to the
+    //   byte: bytes the proxy had delivered a moment *before* arming are still in its
+    //   read→flush→persist pipeline, and that pipeline does not freeze because the wire did — the
+    //   first full-suite run of this assert failed with the position moving 82310 → 83720 while 0
+    //   of 200 keys had leaked, which was the seed blaming the engine for its own race. The
+    //   position is therefore reported (in the summary line), and the counter asserted here is the
+    //   proxy's own, which counts only what the engine was allowed to see.
+    // * not one key of the phase written *during* the stall has reached the target. This is the
+    //   end-to-end version, and the one mutation M1 drives: revert the proxy's in-flight hold
+    //   (`held_s2c` — the race MariaDB showed 0.7 s after arming, evidence/probe-s2-mariadb.log)
+    //   and all 200 keys are at the mock while the stall is still armed, which used to leave this
+    //   seed green while every claim below it was about a stream that had never been deaf.
+    let phase2 = keyset(201, 400);
+    let got2 = mock.keys_received();
+    let leaked: Vec<&String> = phase2.iter().filter(|k| got2.contains(*k)).collect();
+    let delivered_now = binp.delivered_s2c();
+    assert_eq!(
+        delivered_now,
+        delivered_at_arm,
+        "the proxy handed {} more server→client bytes to the engine while the dump port was \
+         stalled ({} at arming, {delivered_now} now): the stream was never deaf, so the watchdog, \
+         the reconnect and the drain claimed below are about a stream that was still being fed — \
+         and {} of the 200 phase-2 keys are already at the target",
+        delivered_now - delivered_at_arm,
+        delivered_at_arm,
+        leaked.len()
+    );
+    assert!(
+        leaked.is_empty(),
+        "{} of the 200 keys written during the stall reached the target before the heal (first \
+         few {:?}): the proxy relayed bytes through a stall it was told to hold, so the stream \
+         was never deaf and the reconnect and drain claims below are about nothing",
+        leaked.len(),
+        &leaked[..leaked.len().min(5)]
+    );
 
     // The engine's OWN watchdog, not the heal: the floor is 15 s here, so this wait is the
     // floor plus the slack of a loaded host (`wait_for` scales it).
@@ -930,8 +980,11 @@ async fn s2_source_stall() {
          engine's own); phase 2 drained in {drained:?} (the design's bound: 75 s = the 60 s a \
          binlog connect may take + the {SILENCE_FLOOR:?} silence floor); frozen during the stall \
          at {f}:{p} (armed at {pinned_f}:{pinned_p}, the unread group of keys 201..=400 starts at \
-         {}:{}, the server stood at {}:{}); sampled during the stall: max rule lag_ms={lag_ms}, \
-         max stream_lag_ms={stream_lag} (see report.md: on a stalled idle stream the engine's own \
+         {}:{}, the server stood at {}:{}); the proxy delivered {delivered_at_arm} server→client \
+         bytes by arming and {delivered_now} by the end of the outage ({} of the 200 phase-2 keys \
+         reached the target meanwhile), and the engine's own row was {ref_f}:{ref_p} at arming and \
+         {f}:{p} at the end; sampled during the stall: max rule lag_ms={lag_max}, \
+         max stream_lag_ms={stream_lag_max} (see report.md: on a stalled idle stream the engine's own \
          idle timer sets caught_up, so its lag reads 0 and the observable proof of the outage is \
          the watchdog line + streaming=false + the frozen position)",
         mock.delivery_count(),
@@ -940,8 +993,7 @@ async fn s2_source_stall() {
         gp2.1,
         server_after.0,
         server_after.1,
-        lag_ms = lag_max,
-        stream_lag = stream_lag_max
+        leaked.len(),
     );
     assert_no_undelivered(&lazy);
     lazy.kill();

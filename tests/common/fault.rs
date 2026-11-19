@@ -106,6 +106,11 @@ pub struct ProxyStat {
     /// server→client bytes only: the size of what the server actually sent, which is what a
     /// binlog group costs on the wire.
     pub bytes_s2c: u64,
+    /// server→client bytes the proxy actually handed to the client. Equal to `bytes_s2c` unless
+    /// something is being held back: while a stall is armed this must not move at all, which is
+    /// the claim S2 asserts (the engine's own position can still advance on bytes the proxy had
+    /// already delivered a moment earlier, so the stall has to be proved at the proxy).
+    pub delivered_s2c: u64,
     /// Dump connections reset by `flap` so far.
     pub flap_cuts: u64,
     /// Times `cut_after_bytes` has fired (it is a one-shot, so 0 or 1).
@@ -151,6 +156,10 @@ struct Core {
     conns: AtomicU64,
     bytes: AtomicU64,
     bytes_s2c: AtomicU64,
+    /// server→client bytes actually handed to the client. `bytes_s2c` counts what the server SENT
+    /// (it is read at the moment of the upstream read, so a stall cannot stop it); this counts what
+    /// the engine was ALLOWED to see, which is the only thing a stalled stream is a claim about.
+    delivered_s2c: AtomicU64,
     flap_cuts: AtomicU64,
     byte_cuts: AtomicU64,
     /// How far past its arming point the last `cut_after_bytes` had relayed when it fired: the
@@ -189,6 +198,7 @@ impl FaultProxy {
             conns: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             bytes_s2c: AtomicU64::new(0),
+            delivered_s2c: AtomicU64::new(0),
             flap_cuts: AtomicU64::new(0),
             byte_cuts: AtomicU64::new(0),
             last_cut_at: AtomicU64::new(0),
@@ -309,6 +319,13 @@ impl FaultProxy {
         self.core.bytes_s2c.load(Ordering::Relaxed)
     }
 
+    /// What the proxy has actually let through to the client. During a stall this must not move:
+    /// `bytes_s2c` cannot answer that question, because it counts at the moment of the upstream
+    /// read and a stall cannot stop the server from sending.
+    pub fn delivered_s2c(&self) -> u64 {
+        self.core.delivered_s2c.load(Ordering::Relaxed)
+    }
+
     fn set(&self, what: &str, f: impl FnOnce(&mut Mode)) {
         f(&mut self.core.mode.lock().unwrap());
         if let Some(l) = &self.core.log {
@@ -396,6 +413,7 @@ impl FaultProxy {
             conns: self.conns(),
             bytes: self.bytes(),
             bytes_s2c: self.core.bytes_s2c.load(Ordering::Relaxed),
+            delivered_s2c: self.core.delivered_s2c.load(Ordering::Relaxed),
             flap_cuts: self.core.flap_cuts.load(Ordering::Relaxed),
             byte_cuts: self.core.byte_cuts.load(Ordering::Relaxed),
             bytes_at_cut: self.core.last_cut_at.load(Ordering::Relaxed),
@@ -487,6 +505,8 @@ async fn relay(cli: TcpStream, core: Arc<Core>, my_gen: u64) {
             if cli.write_all(&held_s2c).await.is_err() {
                 return;
             }
+            core.delivered_s2c
+                .fetch_add(held_s2c.len() as u64, Ordering::Relaxed);
             held_s2c.clear();
             if up.write_all(&held_c2s).await.is_err() {
                 return;
@@ -555,6 +575,7 @@ async fn relay(cli: TcpStream, core: Arc<Core>, my_gen: u64) {
                     if cli.write_all(&buf_s2c[..n]).await.is_err() {
                         return;
                     }
+                    core.delivered_s2c.fetch_add(n as u64, Ordering::Relaxed);
                 }
             },
             // Poll the mode even on an idle connection, so a cut lands within ~50 ms.
