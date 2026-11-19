@@ -921,7 +921,7 @@ impl Drop for Lazy {
             .lock()
             .unwrap()
             .as_mut()
-            .map_or(false, |c| c.try_wait().ok().flatten().is_none());
+            .is_some_and(|c| c.try_wait().ok().flatten().is_none());
         if running {
             self.hard_stop();
             if let Some(l) = &self.log {
