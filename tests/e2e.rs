@@ -9466,11 +9466,12 @@ async fn statement_format_dml_is_counted_and_warned() {
         mock.requests().iter().map(|r| &r.body).collect::<Vec<_>>()
     );
 
-    // One WARN line per table, no more, and nothing of the statement in any of them. The wait is
-    // on the two lines having arrived — a loaded box is slow, not absent — and "exactly one each"
-    // is what the rate limit owes, so that is asserted once they are there. The count of what the
-    // capture holds at all goes into the wording of the wait: a suite that times out here has to
-    // say whether it saw no lines or lines it could not match.
+    // Both tables reported, each with the kind it was, and nothing of the statement in any line.
+    // The wait is on those two lines having arrived — a loaded box is slow, not absent. What the
+    // capture holds beyond them belongs to the engines of the tests running beside this one, which
+    // is why the assertion below is on the shape of the lines and not on their number. The size of
+    // the capture goes into the wording of the wait: a suite that times out here has to say
+    // whether it saw no lines at all or lines it could not match.
     let captured = warnings().len();
     let warned = wait_for(
         Duration::from_secs(10),
@@ -9494,12 +9495,14 @@ async fn statement_format_dml_is_counted_and_warned() {
     // started between my two statements on `orders` owes the second of them, at its own position.
     // What is provable across engines is the shape of the lines: the two tables, each named with
     // the kind it was, and nothing of the statement in any of them.
-    let field = |line: &str, name: &str| -> &str {
+    // A `fn`, not a closure: a closure cannot name the lifetime it ties its return to, and the
+    // elision rules give this one the lifetime of `line`, which is what the fields are cut from.
+    fn field(line: &str, name: &str) -> &str {
         line.split(&format!("{name}="))
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("")
-    };
+    }
     let kinds: std::collections::BTreeSet<(&str, &str)> = warned
         .iter()
         .map(|l| (field(l, "kind"), field(l, "table")))
