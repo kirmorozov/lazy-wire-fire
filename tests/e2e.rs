@@ -9495,21 +9495,26 @@ async fn statement_format_dml_is_counted_and_warned() {
     // started between my two statements on `orders` owes the second of them, at its own position.
     // What is provable across engines is the shape of the lines: the two tables, each named with
     // the kind it was, and nothing of the statement in any of them.
-    // A `fn`, not a closure: a closure cannot name the lifetime it ties its return to, and the
-    // elision rules give this one the lifetime of `line`, which is what the fields are cut from.
-    fn field(line: &str, name: &str) -> &str {
+    // Owned, not borrowed: with two reference parameters no elision rule can say which one a
+    // borrowed return came from (E0106, which CI found in twelve seconds where my box found
+    // nothing at all), and a handful of field values is not worth naming a lifetime for.
+    let field = |line: &str, name: &str| -> String {
         line.split(&format!("{name}="))
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("")
-    }
-    let kinds: std::collections::BTreeSet<(&str, &str)> = warned
+            .to_string()
+    };
+    let kinds: std::collections::BTreeSet<(String, String)> = warned
         .iter()
         .map(|l| (field(l, "kind"), field(l, "table")))
         .collect();
     assert_eq!(
         kinds,
-        std::collections::BTreeSet::from([("UPDATE", "orders"), ("INSERT", "customers")]),
+        std::collections::BTreeSet::from([
+            ("UPDATE".to_string(), "orders".to_string()),
+            ("INSERT".to_string(), "customers".to_string()),
+        ]),
         "one line per table, each naming its kind and its table, and nothing else:\n{}",
         warned.join("\n")
     );
