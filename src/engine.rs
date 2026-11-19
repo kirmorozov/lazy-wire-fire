@@ -48,6 +48,15 @@ const BINLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const XA_PIN_MAX: Duration = Duration::from_secs(3600);
 /// Tables created `LIKE` another that are remembered at most (online schema changes in flight).
 const MAX_SHADOWS: usize = 1000;
+/// Tables the statement-format DML warning ([`Engine::note_statement_dml`]) rate limits at
+/// most. Its key is a name the source states, so unlike lazyview's map (bounded by the tables
+/// whose sessions twist `binlog_format`) this one needs a hard ceiling: a session can name a
+/// new table in every statement, and the engine's memory must not follow it.
+const MAX_STMT_DML_TABLES: usize = 1000;
+/// Minimum time between the WARN lines of one table in [`Engine::note_statement_dml`]: a bulk
+/// job in statement format is one event per statement, so one line per table per interval
+/// carries the count of the rest.
+const STMT_DML_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Status rows are rewritten at least this often (`updated_at`).
 const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 const RETRY_FIRST: Duration = Duration::from_millis(500);
@@ -505,6 +514,17 @@ pub struct Engine {
     /// Tables created `LIKE` another while streaming (copy → original): the copies an online
     /// schema change fills and then swaps in.
     shadows: HashMap<(String, String), (String, String)>,
+    /// Rate limiting of the statement-format DML warning ([`Engine::note_statement_dml`]):
+    /// per (schema, table) the time of the last line — `None` while no line has been logged yet,
+    /// which is how the first event logs at once without any arithmetic on the clock — and the
+    /// events folded into the next line. Bounded by [`MAX_STMT_DML_TABLES`].
+    stmt_dml_last: HashMap<(String, String), (Option<Instant>, u64)>,
+    /// Statement-format DML events seen since the start (`lazywf_statement_events_ignored_total`,
+    /// and `/status`): the map above stops taking tables once it is full, this number does not.
+    stmt_dml_ignored: u64,
+    /// The one WARN [`Engine::note_statement_dml`] says when [`MAX_STMT_DML_TABLES`] is reached:
+    /// a table set that no longer fits says so, instead of looking like a quiet source.
+    stmt_dml_capped: bool,
 
     config_dirty: Option<Instant>,
     config_fp: u64,
@@ -900,6 +920,9 @@ pub async fn run(
         rewinds: Vec::new(),
         rewound: None,
         shadows: HashMap::new(),
+        stmt_dml_last: HashMap::new(),
+        stmt_dml_ignored: 0,
+        stmt_dml_capped: false,
         config_dirty: None,
         config_fp: 0,
         next_poll: Instant::now() + cfg.config_poll,
@@ -1975,8 +1998,8 @@ impl Engine {
             }
             Item::Statement { schema, query, pos } => {
                 self.txn_foreign = true;
-                self.end_txn(pos);
-                self.on_statement(&schema, &query);
+                self.end_txn(pos.clone());
+                self.on_statement(&schema, &query, &pos);
             }
             // The vendored reader surfaces an INCIDENT event as its own item and logs nothing
             // itself; warn here, at the one place that saw it before, and change no state —
@@ -2491,7 +2514,7 @@ impl Engine {
         }
     }
 
-    fn on_statement(&mut self, schema: &str, query: &str) {
+    fn on_statement(&mut self, schema: &str, query: &str, pos: &Position) {
         if let Some(((cs, ct), (os, ot))) = crate::sql::table_like(query, schema) {
             if self.shadows.len() < MAX_SHADOWS {
                 let copy = self.norm(&cs, &ct);
@@ -2552,6 +2575,41 @@ impl Engine {
                 );
             }
         }
+        self.note_statement_dml(schema, query, pos);
+    }
+
+    /// DML that arrived as a statement-format QUERY event: with `binlog_format=ROW` a QUERY
+    /// event carries DDL and administrative statements only, so an `INSERT` / `REPLACE` /
+    /// `UPDATE` / `DELETE` here was logged in statement format by the executing session (that
+    /// session's own doing, not the engine's). Its rows are not in the stream, so the rules that
+    /// read the table missed this change and their targets are wrong until they are rebuilt: the
+    /// WARN is what tells the operator. One line per (schema, table) per
+    /// [`STMT_DML_LOG_INTERVAL`] with the count of the events folded into it, and never the
+    /// statement text — in statement format it carries the row values, and lazywf logs nothing
+    /// secret. Row events never reach the caller's arm, so they pay nothing for this check; the
+    /// rare statement event pays a token scan and one map entry.
+    fn note_statement_dml(&mut self, schema: &str, query: &str, pos: &Position) {
+        let Some(d) = crate::sql::statement_dml(query, schema) else {
+            return;
+        };
+        self.stmt_dml_ignored += 1;
+        if let Some(m) = &self.metrics {
+            m.statement_event_ignored();
+        }
+        let key = self.norm(&d.schema, &d.table);
+        let now = Instant::now();
+        let Self {
+            stmt_dml_last,
+            stmt_dml_capped,
+            ..
+        } = self;
+        let Some(slot) = stmt_dml_slot(stmt_dml_last, key, stmt_dml_capped) else {
+            return;
+        };
+        let Some(count) = stmt_dml_gate(slot, now) else {
+            return; // folded into the next line for this table
+        };
+        warn_statement_dml(&d, pos, count);
     }
 
     // ---- scheduling ---------------------------------------------------------------------
@@ -3287,6 +3345,7 @@ impl Engine {
             "position": resume.to_string(),
             "stream_lag_ms": self.stream_lag_ms(),
             "stream_error": self.stream_error,
+            "statement_events_ignored": self.stmt_dml_ignored,
             "rules": summary,
             "binlog_filtered_schemas": self.binlog_filtered.iter().collect::<Vec<_>>(),
         }));
@@ -3354,6 +3413,69 @@ fn idset_texts(set: &buffer::IdSet) -> Vec<String> {
 fn first_words(q: &str) -> String {
     let w: Vec<&str> = q.split_whitespace().take(4).collect();
     w.join(" ")
+}
+
+/// The rate-limit entry of `(schema, table)`: its slot, or `None` when the table is new and the
+/// map already holds [`MAX_STMT_DML_TABLES`] of them — the key is a name the source states, so
+/// the map cannot grow with it (lazyview's is bounded by the tables whose sessions twist
+/// `binlog_format`; this one keeps a ceiling as well). The count and the metric keep taking every
+/// event; only the per-table lines stop, and `capped` makes sure that is said out loud once.
+/// Split out of the method so the unit test can drive it without a live engine.
+fn stmt_dml_slot<'a>(
+    map: &'a mut HashMap<(String, String), (Option<Instant>, u64)>,
+    key: (String, String),
+    capped: &mut bool,
+) -> Option<&'a mut (Option<Instant>, u64)> {
+    if !map.contains_key(&key) && map.len() >= MAX_STMT_DML_TABLES {
+        if !*capped {
+            *capped = true;
+            warn!(
+                tables = MAX_STMT_DML_TABLES,
+                "too many tables logging DML in statement format: their WARN lines stop, \
+                 lazywf_statement_events_ignored_total still counts them"
+            );
+        }
+        return None;
+    }
+    Some(map.entry(key).or_insert((None, 0)))
+}
+
+/// The rate limit of [`Engine::note_statement_dml`] for one (schema, table) entry: `Some(count)`
+/// when a line is due, `count` being the events it reports (this one plus those folded since the
+/// last line, which the entry forgets as it reports them), and `None` when the event is folded
+/// into the next line for that table. `None` for the time of the last line means "none logged
+/// yet", so the first event always logs and no arithmetic on the clock is needed to say so:
+/// `now - STMT_DML_LOG_INTERVAL` panics when the result would fall before the monotonic clock's
+/// origin — on Linux the boot, so a host up for less than the interval would panic on its first
+/// statement-format DML. Split out of the method so the unit test can drive it without a live
+/// engine.
+fn stmt_dml_gate(slot: &mut (Option<Instant>, u64), now: Instant) -> Option<u64> {
+    if let Some(last) = slot.0 {
+        if now.duration_since(last) < STMT_DML_LOG_INTERVAL {
+            slot.1 += 1; // folded into the next line for this table
+            return None;
+        }
+    }
+    let count = slot.1 + 1;
+    slot.0 = Some(now);
+    slot.1 = 0;
+    Some(count)
+}
+
+/// One WARN line of [`Engine::note_statement_dml`], split out so the unit test can read it back:
+/// all it is given is what the operator needs — kind, schema, table, position and the folded
+/// count — so no part of the statement, which in statement format carries the row values, can
+/// reach the log.
+fn warn_statement_dml(d: &crate::sql::StmtDml, at: &Position, count: u64) {
+    warn!(
+        kind = %d.kind,
+        schema = %d.schema,
+        table = %d.table,
+        at = %at,
+        count,
+        "DML logged in statement format: its rows are not in the binlog, the rules on this \
+         table missed this change"
+    );
 }
 
 async fn flush_job(

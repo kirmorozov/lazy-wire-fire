@@ -185,3 +185,137 @@ fn expressions() {
     }
     assert!(expression("a != 1 AND b <= 2 AND c <=> NULL").is_ok());
 }
+
+/// A QUERY event carries DDL and administrative statements only while `binlog_format` is `ROW`,
+/// so these four keywords are what the engine reports as logged in statement format: the first
+/// keyword decides (its case and any leading comments aside) and the target is the first name
+/// after it, past the modifiers and the one `INTO` / `FROM` — the table the rows leave, never the
+/// one they come from.
+#[test]
+fn statement_dml_reads_keyword_and_target() {
+    let dml = |q: &str| statement_dml(q, "shop").map(|d| (d.kind, d.schema, d.table));
+    let want = |k: &'static str, s: &str, t: &str| Some((k, s.to_string(), t.to_string()));
+    assert_eq!(
+        dml("INSERT INTO orders VALUES (1)"),
+        want("INSERT", "shop", "orders")
+    );
+    assert_eq!(
+        dml("insert into `orders` values (1)"),
+        want("INSERT", "shop", "orders"),
+        "the keyword is case-insensitive and a quoted name is a name"
+    );
+    assert_eq!(
+        dml("INSERT orders VALUES (1)"),
+        want("INSERT", "shop", "orders"),
+        "INTO is optional"
+    );
+    assert_eq!(
+        dml("INSERT IGNORE INTO orders (id) VALUES (1)"),
+        want("INSERT", "shop", "orders")
+    );
+    assert_eq!(
+        dml("REPLACE orders (id) VALUES (1)"),
+        want("REPLACE", "shop", "orders")
+    );
+    assert_eq!(
+        dml("UPDATE orders SET status = 'x' WHERE id = 1"),
+        want("UPDATE", "shop", "orders")
+    );
+    assert_eq!(
+        dml("UPDATE LOW_PRIORITY IGNORE orders o JOIN items i ON i.o = o.id SET o.s = 1"),
+        want("UPDATE", "shop", "orders"),
+        "a multi-table statement names its first table (the rate limit reads no more)"
+    );
+    assert_eq!(
+        dml("DELETE FROM orders WHERE id = 1"),
+        want("DELETE", "shop", "orders")
+    );
+    assert_eq!(
+        dml("DELETE LOW_PRIORITY QUICK IGNORE FROM db2.orders WHERE id = 1"),
+        want("DELETE", "db2", "orders"),
+        "a qualified name is qualified in the schema it changes"
+    );
+    assert_eq!(
+        dml("INSERT INTO billing.orders SELECT * FROM orders"),
+        want("INSERT", "billing", "orders"),
+        "the target, not the table it selects from"
+    );
+    assert_eq!(
+        dml("INSERT INTO orders SELECT * FROM items"),
+        want("INSERT", "shop", "orders")
+    );
+    assert_eq!(
+        dml("INSERT INTO `my db`.`my tbl` VALUES (1)"),
+        want("INSERT", "my db", "my tbl")
+    );
+    for c in [
+        "/* a note */ ",
+        "-- a note\n",
+        "# a note\n",
+        "/* a */ /* b */\n  ",
+    ] {
+        assert_eq!(
+            dml(&format!("{c}UPDATE orders SET a = 1")),
+            want("UPDATE", "shop", "orders"),
+            "{c:?} leads"
+        );
+    }
+    assert_eq!(
+        dml("/* INSERT */ UPDATE orders SET a = 1"),
+        want("UPDATE", "shop", "orders"),
+        "a keyword inside a comment is not the statement's"
+    );
+    assert_eq!(
+        dml("INSERT INTO orders VALUES ('DELETE FROM x')"),
+        want("INSERT", "shop", "orders"),
+        "a literal is never scanned"
+    );
+    assert_eq!(
+        dml("/*!40000 DELETE FROM orders WHERE 1 */"),
+        want("DELETE", "shop", "orders"),
+        "an executable comment is SQL the server ran"
+    );
+
+    // Not DML: what a ROW-format QUERY event does carry (DDL, administrative statements, the
+    // session's own `SET`), and anything whose first word is not one of the four.
+    for not in [
+        "",
+        "   ",
+        "###",
+        "-- only a note",
+        "/* only a note */",
+        "BEGIN",
+        "COMMIT",
+        "SET SESSION binlog_format = 'STATEMENT'",
+        "USE shop",
+        "SELECT 1",
+        "ANALYZE TABLE orders",
+        "OPTIMIZE TABLE orders",
+        "FLUSH TABLES",
+        "CREATE TABLE t (a INT)",
+        "CREATE OR REPLACE TABLE t (a INT)",
+        "DROP TABLE orders",
+        "ALTER TABLE orders ADD c INT",
+        "TRUNCATE TABLE orders",
+        "RENAME TABLE a TO b",
+        "inserted notes are not a keyword",
+    ] {
+        assert_eq!(statement_dml(not, "shop"), None, "{not:?} is not DML");
+    }
+
+    // Garbage after the keyword still says which schema lost a change; `*` is the table then, so
+    // the rate limit keys on the schema alone.
+    for (q, kind) in [
+        ("INSERT", "INSERT"),
+        ("UPDATE", "UPDATE"),
+        ("DELETE FROM", "DELETE"),
+        ("INSERT INTO (", "INSERT"),
+        ("REPLACE", "REPLACE"),
+    ] {
+        assert_eq!(
+            dml(q),
+            want(kind, "shop", "*"),
+            "{q:?} names no readable table"
+        );
+    }
+}

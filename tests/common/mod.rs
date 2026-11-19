@@ -5,7 +5,7 @@
 pub mod fault;
 pub mod grpc_server;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use lazy_wire_fire::config::Config;
 use lazy_wire_fire::health::Health;
+use lazy_wire_fire::metrics::Metrics;
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -234,22 +235,164 @@ pub fn config(db: &Db, extra: &[(&str, &str)]) -> Config {
     cfg
 }
 
-/// Engine logs on the test output (`RUST_LOG`, default `info`).
+/// Engine logs on the test output (`RUST_LOG`, default `info`), with the lines at `WARN` and above
+/// kept for [`warnings`].
 pub fn logs() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
             .unwrap_or_else(|_| "info".into());
-        // `try_init`: a test binary that installs its own subscriber first keeps it.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_test_writer()
-            .try_init();
+        // Two layers over one registry: the formatter, for whoever reads the test output, and
+        // [`Capture`], for the tests. Installing is the one step that must not fail quietly: a
+        // subscriber that is not there means `warnings` stays empty, which from a test looks
+        // exactly like a WARN that was never logged.
+        let sub = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_filter(filter),
+            )
+            .with(Capture);
+        if let Err(e) = tracing::subscriber::set_global_default(sub) {
+            eprintln!("the test subscriber was not installed: {e} (warnings() stays empty)");
+        }
     });
+}
+
+/// How many lines [`warnings`] keeps: the oldest goes when a new one arrives, so a whole suite
+/// costs a bounded buffer instead of every line the engines of every test ever logged. It has to
+/// hold a full suite's worth: the tests run in parallel through one subscriber, and a test reads
+/// its own line only after the others have logged around it.
+const MAX_LOGGED: usize = 8192;
+
+fn captured() -> Arc<Mutex<VecDeque<String>>> {
+    static CAPTURED: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
+    CAPTURED
+        .get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+        .clone()
+}
+
+/// The `WARN`-and-above lines the engines of this test binary logged, oldest first, as plain text
+/// (the level, the target, the message and `name=value` for every field — what a test matches).
+/// The suite runs the engine in-process, so a test that expects a WARN reads its own line here —
+/// and filters by what makes a line its own, which for every engine test is its own schema.
+pub fn warnings() -> Vec<String> {
+    captured()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// The colour codes of one line, dropped: `ESC [ … m` sequences are markup, not text. The line
+/// [`Capture`] assembles carries none of its own, but a value that came from the binlog (a table
+/// name is source-stated text) is whatever the source said, so markup goes whatever its origin.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // The sequence ends at `m`; anything else it holds (the parameter bytes) is markup too.
+        for c in chars.by_ref() {
+            if c == 'm' {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The harness's own `Layer`: it keeps the text of every `WARN` and `ERROR` event for
+/// [`warnings`].
+///
+/// It reads the event rather than the bytes the formatter writes. Which writer a line reaches, and
+/// where the formatter puts its line breaks and its colour, is the formatter's business — a test
+/// must not fail because of either. So the level comes from the event's metadata (a `WARN` is kept
+/// because it *is* one, not because three bytes appear in a rendered string) and the text is
+/// assembled here, one event at a time.
+#[derive(Default)]
+struct Capture;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Capture {
+    fn on_event(&self, ev: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let meta = ev.metadata();
+        // `Level` orders from `ERROR` down, so everything below `WARN` is not the test's business.
+        if *meta.level() < tracing::Level::WARN {
+            return;
+        }
+        let mut fields = Vec::new();
+        let mut message = None;
+        ev.record(&mut Collect {
+            fields: &mut fields,
+            message: &mut message,
+        });
+        let mut line = format!("{} {}", meta.level(), meta.target());
+        if let Some(m) = message {
+            line.push_str(": ");
+            line.push_str(&m);
+        }
+        for (name, value) in fields {
+            line.push(' ');
+            line.push_str(&name);
+            line.push('=');
+            line.push_str(&value);
+        }
+        // The lock of a logged line must not be able to take the engine down with it.
+        let keep = captured();
+        let mut q = keep.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= MAX_LOGGED {
+            q.pop_front();
+        }
+        q.push_back(plain(&line));
+    }
+}
+
+/// The fields of one event, as the plain format renders them: a string as it is (no quotes, so
+/// `table=orders` reads as it is written), anything else through `Debug` — which is what a `%`-
+/// displayed value prints. The message is a field too (`message`), and it goes to the front.
+struct Collect<'a> {
+    fields: &'a mut Vec<(String, String)>,
+    message: &'a mut Option<String>,
+}
+
+impl Collect<'_> {
+    fn put(&mut self, f: &tracing::field::Field, value: String) {
+        if f.name() == "message" {
+            *self.message = Some(value);
+        } else {
+            self.fields.push((f.name().to_string(), value));
+        }
+    }
+}
+
+impl tracing::field::Visit for Collect<'_> {
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        self.put(f, v.to_string());
+    }
+
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        self.put(f, format!("{v:?}"));
+    }
 }
 
 impl Instance {
     pub fn start(cfg: Config) -> Instance {
+        Instance::with(cfg, None)
+    }
+
+    /// Like [`Instance::start`], with the registry the engine counts into: `Metrics::render` of
+    /// that `Arc` is exactly the body `/metrics` serves (`respond` calls nothing else), so a test
+    /// reads the scrape without a port to fight over.
+    pub fn start_with_metrics(cfg: Config, metrics: Arc<Metrics>) -> Instance {
+        Instance::with(cfg, Some(metrics))
+    }
+
+    fn with(cfg: Config, metrics: Option<Arc<Metrics>>) -> Instance {
         logs();
         let (tx, rx) = watch::channel(false);
         // The token comes from the config as it does in `main`, so a test that sets
@@ -259,7 +402,7 @@ impl Instance {
         let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
         let d = done.clone();
         let task = tokio::spawn(async move {
-            let r = lazy_wire_fire::engine::run(cfg, h, None, rx).await;
+            let r = lazy_wire_fire::engine::run(cfg, h, metrics, rx).await;
             *d.lock().unwrap() = Some(r);
         });
         Instance {
@@ -272,7 +415,17 @@ impl Instance {
 
     /// Starts an instance and waits until it streams the binlog.
     pub async fn ready(cfg: Config) -> Instance {
-        let i = Instance::start(cfg);
+        Instance::ready_inner(cfg, None).await
+    }
+
+    /// Like [`Instance::ready`], with the metrics registry the engine counts into (see
+    /// [`Instance::start_with_metrics`]).
+    pub async fn ready_with_metrics(cfg: Config, metrics: Arc<Metrics>) -> Instance {
+        Instance::ready_inner(cfg, Some(metrics)).await
+    }
+
+    async fn ready_inner(cfg: Config, metrics: Option<Arc<Metrics>>) -> Instance {
+        let i = Instance::with(cfg, metrics);
         let allowed = deadline(Duration::from_secs(20));
         let until = Instant::now() + allowed;
         while !i.health.is_ready() {

@@ -7,10 +7,11 @@
 //! with.
 //!
 //! The production-readiness blocker is that "did it deliver" is only a WARN log, invisible to
-//! monitoring. This is the small, bounded signal set that answers it: five metrics over the
-//! flush path, the dedup buffer and the binlog lag. Everything is `std::sync::atomic`; there is
-//! no metrics crate (house style: no new runtime dependencies, the exposition is hand-rolled
-//! next to the hand-rolled health parser in [`crate::health`]).
+//! monitoring. This is the small, bounded signal set that answers it: six metrics over the
+//! flush path, the dedup buffer, the binlog lag and the statements the binlog carries as text.
+//! Everything is `std::sync::atomic`; there is no metrics crate (house style: no new runtime
+//! dependencies, the exposition is hand-rolled next to the hand-rolled health parser in
+//! [`crate::health`]).
 //!
 //! Cardinality is the hazard, so the label sets are frozen at `{rule}`, `{target}` and
 //! `{outcome}` — never a key, a refusal reason or an endpoint URL. Full keys belong to the
@@ -198,6 +199,12 @@ pub struct Metrics {
     inner: Mutex<Registry>,
     /// `lazywf_binlog_lag_seconds{}`: the stream lag (f64 seconds as bits), no labels.
     binlog_lag_bits: AtomicU64,
+    /// `lazywf_statement_events_ignored_total`: DML that arrived as a statement-format QUERY
+    /// event (a session switched its own `binlog_format` away from `ROW`), so its rows are not in
+    /// the stream and the rules on its table missed the change until they are rebuilt. Counted
+    /// per event; the WARN line is rate limited by the engine's `note_statement_dml` to one per
+    /// table per interval. No labels: the table belongs to the log line, not to the surface.
+    statement_events_ignored: AtomicU64,
 }
 
 impl Metrics {
@@ -247,6 +254,14 @@ impl Metrics {
             .store(secs.to_bits(), Ordering::Relaxed);
     }
 
+    /// Counts one DML that arrived as a statement-format QUERY event, whose rows are therefore
+    /// not in the stream (`lazywf_statement_events_ignored_total`). One `fetch_add`, no lookup and
+    /// no lock, on an event that is itself rare: the row path never reaches here.
+    pub fn statement_event_ignored(&self) {
+        self.statement_events_ignored
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Renders the exposition (`text/plain; version=0.0.4`). Allocates freely: only a scrape
     /// calls this. The order is deterministic (rules and pairs sorted, outcomes and buckets in
     /// fixed order) so a scrape snapshot is hand-checkable.
@@ -257,6 +272,10 @@ impl Metrics {
         binlog_lag(
             &mut out,
             f64::from_bits(self.binlog_lag_bits.load(Ordering::Relaxed)),
+        );
+        statement_events_ignored(
+            &mut out,
+            self.statement_events_ignored.load(Ordering::Relaxed),
         );
         pending_keys(&mut out, &r.rules);
         flush_total(&mut out, &r.pairs);
@@ -315,6 +334,16 @@ fn binlog_lag(out: &mut String, secs: f64) {
     out.push_str("# TYPE lazywf_binlog_lag_seconds gauge\n");
     out.push_str("lazywf_binlog_lag_seconds ");
     out.push_str(&fmt_f64(secs));
+    out.push('\n');
+}
+
+/// The instance-wide count of the DML the binlog carried as text instead of row events. Not a
+/// per-rule or per-table label: the table is on the WARN line, and the label sets are frozen.
+fn statement_events_ignored(out: &mut String, n: u64) {
+    out.push_str("# HELP lazywf_statement_events_ignored_total DML that arrived as a statement-format QUERY event (a session switched its own binlog_format away from ROW): its rows are not in the binlog, so the rules on its table missed those changes until they are rebuilt.\n");
+    out.push_str("# TYPE lazywf_statement_events_ignored_total counter\n");
+    out.push_str("lazywf_statement_events_ignored_total ");
+    out.push_str(&n.to_string());
     out.push('\n');
 }
 
@@ -578,6 +607,9 @@ mod tests {
             "# HELP lazywf_binlog_lag_seconds How far behind the binlog the reader is, in seconds (the status table's stream lag).",
             "# TYPE lazywf_binlog_lag_seconds gauge",
             "lazywf_binlog_lag_seconds 0",
+            "# HELP lazywf_statement_events_ignored_total DML that arrived as a statement-format QUERY event (a session switched its own binlog_format away from ROW): its rows are not in the binlog, so the rules on its table missed those changes until they are rebuilt.",
+            "# TYPE lazywf_statement_events_ignored_total counter",
+            "lazywf_statement_events_ignored_total 0",
             "# HELP lazywf_pending_keys Keys pending in a rule's dedup buffer, not yet delivered.",
             "# TYPE lazywf_pending_keys gauge",
             "lazywf_pending_keys{rule=\"orders\"} 5",
@@ -631,6 +663,26 @@ mod tests {
         assert!(m
             .render()
             .contains("lazywf_dropped_keys_total{rule=\"orders\",target=\"search\"} 2"));
+    }
+
+    /// DML that arrives as a statement-format QUERY event is counted per event, whatever the
+    /// WARN line does: the engine rate limits the lines (one per table per interval), the counter
+    /// is what an alert reads. It is instance-wide, so it opens no labelled entry.
+    #[test]
+    fn statement_events_ignored_counts_every_statement_dml() {
+        let m = Metrics::default();
+        assert!(
+            m.render()
+                .contains("lazywf_statement_events_ignored_total 0"),
+            "a counter a scrape has never seen still shows"
+        );
+        for _ in 0..5 {
+            m.statement_event_ignored();
+        }
+        assert!(m
+            .render()
+            .contains("lazywf_statement_events_ignored_total 5"));
+        assert_eq!(m.entry_count(), (0, 0), "no labels, so no registry entry");
     }
 
     fn outcome_of(m: &Metrics, rule: &str, target: &str, o: FlushOutcome) -> u64 {
