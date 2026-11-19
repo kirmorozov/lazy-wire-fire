@@ -9495,26 +9495,24 @@ async fn statement_format_dml_is_counted_and_warned() {
     // started between my two statements on `orders` owes the second of them, at its own position.
     // What is provable across engines is the shape of the lines: the two tables, each named with
     // the kind it was, and nothing of the statement in any of them.
-    // Owned, not borrowed: with two reference parameters no elision rule can say which one a
-    // borrowed return came from (E0106, which CI found in twelve seconds where my box found
-    // nothing at all), and a handful of field values is not worth naming a lifetime for.
-    let field = |line: &str, name: &str| -> String {
+    // The lifetime is named because it has to be: with two reference parameters no elision rule
+    // can decide which one a borrowed return came from, and rustc refuses rather than guessing
+    // (E0106, which CI found in twelve seconds where my box found nothing at all). `line` is the
+    // one it comes from — the fields are cut out of the captured line, while `name` only picks
+    // which field and is gone by the time the slice is returned.
+    fn field<'a>(line: &'a str, name: &str) -> &'a str {
         line.split(&format!("{name}="))
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("")
-            .to_string()
-    };
-    let kinds: std::collections::BTreeSet<(String, String)> = warned
+    }
+    let kinds: std::collections::BTreeSet<(&str, &str)> = warned
         .iter()
         .map(|l| (field(l, "kind"), field(l, "table")))
         .collect();
     assert_eq!(
         kinds,
-        std::collections::BTreeSet::from([
-            ("UPDATE".to_string(), "orders".to_string()),
-            ("INSERT".to_string(), "customers".to_string()),
-        ]),
+        std::collections::BTreeSet::from([("UPDATE", "orders"), ("INSERT", "customers")]),
         "one line per table, each naming its kind and its table, and nothing else:\n{}",
         warned.join("\n")
     );
