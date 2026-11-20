@@ -40,7 +40,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -208,10 +208,21 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// The registry, poisoned or not. Every mutation of it is one whole `BTreeMap` entry — an
+    /// `Arc` handle inserted by `entry().or_insert_with()`, or a removal — so what a task that
+    /// died holding this lock can leave behind is a handle that is present or absent, never a
+    /// half-written one and never a value some later read turns into an outcome. A second panic
+    /// here would be worse than stale series: `render` is the scrape, and the engine's flush
+    /// accounting resolves its handles through here, where a panic ends the process. (The same
+    /// choice `oauth`'s and `gcp`'s token caches make.)
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The (or the existing) handle of `rule`. Called from the config reload only; the entry set
     /// is bounded by the loaded config.
     pub fn rule(&self, rule: &str) -> Arc<RuleHandle> {
-        let mut r = self.inner.lock().expect("metrics");
+        let mut r = self.registry();
         Arc::clone(
             r.rules
                 .entry(rule.to_string())
@@ -221,7 +232,7 @@ impl Metrics {
 
     /// The (or the existing) handle of `(rule, target)`. Called from the config reload only.
     pub fn pair(&self, rule: &str, target: &str) -> Arc<PairHandle> {
-        let mut r = self.inner.lock().expect("metrics");
+        let mut r = self.registry();
         Arc::clone(
             r.pairs
                 .entry((rule.to_string(), target.to_string()))
@@ -234,7 +245,7 @@ impl Metrics {
     /// of lingering (and counting toward cardinality) until the process restarts. A flush already
     /// in flight keeps incrementing the `Arc` it resolved, but the registry no longer renders it.
     pub fn remove_rule(&self, rule: &str) {
-        let mut r = self.inner.lock().expect("metrics");
+        let mut r = self.registry();
         r.rules.remove(rule);
         r.pairs.retain(|(rl, _), _| rl != rule);
     }
@@ -244,7 +255,7 @@ impl Metrics {
     /// is no longer produced (the new one was resolved by [`Metrics::pair`]), so only the old key
     /// goes. Keeps the pair set exactly the loaded `{rule,target}` set, not its history.
     pub fn remove_pair(&self, rule: &str, target: &str) {
-        let mut r = self.inner.lock().expect("metrics");
+        let mut r = self.registry();
         r.pairs.remove(&(rule.to_string(), target.to_string()));
     }
 
@@ -266,7 +277,7 @@ impl Metrics {
     /// calls this. The order is deterministic (rules and pairs sorted, outcomes and buckets in
     /// fixed order) so a scrape snapshot is hand-checkable.
     pub fn render(&self) -> String {
-        let r = self.inner.lock().expect("metrics");
+        let r = self.registry();
         let mut out = String::new();
         build_info(&mut out);
         binlog_lag(
@@ -287,7 +298,7 @@ impl Metrics {
     /// The number of distinct `(rule, target)` entries: bounded by the loaded config. Test hook.
     #[cfg(test)]
     fn entry_count(&self) -> (usize, usize) {
-        let r = self.inner.lock().expect("metrics");
+        let r = self.registry();
         (r.rules.len(), r.pairs.len())
     }
 }
@@ -689,6 +700,64 @@ mod tests {
         let r = m.inner.lock().unwrap();
         r.pairs.get(&(rule.into(), target.into())).unwrap().outcome[o.index()]
             .load(Ordering::Relaxed)
+    }
+
+    /// A poisoned registry is data, not a second panic. Two owners take this lock and both of them
+    /// can be the process's last act: a scrape renders it, and the engine's flush accounting times
+    /// itself through handles resolved here (`set_pending`, `observe_flush`), so an `expect` here
+    /// was a panic on the engine task. Every mutation of the registry is one whole `BTreeMap`
+    /// entry — a handle inserted, or a removal — so what a task that died holding it leaves behind
+    /// is an entry present or absent: here, the whole pre-panic snapshot, still rendered and still
+    /// moving.
+    #[test]
+    fn a_poisoned_registry_renders_and_counts_on() {
+        let m = scenario();
+        crate::poison::poison(&m.inner);
+        // The three sites that lock: resolve a rule, resolve a pair, time a flush.
+        m.rule("orders").observe_flush(Duration::from_millis(1));
+        m.pair("orders", "search").flush(FlushOutcome::Success);
+        m.rule("customers").set_pending(2);
+        let text = m.render();
+        for want in [
+            // what `scenario` built before the poison, unchanged: nothing was lost,
+            "lazywf_flush_total{rule=\"orders\",target=\"search\",outcome=\"retry\"} 3",
+            "lazywf_dropped_keys_total{rule=\"orders\",target=\"search\"} 1",
+            "lazywf_pending_keys{rule=\"orders\"} 5",
+            // and what moved on the poisoned lock: the handle was found, not rebuilt,
+            "lazywf_flush_total{rule=\"orders\",target=\"search\",outcome=\"success\"} 13",
+            "lazywf_flush_duration_seconds{rule=\"orders\",le=\"0.001\"} 1",
+            // a name the panicking task never reached is a new entry like any other,
+            "lazywf_pending_keys{rule=\"customers\"} 2",
+        ] {
+            assert!(text.contains(want), "missing {want} in\n{text}");
+        }
+    }
+
+    /// `remove_rule` is the only two-step update here (the rule entry, then its pairs), so it is
+    /// the one site a torn moment could leave something behind — and what it leaves is a stale
+    /// series until the next reload, never a wrong count. Under poison the removal is applied.
+    #[test]
+    fn a_poisoned_registry_still_forgets_a_removed_rule() {
+        let m = scenario();
+        crate::poison::poison(&m.inner);
+        m.remove_rule("orders");
+        let text = m.render();
+        assert!(
+            !text.contains("rule=\"orders\""),
+            "the removed rule is still exporting:\n{text}"
+        );
+        assert!(
+            text.contains("lazywf_build_info"),
+            "the scrape itself still works:\n{text}"
+        );
+        // The entry set is still live: a pair named after the poison is created whole.
+        m.pair("orders", "search").flush(FlushOutcome::Success);
+        assert!(
+            m.render().contains(
+                "lazywf_flush_total{rule=\"orders\",target=\"search\",outcome=\"success\"} 1"
+            ),
+            "the pair could not be re-resolved"
+        );
     }
 
     #[test]
