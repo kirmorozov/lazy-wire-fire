@@ -1595,6 +1595,257 @@ fn fired(reqs: &[Req], path: &str) -> Vec<String> {
         .collect()
 }
 
+/// The route cache (the hot-path audit's finding 8) must not turn a live rule edit into the
+/// old world: the rebuild that carries the edit drops the built routes, so the next event of
+/// the table is answered by the rule as it is now — its template, then its key — and not by
+/// what the first event was routed with. A cache that survived the edit would keep every
+/// following row on `/o1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_rule_edit_is_answered_by_the_new_route_not_the_cached_one() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "rtedit").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('o', 'hook', 'POST /o1 HTTP/1.1\n\n{{join keys \",\"}}', 50)").await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    // The route is built here, once; the events that follow are answered from the cache.
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(10), "the first route", || async {
+        (fired(&mock.requests(), "/o1") == ["1"]).then_some(())
+    })
+    .await;
+
+    // Edit the template while the engine is running.
+    db.exec("UPDATE lazy_wire_fire_rule SET template = 'POST /o2 HTTP/1.1\n\n{{join keys \",\"}}' WHERE name = 'o'").await;
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    wait_for(Duration::from_secs(10), "the edited template", || async {
+        (fired(&mock.requests(), "/o2") == ["2"]).then_some(())
+    })
+    .await;
+    // And the route that edit built is the one kept: a following event of the same table is
+    // answered by it too, not re-read back onto the old template.
+    db.exec("UPDATE orders SET total = 3 WHERE id = 2").await;
+    wait_for(
+        Duration::from_secs(10),
+        "the rebuilt route kept",
+        || async {
+            (fired(&mock.requests(), "/o2")
+                .iter()
+                .filter(|k| *k == "2")
+                .count()
+                >= 2)
+                .then_some(())
+        },
+    )
+    .await;
+    let r = mock.requests();
+    assert_eq!(
+        fired(&r, "/o1"),
+        ["1"],
+        "the edit reached some events and not others: {r:?}"
+    );
+
+    // Edit the key the same way: the trigger row changes, so what the route marks changes.
+    db.exec("UPDATE lazy_wire_fire_trigger SET `key` = 'x_{{new.id}}' WHERE rule = 'o' AND source_table = 'orders'")
+        .await;
+    db.exec("INSERT INTO orders VALUES (3, 1, 'new', 3)").await;
+    wait_for(Duration::from_secs(10), "the edited key", || async {
+        (fired(&mock.requests(), "/o2").contains(&"x_3".to_string())).then_some(())
+    })
+    .await;
+    inst.stop().await;
+}
+
+/// An `ALTER` that adds a column to a watched table has to reach both caches before the first
+/// row of the new shape: the layout (so the new column can be named at all) and the route
+/// beside it (so the columns a `Watched` decodes are not the ones of the table before it).
+/// The second rule keys on the column the `ALTER` adds — a route built while the table had
+/// four columns can never produce its key. And the pinned backstop message ("... in the
+/// binlog but ...") stays silent: the rows never arrived at a layout that lagged them, which
+/// is what dropping the route together with the layout is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alter_mid_run_rebuilds_the_route_and_the_rule_keeps_decoding() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "altd").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('o', 'hook', 'POST /o HTTP/1.1\n\n{{join keys \",\"}}', 50)").await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('nt', 'hook', 'POST /nt HTTP/1.1\n\n{{join keys \",\"}}', 50)").await;
+    db.trigger("nt", "orders", Some("n_{{new.note}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(10),
+        "the rule on the plain table",
+        || async { (fired(&mock.requests(), "/o") == ["1"]).then_some(()) },
+    )
+    .await;
+
+    // The `ALTER` mid-run, then a row of the new shape on both rules.
+    db.exec("ALTER TABLE orders ADD COLUMN note VARCHAR(20)")
+        .await;
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2, 'hi')")
+        .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the new shape on the plain rule",
+        || async { (fired(&mock.requests(), "/o").contains(&"2".to_string())).then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the column the ALTER added",
+        || async { (fired(&mock.requests(), "/nt").contains(&"n_hi".to_string())).then_some(()) },
+    )
+    .await;
+
+    // The layout behind the rows moved once, with the `ALTER`, and the rows never outran it:
+    // the backstop that names such a lag has nothing to say about this schema.
+    let stale: Vec<String> = warnings()
+        .into_iter()
+        .filter(|l| l.contains(&db.schema) && l.contains("in the binlog but"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "the layout lagged the binlog across the ALTER: {stale:?}"
+    );
+    // And an added column is not a dropped or replaced table: no continuity was lost, so no
+    // reset reason appeared on either rule. The rows are the engine's to write when its loop
+    // tick comes (status::write rides the persist deadline, and a busy shared server can push
+    // that tick out), so poll for both before unwrapping either — the pattern of the
+    // virtual-column test beside this one.
+    let resets = wait_for(
+        Duration::from_secs(15),
+        "the status rows of both rules",
+        || async {
+            let mut got = Vec::new();
+            for name in ["o", "nt"] {
+                let (_, _, reset, _) = db.status(name).await?;
+                got.push((name, reset));
+            }
+            Some(got)
+        },
+    )
+    .await;
+    for (name, reset) in resets {
+        assert!(
+            reset.starts_with("missing: first start"),
+            "the {name} rule lost continuity across the ALTER: {reset}"
+        );
+    }
+    inst.stop().await;
+}
+
+/// Editing a rule rebuilds the routes of its tables, and a rebuild re-runs every check the
+/// first build ran — including the refusal of a trigger that reads past a `VIRTUAL` column on
+/// a server that leaves those columns out of its images. A cached route that skipped the
+/// checks would hand the refused trigger back with the edit. Only the servers that run short
+/// have a refusal to protect: the others log the skip and pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rule_edit_does_not_resurrect_a_refused_virtual_read() {
+    /// The keys every request carried in its `X-Keys` header.
+    fn keys(m: &Mock) -> std::collections::BTreeSet<String> {
+        m.requests()
+            .iter()
+            .filter_map(|r| r.header("x-keys"))
+            .flat_map(|k| k.split('|').map(str::to_string))
+            .collect()
+    }
+
+    let root = need_db!();
+    let db = Db::fresh(&root, "vnores").await;
+    db.exec(
+        "CREATE TABLE items (id INT PRIMARY KEY, price INT, price_x2 INT AS (price * 2) VIRTUAL, \
+         name VARCHAR(50), stock INT)",
+    )
+    .await;
+    tables(&db).await;
+
+    // Which world this server is in, from its own wire (as the virtual-column test does): an
+    // UPDATE image that holds fewer than the five named columns is one that omits the VIRTUAL.
+    let facts = wire_facts(&db, "items", 2, || async {
+        db.exec("INSERT INTO items (id, price, name, stock) VALUES (1, 5, 'probe', 3)")
+            .await;
+        db.exec("UPDATE items SET stock = 9 WHERE id = 1").await;
+    })
+    .await;
+    for line in &facts {
+        println!("vnores {line}");
+    }
+    let short = facts.iter().any(|l| {
+        l.starts_with("Update") && l.contains("value(s)") && !l.contains("row image 5 value(s)")
+    });
+    if !short {
+        println!(
+            "vnores: this server's images hold the VIRTUAL column, so its trigger is never \
+             refused and there is nothing to resurrect; skipping"
+        );
+        return;
+    }
+
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES \
+         ('v', 'hook', 'PURGE /keys HTTP/1.1\nHost: {{endpoint.host}}\nX-Keys: \
+          {{#each keys}}{{this}}{{#unless @last}}|{{/unless}}{{/each}}\n', 100)",
+    )
+    .await;
+    db.trigger("v", "items", Some("{{new.name}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO items (id, price, name, stock) VALUES (2, 7, 'gadget', 4)")
+        .await;
+    db.exec("UPDATE items SET stock = 5 WHERE id = 2").await;
+    inst.quiet().await;
+    assert!(
+        !keys(&mock).contains("gadget"),
+        "the refused trigger marked before any edit: {:?}",
+        keys(&mock)
+    );
+    wait_for(
+        Duration::from_secs(15),
+        "the refusal on the status",
+        || async {
+            let s = db.status("v").await?;
+            (s.3.as_deref()
+                .is_some_and(|e| e.contains("price_x2") && e.contains("name")))
+            .then_some(())
+        },
+    )
+    .await;
+
+    // The edit: the rule's routes are dropped and built again — and the trigger that reads
+    // past the VIRTUAL column is refused again, not remembered as it was never refused.
+    db.exec(
+        "UPDATE lazy_wire_fire_rule SET template = 'PURGE /keys2 HTTP/1.1\nHost: {{endpoint.host}}\nX-Keys: \
+          {{#each keys}}{{this}}{{#unless @last}}|{{/unless}}{{/each}}\n' WHERE name = 'v'",
+    )
+    .await;
+    db.exec("UPDATE items SET stock = 6 WHERE id = 2").await;
+    db.exec("INSERT INTO items (id, price, name, stock) VALUES (3, 2, 'bolt', 1)")
+        .await;
+    inst.quiet().await;
+    let got = keys(&mock);
+    assert!(
+        !got.contains("gadget") && !got.contains("bolt"),
+        "the rebuild resurrected the refused trigger: {got:?}"
+    );
+    let s = db.status("v").await.expect("the status row");
+    let err =
+        s.3.expect("the rebuilt route still says why the trigger marks nothing");
+    assert!(
+        err.contains("price_x2"),
+        "the refusal after the edit says {err}"
+    );
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rule_enabled_again_replays_what_it_missed() {
     let root = need_db!();

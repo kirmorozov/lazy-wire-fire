@@ -1,5 +1,6 @@
 //! Decoding a binlog row image into named JSON (`Layout`, `convert`, `col_kind`) and the
-//! catalog cache that holds one layout per table. Fixtures are `BinlogValue`s, the way the
+//! catalog cache that holds one layout per table — and, keyed by their own names, the layouts
+//! derived from full-metadata table maps. Fixtures are `BinlogValue`s, the way the
 //! reader hands them over; every assertion is the exact value (or the exact message), never
 //! "it did not panic".
 
@@ -341,4 +342,201 @@ fn the_catalog_cache_invalidates_one_table_or_a_schema() {
     assert_eq!(cat.cache.len(), 1);
     cat.clear();
     assert!(cat.cache.is_empty());
+}
+
+/// The `information_schema` read of `shop`.`orders`: every kind a derived layout has to carry.
+fn info_layout() -> Arc<Layout> {
+    Arc::new(Layout::new(
+        names(&["id", "sku", "state", "note"]),
+        vec![
+            ColKind::Unsigned(32),
+            ColKind::Plain,
+            ColKind::Enum(vec!["a".into(), "b".into()]),
+            ColKind::Plain,
+        ],
+    ))
+}
+
+fn tkey(s: &str, t: &str) -> (String, String) {
+    (s.to_string(), t.to_string())
+}
+
+/// The FULL half of the catalog caches per names: a repeat of the same names from the same
+/// read is the one `Arc` (that is the whole point — finding 1), a different list is its own,
+/// and no derived layout is ever the `information_schema` one or shares an `Arc` with it.
+#[test]
+fn full_layouts_are_cached_per_names_and_never_share_the_plain_arc() {
+    let info = info_layout();
+    let mut cat = Catalog::default();
+    cat.put("shop", "orders", info.clone());
+
+    // The event's own names, in the case the event wrote them: `Layout::index` is
+    // case-insensitive, so the kinds still follow the same-named column.
+    let event = names(&["id", "SKU", "STATE", "note"]);
+    let ckey = tkey("shop", "orders");
+    let l1 = cat.full_layout(&ckey, &event, &info);
+    let l2 = cat.full_layout(&ckey, &event, &info);
+    assert!(
+        Arc::ptr_eq(&l1, &l2),
+        "the same names from the same read answer with the same `Arc`"
+    );
+    // The finding itself, counted: a repeat of the event derives nothing. What it replaced —
+    // deriving the layout from the names on every event, which is exactly what the cache
+    // used to do — allocates, and now only ever runs once per (table, names, read).
+    let (again, cached) = crate::alloc_measure::count(|| cat.full_layout(&ckey, &event, &info));
+    assert!(Arc::ptr_eq(&again, &l1));
+    assert_eq!(
+        cached, 0,
+        "the repeat of a FULL event costs one `Arc` clone"
+    );
+    let (_, fresh) = crate::alloc_measure::count(|| layout_from_names(&info, &event));
+    assert!(fresh > 0, "what that clone replaced");
+    assert!(
+        !Arc::ptr_eq(&l1, &info),
+        "never the `information_schema` one"
+    );
+    assert_eq!(l1.names, event, "the names are the event's, not the read's");
+    assert_eq!(l1.kinds[0], ColKind::Unsigned(32));
+    assert_eq!(l1.kinds[2], ColKind::Enum(vec!["a".into(), "b".into()]));
+    assert_eq!(
+        l1.kinds[3],
+        ColKind::Plain,
+        "a column the read does not name would be plain; this one it does"
+    );
+
+    // A second, differently-ordered list is its own layout — the two never share an `Arc`,
+    // which is what the mutation check (key without the names) must break.
+    let other = names(&["note", "state", "sku", "id"]);
+    let l3 = cat.full_layout(&tkey("shop", "orders"), &other, &info);
+    assert!(
+        !Arc::ptr_eq(&l1, &l3),
+        "two lists of one table, two layouts"
+    );
+    assert_eq!(l3.names, other);
+    assert_eq!(cat.full[&tkey("shop", "orders")].len(), 2);
+}
+
+/// The two sides of the catalog never answer for each other: a plain request gets the
+/// `information_schema` layout (never a derived one), a FULL request gets a layout derived
+/// from exactly its names (never the plain one, never one derived from other names).
+#[test]
+fn plain_and_full_requests_never_cross() {
+    let info = info_layout();
+    let mut cat = Catalog::default();
+    cat.put("shop", "orders", info.clone());
+    let event = names(&["id", "sku", "state", "note"]);
+    let derived = cat.full_layout(&tkey("shop", "orders"), &event, &info);
+    let key = tkey("shop", "orders");
+
+    assert!(Arc::ptr_eq(cat.current(&key, None).unwrap(), &info));
+    assert!(Arc::ptr_eq(
+        cat.current(&key, Some(&event)).unwrap(),
+        &derived
+    ));
+
+    // A FULL request for names nobody ever asked about: `layout` would derive a fresh one,
+    // so nothing in the cache is the current answer — and above all not the plain layout.
+    let unknown = names(&["id"]);
+    assert!(
+        cat.current(&key, Some(&unknown)).is_none(),
+        "a FULL request is never answered from the plain read"
+    );
+    // An unknown table answers `None` on both sides.
+    assert!(cat.current(&tkey("shop", "ghosts"), None).is_none());
+    assert!(cat.current(&tkey("shop", "ghosts"), Some(&event)).is_none());
+}
+
+/// A derived layout is only the answer while the read it was derived from is the current
+/// one: any re-read of `information_schema` — the column-count trust path installing its
+/// fresh `Arc`, an invalidation, a clear — takes the derived answer with it, and the same
+/// `Arc` back makes it the answer again.
+#[test]
+fn derived_layouts_die_with_the_read_they_came_from() {
+    let info = info_layout();
+    let mut cat = Catalog::default();
+    cat.put("shop", "orders", info.clone());
+    let event = names(&["id", "sku", "state", "note"]);
+    let derived = cat.full_layout(&tkey("shop", "orders"), &event, &info);
+    let key = tkey("shop", "orders");
+    assert!(Arc::ptr_eq(
+        cat.current(&key, Some(&event)).unwrap(),
+        &derived
+    ));
+
+    // The trust path of `layout` after a count mismatch: a new `Arc` under the same key.
+    let reread = info_layout();
+    assert!(!Arc::ptr_eq(&reread, &info));
+    cat.put("shop", "orders", reread.clone());
+    assert!(
+        cat.current(&key, Some(&event)).is_none(),
+        "derived from a replaced read: not the current answer"
+    );
+    assert!(Arc::ptr_eq(cat.current(&key, None).unwrap(), &reread));
+
+    // Put the very same `Arc` back and the derived layout is the answer again — which is
+    // exactly what `layout` does with it (the cached read, the cached names: the one `Arc`).
+    cat.put("shop", "orders", info.clone());
+    assert!(Arc::ptr_eq(
+        cat.current(&key, Some(&event)).unwrap(),
+        &derived
+    ));
+
+    // Invalidations take the derived map with the plain one — per table, per schema.
+    cat.put("other", "orders", info.clone());
+    cat.full_layout(&tkey("other", "orders"), &event, &info);
+    cat.invalidate("shop", "orders");
+    assert!(cat.current(&key, None).is_none());
+    assert!(cat.current(&key, Some(&event)).is_none());
+    assert!(
+        cat.current(&tkey("other", "orders"), Some(&event))
+            .is_some(),
+        "the other schema keeps both halves"
+    );
+    cat.invalidate("other", "*");
+    assert!(cat
+        .current(&tkey("other", "orders"), Some(&event))
+        .is_none());
+    cat.clear();
+    assert!(cat.cache.is_empty() && cat.full.is_empty());
+}
+
+/// The route probe's pre-check: the generation moves with everything a cached answer was
+/// built from — every install, every drop, both maps — and stays put when a request was
+/// merely answered from what was already there.
+#[test]
+fn the_generation_moves_with_everything_a_cached_answer_was_built_from() {
+    let mut cat = Catalog::default();
+    let g0 = cat.generation();
+
+    let info = info_layout();
+    cat.put("shop", "orders", info.clone());
+    let g1 = cat.generation();
+    assert!(g1 > g0, "a layout installed");
+
+    let event = names(&["id", "sku", "state", "note"]);
+    cat.full_layout(&tkey("shop", "orders"), &event, &info);
+    assert!(cat.generation() > g1, "a derived layout installed");
+    let g2 = cat.generation();
+
+    // Answers, not changes: the cached repeat and every `current` read leave it alone.
+    cat.full_layout(&tkey("shop", "orders"), &event, &info);
+    cat.current(&tkey("shop", "orders"), None);
+    cat.current(&tkey("shop", "orders"), Some(&event));
+    assert_eq!(cat.generation(), g2, "nothing was invalidated");
+
+    // Every way a cached answer can go stale raises it again — including the trust path's
+    // re-read, which is a `put` too.
+    let reread = info_layout();
+    cat.put("shop", "orders", reread.clone());
+    assert!(cat.generation() > g2, "the trust path's re-read");
+    let g3 = cat.generation();
+    cat.invalidate("shop", "orders");
+    assert!(cat.generation() > g3, "one table out");
+    let g4 = cat.generation();
+    cat.put("shop", "items", info.clone());
+    cat.invalidate("shop", "*");
+    assert!(cat.generation() > g4, "a whole schema out");
+    let g5 = cat.generation();
+    cat.clear();
+    assert!(cat.generation() > g5, "everything out");
 }

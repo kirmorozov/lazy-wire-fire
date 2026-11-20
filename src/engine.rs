@@ -36,7 +36,7 @@ use crate::keyspace::{op_text, text_set, IdSets, KeySpaces};
 use crate::lock;
 use crate::metrics::{FlushOutcome, Metrics, PairHandle, RuleHandle};
 use crate::model::{self, On, RuleDef, StepKind, TargetDef, TriggerDef};
-use crate::rows::{Catalog, Layout, LayoutMismatch};
+use crate::rows::{table_map_names, Catalog, Layout, LayoutMismatch};
 use crate::rule::{self, KeyTemplate, Rule};
 use crate::source::{self, Flavor, Item, Position, RowsKind};
 use crate::status::{self, Saved, INSTANCE_ROW};
@@ -431,6 +431,91 @@ impl Watched {
     }
 }
 
+/// A built route and the catalog generation its layout came from (see [`RouteCache`]).
+struct WatchedEntry {
+    gen: u64,
+    w: Arc<Watched>,
+}
+
+/// The per-table cache of built routes. A TableMap event for an already-routed table is
+/// answered from here (see [`Engine::route`]) instead of rebuilding the trigger list, the
+/// `format!`ed name and the flags from the rules on every event.
+///
+/// A hit requires three things: the table's entry exists; it was built at the catalog's
+/// current generation (nothing has been invalidated since — the counter is bumped by every
+/// mutation of either catalog map); and its `Layout` is still the one the catalog hands out
+/// for exactly this event — the plain `information_schema` layout for an event that names no
+/// columns, a layout derived from the event's own names for a full-metadata one. None of the
+/// three allocates except the two small `String`s of the folded key when `lower_names` is on,
+/// and even those are few beside the list and `format!`ed name this cache replaces. That
+/// identity is what keeps the DDL-survival rule: a `Watched` built
+/// from the `information_schema` layout can never answer a FULL-named request, no FULL-derived
+/// layout ever answers a plain one (the catalog's two caches never share an `Arc`, and a FULL
+/// entry's own names are part of its key), and a layout re-read under a DDL is a new `Arc`,
+/// which fails the check even before the generation counter is consulted.
+#[derive(Default)]
+struct RouteCache {
+    entries: HashMap<(String, String), WatchedEntry>,
+}
+
+impl RouteCache {
+    /// Records the route `route` built for a table at the catalog's current generation.
+    fn insert(&mut self, key: (String, String), w: Arc<Watched>, gen: u64) {
+        self.entries.insert(key, WatchedEntry { gen, w });
+    }
+
+    /// Drops everything: the rules were rebuilt, or a reset started — the ways the trigger
+    /// list a cached entry holds can go stale while the layout stays (see
+    /// [`Engine::rebuild_routes`] and [`Engine::start_reset`]).
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Drops one table's entry, or a whole schema's (the `*` form `forget_columns` takes).
+    fn forget(&mut self, key: &(String, String)) {
+        if key.1 == "*" {
+            self.entries.retain(|k, _| k.0 != key.0);
+        } else {
+            self.entries.remove(key);
+        }
+    }
+
+    /// The route for `key`, if the cached one is still the answer for an event that carries
+    /// `names` as its own column names (`None`: the event names none, so only the plain
+    /// `information_schema` layout answers it). The hit check is
+    /// `Arc::ptr_eq(cached.layout, the same Arc<Layout> the catalog currently returns for
+    /// exactly this event's names)` — [`Catalog::current`] is that answer — and a
+    /// generation that moved since the entry was built is a cheap pre-check that something
+    /// was invalidated. Not just "the counter matches": the identity check is what decides.
+    /// With folded names (`lower_names`) the entry is keyed by the folded pair, so the
+    /// lookup folds first — as `norm` does on the path that builds the entry — while the
+    /// catalog is keyed by the event's raw names, so `current` is asked with those.
+    fn probe(
+        &self,
+        catalog: &Catalog,
+        lower_names: bool,
+        key: &(String, String),
+        names: Option<&[String]>,
+    ) -> Option<Route> {
+        let folded;
+        let ekey = if lower_names {
+            folded = (key.0.to_lowercase(), key.1.to_lowercase());
+            &folded
+        } else {
+            key
+        };
+        let entry = self.entries.get(ekey)?;
+        if entry.gen != catalog.generation() {
+            return None;
+        }
+        let current = catalog.current(key, names)?;
+        if !Arc::ptr_eq(&entry.w.layout, current) {
+            return None;
+        }
+        Some(Route::Watched(entry.w.clone()))
+    }
+}
+
 /// The text a row's Simple keys are built in, reused from row to row: building one key is a
 /// `clear` and some pushes, never an allocation.
 #[derive(Default)]
@@ -530,7 +615,9 @@ pub struct Engine {
     config_fp: u64,
     next_poll: Instant,
     targets: HashMap<String, Arc<Target>>,
-    routes: HashMap<(String, String), Vec<(String, usize)>>,
+    routes: HashMap<(String, String), Arc<Vec<(String, usize)>>>,
+    /// The routes built by [`Engine::route`], cached per table (see [`RouteCache`]).
+    route_cache: RouteCache,
     rules: BTreeMap<String, RuleState>,
     saved: HashMap<String, Saved>,
     incarnations: u64,
@@ -928,6 +1015,7 @@ pub async fn run(
         next_poll: Instant::now() + cfg.config_poll,
         targets: HashMap::new(),
         routes: HashMap::new(),
+        route_cache: RouteCache::default(),
         rules: BTreeMap::new(),
         saved,
         incarnations: 0,
@@ -1148,6 +1236,10 @@ impl Engine {
     }
 
     fn start_reset(&mut self, name: &str, reason: String, requested: bool) {
+        // A reset re-reads the table the rule watches: every route built beforehand — its
+        // layout identity, its trigger list, its flags — is dropped with the rest of what it
+        // assumed. Before the early returns: a reset of a rule that is gone is a signal too.
+        self.route_cache.clear();
         self.runs += 1;
         let id = self.runs;
         let Some(st) = self.rules.get_mut(name) else {
@@ -1612,7 +1704,11 @@ impl Engine {
                     .push((name.clone(), i));
             }
         }
-        self.routes = routes;
+        // Shared `Arc`s: a route read costs one clone, not a `Vec` plus a name per entry.
+        self.routes = routes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        // The cached routes hold trigger lists read from the rules these routes were just
+        // rebuilt from: when the rules change, every cached route goes with them.
+        self.route_cache.clear();
     }
 
     // ---- the stream ------------------------------------------------------------------------
@@ -1896,7 +1992,7 @@ impl Engine {
                 if !own {
                     self.txn_foreign = true;
                 }
-                let route = self.route(reader, table_id, &schema, &table).await?;
+                let route = self.route(reader, table_id, schema, table).await?;
                 self.table_ids.insert(table_id, route);
             }
             Item::Rows {
@@ -2012,58 +2108,85 @@ impl Engine {
         Ok(())
     }
 
+    /// The `Watched` route for `schema`.`table`, or `Ignored`.
+    ///
+    /// `schema` and `table` are the event's own `String`s, moved into the route key, so a
+    /// repeat of a table the cache still answers allocates nothing of its own; the hit check
+    /// is [`RouteCache::probe`]. The tables of the engine's own schema are answered by name
+    /// alone, before either cache is touched.
     async fn route(
         &mut self,
         reader: &BinlogReader,
         table_id: u64,
-        schema: &str,
-        table: &str,
+        schema: String,
+        table: String,
     ) -> Result<Route> {
-        if schema == self.cfg.schema && model::is_own_table(table) {
-            return Ok(if model::is_config_table(table) {
+        if schema == self.cfg.schema && model::is_own_table(table.as_str()) {
+            return Ok(if model::is_config_table(&table) {
                 Route::Config
             } else {
                 Route::Ignore
             });
         }
-        let key = self.norm(schema, table);
-        let Some(list) = self.routes.get(&key).cloned() else {
+        let tme = reader.table_map(table_id);
+        // What the event says about its own columns: `None` on a server with
+        // `binlog_row_metadata=MINIMAL`, the event's names on a FULL one. A cached route may
+        // only answer an event whose own names match what it was built from (see `RouteCache`).
+        let names = tme.and_then(table_map_names);
+        let key = (schema, table);
+        if let Some(route) =
+            self.route_cache
+                .probe(&self.catalog, self.lower_names, &key, names.as_deref())
+        {
+            return Ok(route);
+        }
+        let nkey = self.norm(&key.0, &key.1);
+        let Some(list) = self.routes.get(&nkey).cloned() else {
             return Ok(Route::Ignore);
         };
         match self
             .catalog
-            .layout(&mut self.control, schema, table, reader.table_map(table_id))
+            .layout(&mut self.control, &key.0, &key.1, tme)
             .await
         {
             Ok(layout) => {
-                self.mismatched.remove(&key);
+                self.mismatched.remove(&nkey);
                 let triggers: Vec<(String, Arc<Rule>, usize)> = list
                     .iter()
                     .filter_map(|(n, i)| self.rules.get(n).map(|s| (n.clone(), s.rule.clone(), *i)))
                     .collect();
-                self.check_columns(&layout, schema, table, &triggers);
+                self.check_columns(&layout, &key.0, &key.1, &triggers);
                 let triggers = self
-                    .refuse_virtual_reads(&key, &layout, schema, table, triggers)
+                    .refuse_virtual_reads(&nkey, &layout, &key.0, &key.1, triggers)
                     .await?;
                 let any_full = triggers.iter().any(|(_, rule, i)| {
                     matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
                 });
                 let any_on = Self::watched_kinds(&triggers);
-                Ok(Route::Watched(Arc::new(Watched {
+                let w = Arc::new(Watched {
                     layout,
-                    table: format!("{schema}.{table}"),
+                    table: format!("{}.{}", key.0, key.1),
                     triggers,
                     any_full,
                     any_on,
-                })))
+                });
+                // Cached until the rules change (`rebuild_routes` clears this cache), a reset
+                // starts (`start_reset` does too), or the layout behind it is dropped:
+                // `forget_columns` takes the entry with the catalog entry and `virtual_first`,
+                // and every other catalog invalidation is caught by the generation the entry
+                // was stamped with. The probe's identity check is what a stale entry must
+                // still fail on its own.
+                self.route_cache
+                    .insert(nkey, w.clone(), self.catalog.generation());
+                Ok(Route::Watched(w))
             }
             Err(e) if e.downcast_ref::<LayoutMismatch>().is_some() => {
-                self.forget_columns(schema, table);
+                self.forget_columns(&key.0, &key.1);
                 // Once per mismatch, not for every transaction read before the DDL.
-                if self.mismatched.insert(key) {
+                if self.mismatched.insert(nkey) {
                     warn!("{e:#}");
-                    for (n, _) in list {
-                        self.lose_continuity(&n, format!("{e}"));
+                    for (n, _) in list.iter() {
+                        self.lose_continuity(n, format!("{e}"));
                     }
                 }
                 Ok(Route::Ignore)
@@ -2100,7 +2223,7 @@ impl Engine {
 
     /// Drops what is cached about a table's columns, so both the layout and the position of its
     /// first VIRTUAL column are read again: a DDL changed the table, or its layout did not match
-    /// the binlog.
+    /// the binlog. The built route goes with them — a DDL changes the columns a `Watched` decodes.
     fn forget_columns(&mut self, schema: &str, table: &str) {
         self.catalog.invalidate(schema, table);
         let key = self.norm(schema, table);
@@ -2109,6 +2232,7 @@ impl Engine {
         } else {
             self.virtual_first.remove(&key);
         }
+        self.route_cache.forget(&key);
     }
 
     /// Refuses the triggers that would read what the row images do not carry, and returns those
@@ -3546,3 +3670,7 @@ mod hotpath_alloc_tests;
 #[cfg(test)]
 #[path = "tests/engine_skip_kinds_tests.rs"]
 mod skip_kinds_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_route_cache_tests.rs"]
+mod route_cache_tests;

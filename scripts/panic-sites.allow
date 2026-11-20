@@ -131,7 +131,6 @@ src/path.rs	steps.push(Step::Field(rest[i..end].to_string()));
 src/response.rs	.unwrap()
 src/response.rs	Some((i, _)) => format!("{}…", &s[..i]),
 src/response.rs	let c = self.cond.as_ref().expect("a condition");
-src/rows.rs	.map(|i| info.kinds[i].clone())
 src/rows.rs	Ok(i) if i <= labels.len() => Value::String(labels[i - 1].clone()),
 src/rows.rs	Value::from((*i as u64) & mask)
 src/rows.rs	let have = tme.map(|t| t.columns_count() as usize);
