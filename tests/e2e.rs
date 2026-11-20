@@ -1715,9 +1715,24 @@ async fn an_alter_mid_run_rebuilds_the_route_and_the_rule_keeps_decoding() {
         "the layout lagged the binlog across the ALTER: {stale:?}"
     );
     // And an added column is not a dropped or replaced table: no continuity was lost, so no
-    // reset reason appeared on either rule.
-    for name in ["o", "nt"] {
-        let (_, _, reset, _) = db.status(name).await.expect("the status row");
+    // reset reason appeared on either rule. The rows are the engine's to write when its loop
+    // tick comes (status::write rides the persist deadline, and a busy shared server can push
+    // that tick out), so poll for both before unwrapping either — the pattern of the
+    // virtual-column test beside this one.
+    let resets = wait_for(
+        Duration::from_secs(15),
+        "the status rows of both rules",
+        || async {
+            let mut got = Vec::new();
+            for name in ["o", "nt"] {
+                let (_, _, reset, _) = db.status(name).await?;
+                got.push((name, reset));
+            }
+            Some(got)
+        },
+    )
+    .await;
+    for (name, reset) in resets {
         assert!(
             reset.starts_with("missing: first start"),
             "the {name} rule lost continuity across the ALTER: {reset}"
