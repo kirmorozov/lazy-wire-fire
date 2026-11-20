@@ -591,3 +591,7 @@ pub fn key_text(v: &My) -> Option<String> {
 #[cfg(test)]
 #[path = "tests/docs.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/docs_merge_identity_tests.rs"]
+mod merge_identity_tests;
