@@ -441,6 +441,32 @@ async fn p1_sigkill_mid_flush() {
         (pf.clone(), pp) < cp2,
         "the in-flight flush was confirmed although its expect was never met"
     );
+    // The other half of what a restart reads. `choose_start` resumes at the MINIMUM of the
+    // instance row and every rule row (src/engine.rs:1094), so the child's start is not the rule
+    // row on its own: the first MariaDB run of this seed had the instance row still at
+    // mysql-bin.000002:10222 while rule `o` had been confirmed at 29536, and the restarted child
+    // legitimately started at the older of the two (evidence/proof-mar2.log). Read the pair, and
+    // require it to have settled — the flush is held, so nothing may be confirmed after here, and
+    // a pair taken from a moving engine would make the expectation below meaningless.
+    let (sf, spos) = instance_row(&db)
+        .await
+        .expect("instance row before the kill");
+    sleep_ms(300).await;
+    let (pf2, pp2, _, _) = db.status("o").await.expect("status row, second read");
+    let (sf2, spos2) = instance_row(&db).await.expect("instance row, second read");
+    assert!(
+        (sf.as_str(), spos) <= (sf2.as_str(), spos2) && (pf.as_str(), pp) <= (pf2.as_str(), pp2),
+        "a saved row went backwards while the child was held mid-flush: instance {sf}:{spos} -> \
+         {sf2}:{spos2}, rule {pf}:{pp} -> {pf2}:{pp2} — nothing was confirmed in between, so \
+         neither row may move back"
+    );
+    let (pf, pp) = (pf2, pp2);
+    let (sf, spos) = (sf2, spos2);
+    let (ef, ep) = if (sf.as_str(), spos) <= (pf.as_str(), pp) {
+        (sf.clone(), spos)
+    } else {
+        (pf.clone(), pp)
+    };
     sp.check();
     log.add(format!(
         "killing child 1 at {pf}:{pp} (in-flight flush, expect unmet)"
@@ -460,7 +486,8 @@ async fn p1_sigkill_mid_flush() {
     drain(&sp, &lazy2, &db, "o", cp2.clone(), 75).await;
     sp.check();
 
-    // P6: the restart resumes from the persisted row (monotone positions are the sampler's).
+    // P6: the restart resumes from the saved rows, so positions never go backwards (monotonicity
+    // itself is the sampler's claim; this is the one place the resume point is read directly).
     let starts = lazy2.log_lines_matching("starting from the saved positions");
     assert!(
         !starts.is_empty(),
@@ -471,8 +498,11 @@ async fn p1_sigkill_mid_flush() {
     let v: serde_json::Value = serde_json::from_str(&line).expect("json log line");
     assert_eq!(
         v["fields"]["position"].as_str(),
-        Some(format!("{pf}:{pp}").as_str()),
-        "the restarted child did not start at the persisted row"
+        Some(format!("{ef}:{ep}").as_str()),
+        "the restarted child did not start at the minimum of the two saved rows: the instance row \
+         was {sf}:{spos} and the rule row {pf}:{pp}, so `choose_start` had to resume at \
+         {ef}:{ep} (re-reading the range the newer row already covers is what that row's \
+         `skip_until` skips)"
     );
 
     assert_all_keys(&mock, 1, 600, "P1");
@@ -939,15 +969,26 @@ async fn s2_source_stall() {
         cp2.0,
         cp2.1
     );
+    // The outage left a backlog: the server is ahead of the deaf engine by (at least) the group it
+    // never read. The first version of this line also required the backlog to have *grown* over the
+    // outage, and that is not true in general: bytes the proxy handed over a moment *before*
+    // arming are still in the engine's read→flush→persist pipeline and keep being confirmed after
+    // the stall is armed, so the gap may shrink — MariaDB measured 22 055 -> 12 318 while the proxy
+    // delivered nothing and 0 of 200 keys leaked (evidence/proof-mar3.log). What the outage does
+    // guarantee is asserted above (the position never entered the unread group, no phase-2 key
+    // reached the target, the proxy's delivered counter did not move) and here: at the end of the
+    // outage the server is still ahead of the engine by the unread group's bytes.
     let behind_before = gap(&server_before, &(pinned_f.clone(), pinned_p));
     let behind_after = gap(&server_after, &(f.clone(), p));
     assert!(
-        server_after > (f.clone(), p) && behind_after >= behind_before,
-        "the backlog did not grow during the stall: the server is at {}:{} while the engine is \
-         at {f}:{p} (it was {behind_before} bytes behind when the stall was armed, \
-         {behind_after} now)",
+        server_after > (f.clone(), p) && behind_after > 0,
+        "the stall left no backlog: the server is at {}:{} while the engine is at {f}:{p} \
+         ({behind_before} bytes behind at arming, {behind_after} now) — the phase-2 group begins \
+         at {}:{}, so a stream that read nothing cannot have come past it",
         server_after.0,
-        server_after.1
+        server_after.1,
+        gp2.0,
+        gp2.1
     );
     sp.check();
     log.add(format!(
@@ -983,7 +1024,9 @@ async fn s2_source_stall() {
          {}:{}, the server stood at {}:{}); the proxy delivered {delivered_at_arm} server→client \
          bytes by arming and {delivered_now} by the end of the outage ({} of the 200 phase-2 keys \
          reached the target meanwhile), and the engine's own row was {ref_f}:{ref_p} at arming and \
-         {f}:{p} at the end; sampled during the stall: max rule lag_ms={lag_max}, \
+         {f}:{p} at the end; the server stayed {behind_after} bytes ahead of the engine through the outage
+          ({behind_before} at arming — the gap may shrink, see the assert above); sampled during
+          the stall: max rule lag_ms={lag_max}, \
          max stream_lag_ms={stream_lag_max} (see report.md: on a stalled idle stream the engine's own \
          idle timer sets caught_up, so its lag reads 0 and the observable proof of the outage is \
          the watchdog line + streaming=false + the frozen position)",
