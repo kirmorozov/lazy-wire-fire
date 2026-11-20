@@ -248,10 +248,90 @@ pub fn table_map_names(tme: &TableMapEvent<'_>) -> Option<Vec<String>> {
     None
 }
 
-/// `information_schema` layouts, cached per table.
+/// The layout an event's own column names describe: every column keeps the kind of the
+/// `information_schema` column of the same name (a name the read does not know is plain).
+/// Pure: the same `info` and the same names always derive the same layout.
+pub fn layout_from_names(info: &Layout, names: &[String]) -> Arc<Layout> {
+    let kinds = names
+        .iter()
+        .map(|n| {
+            info.index(n)
+                .and_then(|i| info.kinds.get(i).cloned())
+                .unwrap_or(ColKind::Plain)
+        })
+        .collect();
+    Arc::new(Layout::new(names.to_vec(), kinds))
+}
+
+/// The `information_schema` layouts, cached per table — and, keyed by those names, the
+/// layouts derived from a table map's own names (`binlog_row_metadata=FULL`).
 #[derive(Default)]
 pub struct Catalog {
-    cache: HashMap<(String, String), Arc<Layout>>,
+    cache: Cache,
+    /// The FULL-metadata layouts, keyed by the names of the events that asked for them and
+    /// stamped with the `information_schema` read they were derived from: an in-flight DDL
+    /// makes two events of one table name different columns, and each keeps its own layout.
+    /// A layout of this map is only ever handed out to an event carrying these very names,
+    /// and only while the read it was derived from is still the current one (see
+    /// [`Catalog::current`]) — the two maps never share an `Arc`.
+    full: HashMap<(String, String), HashMap<Vec<String>, (Arc<Layout>, Arc<Layout>)>>,
+}
+
+/// The plain `(schema, table)` layout map. A thin `HashMap` wrapper whose every mutation —
+/// every layout installed, every one dropped — raises the catalog's generation: an answer
+/// cached at an older generation cannot outlive what it was built from. This is what lets
+/// the column-count trust path in [`Catalog::layout`] keep its own
+/// `self.cache.insert(key, info.clone())` line verbatim: a re-read installed is an `insert`
+/// through here, and it raises.
+#[derive(Default)]
+struct Cache {
+    map: HashMap<(String, String), Arc<Layout>>,
+    generation: u64,
+}
+
+impl Cache {
+    /// Raises the generation and installs the layout — the one door a layout goes in by.
+    fn insert(&mut self, key: (String, String), layout: Arc<Layout>) -> Option<Arc<Layout>> {
+        self.generation += 1;
+        self.map.insert(key, layout)
+    }
+
+    fn get(&self, key: &(String, String)) -> Option<&Arc<Layout>> {
+        self.map.get(key)
+    }
+
+    fn remove(&mut self, key: &(String, String)) -> Option<Arc<Layout>> {
+        self.generation += 1;
+        self.map.remove(key)
+    }
+
+    fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&(String, String), &mut Arc<Layout>) -> bool,
+    {
+        self.generation += 1;
+        self.map.retain(f)
+    }
+
+    fn clear(&mut self) {
+        self.generation += 1;
+        self.map.clear()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &(String, String)) -> bool {
+        self.map.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 /// Why a row image cannot be named.
@@ -268,13 +348,90 @@ impl Catalog {
     pub fn invalidate(&mut self, schema: &str, table: &str) {
         if table == "*" {
             self.cache.retain(|(s, _), _| s != schema);
+            self.full.retain(|(s, _), _| s != schema);
         } else {
-            self.cache.remove(&(schema.to_string(), table.to_string()));
+            let key = (schema.to_string(), table.to_string());
+            self.cache.remove(&key);
+            self.full.remove(&key);
         }
     }
 
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.full.clear();
+    }
+
+    /// What anything answering from this catalog must have been built at. The number is
+    /// raised by every mutation of either map: `Cache::insert` — the only door a layout is
+    /// installed by, which both the first load and the column-count re-read of
+    /// [`Catalog::layout`] go through — `Cache::remove`/`retain`/`clear`, and the insert in
+    /// `full_layout`; the `full` map is written nowhere else. So the counter cannot lag a
+    /// change it should cover, and it is read by the engine's route probe as the cheap
+    /// pre-check beside the identity check that really decides the question
+    /// ([`Catalog::current`]).
+    pub fn generation(&self) -> u64 {
+        self.cache.generation
+    }
+
+    /// Records a freshly read `information_schema` layout.
+    #[cfg(test)]
+    pub(crate) fn put(&mut self, schema: &str, table: &str, layout: Arc<Layout>) {
+        self.cache
+            .insert((schema.to_string(), table.to_string()), layout);
+    }
+
+    /// The layout this catalog answers with, right now, for an event on `key` carrying
+    /// `names` as its own column names (`None`: the event names no columns at all). It is
+    /// [`Catalog::layout`]'s answer minus the database: the current `information_schema`
+    /// read for a plain event, and for a FULL one a layout derived from exactly these names
+    /// from exactly this read. A FULL entry derived from a since-replaced read answers
+    /// `None` — `layout` would derive a fresh `Arc` for that event, so the entry in the map
+    /// is not the current answer — and a plain request can never be answered from the
+    /// derived map nor a FULL one from the plain read, which is the DDL-survival rule.
+    pub fn current(
+        &self,
+        key: &(String, String),
+        names: Option<&[String]>,
+    ) -> Option<&Arc<Layout>> {
+        let info = self.cache.get(key)?;
+        match names {
+            None => Some(info),
+            Some(names) => self
+                .full
+                .get(key)?
+                .get(names)
+                .filter(|(from, _)| Arc::ptr_eq(from, info))
+                .map(|(_, l)| l),
+        }
+    }
+
+    /// The layout of these table-map names, cached per (table, names): a repeat of the same
+    /// names from the same read costs one `Arc` clone and no allocation of its own; new ones
+    /// (or ones from a since-read table) derive from `info` once, together with the read they
+    /// were derived from. `pub(crate)` so the engine's route-cache tests can stock a catalog
+    /// the way `layout` does; nothing outside this module calls it.
+    pub(crate) fn full_layout(
+        &mut self,
+        key: &(String, String),
+        names: &[String],
+        info: &Arc<Layout>,
+    ) -> Arc<Layout> {
+        if let Some(l) = self
+            .full
+            .get(key)
+            .and_then(|m| m.get(names))
+            .filter(|(from, _)| Arc::ptr_eq(from, info))
+            .map(|(_, l)| l.clone())
+        {
+            return l;
+        }
+        let l = layout_from_names(info, names);
+        self.full
+            .entry(key.clone())
+            .or_default()
+            .insert(names.to_vec(), (info.clone(), l.clone()));
+        self.cache.generation += 1;
+        l
     }
 
     async fn load(conn: &mut Conn, schema: &str, table: &str) -> Result<Arc<Layout>> {
@@ -312,15 +469,7 @@ impl Catalog {
             }
         };
         if let Some(names) = tme.and_then(table_map_names) {
-            let kinds = names
-                .iter()
-                .map(|n| {
-                    info.index(n)
-                        .map(|i| info.kinds[i].clone())
-                        .unwrap_or(ColKind::Plain)
-                })
-                .collect();
-            return Ok(Arc::new(Layout::new(names, kinds)));
+            return Ok(self.full_layout(&key, &names, &info));
         }
         if let Some(have) = have {
             if have != info.len() {

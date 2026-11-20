@@ -1595,6 +1595,74 @@ fn fired(reqs: &[Req], path: &str) -> Vec<String> {
         .collect()
 }
 
+/// An `ALTER` that adds a column to a watched table has to reach both caches before the first
+/// row of the new shape: the layout (so the new column can be named at all) and the route
+/// beside it (so the columns a `Watched` decodes are not the ones of the table before it).
+/// The second rule keys on the column the `ALTER` adds — a route built while the table had
+/// four columns can never produce its key. And the pinned backstop message ("... in the
+/// binlog but ...") stays silent: the rows never arrived at a layout that lagged them, which
+/// is what dropping the route together with the layout is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alter_mid_run_rebuilds_the_route_and_the_rule_keeps_decoding() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "altd").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('o', 'hook', 'POST /o HTTP/1.1\n\n{{join keys \",\"}}', 50)").await;
+    db.trigger("o", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('nt', 'hook', 'POST /nt HTTP/1.1\n\n{{join keys \",\"}}', 50)").await;
+    db.trigger("nt", "orders", Some("n_{{new.note}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(10),
+        "the rule on the plain table",
+        || async { (fired(&mock.requests(), "/o") == ["1"]).then_some(()) },
+    )
+    .await;
+
+    // The `ALTER` mid-run, then a row of the new shape on both rules.
+    db.exec("ALTER TABLE orders ADD COLUMN note VARCHAR(20)")
+        .await;
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2, 'hi')")
+        .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the new shape on the plain rule",
+        || async { (fired(&mock.requests(), "/o").contains(&"2".to_string())).then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the column the ALTER added",
+        || async { (fired(&mock.requests(), "/nt").contains(&"n_hi".to_string())).then_some(()) },
+    )
+    .await;
+
+    // The layout behind the rows moved once, with the `ALTER`, and the rows never outran it:
+    // the backstop that names such a lag has nothing to say about this schema.
+    let stale: Vec<String> = warnings()
+        .into_iter()
+        .filter(|l| l.contains(&db.schema) && l.contains("in the binlog but"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "the layout lagged the binlog across the ALTER: {stale:?}"
+    );
+    // And an added column is not a dropped or replaced table: no continuity was lost, so no
+    // reset reason appeared on either rule.
+    for name in ["o", "nt"] {
+        let (_, _, reset, _) = db.status(name).await.expect("the status row");
+        assert!(
+            reset.starts_with("missing: first start"),
+            "the {name} rule lost continuity across the ALTER: {reset}"
+        );
+    }
+    inst.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rule_enabled_again_replays_what_it_missed() {
     let root = need_db!();
