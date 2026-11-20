@@ -20,7 +20,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use common::fault::{
-    drain, sweep_ran, sweep_xa_once, FaultLog, FaultProxy, Lazy, Sampler, XaGuard, XaPin,
+    drain, sweep_ran, sweep_xa_once, xa_recover_lwf, FaultLog, FaultProxy, Lazy, Sampler, XaGuard,
+    XaPin,
 };
 use common::*;
 use mysql_async::prelude::*;
@@ -1557,6 +1558,20 @@ async fn s5_source_cut_around_xa() {
                 .await
                 .unwrap_or_else(|e| panic!("{q} ({xid}): {e}"));
         }
+        // The branch is now visible to the only reader the harness's sweep has. Asserting it shows up
+        // here is what keeps `sweep_xa_once`'s detection half from being a line that never saw a
+        // branch: at suite start there is nothing to find, so an empty list proves nothing about the
+        // reader. (The *rollback* half cannot be pinned by a seed: leaving a branch no in-process
+        // guard owns also blocks that schema's teardown, so the mutant that neuters the rollback
+        // hangs instead of failing — it is demonstrated by hand instead, in
+        // `evidence/xa-blocks-drop-*.log`, and reported that way in report.md §5.)
+        let seen = xa_recover_lwf(&root).await;
+        assert!(
+            seen.iter().any(|x| x.name == xid || x.gtrid == xid),
+            "round {round}: '{xid}' is prepared on the server but the sweep's own reader does not \
+             list it (it sees {seen:?}) — a sweep that cannot see a branch cannot roll it back \
+             either, so its `left.is_empty()` below would be aiming at nothing",
+        );
         // A filler transaction of its own, so the plain group does not begin right after the
         // XA's (what e2e does, and why: a statement matching no rows writes no group at all).
         // Its key is drawn from the round, because a second `INSERT` of the same primary key

@@ -1726,31 +1726,76 @@ fn text(v: &[u8]) -> String {
     String::from_utf8_lossy(v).into_owned()
 }
 
-/// The prepared-but-unfinished `lwf_*` transactions of one server. No answer, or no right to ask,
-/// is reported as none: nothing is claimed about transactions that cannot be seen.
+/// The prepared-but-unfinished `lwf_*` transactions of one server, read with plain `XA RECOVER`.
+/// No answer, or no right to ask, is reported as none: nothing is claimed about transactions that
+/// cannot be seen — which is exactly why S5 asserts that a branch it just prepared shows up here.
+/// The sweep's emptiness has to mean the server is clean, not that the reader is blind.
+///
+/// Both servers answer the same four columns — `formatID, gtrid_length, bqual_length, data` —
+/// with the branch's strings living only in `data`, laid out as gtrid followed by bqual and
+/// sliced by the two lengths (checked against a live MySQL 8.4 and MariaDB 10.11 through the
+/// driver, not from documentation). `XA RECOVER CONVERT XID` must NOT be used here: MariaDB
+/// rejects the phrase outright (error 1064), and MySQL answers it with `data` hex-escaped
+/// (`"0x6C7766.."`), which slices to garbage. The first version of this reader trusted the old
+/// `(formatID, gtrid, bqual, data)` column layout — which neither server produces — so it matched
+/// nothing anywhere, and the sweep had never rolled back a branch it recovered.
 pub async fn xa_recover_lwf(root: &str) -> Vec<XaLeft> {
     let mut c = root_conn(root).await;
     let rows: Vec<mysql_async::Row> = match tokio::time::timeout(
         Duration::from_secs(20),
-        // CONVERT XID: the binary gtrid/bqual come back in printable form, so the name the sweep
-        // reports and the strings it rolls back are the ones the server showed.
-        c.query::<mysql_async::Row, _>("XA RECOVER CONVERT XID"),
+        c.query::<mysql_async::Row, _>("XA RECOVER"),
     )
     .await
     {
         Ok(Ok(r)) => r,
-        _ => Vec::new(),
+        Ok(Err(e)) => {
+            // Not silent: a reader that swallows its own failures reports "no leftover branch"
+            // beside a branch that stands prepared, which is the exact blind spot S5's visibility
+            // assert exists to catch. The emptiness must mean the server is clean, so this line
+            // has to be visible in the log when it fires.
+            eprintln!("xa_recover_lwf> query failed: {}", short(&e.to_string()));
+            Vec::new()
+        }
+        Err(_) => {
+            eprintln!("xa_recover_lwf> query TIMEOUT (20 s)");
+            Vec::new()
+        }
     };
     let out = rows
         .into_iter()
         .filter_map(|row| {
-            let gtrid = text(&row.get_opt::<Vec<u8>, _>(1)?.ok()?);
-            let bqual = text(&row.get_opt::<Vec<u8>, _>(2)?.ok()?);
-            let name = row
+            // The two length columns come over the driver's text protocol as byte-strings
+            // (`Bytes("17")`), so they are read from their digits; the native integer form is
+            // accepted as well. Treating them as the gtrid/bqual strings themselves — which is
+            // what the first version did, on the MySQL 5.x-era column layout — made every row
+            // look like nothing.
+            let len = |col: usize| -> usize {
+                let digits = row
+                    .get_opt::<Vec<u8>, _>(col)
+                    .and_then(|v| v.ok())
+                    .and_then(|v| text(&v).parse::<usize>().ok());
+                let number = row.get_opt::<u64, _>(col).and_then(|v| v.ok());
+                digits.or(number.map(|v| v as usize)).unwrap_or(0)
+            };
+            // The branch's bytes: gtrid followed by bqual, sliced by the two lengths. Slicing the
+            // raw bytes (not the lossy string) keeps the offsets the server counted in bytes.
+            let raw = row
                 .get_opt::<Vec<u8>, _>(3)
                 .and_then(|v| v.ok())
-                .map(|v| text(&v))
-                .unwrap_or_else(|| format!("{gtrid},{bqual}"));
+                .unwrap_or_default();
+            let (gl, bl) = (len(1), len(2));
+            let gtrid =
+                String::from_utf8_lossy(raw.get(..gl.min(raw.len())).unwrap_or(&[])).into_owned();
+            let bqual =
+                String::from_utf8_lossy(raw.get(gl..(gl + bl).min(raw.len())).unwrap_or(&[]))
+                    .into_owned();
+            // `name` is what the single-string rollback form takes: the server's own bytes when
+            // there are any, the comma-joined pair otherwise.
+            let name = if raw.is_empty() {
+                format!("{gtrid},{bqual}")
+            } else {
+                text(&raw)
+            };
             (name.starts_with("lwf_") || gtrid.starts_with("lwf_")).then_some(XaLeft {
                 name,
                 gtrid,
