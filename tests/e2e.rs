@@ -9541,3 +9541,1651 @@ async fn statement_format_dml_is_counted_and_warned() {
     }
     inst.stop().await;
 }
+
+// ---- control-plane resilience (coverage PR-1) -------------------------------------------------
+//
+// The failure paths of the control plane: `flush_job`'s fence and `keys_sql` failure arms, the
+// control-connection heal (`Engine::heal_control`, `lock::reacquire`, the reconnect arm of the
+// standby loop in `lock::acquire`), and the config-reload paths (`reload_config`'s error joins,
+// the frozen rule, and the two retry timers: the 1 s reload retry and the 5 s `reset_requested`
+// clear retry). Each test breaks something on purpose and asserts the failure happened FOR the
+// stated reason (the error text, the captured WARN, what the mock did and did not receive) and
+// that the recovery is real (the position moves, the keys arrive), never merely "no error".
+
+/// The instance lock of a test engine: every test's `config()` runs the default instance.
+fn instance_lock(db: &Db) -> String {
+    format!("lazywf:{}:default", db.schema)
+}
+
+/// The connection id that holds `lock` (`None`: nobody does).
+async fn lock_holder(db: &Db, lock: &str) -> Option<u64> {
+    let mut c = db.conn().await;
+    let r: Option<Option<u64>> = c
+        .exec_first("SELECT IS_USED_LOCK(?)", (lock,))
+        .await
+        .unwrap();
+    quit(c).await;
+    r.flatten()
+}
+
+/// Whether the server still has a connection with this processlist id.
+async fn conn_alive(db: &Db, id: u64) -> bool {
+    let mut c = db.conn().await;
+    let r: Option<i64> = c
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ?",
+            (id,),
+        )
+        .await
+        .unwrap();
+    quit(c).await;
+    r.unwrap_or(0) > 0
+}
+
+/// The id holding `lock`, when that connection is still in the processlist: a session the server
+/// has killed but not finished tearing down must not pass for a live holder.
+async fn lock_holder_live(db: &Db, lock: &str) -> Option<u64> {
+    let mut c = db.conn().await;
+    let r: Option<Option<u64>> = c
+        .exec_first(
+            "SELECT h FROM (SELECT IS_USED_LOCK(?) AS h) t \
+             WHERE t.h IN (SELECT ID FROM information_schema.processlist)",
+            (lock,),
+        )
+        .await
+        .unwrap();
+    quit(c).await;
+    r.flatten()
+}
+
+/// Kills one connection of this test's own engine by its processlist id.
+async fn kill_conn(db: &Db, id: u64) {
+    let mut c = db.conn().await;
+    c.query_drop(format!("KILL {id}"))
+        .await
+        .unwrap_or_else(|e| panic!("KILL {id}: {e}"));
+    quit(c).await;
+}
+
+/// The processlist rows (id, command) of the connections of one account.
+async fn user_conns(db: &Db, user: &str) -> Vec<(u64, String)> {
+    let mut c = db.conn().await;
+    let r: Vec<(u64, Option<String>)> = c
+        .query(format!(
+            "SELECT ID, COMMAND FROM information_schema.processlist WHERE USER = '{user}'"
+        ))
+        .await
+        .unwrap();
+    quit(c).await;
+    r.into_iter()
+        .map(|(id, cmd)| (id, cmd.unwrap_or_default()))
+        .collect()
+}
+
+/// Creates an account with the documented least privileges and returns a DSN to it.
+async fn engine_user(db: &Db, user: &str, pw: &str, root: &str) -> String {
+    let mariadb = {
+        let mut c = db.conn().await;
+        let v: String = c.query_first("SELECT VERSION()").await.unwrap().unwrap();
+        quit(c).await;
+        v.contains("MariaDB")
+    };
+    db.exec(&format!("DROP USER IF EXISTS '{user}'@'%'")).await;
+    db.exec(&format!("CREATE USER '{user}'@'%' IDENTIFIED BY '{pw}'"))
+        .await;
+    db.exec(&format!(
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT{} ON *.* TO '{user}'@'%'",
+        if mariadb { ", BINLOG MONITOR" } else { "" }
+    ))
+    .await;
+    db.exec(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON `{}`.* TO '{user}'@'%'",
+        db.schema
+    ))
+    .await;
+    let (scheme, rest) = root.split_once("://").unwrap();
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    format!(
+        "{scheme}://{user}:{pw}@{host}/{}?prefer_socket=false",
+        db.schema
+    )
+}
+
+/// The captured WARN-and-above lines that contain every needle AND the schema of the `Db` the test
+/// created. Where the line names its schema this is the filter the harness contract asks for
+/// (`tests/common/mod.rs:276-279`), and it cannot drift from the schema the test really made: a
+/// hand-typed schema in a needle that expects NO lines is the bad failure mode — it passes forever.
+///
+/// It is therefore only used where the line provably carries the schema. Of the lines this section
+/// reads, the server's 1146 does (both servers): `Table 'lwf_ksql.items' doesn't exist` inside the
+/// `keys_sql` WARN, `Table 'lwf_clr5s.lazy_wire_fire_rule' doesn't exist` inside the
+/// `clearing reset_requested` one. These do NOT, so their tests attribute by `rule=` (or by the
+/// account they created) instead: the 1045 behind `fence connection` names a user, the 1142 of the
+/// reload WARN names `for table 'lazy_wire_fire_rule'`, and a rule that cannot compile names only
+/// its trigger.
+fn warn_lines_in(db: &Db, needles: &[&str]) -> Vec<String> {
+    warn_lines(&[needles, &[&db.schema]].concat())
+}
+
+/// The captured WARN-and-above lines that contain every needle. The raw form, for the texts that
+/// carry nothing of the test's own — in the arms this section reads there are exactly three, and
+/// they are these (`src`, as of `8415d23`):
+///
+/// ```text
+/// warn!("writing lazy_wire_fire_status: {e:#}")                    src/engine.rs:3241
+/// warn!("reloading the configuration: {e:#}; retrying")            src/engine.rs:3230
+/// warn!("standby: control connection lost ({e}); reconnecting")   src/lock.rs:44
+/// ```
+///
+/// No needle can attribute those, so a test that reads one does it in two moves: `warn_baselines` /
+/// `warn_grew` make the line carry a reason (a wording of [`DEAD_CONNECTION`], or an error text of
+/// the test's own), and the claim itself is settled where the test does own the evidence — the
+/// session gone from `information_schema.processlist`, the lock's holder being a live connection of
+/// another id, the standby's own account having a new connection, the status row not having moved,
+/// the key the mock ANSWERED. Every other WARN read here carries `rule = %name`, and a test's rule
+/// names are its own: no other test in this file inserts a rule of that name.
+fn warn_lines(needles: &[&str]) -> Vec<String> {
+    warnings()
+        .into_iter()
+        .filter(|l| needles.iter().all(|n| l.contains(n)))
+        .collect()
+}
+
+/// How a killed connection answers a statement on these servers. A test that proves an arm noticed
+/// a dead connection ANDs one of these wordings into the WARN it waits for: "a WARN of this shape
+/// appeared" is then "this statement died on a dead connection", not "the engine logged something".
+const DEAD_CONNECTION: &[&str] = &[
+    "connection closed",
+    "Connection refused",
+    "Broken pipe",
+    "Connection reset by peer",
+    "Lost connection",
+    "gone away",
+];
+
+/// The captured-WARN counts for one needle set plus each wording of `reasons`, in that order. The
+/// ring is process-wide (every engine in this binary logs into it, tests and their retries
+/// included), so a test never matches history: it takes this baseline before it breaks something
+/// and asks `warn_grew` whether one of the lines appeared after.
+fn warn_baselines(needles: &[&str], reasons: &[&str]) -> Vec<usize> {
+    reasons
+        .iter()
+        .map(|r| warn_lines(&[needles, &[*r]].concat()).len())
+        .collect()
+}
+
+/// The first wording of `reasons` that has more matching lines than in `base` — the WARN that
+/// appeared since `warn_baselines` — as the line itself, so a test asserts on what the engine
+/// actually said rather than on the fact that something was logged.
+fn warn_grew(needles: &[&str], reasons: &[&str], base: &[usize]) -> Option<String> {
+    reasons.iter().zip(base).find_map(|(r, b)| {
+        let matched = warn_lines(&[needles, &[*r]].concat());
+        (matched.len() > *b)
+            .then(|| matched.last().cloned())
+            .flatten()
+    })
+}
+
+/// Records the path of every request the mock ANSWERS, in order, and answers 2xx. The record is
+/// the answer, not the arrival: a request the mock held and then reset is in `requests()` but
+/// was never answered, so it is not here — which is the difference between "the engine sent the
+/// step" and "the step was delivered", and what lets a test tell one run of a reset from another.
+fn answer_log(mock: &Mock) -> Arc<Mutex<Vec<String>>> {
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let l = log.clone();
+    mock.respond(move |r| {
+        l.lock().unwrap().push(r.path.clone());
+        (200, "{}".into())
+    });
+    log
+}
+
+/// How many times `path` was answered by this mock (see [`answer_log`]).
+fn answered(log: &Arc<Mutex<Vec<String>>>, path: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.as_str() == path)
+        .count()
+}
+
+/// What the mock saw, for an assertion message: every request that arrived (a held one included,
+/// which is how a test tells "sent" from "delivered") and every path that was answered.
+fn traffic(mock: &Mock, log: &Arc<Mutex<Vec<String>>>) -> String {
+    let reqs: Vec<String> = mock
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    format!(
+        "arrived {reqs:?} answered {:?}",
+        log.lock().unwrap().clone()
+    )
+}
+
+/// The engine started directly (as `Instance::with` does), with the parts a test drives by
+/// hand: the shutdown sender, the health, and the engine's own answer once the task is done.
+struct Direct {
+    stop: watch::Sender<bool>,
+    health: Arc<lazy_wire_fire::health::Health>,
+    done: Arc<Mutex<Option<anyhow::Result<()>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn start_direct(cfg: lazy_wire_fire::config::Config) -> Direct {
+    common::logs();
+    let (tx, rx) = watch::channel(false);
+    let health = Arc::new(lazy_wire_fire::health::Health::default());
+    let h = health.clone();
+    let done: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+    let d = done.clone();
+    let task = tokio::spawn(async move {
+        let r = lazy_wire_fire::engine::run(cfg, h, None, rx).await;
+        *d.lock().unwrap() = Some(r);
+    });
+    Direct {
+        stop: tx,
+        health,
+        done,
+        task,
+    }
+}
+
+impl Direct {
+    async fn ready(&self) {
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while !self.health.is_ready() {
+            if self.died() {
+                panic!(
+                    "the engine died before it got ready: {:?}",
+                    self.done.lock().unwrap()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the engine did not get ready in 30 s"
+            );
+            sleep_ms(20).await;
+        }
+    }
+
+    fn died(&self) -> bool {
+        self.done.lock().unwrap().is_some()
+    }
+
+    /// The engine's own answer once it has finished (it must have finished cleanly).
+    async fn stop_clean(self) {
+        let _ = self.stop.send(true);
+        let grace = Duration::from_secs(20);
+        match tokio::time::timeout(grace, self.task).await {
+            Ok(Ok(())) => {}
+            other => panic!("engine did not stop cleanly: {other:?} after {grace:?}"),
+        }
+        let engine = self.done.lock().unwrap().take();
+        match engine {
+            Some(Ok(())) => {}
+            other => panic!("engine did not stop cleanly: it answered {other:?}"),
+        }
+    }
+}
+
+/// The fence of a flush cannot connect: the flush fails at `action::fence` (the fail closure of
+/// `flush_job`), every key of the flush is kept (`keep_queries`), the position does NOT advance,
+/// and after the account works again the same keys flush and the position moves. The fence runs
+/// on lazywf's own pool (`Env::pool`), so rotating the engine account's password and killing its
+/// pool connections (only this engine's own connections) is what reaches that arm: a fence
+/// whose connection cannot be made is the error the flush reports, while the control connection
+/// (which the pool refusal does not touch) keeps the engine alive and writing status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_fails_when_the_fence_connection_cannot_connect() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fenceconn").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('frul', 'hook', 'POST /fk HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("frul", "orders", Some("{{new.id}}"), None).await;
+    let user = "lwf_fnc";
+    let dsn = engine_user(&db, user, "fnc-pw-one", &root).await;
+    let edb = Db {
+        schema: db.schema.clone(),
+        dsn: dsn.clone(),
+    };
+    let inst = Instance::ready(config(&edb, &[])).await;
+
+    // Control: the account works, the first key flushes and the position moves.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(15), "the baseline key", || async {
+        (fired(&mock.requests(), "/fk").contains(&"1".to_string())).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let holder = lock_holder(&db, &instance_lock(&db))
+        .await
+        .expect("the engine holds its instance lock");
+
+    // Break: the password rotates and the pool connections of THIS engine are swept away (never
+    // the control connection the lock names, never the binlog reader): any pool connection made
+    // after this is refused, so `fence` fails before the first key of the flush reaches the
+    // target. The sweep repeats for a moment because the pool keeps no minimum and an idle
+    // connection of the old password is the one thing that would let a flush through.
+    db.exec(&format!(
+        "ALTER USER '{user}'@'%' IDENTIFIED BY 'fnc-pw-two'"
+    ))
+    .await;
+    let w0 = warn_lines(&["frul", "fence connection"]).len();
+    for _ in 0..10 {
+        let ids: Vec<u64> = user_conns(&db, user)
+            .await
+            .into_iter()
+            .filter(|(id, cmd)| *id != holder && !cmd.starts_with("Binlog Dump"))
+            .map(|(id, _)| id)
+            .collect();
+        for id in ids {
+            kill_conn(&db, id).await;
+        }
+        sleep_ms(200).await;
+    }
+
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    // The flush fails FOR the fence: the fail closure's error names the fence connection, and
+    // it keeps failing (the keys retry, they are not dropped), and the engine survives it.
+    wait_for(
+        Duration::from_secs(20),
+        "the fence failures repeat",
+        || async { (warn_lines(&["frul", "fence connection"]).len() >= w0 + 3).then_some(()) },
+    )
+    .await;
+    sleep_ms(500).await;
+    let keys = fired(&mock.requests(), "/fk");
+    assert!(
+        !keys.contains(&"2".to_string()),
+        "the key was delivered: {keys:?}"
+    );
+    let (af, ap, _, err) = db.status("frul").await.unwrap();
+    assert!((af, ap) < after, "the position passed the flush's insert");
+    let shown = err.unwrap_or_default();
+    assert!(
+        shown.contains("fence connection"),
+        "the last error does not name the fence: {shown:?}"
+    );
+    assert!(inst.health.is_ready(), "the engine died on the fence");
+
+    // Restore: the same keys flush (the queries were kept, the keys were never lost) and the
+    // position moves past the insert the failure held it below.
+    db.exec(&format!(
+        "ALTER USER '{user}'@'%' IDENTIFIED BY 'fnc-pw-one'"
+    ))
+    .await;
+    wait_for(
+        Duration::from_secs(20),
+        "the held key after the restore",
+        || async {
+            let (af, ap, _, _) = db.status("frul").await?;
+            (fired(&mock.requests(), "/fk").contains(&"2".to_string()) && (af, ap) >= after)
+                .then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+    db.exec(&format!("DROP USER IF EXISTS '{user}'@'%'")).await;
+}
+
+/// A `keys_sql` that starts erroring mid-run fails the whole flush (`action::resolve_keys`'
+/// error arm in `flush_job`): the flush's keys reach neither the target nor the position; when
+/// the SQL works again the keys resolve and flush — including the key only `keys_sql` can find,
+/// which proves the query payloads were kept (`keep_queries`). A `keys_sql` that resolves to
+/// NOTHING is the other arm: a no-op flush that still confirms (the position passes it, the
+/// next key still fires — not a silent skip that would strand the generation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_sql_failure_holds_and_empty_resolution_confirms() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "ksql").await;
+    shop(&db).await;
+    db.exec("CREATE TABLE items (oid INT, cid INT, PRIMARY KEY (oid, cid))")
+        .await;
+    db.exec("CREATE TABLE mapping (cid INT, k VARCHAR(20), PRIMARY KEY (cid))")
+        .await;
+    db.exec("INSERT INTO items VALUES (1, 100), (2, 200)").await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('krul', 'hook', 'POST /kk HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("krul", "orders", Some("{{new.id}}"), None).await;
+    db.trigger(
+        "krul",
+        "orders",
+        None,
+        Some("SELECT cid AS _key FROM items WHERE oid = :new.id"),
+    )
+    .await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('erul', 'hook', 'POST /ee HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger(
+        "erul",
+        "customers",
+        None,
+        Some("SELECT k AS _key FROM mapping WHERE cid = :new.id"),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // Control: the marked key AND the key only `keys_sql` finds reach the target.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(15), "the resolved key", || async {
+        let k = fired(&mock.requests(), "/kk");
+        (k.contains(&"1".to_string()) && k.contains(&"100".to_string())).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    mock.clear();
+
+    // Break: `keys_sql` errors (its table is gone) while flushes of this rule are pending. The
+    // server's 1146 names the table with this schema in front of it (`Table 'lwf_ksql.items'
+    // doesn't exist`), so the schema is a needle the line really carries.
+    db.exec("RENAME TABLE items TO items_gone").await;
+    let w0 = warn_lines_in(&db, &["krul", "keys_sql"]).len();
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the keys_sql failures repeat",
+        || async { (warn_lines_in(&db, &["krul", "keys_sql"]).len() >= w0 + 2).then_some(()) },
+    )
+    .await;
+    let keys = fired(&mock.requests(), "/kk");
+    assert!(
+        !keys.contains(&"2".to_string()) && !keys.contains(&"200".to_string()),
+        "a key of the failed flush was delivered: {keys:?}"
+    );
+    let (af, ap, _, err) = db.status("krul").await.unwrap();
+    assert!((af, ap) < after, "the position passed the failing flush");
+    let shown = err.unwrap_or_default();
+    assert!(
+        shown.contains("keys_sql"),
+        "the last error does not name keys_sql: {shown:?}"
+    );
+
+    // Restore: the flush succeeds — and the key that only `keys_sql` can name (200) arrives,
+    // which is only possible when the failed flush kept its query payloads.
+    db.exec("RENAME TABLE items_gone TO items").await;
+    wait_for(
+        Duration::from_secs(20),
+        "both keys after the restore",
+        || async {
+            let (af, ap, _, _) = db.status("krul").await?;
+            let k = fired(&mock.requests(), "/kk");
+            (k.contains(&"2".to_string()) && k.contains(&"200".to_string()) && (af, ap) >= after)
+                .then_some(())
+        },
+    )
+    .await;
+
+    // Empty resolution: the `keys_sql` finds nothing. The flush is a no-op (the target sees
+    // nothing) yet it CONFIRMS: the position passes it and the next key still fires — an
+    // unconfirmed generation would strand both (and log "flush skipped").
+    mock.clear();
+    inst.quiet().await;
+    db.exec("INSERT INTO customers VALUES (7, 'Gil')").await;
+    let after_e = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the empty flush confirmed",
+        || async {
+            let (af, ap, _, _) = db.status("erul").await?;
+            ((af, ap) >= after_e).then_some(())
+        },
+    )
+    .await;
+    sleep_ms(400).await;
+    assert!(
+        fired(&mock.requests(), "/ee").is_empty(),
+        "the empty flush delivered something: {:?}",
+        mock.requests()
+    );
+    assert!(
+        !warn_lines(&["erul", "flush skipped"])
+            .into_iter()
+            .any(|l| l.contains("generation is already in flight")),
+        "a later flush found the generation still in flight (a silent skip)"
+    );
+    // The same rule delivers once its `keys_sql` resolves: the buffer and its generation are alive.
+    db.exec("INSERT INTO mapping VALUES (7, 'k7')").await;
+    db.exec("UPDATE customers SET name = 'Gil B' WHERE id = 7")
+        .await;
+    wait_for(
+        Duration::from_secs(15),
+        "the resolved key of erul",
+        || async { (fired(&mock.requests(), "/ee").contains(&"k7".to_string())).then_some(()) },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// The engine's own control connection is killed — the connection holding the instance lock, and
+/// only this engine's own connection. The persist fails (the WARN says which arm noticed and names
+/// the killed connection), the lock goes with the killed session (asserted in the database:
+/// `IS_USED_LOCK` is NULL while the engine is not looking), `heal_control` reconnects and
+/// `lock::reacquire` takes the lock again (asserted in the database: the holder's id changes from
+/// the killed one), the engine stays alive, and a key written after the kill reaches the target:
+/// the reconnected connection is usable, not merely open.
+///
+/// The status write is the only thing that touches `control` here, and it is slowed to 5 s: the
+/// kill then lands while the connection is idle, so the server has finished releasing the killed
+/// session's lock before the engine notices, and the assertions below have a window to look at the
+/// lock in between. A kill that lands mid-statement leaves the engine racing a session that is
+/// still dying, which is a different and not deterministic story.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_control_connection_is_healed_and_flushing_continues() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "healctl").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('hrul', 'hook', 'POST /hk HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("hrul", "orders", Some("{{new.id}}"), None).await;
+    let lock = instance_lock(&db);
+    // The config poll never fires here, so the WARN that proves which arm noticed is the status
+    // write's, and the 5 s cadence is the window the kill lands in.
+    let inst = Instance::ready(config(
+        &db,
+        &[
+            ("LAZYWF_CONFIG_POLL_MS", "120000"),
+            ("LAZYWF_STATUS_MS", "5000"),
+        ],
+    ))
+    .await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(15), "the baseline key", || async {
+        (fired(&mock.requests(), "/hk").contains(&"1".to_string())).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+    let before = lock_holder(&db, &lock)
+        .await
+        .expect("the engine holds its lock");
+    // The WARN ring is shared with every other test in this binary and this line carries no rule,
+    // schema or account of its own, so the assertion is a delta over the baseline of each wording
+    // taken here, and the rest of the attribution is done in the database below (the session that
+    // is gone, the lock's new holder, the key that gets delivered).
+    // Where the server is in its binlog now: the row the engine persists must still be BEHIND this
+    // when the failure WARN appears (see the assertion after it).
+    let boundary = binlog_end(&db).await;
+    let base = warn_baselines(&["writing lazy_wire_fire_status"], DEAD_CONNECTION);
+
+    kill_conn(&db, before).await;
+    // The killed session really is gone from the server, so the lock cannot have stayed with it.
+    wait_for(
+        Duration::from_secs(10),
+        "the killed session gone",
+        || async { (!conn_alive(&db, before).await).then_some(()) },
+    )
+    .await;
+    // The engine notices on a write it has to make anyway, and the line says which arm it noticed
+    // on and what the killed connection answered.
+    let noticed = wait_for(
+        Duration::from_secs(40),
+        "the persist noticed the kill, naming the dead connection",
+        || async { warn_grew(&["writing lazy_wire_fire_status"], DEAD_CONNECTION, &base) },
+    )
+    .await;
+    // And the write of that run really did not land: the row the engine reports is still the one
+    // from before the kill, because `persist` asks for the lock before it writes anything, so the
+    // dead connection loses the whole write and not one statement of it. A WARN borrowed from
+    // another test could not keep this row where it is.
+    let (row_file, row_pos) = db
+        .status("hrul")
+        .await
+        .map(|(f, p, _, _)| (f, p))
+        .unwrap_or_default();
+    assert!(
+        (row_file.as_str(), row_pos) < (boundary.0.as_str(), boundary.1),
+        "the status row already shows {row_file}:{row_pos}, at or past the position the kill \
+         happened at ({boundary:?}): the write of that run did not fail, so this WARN is not its \
+         failure: {noticed}"
+    );
+    // A live connection other than the killed one holds the lock now: `GET_LOCK` could only grant
+    // it because the killed session took its lock to the grave, and `lock::reacquire` is what asked
+    // for it — in the database, not just in a log line.
+    wait_for(
+        Duration::from_secs(40),
+        "the lock on a new live connection",
+        || async {
+            lock_holder_live(&db, &lock)
+                .await
+                .and_then(|id| (id != before).then_some(()))
+        },
+    )
+    .await;
+    // And the engine is still alive on that new connection: what the arm is accused of is giving
+    // up, and `lost the instance lock` (src/lock.rs:77) is a `bail!` returned to `run()`, never a
+    // WARN, so "no such WARN" would prove nothing. The proof is that it keeps beating here and
+    // shuts down clean at the end.
+    assert!(
+        inst.health.is_ready(),
+        "the engine gave up instead of healing its control connection (it stopped beating after: \
+         {noticed})"
+    );
+
+    // The proof the reconnect was real: a key written after the kill reaches the target, and
+    // the position moves past it.
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(30), "a key after the kill", || async {
+        let (af, ap, _, _) = db.status("hrul").await?;
+        (fired(&mock.requests(), "/hk").contains(&"2".to_string()) && (af, ap) >= after)
+            .then_some(())
+    })
+    .await;
+    // The engine finished cleanly: the kill healed instead of killing it.
+    inst.stop().await;
+}
+
+/// The instance lock was taken while the control connection was down: `heal_control`'s
+/// `lock::reacquire` refuses and the engine dies with exactly that error (the fatal is proven
+/// by the message, the reload-failure WARN proves what made it notice, and the timing is
+/// deterministic: both timers stand at 120 s, so only the dirty config row moves the engine).
+/// The control: the very same kill and grab, but the lock is released before the engine
+/// notices — the heal succeeds, the config lands, delivery goes on, and the engine lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instance_lock_taken_during_control_loss_is_fatal() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "lockfatal").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let ans = answer_log(&mock);
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('lrul', 'hook', 'POST /lk HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("lrul", "orders", Some("{{new.id}}"), None).await;
+    let lock = instance_lock(&db);
+    let slow = [
+        ("LAZYWF_STATUS_MS", "120000"),
+        ("LAZYWF_CONFIG_POLL_MS", "120000"),
+    ];
+    let eng = start_direct(config(&db, &slow));
+    eng.ready().await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(15), "the baseline key", || async {
+        (fired(&mock.requests(), "/lk").contains(&"1".to_string())).then_some(())
+    })
+    .await;
+    let before = lock_holder(&db, &lock)
+        .await
+        .expect("the engine holds its lock");
+    // Which arm noticed the dead control connection is a corroborating signal only: this WARN
+    // carries no schema or rule of its own, so it gets the reason of the failure and a baseline per
+    // wording, while the claim that carries weight — the engine died ON THIS LOCK — is the error it
+    // returned, which names this schema's lock by name.
+    let base = warn_baselines(
+        &["reloading the configuration", "retrying"],
+        DEAD_CONNECTION,
+    );
+
+    kill_conn(&db, before).await;
+    wait_for(
+        Duration::from_secs(10),
+        "the lock released with the connection",
+        || async { (lock_holder(&db, &lock).await.is_none()).then_some(()) },
+    )
+    .await;
+    // Take the engine's own instance lock on a session of ours (kept open across the race).
+    let mut admin = db.conn().await;
+    let got: Option<Option<i64>> = admin
+        .exec_first("SELECT GET_LOCK(?, 5)", (&lock,))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.flatten(),
+        Some(1),
+        "the second connection could not take the instance lock: the premise is broken"
+    );
+
+    // The only control use left is the reload the dirty config row forces: it fails (the
+    // control connection is dead), `heal_control` reconnects, `reacquire` refuses — fatal.
+    db.exec("UPDATE lazy_wire_fire_rule SET debounce_ms = 60 WHERE name = 'lrul'")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "the engine to die on the lock",
+        || async { eng.died().then_some(()) },
+    )
+    .await;
+    let err = eng
+        .done
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the engine answered");
+    let shown = format!("{:#}", err.unwrap_err());
+    let noticed = warn_grew(
+        &["reloading the configuration", "retrying"],
+        DEAD_CONNECTION,
+        &base,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "nothing shows the reload was the arm that noticed the dead control connection, and \
+             died on it: {shown}"
+        )
+    });
+    assert!(
+        shown.contains("taken by another instance") && shown.contains(&lock),
+        "the fatal does not name the lock taken by another instance (the arm that noticed was: \
+         {noticed}): {shown}"
+    );
+    admin
+        .exec_drop("DO RELEASE_LOCK(?)", (&lock,))
+        .await
+        .unwrap();
+    quit(admin).await;
+    drop(eng.stop);
+
+    // The control: the same kill and the same grab in a second schema — only the lock goes back
+    // BEFORE the engine looks for it. Then `reacquire` takes it again on the new connection, the
+    // reload lands, delivery goes on, and the engine lives (which is what makes the fatal above
+    // the fault of the held lock and not of the kill).
+    mock.clear();
+    let db2 = {
+        // A second schema: the dead engine's status rows and lock name must not blur this one.
+        let d = Db::fresh(&root, "lockctl2").await;
+        shop(&d).await;
+        d.target("hook", "http", &mock.url(), None, "{}").await;
+        d.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('lrul2', 'hook', 'POST /lk HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+            .await;
+        d.trigger("lrul2", "orders", Some("{{new.id}}"), None).await;
+        d
+    };
+    let lock2 = instance_lock(&db2);
+    let eng2 = start_direct(config(&db2, &slow));
+    eng2.ready().await;
+    db2.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db2.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(15),
+        "the baseline key of the control",
+        || async { (fired(&mock.requests(), "/lk").contains(&"1".to_string())).then_some(()) },
+    )
+    .await;
+    let before2 = lock_holder(&db2, &lock2)
+        .await
+        .expect("the engine holds its lock");
+    let cbase = warn_baselines(
+        &["reloading the configuration", "retrying"],
+        DEAD_CONNECTION,
+    );
+
+    kill_conn(&db2, before2).await;
+    wait_for(
+        Duration::from_secs(10),
+        "the lock released with the connection",
+        || async { (lock_holder(&db2, &lock2).await.is_none()).then_some(()) },
+    )
+    .await;
+    // The same grab — and the same release, before the engine has any reason to look: both
+    // timers stand at 120 s, so the config row below is the only control use left.
+    let mut admin = db2.conn().await;
+    let got: Option<Option<i64>> = admin
+        .exec_first("SELECT GET_LOCK(?, 5)", (&lock2,))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.flatten(),
+        Some(1),
+        "the second connection could not take the instance lock: the premise is broken"
+    );
+    admin
+        .exec_drop("DO RELEASE_LOCK(?)", (&lock2,))
+        .await
+        .unwrap();
+    quit(admin).await;
+
+    // The reload the dirty row forces: it fails on the dead control connection (the WARN names
+    // the arm), `heal_control` reconnects and takes the lock again — and the engine goes on
+    // reading its configuration: a rule that did not exist when the connection died delivers.
+    db2.exec("UPDATE lazy_wire_fire_rule SET debounce_ms = 60 WHERE name = 'lrul2'")
+        .await;
+    let reloaded = wait_for(
+        Duration::from_secs(20),
+        "the reload after the heal",
+        || async {
+            warn_grew(
+                &["reloading the configuration", "retrying"],
+                DEAD_CONNECTION,
+                &cbase,
+            )
+        },
+    )
+    .await;
+    assert!(
+        !eng2.died(),
+        "the engine died although the lock was free again (it had noticed the dead connection \
+         here: {reloaded})"
+    );
+    let holder2 = lock_holder_live(&db2, &lock2)
+        .await
+        .expect("the healed engine holds its instance lock again on a live connection");
+    assert_ne!(
+        holder2, before2,
+        "the lock is still on the killed connection"
+    );
+    // A rule that did not exist when the control connection died, read through the healed one.
+    // One transaction, so no reload can ever see the rule without its trigger (with both timers
+    // at 120 s there would be no second look), and with `reset_steps`, whose step the engine runs
+    // the moment it registers the rule: an answer on `/lk2warm` can only have come from THIS
+    // engine having read THIS rule, which no status row (its timer stands at 120 s too) could
+    // prove. The key goes in only after that: a new rule starts at the current binlog position,
+    // so a key that passed before the rule was read is not its to deliver.
+    let warm = json!([{"once": true, "template": "DELETE /lk2warm HTTP/1.1\n\n"}]).to_string();
+    let mut add = db2.conn().await;
+    add.query_drop("START TRANSACTION").await.unwrap();
+    add.exec_drop(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('lrul2b', 'hook', 'POST /lk2 HTTP/1.1\n\n{{join keys \",\"}}', ?, 50)",
+        (warm,),
+    )
+    .await
+    .unwrap();
+    add.query_drop("INSERT INTO lazy_wire_fire_trigger (rule, source_table, `key`) VALUES ('lrul2b', 'orders', '{{new.id}}')")
+        .await
+        .unwrap();
+    add.query_drop("COMMIT").await.unwrap();
+    quit(add).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the engine to read the rule added after the heal",
+        || async { (answered(&ans, "/lk2warm") >= 1).then_some(()) },
+    )
+    .await;
+    db2.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    wait_for(
+        Duration::from_secs(20),
+        "the rule added after the heal to deliver",
+        || async { (fired(&mock.requests(), "/lk2").contains(&"2".to_string())).then_some(()) },
+    )
+    .await;
+    // One warm step, one flush of the key: the rule was read once and delivered what it marks.
+    sleep_ms(500).await;
+    assert_eq!(
+        answered(&ans, "/lk2warm"),
+        1,
+        "the new rule's reset did not run exactly once ({})",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        fired(&mock.requests(), "/lk2")
+            .iter()
+            .filter(|k| k.as_str() == "2")
+            .count(),
+        1,
+        "the healed engine did not deliver the new rule's key exactly once: {:?}",
+        mock.requests()
+    );
+    eng2.stop_clean().await;
+}
+
+/// The standby's only connection is the one that polls `GET_LOCK` (`lock::acquire` runs before
+/// any pool exists), so killing it is the reconnect arm of the standby loop in `lock::acquire`.
+/// The WARN names the arm; a NEW connection of the standby's own account proves the reconnect
+/// happened in the server and not only in a log line; the healed standby does NOT take the lock
+/// from the live copy; and it is that healed connection that takes over and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standby_reconnects_its_control_connection() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "stbyctl").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('srul', 'hook', 'POST /sk HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("srul", "orders", Some("{{new.id}}"), None).await;
+    // Two accounts: whose connection is whose is then a fact from the server, not a guess.
+    let dsn_a = engine_user(&db, "lwf_stba", "stby-pw-a", &root).await;
+    let dsn_b = engine_user(&db, "lwf_stbb", "stby-pw-b", &root).await;
+    let with = |dsn: &str| Db {
+        schema: db.schema.clone(),
+        dsn: dsn.to_string(),
+    };
+    let inst = Instance::ready(config(&with(&dsn_a), &[])).await;
+    let stby = Instance::start(config(&with(&dsn_b), &[]));
+    sleep_ms(1500).await;
+    assert!(
+        !stby.health.is_ready(),
+        "the standby became active beside the active copy"
+    );
+
+    // What the killed connection answers with. This WARN carries no rule, schema or account of its
+    // own, so each wording gets a baseline here and the attribution of the reconnect is done in the
+    // server below, on the standby's own account (`lwf_stbb` exists only in this test).
+    let base = warn_baselines(&["standby: control connection lost"], DEAD_CONNECTION);
+    let killed: u64 = wait_for(
+        Duration::from_secs(30),
+        "an idle connection of the standby to kill",
+        || async {
+            let idle = user_conns(&db, "lwf_stbb")
+                .await
+                .into_iter()
+                .find(|(_, cmd)| cmd == "Sleep");
+            match idle {
+                Some((id, _)) => {
+                    kill_conn(&db, id).await;
+                    Some(id)
+                }
+                None => None,
+            }
+        },
+    )
+    .await;
+    // The arm that noticed, by its own words, on a connection the server says is gone.
+    let noticed = wait_for(
+        Duration::from_secs(30),
+        "the standby to notice its dead connection",
+        || async {
+            warn_grew(
+                &["standby: control connection lost"],
+                DEAD_CONNECTION,
+                &base,
+            )
+        },
+    )
+    .await;
+    // The reconnect happened in the server: the account has a connection that is not the killed
+    // one (the standby has no pool, so this is its control connection).
+    wait_for(
+        Duration::from_secs(30),
+        "the standby to reconnect",
+        || async {
+            let cs = user_conns(&db, "lwf_stbb").await;
+            (!cs.is_empty() && !cs.iter().any(|(i, _)| *i == killed)).then_some(())
+        },
+    )
+    .await;
+    // Still only standing by: the new connection did not take the lock from the live copy.
+    sleep_ms(1500).await;
+    assert!(
+        !stby.health.is_ready(),
+        "the healed standby took the lock beside the active copy (the failure it healed was: \
+         {noticed})"
+    );
+    assert!(inst.health.is_ready(), "the active copy died");
+
+    // The healed connection works: the active copy fires, then stops, and the standby — on the
+    // connection it made after the kill — takes the lock and fires too.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(20), "the active copy's key", || async {
+        (fired(&mock.requests(), "/sk").contains(&"1".to_string())).then_some(())
+    })
+    .await;
+    inst.stop().await;
+    wait_for(
+        Duration::from_secs(30),
+        "the standby to take over",
+        || async { stby.health.is_ready().then_some(()) },
+    )
+    .await;
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "a key delivered by the healed standby",
+        || async {
+            let (af, ap, _, _) = db.status("srul").await?;
+            (fired(&mock.requests(), "/sk").contains(&"2".to_string()) && (af, ap) >= after)
+                .then_some(())
+        },
+    )
+    .await;
+    stby.stop().await;
+    // The two accounts of this test are its own: no leftovers on a shared server.
+    for u in ["lwf_stba", "lwf_stbb"] {
+        db.exec(&format!("DROP USER IF EXISTS '{u}'@'%'")).await;
+    }
+}
+
+/// A rule that breaks while running is frozen where it stands: both error paths of
+/// `reload_config` join their causes (the two trigger errors into `trigger_error`, the row parse
+/// error into `error`), the WARNs name which is which, the status row shows the rule error, and
+/// `rebuild_routes` marks nothing for the broken rule — its saved position stays pinned below
+/// what it missed while the healthy rule of the same engine keeps flowing. Healed, it is the
+/// unfreeze arm that decides how the gap is covered: `lose_continuity`, which for a rule with
+/// `reset_steps` means the reset runs again (and a key that arrived while broken is not
+/// silently delivered by the buffer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_rule_freezes_where_it_stands_and_heals_by_its_reset() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "freeze1").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let ans = answer_log(&mock);
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"once": true, "template": "PURGE /zpurge HTTP/1.1\n\n"}]).to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) VALUES ('zrul', 'hook', \
+         'POST /zk HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (steps.clone(),),
+    )
+    .await;
+    db.trigger("zrul", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('z2', 'hook', 'POST /z2 HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("z2", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(Duration::from_secs(15), "the first-start reset", || async {
+        (answered(&ans, "/zpurge") == 1).then_some(())
+    })
+    .await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(15),
+        "both rules before the break",
+        || async {
+            let k = fired(&mock.requests(), "/zk");
+            let c = fired(&mock.requests(), "/z2");
+            (k.contains(&"1".to_string()) && c.contains(&"1".to_string())).then_some(())
+        },
+    )
+    .await;
+    inst.quiet().await;
+
+    // Break it three ways at once, in one transaction: the engine reads one configuration in
+    // which all three causes are present together, so each reaches the log with its own words.
+    let mut bad = db.conn().await;
+    bad.query_drop("START TRANSACTION").await.unwrap();
+    bad.query_drop("INSERT INTO lazy_wire_fire_trigger (rule, source_table, keys_sql) VALUES ('zrul','order_tags','SELECT tag FROM order_tags WHERE order_id = :bogus')")
+        .await
+        .unwrap();
+    bad.query_drop("INSERT INTO lazy_wire_fire_trigger (rule, source_table, keys_sql) VALUES ('zrul','order_tags','SELECT tag FROM order_tags WHERE order_id = :new.order_id')")
+        .await
+        .unwrap();
+    bad.exec_drop(
+        "UPDATE lazy_wire_fire_rule SET reset_steps = ? WHERE name = 'zrul'",
+        ("{not json",),
+    )
+    .await
+    .unwrap();
+    bad.query_drop("COMMIT").await.unwrap();
+    quit(bad).await;
+    // The trigger join: both causes in ONE message ("; " in `reload_config`).
+    wait_for(
+        Duration::from_secs(20),
+        "both trigger causes joined",
+        || async {
+            (!warn_lines(&["zrul", "cannot mark keys", ":bogus", "no `_key` column"]).is_empty())
+                .then_some(())
+        },
+    )
+    .await;
+    // The row parse error, joined into the rule's own error, is what the status row shows.
+    wait_for(
+        Duration::from_secs(20),
+        "the rule error in the status row",
+        || async {
+            let (_, _, _, err) = db.status("zrul").await?;
+            err.is_some_and(|e| e.contains("`reset_steps` is not a valid JSON array"))
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(
+        !warn_lines(&["zrul", "cannot fire", "reset_steps"]).is_empty(),
+        "the rule error was never warned as what it is: {:?}",
+        warn_lines(&["zrul", "cannot fire"])
+    );
+
+    // Nothing is marked for the frozen rule: its keys reach neither the target nor its position.
+    db.exec("INSERT INTO orders VALUES (5, 1, 'new', 5), (6, 1, 'new', 6)")
+        .await;
+    let missed = binlog_end(&db).await;
+    sleep_ms(2000).await;
+    let keys = fired(&mock.requests(), "/zk");
+    assert!(
+        !keys.contains(&"5".to_string()) && !keys.contains(&"6".to_string()),
+        "a frozen rule delivered what it was not supposed to mark: {keys:?}"
+    );
+    let (zf, zp, _, _) = db.status("zrul").await.unwrap();
+    assert!(
+        (&zf, &zp) < (&missed.0, &missed.1),
+        "the frozen rule's position passed what it missed: {zf}:{zp} vs {missed:?}"
+    );
+    // The healthy rule of the same engine is unaffected: only the broken rule is pinned.
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the healthy rule to keep moving",
+        || async {
+            let (f, p, _, _) = db.status("z2").await?;
+            ((f, p) >= missed).then_some(())
+        },
+    )
+    .await;
+
+    // Heal: the triggers go and the row parses again — one transaction, so the unfreeze happens
+    // with the rule's `reset_steps` already readable. Nothing may answer while that unfreeze is
+    // supposed to be in flight: its step 1 is what holds the reason in the status row, because
+    // the moment the last step is answered the row is overwritten with `done: <time>`.
+    mock.hold_after(0);
+    let mut heal = db.conn().await;
+    heal.query_drop("START TRANSACTION").await.unwrap();
+    heal.query_drop(
+        "DELETE FROM lazy_wire_fire_trigger WHERE rule = 'zrul' AND keys_sql IS NOT NULL",
+    )
+    .await
+    .unwrap();
+    heal.exec_drop(
+        "UPDATE lazy_wire_fire_rule SET reset_steps = ? WHERE name = 'zrul'",
+        (steps.clone(),),
+    )
+    .await
+    .unwrap();
+    heal.query_drop("COMMIT").await.unwrap();
+    quit(heal).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the unfrozen rule to say why it restarted",
+        || async {
+            let (_, _, rs, _) = db.status("zrul").await?;
+            (rs.contains("running: step 1/1")
+                && rs.contains("its triggers work again after an error"))
+            .then_some(())
+        },
+    )
+    .await;
+    // The reason is a promise, not the proof: the reset is what covers the keys the frozen rule
+    // never marked, so let the held step be answered and require that this reset ran. Two
+    // answers ever: the one at first start and this one.
+    mock.heal();
+    wait_for(
+        Duration::from_secs(20),
+        "the reset that covers the gap",
+        || async { (answered(&ans, "/zpurge") >= 2).then_some(()) },
+    )
+    .await;
+    wait_for(Duration::from_secs(20), "the reset to finish", || async {
+        let (_, _, rs, _) = db.status("zrul").await?;
+        rs.starts_with("done:").then_some(())
+    })
+    .await;
+    sleep_ms(500).await;
+    assert_eq!(
+        answered(&ans, "/zpurge"),
+        2,
+        "the reset ran other than once at first start and once on the unfreeze ({})",
+        traffic(&mock, &ans)
+    );
+    // It marks again: a key after the heal is delivered, and the ones it missed while frozen
+    // are still not in the buffer (the reset, not a replay of marks, is what covers them).
+    db.exec("INSERT INTO orders VALUES (7, 1, 'new', 7)").await;
+    let back = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(20), "a key after the heal", || async {
+        let (f, p, _, _) = db.status("zrul").await?;
+        (fired(&mock.requests(), "/zk").contains(&"7".to_string()) && (f, p) >= back).then_some(())
+    })
+    .await;
+    let keys = fired(&mock.requests(), "/zk");
+    assert_eq!(
+        keys.iter().filter(|k| k.as_str() == "1").count(),
+        1,
+        "the key delivered before the break fired again: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"5".to_string()) && !keys.contains(&"6".to_string()),
+        "the frozen rule replayed marks it never made: {keys:?}"
+    );
+    inst.stop().await;
+}
+
+/// A rule changed while its reset is in flight: `update_rule` notices the fingerprint of the
+/// running reset differs and starts it over, with the reason chain of both in the status row —
+/// and started over means step 1 runs a second time, not the old run's remainder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rule_change_restarts_the_reset_in_flight() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "midreset").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let ans = answer_log(&mock);
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"once": true, "template": "DELETE /rcache HTTP/1.1\n\n"}]).to_string();
+    // The restarted run runs the NEW rule's steps from step 1, so a second path tells the two
+    // runs apart for good: an answer on `/rcache2` can only have come from the restarted one.
+    let steps2 = json!([{"once": true, "template": "DELETE /rcache2 HTTP/1.1\n\n"}]).to_string();
+    // `reset_requested = 1` in the INSERT would not survive the start: both the flag and the
+    // first start ask for a reset at load and the first start overwrites the other. So the
+    // requested reset below is raised on a live engine, once the first-start one is over.
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, reset_requested, debounce_ms) \
+         VALUES ('rrul', 'hook', 'POST /mr HTTP/1.1\n\n{{join keys \",\"}}', ?, 0, 100)",
+        (steps.clone(),),
+    )
+    .await;
+    db.trigger("rrul", "orders", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the first-start reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("rrul").await?;
+            (rs.starts_with("done:") && answered(&ans, "/rcache") == 1).then_some(())
+        },
+    )
+    .await;
+
+    // Now raise the flag with nothing able to answer: the requested reset reaches its step 1 and
+    // stands there unanswered, which is the only place a restart can be seen to restart.
+    mock.hold_after(0);
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'rrul'")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "the requested reset to reach step 1",
+        || async {
+            let (_, _, rs, _) = db.status("rrul").await?;
+            (rs.contains("running: step 1/1") && rs.contains(": reset_requested")).then_some(())
+        },
+    )
+    .await;
+    // THE premise of what follows, proven rather than assumed: the row says step 1 is running and
+    // the mock has answered this rule's step exactly once in its whole life — the first start's.
+    // So this run is in flight with its step unanswered: the change below finds it mid-step.
+    assert_eq!(
+        answered(&ans, "/rcache"),
+        1,
+        "the requested reset's step 1 had already been answered: it was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+
+    // Change the rule (its fingerprint) with that step still unanswered.
+    db.exec_params(
+        "UPDATE lazy_wire_fire_rule SET template = 'POST /mr2 HTTP/1.1\n\n{{join keys \",\"}}', \
+         reset_steps = ? WHERE name = 'rrul'",
+        (steps2,),
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(20),
+        "the reset to say it restarted",
+        || async {
+            let (_, _, rs, _) = db.status("rrul").await?;
+            (rs.contains("running: step 1/1")
+                && rs.contains("reset_requested; restarted after the rule changed"))
+            .then_some(())
+        },
+    )
+    .await;
+    // Now the two runs can be told apart by what they were ANSWERED, which nothing in the status
+    // row could: the restarted run runs the NEW rule's step, so `/rcache2` is its signature, and
+    // the abandoned run's own step — held, then reset by `heal()` — goes out again as the HTTP
+    // layer's fresh retry (a step is at-least-once, which is why it must be idempotent).
+    mock.heal();
+    wait_for(
+        Duration::from_secs(20),
+        "the restarted reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("rrul").await?;
+            (rs.starts_with("done:") && answered(&ans, "/rcache2") >= 1).then_some(())
+        },
+    )
+    .await;
+    sleep_ms(500).await;
+    assert_eq!(
+        answered(&ans, "/rcache2"),
+        1,
+        "the restarted run did not run the new step exactly once from the beginning ({})",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        answered(&ans, "/rcache"),
+        2,
+        "the old step was not run once at first start and once by the run that was restarted ({})",
+        traffic(&mock, &ans)
+    );
+    // The change itself landed: keys now go to the new template's path.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (3, 1, 'new', 3)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(20), "the new template", || async {
+        let (af, ap, _, _) = db.status("rrul").await?;
+        (fired(&mock.requests(), "/mr2").contains(&"3".to_string()) && (af, ap) >= after)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        fired(&mock.requests(), "/mr").is_empty(),
+        "the old template fired after the change: {:?}",
+        mock.requests()
+    );
+    // The finished reset clears the flag it was asked with (`reset_requested`).
+    wait_for(
+        Duration::from_secs(20),
+        "reset_requested cleared",
+        || async {
+            let mut c = db.conn().await;
+            let r: Option<i8> = c
+                .exec_first(
+                    "SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'rrul'",
+                    (),
+                )
+                .await
+                .unwrap();
+            quit(c).await;
+            (r == Some(0)).then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// A configuration the engine cannot read: `reload_config` fails, the WARN says so, and the
+/// retry is the 1 s one and not the 120 s poll — proven by what the engine does with a rule the
+/// server only lets it read again later. Revoking SELECT on the rule table alone (table-granular
+/// grants, which is the only kind a table `REVOKE` can take away) is what makes the load fail;
+/// while it fails, the rules already loaded keep firing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_config_reload_retries_in_one_second() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "rlretry").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('arl', 'hook', 'POST /ar HTTP/1.1\n\n{{join keys \",\"}}', 100)")
+        .await;
+    db.trigger("arl", "orders", Some("{{new.id}}"), None).await;
+
+    // The engine account, granted table by table: a database-level grant cannot be carved out
+    // by a table REVOKE, so this is what makes revoking one config table bite.
+    let user = "lwf_rld";
+    let mariadb = {
+        let mut c = db.conn().await;
+        let v: String = c.query_first("SELECT VERSION()").await.unwrap().unwrap();
+        quit(c).await;
+        v.contains("MariaDB")
+    };
+    db.exec(&format!("DROP USER IF EXISTS '{user}'@'%'")).await;
+    db.exec(&format!(
+        "CREATE USER '{user}'@'%' IDENTIFIED BY 'rld-pw-1'"
+    ))
+    .await;
+    db.exec(&format!(
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT{} ON *.* TO '{user}'@'%'",
+        if mariadb { ", BINLOG MONITOR" } else { "" }
+    ))
+    .await;
+    db.exec(&format!(
+        "GRANT CREATE ON `{}`.* TO '{user}'@'%'",
+        db.schema
+    ))
+    .await;
+    // The fence table is created lazily by the engine, and a table-level GRANT needs the table
+    // to exist, so it is made here first with the very DDL `fence::probe` would use.
+    db.exec("CREATE TABLE IF NOT EXISTS `lazy_wire_fire_fence` (`id` VARCHAR(64) NOT NULL PRIMARY KEY, `n` BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        .await;
+    for t in [
+        "lazy_wire_fire_target",
+        "lazy_wire_fire_rule",
+        "lazy_wire_fire_trigger",
+        "lazy_wire_fire_status",
+        "lazy_wire_fire_fence",
+        "customers",
+        "orders",
+        "order_tags",
+    ] {
+        db.exec(&format!(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON `{}`.`{t}` TO '{user}'@'%'",
+            db.schema
+        ))
+        .await;
+    }
+    let (scheme, rest) = root.split_once("://").unwrap();
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let edb = Db {
+        schema: db.schema.clone(),
+        dsn: format!(
+            "{scheme}://{user}:rld-pw-1@{host}/{}?prefer_socket=false",
+            db.schema
+        ),
+    };
+    // The config poll stands at 120 s: only the failure retry can read a config in this test.
+    let inst = Instance::ready(config(
+        &edb,
+        &[
+            ("LAZYWF_CONFIG_POLL_MS", "120000"),
+            ("LAZYWF_STATUS_MS", "200"),
+        ],
+    ))
+    .await;
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(Duration::from_secs(20), "the baseline key", || async {
+        (fired(&mock.requests(), "/ar").contains(&"1".to_string())).then_some(())
+    })
+    .await;
+    inst.quiet().await;
+
+    // Break: the rule table can no longer be read.
+    db.exec(&format!(
+        "REVOKE SELECT ON `{}`.`lazy_wire_fire_rule` FROM '{user}'@'%'",
+        db.schema
+    ))
+    .await;
+    // The engine's own account names itself in the refusal, which is what makes these lines this
+    // test's: no other test creates `lwf_rld`, and no other reason but the refusal is accepted.
+    let w0 = warn_lines(&["reloading the configuration", "retrying", user, "denied"]).len();
+    let t0 = std::time::Instant::now();
+    // A rule added now stays invisible: the load fails before any rule is read.
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('blr', 'hook', 'POST /br HTTP/1.1\n\n{{join keys \",\"}}', 50)")
+        .await;
+    db.trigger("blr", "orders", Some("{{new.id}}"), None).await;
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    // The rules it already has keep firing (the failed load changes nothing), and it retries at
+    // its own 1 s pace, not at the 120 s poll: several attempts within seconds.
+    wait_for(Duration::from_secs(30), "the reload retries", || async {
+        (warn_lines(&["reloading the configuration", "retrying", user, "denied"]).len() >= w0 + 3)
+            .then_some(())
+    })
+    .await;
+    let retrying = t0.elapsed();
+    assert!(
+        retrying < Duration::from_secs(30),
+        "three reload attempts took {retrying:?} with the poll at 120 s: this is not the 1 s retry"
+    );
+    assert!(
+        fired(&mock.requests(), "/ar").contains(&"2".to_string()),
+        "the rules already loaded stopped firing while the configuration could not be read"
+    );
+    assert!(
+        !fired(&mock.requests(), "/br").contains(&"2".to_string()),
+        "the rule the engine could not read fired anyway: {:?}",
+        mock.requests()
+    );
+    assert!(
+        inst.health.is_ready(),
+        "the engine died on the failed reload"
+    );
+
+    // Restore: the next 1 s retry reads it, and the rule that appeared while the table was
+    // closed to the engine now fires — which the 120 s poll could not have done in this time.
+    db.exec(&format!(
+        "GRANT SELECT ON `{}`.`lazy_wire_fire_rule` TO '{user}'@'%'",
+        db.schema
+    ))
+    .await;
+    let granted = std::time::Instant::now();
+    wait_for(
+        Duration::from_secs(30),
+        "the closed rule to be read",
+        || async { db.status("blr").await.map(|_| ()) },
+    )
+    .await;
+    let seen = granted.elapsed();
+    assert!(
+        seen < Duration::from_secs(30),
+        "the rule appeared only after {seen:?} with the poll at 120 s: this is not the 1 s retry"
+    );
+    db.exec("INSERT INTO orders VALUES (3, 1, 'new', 3)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the rule read after the restore",
+        || async {
+            let (af, ap, _, _) = db.status("blr").await?;
+            (fired(&mock.requests(), "/br").contains(&"3".to_string()) && (af, ap) >= after)
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(
+        !fired(&mock.requests(), "/br").contains(&"2".to_string()),
+        "the key that passed while the rule was unreadable was replayed by a rewind: {:?}",
+        mock.requests()
+    );
+    inst.stop().await;
+    db.exec(&format!("DROP USER IF EXISTS '{user}'@'%'")).await;
+}
+
+/// The `reset_requested = 0` of a finished reset, refused by the server: the WARN names the
+/// statement and the 5 s wait, the flag stays 1 through the wait (the retry is 5 s, not the 1 s
+/// the reload uses), and it clears on the next attempt once the table is back — with the reset
+/// itself already done and the engine otherwise healthy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_reset_requested_clear_waits_five_seconds() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "clr5s").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"once": true, "template": "PURGE /ccache HTTP/1.1\n\n"}]).to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, reset_requested, debounce_ms) \
+         VALUES ('crul', 'hook', 'POST /cr HTTP/1.1\n\n{{join keys \",\"}}', ?, 1, 100)",
+        (steps,),
+    )
+    .await;
+    db.trigger("crul", "orders", Some("{{new.id}}"), None).await;
+    // The reset's step is unanswered: the reset cannot finish, so the clear cannot be attempted
+    // before the table is taken away.
+    mock.hold_after(0);
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(Duration::from_secs(20), "the held reset step", || async {
+        (mock.requests().iter().any(|r| r.path == "/ccache")).then_some(())
+    })
+    .await;
+    db.exec("RENAME TABLE lazy_wire_fire_rule TO lazy_wire_fire_rule_off")
+        .await;
+    // The server refuses the clear with 1146, and that text names the table with this schema in
+    // front of it (`Table 'lwf_clr5s.lazy_wire_fire_rule' doesn't exist`): the schema is a needle
+    // the line really carries, so a matching line can only be this test's.
+    let w0 = warn_lines_in(&db, &["crul", "clearing reset_requested"]).len();
+    mock.heal();
+
+    // The reset finishes and the clear of the flag fails FOR the missing table.
+    wait_for(
+        Duration::from_secs(20),
+        "the clear failure named",
+        || async {
+            (!warn_lines_in(
+                &db,
+                &["crul", "clearing reset_requested", "retrying in 5 s"],
+            )
+            .is_empty())
+            .then_some(())
+        },
+    )
+    .await;
+    let warned = warn_lines_in(&db, &["crul", "clearing reset_requested"]);
+    assert!(
+        warned.iter().any(|l| l.contains("lazy_wire_fire_rule")),
+        "the clear failure does not name the statement's table: {warned:?}"
+    );
+    // Through the wait it is not retried (the flag is still 1, still only one WARN), and the
+    // reset that asked for it is finished.
+    sleep_ms(2000).await;
+    let now = warn_lines_in(&db, &["crul", "clearing reset_requested"]);
+    assert_eq!(
+        now.len(),
+        w0 + 1,
+        "the clear retried inside the 5 s wait: {now:?}"
+    );
+    let mut c = db.conn().await;
+    let held: Option<i8> = c
+        .exec_first(
+            "SELECT reset_requested FROM lazy_wire_fire_rule_off WHERE name = 'crul'",
+            (),
+        )
+        .await
+        .unwrap();
+    quit(c).await;
+    assert_eq!(
+        held,
+        Some(1),
+        "the flag was cleared while the table was gone"
+    );
+    let (_, _, rs, _) = db.status("crul").await.unwrap();
+    assert!(
+        rs.starts_with("done:") || rs.contains("running"),
+        "the reset that asked for the clear is not where it should be: {rs}"
+    );
+
+    // The table is back: the attempt that the 5 s timer holds does the clear the server refused.
+    db.exec("RENAME TABLE lazy_wire_fire_rule_off TO lazy_wire_fire_rule")
+        .await;
+    let t0 = std::time::Instant::now();
+    wait_for(
+        Duration::from_secs(30),
+        "the flag cleared by the retry",
+        || async {
+            let mut c = db.conn().await;
+            let r: Option<i8> = c
+                .exec_first(
+                    "SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'crul'",
+                    (),
+                )
+                .await
+                .unwrap();
+            quit(c).await;
+            (r == Some(0)).then_some(())
+        },
+    )
+    .await;
+    assert!(
+        t0.elapsed() >= Duration::from_secs(1),
+        "the clear did not wait for its timer: {:?}",
+        t0.elapsed()
+    );
+    assert!(inst.health.is_ready(), "the engine died on the clear");
+    // The rule itself still works after all of that.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (4, 1, 'new', 4)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(Duration::from_secs(20), "a key after the clear", || async {
+        let (af, ap, _, _) = db.status("crul").await?;
+        (fired(&mock.requests(), "/cr").contains(&"4".to_string()) && (af, ap) >= after)
+            .then_some(())
+    })
+    .await;
+    inst.stop().await;
+}
