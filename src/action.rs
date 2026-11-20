@@ -432,6 +432,9 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
                     let rows = rows
                         .into_iter()
                         .map(|r| {
+                            // `mysql_common::Row::unwrap` panics only on a column that was
+                            // `take()`n; nothing in lazywf takes values out of a row, so every
+                            // value is present.
                             r.unwrap()
                                 .into_iter()
                                 .enumerate()

@@ -773,11 +773,13 @@ pub fn rule_errors(def: &RuleDef, target: &TargetDef, fields: &[docs::Field]) ->
         .map(|o| o.max_message_bytes)
         .unwrap_or(MAX_MESSAGE_BYTES);
     if def.fire_per == FirePer::Batch && def.batch_max_bytes.is_some_and(|n| n > limit) {
-        out.push(format!(
-            "`batch_max_bytes` {} is over {limit}, the largest message the target takes \
-             (`vars.max_message_bytes`)",
-            def.batch_max_bytes.unwrap()
-        ));
+        // the `is_some_and` above already proved it is `Some`; bind it instead of unwrapping
+        if let Some(n) = def.batch_max_bytes {
+            out.push(format!(
+                "`batch_max_bytes` {n} is over {limit}, the largest message the target takes \
+                 (`vars.max_message_bytes`)",
+            ));
+        }
     }
     let Some(url) = target.endpoints.first() else {
         return out;

@@ -326,7 +326,8 @@ impl Message {
 /// The header is kept as written.
 fn check_content_type(v: &str) -> Result<String> {
     let mut parts = v.split(';');
-    let media = parts.next().unwrap();
+    // `split` always yields a first item; `unwrap_or(v)` says so instead of unwrapping
+    let media = parts.next().unwrap_or(v);
     for param in parts {
         let (k, val) = param
             .trim()

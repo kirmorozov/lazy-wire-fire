@@ -1,0 +1,309 @@
+# panic-sites.allow — every panic-capable site in lazywf's own non-test src/, as of the last
+# review. Written by `scripts/check-panic-sites.sh --prune`; add a line by hand only when a
+# pull request justifies a new site in its description.
+#
+# One entry per line, tab-separated, matched by CONTENT (never by line number, so moving code
+# or editing unrelated lines never fails the check):
+#
+#     <path>	<whitespace-collapsed source text of the site's line>[	<count>]
+#
+# `count` is written only when the same text occurs several times in the file. A site that is
+# not here fails `make lint`; an entry whose site no longer exists only warns, and
+# `scripts/check-panic-sites.sh --prune` drops it.
+src/action.rs	&context(rule, target, &keys[a..b], &docs[a..b], &ep, reset),
+src/action.rs	&docs[*a..*b],
+src/action.rs	&docs[a..b],	2
+src/action.rs	&keys[*a..*b],
+src/action.rs	&keys[a..b],	2
+src/action.rs	.map(|i| My::Bytes(chunk[i.min(chunk.len() - 1)].clone().into_bytes()))
+src/action.rs	f.failed_keys.extend(keys[*a..*b].iter().cloned());
+src/action.rs	f.failed_keys.extend(keys[a..b].iter().cloned());	4
+src/action.rs	f.keys_done += (b - a) as u64;
+src/action.rs	f.rejected.push((keys[a].clone(), format!("{e:#}")));	2
+src/action.rs	for (a, b) in &parts[n + 1..] {
+src/action.rs	for c in &chunks[n + 1..] {
+src/action.rs	if book_items(&keys[a..b], items, f) {
+src/action.rs	let unit = std::mem::take(&mut chunks[i]);
+src/action.rs	r.unwrap()
+src/aws.rs	Value::Number(n) => n.as_u64().map(|n| n as usize),
+src/aws.rs	if b[i] == b'%' && i + 2 < b.len() {
+src/aws.rs	let close = text[open..].find("</Code>")?;
+src/aws.rs	let code = text[open..open + close].trim();
+src/aws.rs	let text = &text[start..];
+src/aws.rs	out.push(if b[i] == b'+' { b' ' } else { b[i] });
+src/aws.rs	out[i] = Some(item);
+src/aws.rs	out[i] = Some(match e.get("SenderFault").and_then(Value::as_bool) {
+src/config.rs	(1 << 30) | (h.finish() as u32 & ((1 << 30) - 1))
+src/config.rs	Some(i) if rest[..i].find('/').is_none() => &rest[i + 1..],
+src/config.rs	let authority = &rest[..authority_end];
+src/config.rs	pool_size: num("LAZYWF_POOL_SIZE", 16)?.max(2) as usize,
+src/config.rs	send_concurrency: num("LAZYWF_SEND_CONCURRENCY", 16)?.max(1) as usize,
+src/docs.rs	.expect("plan has _key");
+src/docs.rs	None => p.set(&mut e.doc, row[vi].clone()),
+src/docs.rs	Role::Op if crate::template::text(&row[i]).eq_ignore_ascii_case("delete") => {
+src/docs.rs	Role::Set(p) => p.set(&mut e.doc, row[i].clone()),
+src/docs.rs	decimals as usize
+src/docs.rs	for (nb, b) in &plans[i + 1..] {
+src/docs.rs	for b in &places[i + 1..] {
+src/docs.rs	format!(".{}", &s[..d])
+src/docs.rs	if !row[vi].is_null() {
+src/docs.rs	if ms.iter().all(|(i, _)| row[*i].is_null()) {
+src/docs.rs	inner.set(&mut el, row[*i].clone());
+src/docs.rs	let elem = if ms.len() == 1 && ms[0].1.is_root() {
+src/docs.rs	let key = match &row[key_at] {
+src/docs.rs	let ms = &members[&g];
+src/docs.rs	let mut full = self.groups[*g].clone();
+src/docs.rs	let raw = crate::template::text(&row[pi]);
+src/docs.rs	p.set(&mut e.doc, row[vi].clone());
+src/docs.rs	row[i] = parse_json(std::mem::take(&mut row[i]));
+src/docs.rs	row[ms[0].0].clone()
+src/docs.rs	self.groups[*g].clone(),
+src/engine.rs	"pending_keys": st.buffer.pending_keys() as u64,
+src/engine.rs	*done += batch.take().map_or(0, |b| b.len() as u64);
+src/engine.rs	.expect("a Full-key trigger means the table has objects");
+src/engine.rs	.expect("begin moved the pending ids into the generation");
+src/engine.rs	.expect("inserted just above if it was missing");
+src/engine.rs	.with_constraints(PoolConstraints::new(0, cfg.pool_size).expect("0 <= max"))
+src/engine.rs	info!(rule = %d.rule, "reset step {}: {} stray keys", run.step + 1, per_ep.iter().map(|s| s.len() as u64).sum::<u64>());
+src/engine.rs	let (Some(b), Some(a)) = (images[0], images[1]) else {
+src/engine.rs	let Some(img) = images[ii] else {
+src/engine.rs	let chunk = pending.clone().expect("set above");	2
+src/engine.rs	let moved_away = pairs[..k].iter().any(|(f, _)| f == to);
+src/engine.rs	let obj = objs[ii].get_or_insert_with(|| w.layout.object(img)).clone();
+src/engine.rs	let pos = self.rule_pos(&self.rules[name]);
+src/engine.rs	let reset = json!({"step": rule.def.reset_steps[i].name, "keys": []});
+src/engine.rs	let reset = json!({"step": rule.def.reset_steps[i].name, "keys": chunk});
+src/engine.rs	let run = st.reset.as_mut().expect("checked above");
+src/engine.rs	let s = key::SpaceId(i as u16);
+src/engine.rs	let st = self.rules.get_mut(name).expect("present");	2
+src/engine.rs	let st = self.rules.remove(&name).expect("present");
+src/engine.rs	let step = &rule.def.reset_steps[i];
+src/engine.rs	let t = &rule.triggers[*i].def.on;
+src/engine.rs	let t = &rule.triggers[*ti];	2
+src/engine.rs	let t = &rule.triggers[ti];
+src/engine.rs	let taken = per_ep[*ep].take(batch);
+src/engine.rs	let total = keys.len() as u64;
+src/engine.rs	m.set_pending(st.buffer.pending_keys() as u64);
+src/engine.rs	matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
+src/engine.rs	reg.set_binlog_lag(self.stream_lag_ms() as f64 / 1000.0);
+src/engine.rs	rules.get_mut(name).expect("present").buffer.locate(k);	2
+src/engine.rs	st.counters.select_ms = fired.select_time.as_millis() as u64;
+src/health.rs	buf.extend_from_slice(&chunk[..n]);
+src/http.rs	Some((i, _)) => format!("{}…", &s[..i]),
+src/http.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
+src/http.rs	Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
+src/http.rs	body.extend_from_slice(&chunk[..size]);
+src/http.rs	match parsed.parse(&c.buf[..head_end]) {
+src/http.rs	return Ok(String::from_utf8_lossy(&line[..i]).into_owned());
+src/http.rs	self.buf.extend_from_slice(&chunk[..n]);
+src/keyspace.rs	pub const SPACES: usize = Self::SLOTS as usize + 1;
+src/lock.rs	&hex::encode(Sha256::digest(n.as_bytes()))[..40]
+src/logging.rs	f.add_directive(cap.parse().expect("CAPPED holds valid directives"))
+src/metrics.rs	&h.outcome[outcome.index()]
+src/metrics.rs	buf.extend_from_slice(&chunk[..n]);
+src/metrics.rs	cumulative += h.buckets[i].load(Ordering::Relaxed);
+src/metrics.rs	format!("{}", v as i64)
+src/metrics.rs	self.buckets[i].fetch_add(1, Ordering::Relaxed);
+src/metrics.rs	self.outcome[outcome.index()].fetch_add(1, Ordering::Relaxed);
+src/model.rs	let positive = |v: Option<u64>| v.filter(|n| *n > 0).map(|n| n as usize);
+src/oauth.rs	Some((i, _)) => format!("{}…", &one[..i]),
+src/oauth.rs	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig[..])
+src/oauth.rs	out.push_str(&rest[..i]);
+src/oauth.rs	out.push_str(&rest[..lead]);
+src/oauth.rs	out.push_str(&rest[i..i + NAME.len()]);
+src/oauth.rs	rest = &rest[end..];
+src/oauth.rs	rest = &rest[i + NAME.len()..];
+src/oauth.rs	rest = &rest[lead..];
+src/path.rs	(Step::Index(i), Value::Array(a)) => a.get(*i as usize),
+src/path.rs	Path(self.0[..n].to_vec())
+src/path.rs	Path(self.0[n..].to_vec())
+src/path.rs	a[idx] = value;
+src/path.rs	cur = &mut a[idx];
+src/path.rs	cur = a.last_mut().expect("pushed");
+src/path.rs	let Some(close) = rest[i..].find(']') else {
+src/path.rs	let a = cur.as_array_mut().expect("array");	2
+src/path.rs	let end = rest[i..].find(['.', '[', ']']).map_or(b.len(), |n| i + n);
+src/path.rs	let idx = *idx as usize;
+src/path.rs	let inner = rest[i + 1..i + close].trim();
+src/path.rs	let m = cur.as_object_mut().expect("object");
+src/path.rs	match b[i] {
+src/path.rs	steps.push(Step::Field(rest[i..end].to_string()));
+src/response.rs	.unwrap()
+src/response.rs	Some((i, _)) => format!("{}…", &s[..i]),
+src/response.rs	let c = self.cond.as_ref().expect("a condition");
+src/rows.rs	.map(|i| info.kinds[i].clone())
+src/rows.rs	Ok(i) if i <= labels.len() => Value::String(labels[i - 1].clone()),
+src/rows.rs	Value::from((*i as u64) & mask)
+src/rows.rs	let have = tme.map(|t| t.columns_count() as usize);
+src/secrets.rs	Some(at) => format!("{head}***@{}", &rest[at + 1..]),
+src/secrets.rs	Some(i) => (&s[..i + 3], &s[i + 3..]),
+src/secrets.rs	diff |= (x ^ y) as usize;
+src/secrets.rs	match rest[..end].rfind('@') {
+src/sign.rs	.map(|d| (d.as_nanos() as u64).wrapping_add(std::process::id() as u64))
+src/sign.rs	let mut mac = HmacSha256::new_from_slice(key).expect("HMAC takes keys of any size");	2
+src/sql.rs	"=" if next.is_some_and(|n| n.start == l.end && &sql[n.start..n.end] == "=") => {
+src/sql.rs	Tok::Other => match &sql[l.start..l.end] {
+src/sql.rs	for mut l in lex(&rest[skip..]) {
+src/sql.rs	i += sql[i..].chars().next().map_or(1, char::len_utf8);
+src/sql.rs	i = sql[i..].find('\n').map_or(b.len(), |n| i + n + 1);	2
+src/sql.rs	if b[j] == b'\\' && q != b'`' {
+src/sql.rs	if b[j] == q {
+src/sql.rs	let body = &sql[i + 2..end.saturating_sub(2).max(i + 2)];
+src/sql.rs	let c = b[i];
+src/sql.rs	let end = sql[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+src/sql.rs	let inner = &s[1..s.len() - if s.ends_with(q) { 1 } else { 0 }];
+src/sql.rs	let q = b[0] as char;
+src/sql.rs	let q = b[i];
+src/sql.rs	let raw = &sql[i + 1..j];
+src/sql.rs	out.push(text[from..].trim().to_string());
+src/sql.rs	out.push(text[from..l.start].trim().to_string());
+src/sql.rs	out.push_str(&sql[last..]);
+src/sql.rs	out.push_str(&sql[last..p.start]);
+src/sql.rs	t: &'a [Tok],
+src/sql.rs	tok: Tok::Quoted(unquote(&sql[start..i])),
+src/sql.rs	tok: Tok::Word(sql[start..i].to_string()),
+src/sql.rs	while i < b.len() && is_ident(b[i]) {
+src/sql.rs	while j < b.len() && is_ident(b[j]) {
+src/sqlwire.rs	1 => Ok(Some(parts.into_iter().next().expect("one"))),
+src/sqlwire.rs	for (i, v) in r.unwrap().into_iter().enumerate() {
+src/sqlwire.rs	let client = guard.as_ref().expect("open");	2
+src/sqlwire.rs	let conn = guard.as_mut().expect("open");
+src/status.rs	Some((i, _)) => format!("{}…", &s[..i]),
+src/target.rs	b["host"].as_str().unwrap_or_default().to_string(),
+src/target.rs	b["port"]
+src/target.rs	ep.ctx["host"].as_str().unwrap_or_default().to_string(),
+src/target.rs	ep.ctx["port"]
+src/target.rs	if let Some(bs) = ep.ctx["brokers"].as_array() {
+src/targets/amqp.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
+src/targets/amqp.rs	Some(i) => (&s[..i], &s[i + 1..]),
+src/targets/amqp.rs	if b[i] == b'%' {
+src/targets/amqp.rs	out.push(b[i]);
+src/targets/grpc/contract.rs	h.write(&(key.len() as u64).to_le_bytes());
+src/targets/grpc/mod.rs	.map(|n| n as usize)
+src/targets/grpc/mod.rs	PerKey(&'a [String]),
+src/targets/grpc/mod.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
+src/targets/grpc/schema.rs	.expect("the committed contract descriptor decodes")
+src/targets/grpc/schema.rs	Kind::Float => Value::F32(n.as_f64().ok_or_else(not_here)? as f32),
+src/targets/grpc/stream.rs	.expect("the endpoint path of `Addr` is a valid path and query"),
+src/targets/grpc/stream.rs	None => LADDER[self.step.load(Ordering::Relaxed).min(LADDER.len() - 1)],
+src/targets/grpc/stream.rs	as usize;
+src/targets/grpc/stream.rs	debug_assert!(!items.is_empty(), "an empty flush never reaches the ring");
+src/targets/grpc/stream.rs	frame.put_u32(packed.len() as u32);
+src/targets/grpc/stream.rs	let flag = self.carry[0];
+src/targets/grpc/stream.rs	let packed = self.codec.pack(&message[5..], self.min);
+src/targets/grpc/stream.rs	let seq = from + i as u64;
+src/targets/grpc/stream.rs	let slot = &st.slots[(ack.seq as usize) & RING_MASK];
+src/targets/grpc/stream.rs	let slot = &st.slots[(item.seq as usize) & RING_MASK];
+src/targets/grpc/stream.rs	let take = &data[..data.len().min(EXCERPT_BYTES - buf.len())];
+src/targets/grpc/stream.rs	st.next = from + n as u64 - 1;
+src/targets/grpc/stream.rs	st.slots[(item.seq as usize) & RING_MASK] = Slot {
+src/targets/grpc/stream.rs	u32::from_be_bytes([self.carry[1], self.carry[2], self.carry[3], self.carry[4]])
+src/targets/grpc/stream.rs	unreachable!("every pass of this loop returns")
+src/targets/grpc/wire.rs	format!("the call failed: {name} ({})", code as i32)
+src/targets/grpc/wire.rs	format!("the call failed: {name} ({}): {message}", code as i32)
+src/targets/kafka.rs	.expect("millis are always a valid Utc time"),
+src/targets/kafka.rs	.map(|o| o.expect("every record was answered"))
+src/targets/kafka.rs	.timestamp_millis_opt(crate::time::unix_now_ms() as i64)
+src/targets/kafka.rs	Ok(n as usize)
+src/targets/kafka.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
+src/targets/kafka.rs	_ => partitions[0],
+src/targets/kafka.rs	for half in [&idxs[..mid], &idxs[mid..]] {
+src/targets/kafka.rs	h as i32
+src/targets/kafka.rs	headers: job.action.records[i]
+src/targets/kafka.rs	if n == 0 || n > u32::MAX as u64 {
+src/targets/kafka.rs	if out[i].is_none() {	2
+src/targets/kafka.rs	keys: &'a [String],
+src/targets/kafka.rs	let (host, port) = &addr.brokers[0];
+src/targets/kafka.rs	let h = (murmur2(key.as_bytes()) as u32) & 0x7fff_ffff;
+src/targets/kafka.rs	let inner = slot.as_mut().expect("opened above");
+src/targets/kafka.rs	let len = data.len() as u32;
+src/targets/kafka.rs	let tail = &data[(data.len() & !3)..];
+src/targets/kafka.rs	out[i] = Some((
+src/targets/kafka.rs	out[i] = Some((pid, o.clone()));	2
+src/targets/kafka.rs	partitions[h as usize % partitions.len()]
+src/targets/kafka.rs	value: Some(job.action.records[i].bytes.clone()),
+src/targets/lambda.rs	out[i] = Item::Transient(format!("key `{id}`: listed in batchItemFailures"));
+src/targets/rabbitmq_stream.rs	.body(action.records[i].bytes.clone())
+src/targets/rabbitmq_stream.rs	Some((h % partitions.len() as u32) as usize)
+src/targets/rabbitmq_stream.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
+src/targets/rabbitmq_stream.rs	if bytes[i] == b'%' && i + 2 < bytes.len() {
+src/targets/rabbitmq_stream.rs	if let Ok(n) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16) {
+src/targets/rabbitmq_stream.rs	let inner = slot.as_mut().expect("opened above");
+src/targets/rabbitmq_stream.rs	out.push(bytes[i]);
+src/targets/rabbitmq_stream.rs	out[*i] = Some(match c {
+src/targets/rabbitmq_stream.rs	out[i] = Some(Outcome::Refused(
+src/targets/redis.rs	Reply::Bulk(Some(self.bytes(n as usize).await?))
+src/targets/redis.rs	cur.push(match b[i + 1] {
+src/targets/redis.rs	cur.push(u8::from_str_radix(&line[i + 2..i + 4], 16).expect("hex"));
+src/targets/redis.rs	guard.as_mut().expect("open").call(args).await
+src/targets/redis.rs	if let Some(i) = self.buf[self.pos..].windows(2).position(|w| w == b"\r\n") {
+src/targets/redis.rs	let (arr, _) = stack.pop().expect("non-empty");
+src/targets/redis.rs	let name = String::from_utf8_lossy(&args[0]).to_uppercase();
+src/targets/redis.rs	let s = String::from_utf8_lossy(&self.buf[self.pos..self.pos + i]).into_owned();
+src/targets/redis.rs	let v = self.buf[self.pos..self.pos + n].to_vec();
+src/targets/redis.rs	self.buf.extend_from_slice(&chunk[..n]);
+src/targets/redis.rs	stack.push((Vec::with_capacity((n as usize).min(1024)), n as usize));
+src/targets/redis.rs	while i < b.len() && b[i].is_ascii_whitespace() {
+src/targets/servicebus.rs	(now_ms + timeout.as_millis() as u64 + TOKEN_REFRESH_SECS * 1000) as i64,
+src/targets/servicebus.rs	.map(|o| o.expect("every message was answered"))
+src/targets/servicebus.rs	Ok(Ok(o)) => out[i] = Some(disposition_outcome(&o)),
+src/targets/servicebus.rs	Ok(n as usize)
+src/targets/servicebus.rs	SimpleValue::Int(i) => Some(*i as i64),
+src/targets/servicebus.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
+src/targets/servicebus.rs	_ => out[i] = Some(Outcome::Transient(format!("the send failed: {e}"))),
+src/targets/servicebus.rs	if out[i].is_some() {
+src/targets/servicebus.rs	let inner = slot.as_mut().expect("opened above");
+src/targets/servicebus.rs	let m = &self.msgs[i];
+src/targets/servicebus.rs	out[i] = Some(Outcome::Refused("the message could not be encoded".into()));
+src/targets/servicebus.rs	out[i] = Some(Outcome::Refused(why.clone()));
+src/targets/smtp.rs	Ok(n as usize)
+src/targets/smtp.rs	Some(i) => (&s[..i], &s[i + 1..]),
+src/targets/smtp.rs	i64::from(c.severity as u8) * 100 + i64::from(c.category as u8) * 10 + i64::from(c.detail as u8)
+src/targets/smtp.rs	let conn = slot.as_mut().expect("a session just opened");
+src/targets/sns.rs	Ok(n as usize)
+src/targets/sns.rs	if b[i] != b'<' {
+src/targets/sns.rs	if n == 0 || n as usize > SNS_MAX_MESSAGE_SIZE {
+src/targets/sns.rs	if self_closed(&xml[j..gt]) {
+src/targets/sns.rs	let Some(rel) = xml[j..].find('>') else {
+src/targets/sns.rs	let after = &rest[i + 1..];
+src/targets/sns.rs	let close = match xml[gt + 1..].find(&format!("</{name}>")) {
+src/targets/sns.rs	let group = &groups[&(i + 1)];
+src/targets/sns.rs	let name = &after[..end];
+src/targets/sns.rs	let name = xml[i + 1..j].to_string();
+src/targets/sns.rs	let text = unescape(&xml[gt + 1..close]);
+src/targets/sns.rs	out.push_str(&rest[..i]);
+src/targets/sns.rs	rest = &after[end + 1..];	2
+src/targets/sns.rs	while j < b.len() && b[j].is_ascii_alphanumeric() {
+src/template.rs	.and_then(|n| tag[4 + n..].find("}}}}").map(|m| 4 + n + m + 4))
+src/template.rs	.unwrap()	2
+src/template.rs	Some(tag[3..].find("}}").map_or(tag.len(), |n| 3 + n + 2))
+src/template.rs	Some(tag[5..].find("--}}").map_or(tag.len(), |n| 5 + n + 4))
+src/template.rs	if INDICATORS.contains(&b[0])
+src/template.rs	j += if b[j] == b'\\' { 2 } else { 1 };
+src/template.rs	let (k, val) = m.iter().next().unwrap();
+src/template.rs	let Some(close) = tag[2..].find("}}") else {
+src/template.rs	let after = &rest[open + 2..];
+src/template.rs	let body = rest[open + 2..].trim_start_matches(['{', '~']).trim_start();
+src/template.rs	let c = b[i];
+src/template.rs	let inner = &tag[2..close - 2];
+src/template.rs	let inner = after[..close].trim();
+src/template.rs	let tag = &rest[open..];
+src/template.rs	let tok = &inner[i..j];
+src/template.rs	out.push_str(&format!("\\u{:04X}", c as u32));
+src/template.rs	out.push_str(&inner[i..end]);
+src/template.rs	out.push_str(&rest[..open]);
+src/template.rs	out.push_str(&tag[..end]);
+src/template.rs	rest = &after[close + 2..];
+src/template.rs	rest = &rest[open + 2..];
+src/template.rs	rest = &tag[close..];
+src/template.rs	rest = &tag[end..];
+src/template.rs	segs.push(Seg::Lit(rest[..open].to_string()));
+src/template.rs	tag[4..]
+src/template.rs	while j < b.len() && !b[j].is_ascii_whitespace() && !b"()=~{}|\"'".contains(&b[j]) {
+src/template.rs	while j < b.len() && b[j] != c {
+src/template.rs	|| b[0] == b' '
+src/template.rs	|| b[b.len() - 1] == b' '
+src/time.rs	.map(|d| d.as_millis() as u64)
+src/time.rs	let (y, m, d) = civil((unix / 86_400) as i64);
+src/time.rs	let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+src/time.rs	let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;

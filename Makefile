@@ -45,8 +45,13 @@ test-grpc:
 
 # The lazyview copies (vendor/lazyview.lock) are checked against the lock, and on CI
 # (CI=true) also against lazyview itself at the locked commit.
+# The panic-site gate goes before the clippy runs: it is the cheap check, so a new
+# `unwrap` fails `make lint` in seconds rather than after the two clippy passes, and its
+# fixture test proves the gate cannot pass vacuously (scripts/test-check-panic-sites.sh).
 lint:
 	$(CARGO) fmt --check
+	scripts/check-panic-sites.sh
+	scripts/test-check-panic-sites.sh
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CARGO) clippy --all-targets --features roaring -- -D warnings
 	scripts/sync-lazyview.sh --check $(if $(CI),--upstream)

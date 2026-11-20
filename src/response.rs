@@ -438,6 +438,8 @@ impl Values {
             .await?
             .ok_or_else(|| anyhow!("no row"))?;
         let cols = got.columns();
+        // `mysql_common::Row::unwrap` panics only on a column that was `take()`n; nothing in
+        // lazywf takes values out of a row, so every value is present.
         Ok(got
             .unwrap()
             .into_iter()

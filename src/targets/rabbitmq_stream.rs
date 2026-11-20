@@ -1005,11 +1005,13 @@ async fn items_of(
 pub fn rule_errors(def: &RuleDef, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     if def.fire_per == FirePer::Batch && def.batch_max_bytes.is_some_and(|n| n > limit) {
-        out.push(format!(
-            "`batch_max_bytes` {} is over {limit}, the most one publish takes \
-             (the stream frame limit)",
-            def.batch_max_bytes.unwrap()
-        ));
+        // the `is_some_and` above already proved it is `Some`; bind it instead of unwrapping
+        if let Some(n) = def.batch_max_bytes {
+            out.push(format!(
+                "`batch_max_bytes` {n} is over {limit}, the most one publish takes \
+                 (the stream frame limit)",
+            ));
+        }
     }
     out
 }
