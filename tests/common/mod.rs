@@ -596,6 +596,14 @@ enum MockFault {
         n: usize,
         answered: usize,
     },
+    /// Answer the first `n` requests with `status` (design §3: the 5xx burst of T3; S5 keeps a
+    /// flush refused with it). A refused answer is a fault event the mock itself registers, never
+    /// a delivery (design §1 P4).
+    RespondNth {
+        n: usize,
+        status: u16,
+        answered: usize,
+    },
 }
 
 struct MockState {
@@ -714,6 +722,9 @@ impl Mock {
                                                 *answered += 1;
                                                 false
                                             }
+                                            // respond_nth answers every request (some with 5xx):
+                                            // nothing is ever held by it.
+                                            MockFault::RespondNth { .. } => false,
                                             MockFault::Live => false,
                                         }
                                     };
@@ -752,12 +763,39 @@ impl Mock {
                                     .collect();
                                 let (status, body, extra) = {
                                     let mut g = st.lock().unwrap();
-                                    let (status, body) = (g.handler)(&req);
+                                    let (mut status, body) = (g.handler)(&req);
+                                    // The `respond_nth` burst: the answer is overridden here, in
+                                    // the same single lock scope the held-request path warns
+                                    // about, and the firing is registered in the harness fault log
+                                    // (one lock each, never the mock's while the log's is held).
+                                    let mut refused = None;
+                                    // The tag is copied out first: `g.fault` is borrowed mutably
+                                    // for the rest of this scope.
+                                    let tag = g.tag.clone();
+                                    if let MockFault::RespondNth {
+                                        n,
+                                        status: s,
+                                        answered,
+                                    } = &mut g.fault
+                                    {
+                                        if *answered < *n {
+                                            *answered += 1;
+                                            status = *s;
+                                            refused = Some(format!(
+                                                "mock {tag} respond_nth({n})={s} fired: {} {} \
+                                                 refused ({}/{})",
+                                                req.method, req.path, *answered, n
+                                            ));
+                                        }
+                                    }
                                     let extra: String = (g.headers)(&req)
                                         .into_iter()
                                         .map(|(k, v)| format!("{k}: {v}\r\n"))
                                         .collect();
                                     g.reqs.push(req);
+                                    if let (Some(l), Some(msg)) = (&g.fault_log, refused) {
+                                        l.add(msg);
+                                    }
                                     (status, body, extra)
                                 };
                                 let resp = format!(
@@ -841,6 +879,21 @@ impl Mock {
         g.fault = MockFault::HoldAfter { n, answered: 0 };
         if let Some(l) = &g.fault_log {
             l.add(format!("mock {} hold_after({n}) armed", g.tag));
+        }
+    }
+
+    /// Answer the first `n` still-unanswered requests with `status`, the rest with the current
+    /// handler (design §3's `respond_nth`). Every refusal it hands out registers a fault-log
+    /// event, so a refused flush is a fault event, never a delivery (design §1 P4).
+    pub fn respond_nth(&self, n: usize, status: u16) {
+        let mut g = self.state.lock().unwrap();
+        g.fault = MockFault::RespondNth {
+            n,
+            status,
+            answered: 0,
+        };
+        if let Some(l) = &g.fault_log {
+            l.add(format!("mock {} respond_nth({n}, {status}) armed", g.tag));
         }
     }
 
