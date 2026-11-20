@@ -2095,7 +2095,10 @@ async fn h1_sampler_pin_floor_still_bites() {
 ///    answered), so the flush is frozen, the keys are never delivered and the phase stays open —
 ///    the exact state P2 speaks about. The engine's own row is verified to sit *below* the
 ///    checkpoint and the sampler, which has sampled several times by then, has said nothing. That
-///    is the control half: without it, a sampler that refuses everything would pass step 2.
+///    is the control half: without it, a sampler that refuses everything would pass step 2. A
+///    small delivered phase comes first (see the note where it is written) so that the row this
+///    step reads exists because the seed caused it, not because the engine happened to persist
+///    something during its start.
 /// 2. The child is terminated (so no one writes the row back) and the row is forged to *exactly*
 ///    the checkpoint — the boundary itself, not a byte past it, so a `>=` relaxed to `>` is caught
 ///    here too. The sampler must refuse, naming P2, the rule and the phase whose keys are missing.
@@ -2126,7 +2129,26 @@ async fn h2_sampler_checkpoint_check_still_bites() {
     let sp = Sampler::start(&db, log.clone());
     sp.add_log(&lazy.log_path);
 
-    // The hold first, then the write: nothing this phase produces can be answered, so its keys stay
+    // A delivered phase FIRST, for the same reason S2 has one: the row this seed reads in the
+    // control (and forges in step 2) exists only once the engine has confirmed something, and a
+    // seed may not read a row its own steps did not cause. The first version armed the hold as the
+    // very first thing it did and then expected the row; on a run where the engine had persisted
+    // nothing yet, `status("h")` answered None and the seed died on its own control, not on P2
+    // (observed on the box, mariadb1011, 2026-11-20: 8 passed / 1 failed, h2 at "rule row while the
+    // flush is held"). Draining a warm-up phase makes the row's existence a consequence, not luck.
+    bulk_orders(&db, 1, 10).await;
+    let cp0 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "h",
+        "the 10 delivered orders",
+        cp0.clone(),
+        keyset(1, 10),
+        &mock,
+    );
+    drain(&sp, &lazy, &db, "h", cp0.clone(), 60).await;
+
+    // The hold now, then the write: nothing this phase produces can be answered, so its keys stay
     // undelivered and its phase stays open — the state P2 exists for.
     mock.hold_after(0);
     bulk_orders(&db, 201, 210).await;
@@ -2153,11 +2175,15 @@ async fn h2_sampler_checkpoint_check_still_bites() {
     .await;
 
     // The control: an honest engine keeps the row below the checkpoint of a phase whose keys have
-    // not arrived, and the sampler must have looked without saying anything.
-    let (before_f, before_p, _, _) = db
-        .status("h")
-        .await
-        .expect("rule row while the flush is held");
+    // not arrived, and the sampler must have looked without saying anything. Read with a deadline
+    // rather than `expect`: the warm-up above makes the row's existence a consequence, and a seed
+    // should still say which condition it is waiting on if one ever is slow.
+    let (before_f, before_p, _, _) = wait_for(
+        Duration::from_secs(30),
+        "the rule row the drained warm-up left behind",
+        || async { db.status("h").await },
+    )
+    .await;
     assert!(
         (before_f.clone(), before_p) < cp,
         "the engine confirmed {}:{} at or past the checkpoint {}:{} of a phase whose keys were \
