@@ -323,6 +323,8 @@ impl MySqlClient {
                 .map(|r| {
                     let cols = r.columns();
                     let mut m = Map::new();
+                    // `mysql_common::Row::unwrap` panics only on a column that was `take()`n;
+                    // nothing in lazywf takes values out of a row, so every value is present.
                     for (i, v) in r.unwrap().into_iter().enumerate() {
                         // Prepared results carry FLOAT as the binary f32 (1.100000023841858);
                         // the text protocol gave its shortest decimal text (1.1), which is
@@ -333,9 +335,12 @@ impl MySqlClient {
                             }
                             v => v,
                         };
+                        // the row's values and columns have the same length; go through `get`
+                        // so both sides of the pair read the same way
+                        let col = cols.get(i);
                         m.insert(
-                            cols[i].name_str().into_owned(),
-                            crate::docs::to_json(v, cols.get(i)),
+                            col.map(|c| c.name_str().into_owned()).unwrap_or_default(),
+                            crate::docs::to_json(v, col),
                         );
                     }
                     Value::Object(m)
