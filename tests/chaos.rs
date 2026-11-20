@@ -1147,12 +1147,27 @@ async fn s3_source_flapping() {
     assert_no_undelivered(&lazy);
 
     // What was measured, and what it has to satisfy. (1) the storm was real: the proxy counted
-    // exactly the design's six resets, and the engine tried to connect that many more times.
+    // exactly the design's six resets, and the engine tried to connect that many more times. The
+    // two counters are asked for separately on purpose: `flap_cuts` says how many connects the
+    // storm *claimed*, `flap_resets` says how many sockets were actually given an RST. Mutation M2
+    // (the reset call removed, the counting left alone) left every connection to be closed by the
+    // normal drop — a plain EOF, not the reset the seed injects — the engine reconnected from that
+    // anyway, and S3 was green. So the claim "every accepted dump connection was reset" is only
+    // backed by the counter taken where the reset is performed. What the peer's side of that is
+    // remains the asserts below about the engine's own reconnects, its announced backoff ladder and
+    // the 900 keys.
     let st = binp.stat();
     assert_eq!(
         st.flap_cuts, 6,
         "the flap reset {} connections, not the six the seed injects",
         st.flap_cuts
+    );
+    assert_eq!(
+        st.flap_resets, 6,
+        "the flap counted {} cuts but only reset {} connections: a storm that decrements its own \
+         counter without touching the sockets is a number, not a fault, and nothing below this \
+         line would have noticed",
+        st.flap_cuts, st.flap_resets
     );
     assert!(
         st.conns >= conns0 + 6,

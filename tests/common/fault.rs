@@ -113,6 +113,10 @@ pub struct ProxyStat {
     pub delivered_s2c: u64,
     /// Dump connections reset by `flap` so far.
     pub flap_cuts: u64,
+    /// Dump connections the flap actually gave an RST to (`flap_cuts` is decremented before the
+    /// reset; this one is counted after it succeeded, so the two can disagree — and S3 refuses a
+    /// storm where they do).
+    pub flap_resets: u64,
     /// Times `cut_after_bytes` has fired (it is a one-shot, so 0 or 1).
     pub byte_cuts: u64,
     /// How many server→client bytes had flowed past the arming point when the last
@@ -161,6 +165,9 @@ struct Core {
     /// the engine was ALLOWED to see, which is the only thing a stalled stream is a claim about.
     delivered_s2c: AtomicU64,
     flap_cuts: AtomicU64,
+    /// Dump connections the flap really reset (`hard_close_counted` said the socket took the
+    /// linger-0 drop). Counted where the reset is performed, never where it is planned.
+    flap_resets: AtomicU64,
     byte_cuts: AtomicU64,
     /// How far past its arming point the last `cut_after_bytes` had relayed when it fired: the
     /// seed's proof of *where* in a group the reset landed, counted by the proxy.
@@ -200,6 +207,7 @@ impl FaultProxy {
             bytes_s2c: AtomicU64::new(0),
             delivered_s2c: AtomicU64::new(0),
             flap_cuts: AtomicU64::new(0),
+            flap_resets: AtomicU64::new(0),
             byte_cuts: AtomicU64::new(0),
             last_cut_at: AtomicU64::new(0),
             accepts: Mutex::new(Vec::new()),
@@ -241,6 +249,8 @@ impl FaultProxy {
                     // one of the storm has been reset the mode ends by itself, so the next
                     // connect is relayed ("cut every accepted connection 6 times, then let it
                     // through", design §2 S3 — counted by the proxy, never guessed by the test).
+                    // `flap_cuts` counts the connects the storm claimed; `flap_resets` is counted
+                    // only where the reset is performed, so S3 can tell a storm from a counter.
                     Kind::Flap => {
                         let (n, done) = {
                             let mut m = c.mode.lock().unwrap();
@@ -251,7 +261,9 @@ impl FaultProxy {
                             }
                             (c.flap_cuts.fetch_add(1, Ordering::Relaxed) + 1, done)
                         };
-                        hard_close(cli);
+                        if hard_close_counted(cli) {
+                            c.flap_resets.fetch_add(1, Ordering::Relaxed);
+                        }
                         if let Some(l) = &c.log {
                             l.add(format!(
                                 "proxy {} flap: dump connection #{n} reset{}",
@@ -415,6 +427,7 @@ impl FaultProxy {
             bytes_s2c: self.core.bytes_s2c.load(Ordering::Relaxed),
             delivered_s2c: self.core.delivered_s2c.load(Ordering::Relaxed),
             flap_cuts: self.core.flap_cuts.load(Ordering::Relaxed),
+            flap_resets: self.core.flap_resets.load(Ordering::Relaxed),
             byte_cuts: self.core.byte_cuts.load(Ordering::Relaxed),
             bytes_at_cut: self.core.last_cut_at.load(Ordering::Relaxed),
         }
@@ -446,12 +459,22 @@ impl Core {
 }
 
 /// Drop with `SO_LINGER` 0: the kernel sends RST, so the peer sees a reset, not a clean FIN.
-/// `with_timeout(0)` does not block the thread (the deprecation note's worry), and this is
-/// harness code that never runs in the product.
-#[allow(deprecated)]
+/// Nobody is counting this one; where the count matters use [`hard_close_counted`].
 fn hard_close(s: TcpStream) {
-    let _ = s.set_linger(Some(Duration::ZERO));
+    let _ = hard_close_counted(s);
+}
+
+/// `hard_close` with the answer to "was the reset really performed": linger 0 is what makes the
+/// drop send an RST instead of a FIN, and its error is the only signal available before the
+/// descriptor goes away. The flap counts through this, so a flap that decrements its own counter
+/// without ever touching a socket cannot claim a storm it did not deliver (mutation M2, and S3's
+/// `flap_resets` assert). What it cannot claim is what the peer saw — the engine's side of that is
+/// S3's own asserts about reconnects, the backoff ladder and the 900 keys.
+#[allow(deprecated)]
+fn hard_close_counted(s: TcpStream) -> bool {
+    let ok = s.set_linger(Some(Duration::ZERO)).is_ok();
     drop(s);
+    ok
 }
 
 async fn relay(cli: TcpStream, core: Arc<Core>, my_gen: u64) {
