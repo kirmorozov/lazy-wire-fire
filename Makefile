@@ -72,10 +72,10 @@ E2E_THREADS ?= 4
 E2E_TARGETS := redis valkey postgres s3
 
 # Owner rule (2026-11-16): a test server is a composition for the run, not a container that stays up
-# for days. `test-e2e`, `test-e2e-all`, `test-e2e-search`, `test-e2e-queues`, `test-e2e-pgsrc` and
-# `test-matrix` (`test-prerelease` delegates to it) each bring up exactly the services their own run
-# talks to and remove them again with `rm -sfv` per service, so a run leaves no container behind;
-# `test-chaos` brings nothing up and is not one of them. `rm -sfv` names this run's services and
+# for days. `test-e2e`, `test-e2e-all`, `test-chaos`, `test-chaos-all`, `test-e2e-search`,
+# `test-e2e-queues`, `test-e2e-pgsrc` and `test-matrix` (`test-prerelease` delegates to it) each
+# bring up exactly the services their own run talks to and remove them again with `rm -sfv` per
+# service, so a run leaves no container behind. `rm -sfv` names this run's services and
 # leaves the rest alone, where `down` would take the whole `lazywf-test` project away — including the
 # standing `make servers` set another session may be using — so dropping everything stays
 # `make servers-down`'s job, where an operator asks for it.
@@ -108,13 +108,25 @@ test-e2e-all:
 
 # The chaos seeds (tests/chaos.rs): the engine as a child, in-process fault proxies between it
 # and the servers, faults gated on observed events. Children plus proxies: two test threads.
-# On the shared servers of this host run it through the shared runner (BIN=<chaos binary>
-# tmp/e2e-shared.sh), which holds the heavy-suite lock and cleans the lwf_* schemas.
+# What the run talks to is the server under test and its own children: every target is an
+# in-process mock and the proxies are in-process, so this brings up `mysql84` alone — no
+# services of $(E2E_TARGETS) — and removes it again on the rule above.
 test-chaos:
+	@set -e; \
+	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
+	$(COMPOSE) up -d --wait mysql84; \
 	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test chaos -- --test-threads=2
 
-# The same on both servers of the default set.
-test-chaos-all: test-chaos
+# The same on both servers of the default set. Self-contained rather than `test-chaos-all:
+# test-chaos`, as with `test-e2e-all`: the first run's teardown would take MySQL away from the
+# second. The MySQL run goes first and a failure of it stops the MariaDB run, as before.
+test-chaos-all:
+	@set -e; \
+	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 mariadb1011 >/dev/null 2>&1 || true' EXIT; \
+	trap 'exit 1' INT TERM; \
+	$(COMPOSE) up -d --wait mysql84 mariadb1011; \
+	LAZYWF_TEST_DSN=$(E2E_DSN) $(CARGO) test --test chaos -- --test-threads=2; \
 	LAZYWF_TEST_DSN=$(E2E_DSN_MARIADB) $(CARGO) test --test chaos -- --test-threads=2
 
 # The search re-sync against OpenSearch 2.19, Elasticsearch 7.17 and 8.17 (compose profile
