@@ -4,7 +4,11 @@
 //! deliveries), never on a wall-clock sleep. S1 `source_cut_mid_stream`, T1 `target_down`
 //! (with a healthy sibling rule that must keep advancing) and P1 `sigkill_mid_flush` exercise
 //! P1–P5 jointly; S2–S5 add the rest of the source class (stall, flapping, a cut inside a
-//! 50 000-row group, and an XA whose COMMIT lands across a cut and across a kill).
+//! 50 000-row group, and an XA whose COMMIT lands across a cut and across a kill). `h1` and `h2`
+//! are harness self-tests, and they are the reason two of the sampler's invariants can be trusted:
+//! each forges a row that *should* be refused — a position below a declared XA floor, and a position
+//! at the checkpoint of a phase whose keys never arrived — and requires the refusal. An invariant
+//! nobody has seen fail is not an invariant.
 //!
 //! `make test-chaos`, or through the shared runner: `BIN=<chaos binary> TESTS_DIR=<tests>
 //! tmp/e2e-shared.sh` (schema names stay literal `chaos_*` so its cleanup finds them).
@@ -2062,6 +2066,136 @@ async fn h1_sampler_pin_floor_still_bites() {
     assert_no_undelivered(&lazy);
     // `sp.check()` is NOT called: the violation just read is the expected outcome of the seed.
     drop(guard);
+    sp.stop();
+}
+
+/// The other checker the whole file leans on, proven the same way as the floor: P2, "while a
+/// phase's keys are not all at the target, its rule's position stays below that phase's
+/// checkpoint". Every seed that *has* an open phase gets it for free from an honest engine, which
+/// never crosses that line, so the branch in `sample` that reports it is a code path no green run
+/// ever takes — mutation M3 (the check disabled) left the whole suite green, which is how I found
+/// that nothing owned it. `h2_sampler_checkpoint_check_still_bites` takes it in both directions:
+///
+/// 1. Ten orders are written with the target holding every request it takes (accepted, never
+///    answered), so the flush is frozen, the keys are never delivered and the phase stays open —
+///    the exact state P2 speaks about. The engine's own row is verified to sit *below* the
+///    checkpoint and the sampler, which has sampled several times by then, has said nothing. That
+///    is the control half: without it, a sampler that refuses everything would pass step 2.
+/// 2. The child is terminated (so no one writes the row back) and the row is forged to *exactly*
+///    the checkpoint — the boundary itself, not a byte past it, so a `>=` relaxed to `>` is caught
+///    here too. The sampler must refuse, naming P2, the rule and the phase whose keys are missing.
+///
+/// Like h1, `check()` is never called after the forgery: the violation is the expected outcome, so
+/// it is read through [`Sampler::violation`] and quoted in the summary. P5 does not apply to this
+/// seed — its flush was never answered, which is a fault the seed itself injected, and the child
+/// log is checked before that point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_sampler_checkpoint_check_still_bites() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_h2").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("h2-hook");
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    join_rule(&db, "h", "hook", "orders").await;
+    // No proxies: like h1, this seed injects no fault at the wire. It injects a row.
+    let mut lazy = Lazy::start(
+        "h2_sampler_checkpoint_check_still_bites",
+        &db,
+        &[],
+        Some(log.clone()),
+    );
+    lazy.ready(60).await;
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_log(&lazy.log_path);
+
+    // The hold first, then the write: nothing this phase produces can be answered, so its keys stay
+    // undelivered and its phase stays open — the state P2 exists for.
+    mock.hold_after(0);
+    bulk_orders(&db, 201, 210).await;
+    let cp = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "h",
+        "the 10 held orders",
+        cp.clone(),
+        keyset(201, 210),
+        &mock,
+    );
+    wait_for(
+        Duration::from_secs(60),
+        "the held flush to reach the target and be frozen",
+        || async { log.has("hold_after fired").then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(30),
+        "the sampler to have sampled the open phase a few times",
+        || async { (sp.samples() >= 3).then_some(()) },
+    )
+    .await;
+
+    // The control: an honest engine keeps the row below the checkpoint of a phase whose keys have
+    // not arrived, and the sampler must have looked without saying anything.
+    let (before_f, before_p, _, _) = db
+        .status("h")
+        .await
+        .expect("rule row while the flush is held");
+    assert!(
+        (before_f.clone(), before_p) < cp,
+        "the engine confirmed {}:{} at or past the checkpoint {}:{} of a phase whose keys were \
+         never delivered: P2 would be reporting a real violation in a seed that expects none",
+        before_f,
+        before_p,
+        cp.0,
+        cp.1
+    );
+    assert!(
+        sp.violation().is_none(),
+        "the sampler called the honest state a violation before anything was forged: {}",
+        sp.violation().expect("just checked")
+    );
+    assert!(
+        sp.open_phases()
+            .iter()
+            .any(|(r, _, _, missing)| r == "h" && *missing == 10),
+        "the phase must be open with all 10 keys missing for the forgery to test P2: {:?}",
+        sp.open_phases()
+    );
+
+    // Forge to exactly the checkpoint, with the child gone so nobody writes the row back.
+    lazy.term().await;
+    log.add(format!(
+        "h2: forging the rule row up to the checkpoint {cp:?} with its 10 keys still missing"
+    ));
+    forge_row(&db, "h", &cp).await;
+    let v = wait_for(
+        Duration::from_secs(30),
+        "the sampler to call the checkpoint of an undelivered phase a violation",
+        || async { sp.violation() },
+    )
+    .await;
+    assert!(
+        v.contains("P2:") && v.contains("rule h") && v.contains("is open"),
+        "the refusal must be P2 naming the rule and the open phase whose keys are missing, got {v}"
+    );
+
+    eprintln!(
+        "H2: {} samples with the honest row at {before_f}:{before_p} and the checkpoint at {}:{} \
+         (10 keys held at the mock, phase open), then forged to the checkpoint and the sampler \
+         refused: {}",
+        sp.samples(),
+        cp.0,
+        cp.1,
+        v.lines().next().unwrap_or_default(),
+    );
+    // P5 while the engine still owed nothing: the child was terminated after the hold, so a real
+    // undelivered line at this point would be a finding. (`sp.check()` is NOT called: the violation
+    // above is the outcome this seed asks for.)
+    assert_no_undelivered(&lazy);
+    mock.heal();
     sp.stop();
 }
 
