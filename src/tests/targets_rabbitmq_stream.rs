@@ -327,3 +327,33 @@ fn a_batch_over_the_frame_limit_refuses_at_load() {
         "a key fires no batch"
     );
 }
+
+/// A poisoned confirm map is neither a second panic nor a stuck publisher. `resolve` still delivers
+/// what the broker said, `lose_all` still answers everything still awaited as `Lost`, and an id that
+/// never made it into the map before the panic is answered by the publish deadline — which is
+/// `Confirm::Lost`, a retry, never a refusal.
+#[tokio::test]
+async fn confirm_waiters_settle_their_items_on_a_poisoned_lock() {
+    let w: Waiters = StdMutex::new(HashMap::new());
+    let (tx, before) = oneshot::channel();
+    lock_waiters(&w).insert(1, tx);
+    crate::poison::poison(&w);
+    // Registered after the poison, exactly as the publish path registers a batch: one `insert` per
+    // publishing id, the sender whole in each.
+    let (tx2, after) = oneshot::channel();
+    lock_waiters(&w).insert(2, tx2);
+    resolve(&w, 1, Confirm::Confirmed);
+    assert!(
+        matches!(before.await.unwrap(), Confirm::Confirmed),
+        "the confirm the broker gave still reaches the record it belongs to"
+    );
+    // An id the map never held is answered by nobody here — and that is the safe answer, because
+    // the await turns it into `Lost` at the deadline.
+    resolve(&w, 99, Confirm::Confirmed);
+    lose_all(&w);
+    assert!(
+        matches!(after.await.unwrap(), Confirm::Lost),
+        "everything still awaited is answered as lost, which the caller turns into a retry"
+    );
+    assert!(lock_waiters(&w).is_empty(), "and the map is empty again");
+}

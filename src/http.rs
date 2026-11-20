@@ -5,7 +5,7 @@
 //! line that is only whitespace is ignored. The client sends it as HTTP/1.1, adding `Host`
 //! (when missing), `Content-Length` (from the body) and the target's authentication.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -473,8 +473,17 @@ impl Client {
         })
     }
 
+    /// The idle pool, poisoned or not. `push` and `pop` move one whole `(Conn, Instant)` at a time,
+    /// so what a task that died holding this lock can leave behind is a connection lost (the next
+    /// send dials a new one) or a stale one still in the list — and `send` already survives that: a
+    /// pooled connection found closed is retried on a fresh one. Locking was a second panic on every
+    /// http send.
+    fn idle_pool(&self) -> MutexGuard<'_, Vec<(Conn, Instant)>> {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn pooled(&self) -> Option<Conn> {
-        let mut idle = self.idle.lock().expect("pool");
+        let mut idle = self.idle_pool();
         while let Some((c, at)) = idle.pop() {
             if at.elapsed() < POOL_IDLE {
                 return Some(c);
@@ -484,7 +493,7 @@ impl Client {
     }
 
     fn put_back(&self, c: Conn) {
-        let mut idle = self.idle.lock().expect("pool");
+        let mut idle = self.idle_pool();
         if idle.len() < POOL_MAX {
             idle.push((c, Instant::now()));
         }

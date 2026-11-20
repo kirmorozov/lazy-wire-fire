@@ -438,3 +438,30 @@ async fn an_empty_credential_goes_on_the_wire_as_empty() {
         assert!(sent.ends_with("\r\n\r\nx"), "{kind}: {sent}");
     }
 }
+
+/// A poisoned endpoint client pool is a cache with a hole in it, not a failed send: the origin is
+/// looked up, a client that is not there is built and inserted whole, and the next call finds that
+/// one. Nothing here can hand out half a client, and no part of the secret URL is in the key.
+#[test]
+fn the_endpoint_client_pool_yields_a_client_on_a_poisoned_lock() {
+    let pool: Mutex<HashMap<String, Arc<HttpClient>>> = Mutex::new(HashMap::new());
+    let tls = TlsSpec::parse(None).unwrap();
+    crate::poison::poison(&pool);
+    let url = SecretUrl::parse("https://hooks.example.test/ingest/4f2a").unwrap();
+    let first = secret_client(&pool, &url, &tls).expect("a client is built on a poisoned pool");
+    let again = secret_client(&pool, &url, &tls).expect("and found in the pool the next time");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "the pool cached it, not rebuilt it"
+    );
+    // Another origin is another entry, built the same way, with the secret part of neither in its
+    // key.
+    let other = SecretUrl::parse("https://other.example.test/x").unwrap();
+    let second = secret_client(&pool, &other, &tls).unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    let again_other = secret_client(&pool, &other, &tls).unwrap();
+    assert!(
+        Arc::ptr_eq(&again_other, &second),
+        "and the second origin is cached too, not rebuilt per call"
+    );
+}

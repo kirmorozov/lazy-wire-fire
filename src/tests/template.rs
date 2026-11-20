@@ -773,3 +773,25 @@ fn push_text_appends_what_text_returns() {
     push_text(&Value::String("|x".into()), &mut s);
     assert_eq!(s, "7|x");
 }
+
+/// A poisoned regex memo is a memo with a hole in it, not a failed render: the pattern is still
+/// compiled, still cached (the very same `Arc` comes back the second time), still rewrites, and a
+/// pattern that does not compile is still the helper's own error rather than a panic.
+#[test]
+fn replace_compiles_and_caches_on_a_poisoned_memo() {
+    let r = Replace::default();
+    crate::poison::poison(&r.cache);
+    let first = r
+        .compiled("(\\d+)")
+        .expect("a valid pattern compiles on a poisoned cache");
+    assert_eq!(first.replace_all("a1b22", "<$1>"), "a<1>b<22>");
+    let second = r.compiled("(\\d+)").expect("and compiles again");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "the entry was cached, not recompiled"
+    );
+    assert!(
+        r.compiled("([0-9]+").is_err(),
+        "a bad pattern is refused as it always was"
+    );
+}

@@ -339,3 +339,186 @@ async fn an_empty_flush_is_answered_before_the_stream() {
     assert!(out.verdicts.is_empty(), "{:?}", out.verdicts);
     assert!(out.refused.is_none(), "an empty flush is nothing's refusal");
 }
+
+/// The reconnect curve is two counters behind a mutex: a task that died holding it leaves a fail
+/// count, not a panic on the next dial.
+#[tokio::test]
+async fn the_backoff_counts_on_a_poisoned_lock() {
+    let call = Call::new(codec_ask(Some(Codec::Identity)));
+    crate::poison::poison(&call.backoff);
+    call.lock_backoff().fails = 4;
+    assert_eq!(call.lock_backoff().fails, 4, "the curve survived the panic");
+    call.lock_backoff().fails = 0;
+    assert_eq!(
+        call.lock_backoff().fails,
+        0,
+        "and a successful open still resets it"
+    );
+}
+
+/// A poisoned batch of answers still reads its own slots, still takes the verdict the server gave,
+/// and still finishes: the slots it cannot show are answered `Lost` by `take`, the same answer the
+/// flush's deadline would have given them. No verdict is invented, and no flush waits on a slot
+/// nobody can fill.
+#[test]
+fn a_poisoned_batch_still_answers_and_still_finishes() {
+    let b = Batch::new(3, 10);
+    crate::poison::poison(&b.answers);
+    assert!(
+        !b.answered() && b.unanswered() == 3,
+        "a poisoned batch still knows what it has been told"
+    );
+    b.set(
+        1,
+        Verdict::Ack {
+            seq: 2,
+            hash: 7,
+            status: AckStatus::Ok,
+            reason: String::new(),
+        },
+    );
+    assert_eq!(b.unanswered(), 2, "the answer landed in its own slot");
+    b.set(1, Verdict::Lost("a later, lesser answer".into()));
+    let v = b.take();
+    assert!(
+        matches!(
+            &v[1],
+            Verdict::Ack {
+                seq: 2,
+                hash: 7,
+                status: AckStatus::Ok,
+                ..
+            }
+        ),
+        "the first answer is the one kept: {:?}",
+        v[1]
+    );
+    assert!(
+        matches!(&v[0], Verdict::Lost(_)) && matches!(&v[2], Verdict::Lost(_)),
+        "the slots nobody answered are lost, not absent: {v:?}"
+    );
+}
+
+/// A task that died holding the ring's lock ends the stream rather than being answered for: `close`
+/// gives every batch in flight its reason and wakes its flush, so nothing is silently dropped and
+/// nothing waits for an ack that will not come. The ring is deliberately *not* cleared in place —
+/// the counters stay as they were and no sequence number already handed out is handed out again on a
+/// live stream, because an ack is routed by `seq & RING_MASK` and a reused number could land in
+/// another batch's slot and count a key delivered that was not.
+#[tokio::test]
+async fn a_poisoned_ring_ends_the_stream_with_a_reason() {
+    let shared = codec_ask(Some(Codec::Identity));
+    let tail = Arc::new(Tail::new(Arc::clone(&shared)));
+    let r = tail.reserve(&outbound(&["a", "b", "c"])).unwrap();
+    let waiter = {
+        let tail = Arc::clone(&tail);
+        let batch = Arc::clone(&r.batch);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !batch.answered() {
+                if !wait(&tail, deadline).await {
+                    break;
+                }
+            }
+            batch.take()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    crate::poison::poison(&tail.state);
+    assert_eq!(
+        tail.pending(),
+        3,
+        "the readers answer instead of panicking, and still say what is in flight"
+    );
+    assert!(
+        tail.reserve(&outbound(&["late"])).is_none(),
+        "no reservation is made on a ring nobody trusts"
+    );
+    let v = waiter.await.unwrap();
+    assert!(
+        v.iter()
+            .all(|v| matches!(v, Verdict::Lost(w) if w.contains("poison"))),
+        "every item in flight is answered with a cause, not left waiting: {v:?}"
+    );
+    let f = tail.over_now().expect("the stream says it is over");
+    assert!(!f.refuse, "a poison is a moment, not a verdict on the keys");
+    assert!(
+        tail.reserve(&outbound(&["again"])).is_none(),
+        "and the stream is over for the next flush as well"
+    );
+    assert_eq!(
+        tail.pending(),
+        3,
+        "the window's counters are left as they were, not zeroed to look clean"
+    );
+}
+
+/// The other multi-step writer, `forget`: on a poisoned lock it does not subtract counters that may
+/// already disagree with the slots (that is how a window drifts, and then wedges at "full"). It ends
+/// the stream, which is the state this file already has for "nothing more may be reserved", and both
+/// the forgotten flush and the one still in flight are answered as lost.
+#[tokio::test]
+async fn a_poisoned_forget_ends_the_stream_instead_of_drifting_the_window() {
+    let shared = codec_ask(Some(Codec::Identity));
+    let tail = Arc::new(Tail::new(Arc::clone(&shared)));
+    let a = tail.reserve(&outbound(&["a", "b"])).unwrap();
+    let b = tail.reserve(&outbound(&["c"])).unwrap();
+    crate::poison::poison(&tail.state);
+    tail.forget(&a.batch);
+    let va = a.batch.take();
+    let vb = b.batch.take();
+    assert!(
+        va.iter()
+            .all(|v| matches!(v, Verdict::Lost(w) if w.contains("poison"))),
+        "the flush that was forgotten is answered: {va:?}"
+    );
+    assert!(
+        vb.iter()
+            .all(|v| matches!(v, Verdict::Lost(w) if w.contains("poison"))),
+        "and so is the one still in flight: {vb:?}"
+    );
+    assert!(tail.over_now().is_some(), "the stream is over");
+    assert!(
+        tail.reserve(&outbound(&["d"])).is_none(),
+        "no sequence number is handed out on it again"
+    );
+}
+
+/// `answer` on a poisoned ring keeps both of its duties: an acknowledgement it cannot stand behind
+/// (the `hash` is not the one the item was sent with) still gets no verdict out of lazywf — that is
+/// the check that stops a stale ack confirming a newer document — while one it can stand behind still
+/// lands, so the item is not made to wait for an answer it earned.
+#[tokio::test]
+async fn a_poisoned_ring_still_refuses_an_ack_it_cannot_stand_behind() {
+    let shared = codec_ask(Some(Codec::Identity));
+    let tail = Arc::new(Tail::new(Arc::clone(&shared)));
+    let r = tail.reserve(&outbound(&["a", "b"])).unwrap();
+    crate::poison::poison(&tail.state);
+    let hash = r.envelope.items[1].hash;
+    tail.answer(&Ack {
+        seq: 2,
+        hash: hash ^ 1,
+        status: AckStatus::Ok as i32,
+        reason: String::new(),
+    });
+    assert_eq!(
+        r.batch.unanswered(),
+        2,
+        "an ack whose hash is not the one the item was sent with is still ignored"
+    );
+    tail.answer(&Ack {
+        seq: 2,
+        hash,
+        status: AckStatus::Ok as i32,
+        reason: String::new(),
+    });
+    assert_eq!(
+        r.batch.unanswered(),
+        1,
+        "and an ack it can stand behind still reaches the item"
+    );
+    assert!(
+        tail.over_now().is_none(),
+        "answering is not what ends the stream"
+    );
+}
