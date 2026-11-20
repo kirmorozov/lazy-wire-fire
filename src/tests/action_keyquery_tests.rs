@@ -105,3 +105,37 @@ fn counting_the_allocator_counts_allocations_on_this_thread() {
     let (_, n) = alloc_measure::count(|| Vec::<u8>::with_capacity(64));
     assert_eq!(n, 1, "one Vec::with_capacity counts one");
 }
+
+/// The commit-fence memo answers on a poisoned lock. A probe is decided before the lock and stored
+/// by one `insert`, and an over-full memo is dropped whole, so what a task that died holding it can
+/// leave is one connection re-probed (`fence::probe` is idempotent) — never a second panic on the
+/// job task, which is where the fence runs.
+#[test]
+fn the_probe_memo_answers_on_a_poisoned_lock() {
+    let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+    let env = super::Env::new(
+        pool.clone(),
+        pool,
+        crate::source::Flavor::MySql,
+        std::time::Duration::ZERO,
+        1,
+    );
+    crate::poison::poison(&env.probes);
+    assert_eq!(
+        super::probe_cached(&super::probe_memo(&env), 7),
+        None,
+        "a poisoned memo still reads as empty"
+    );
+    super::probe_remember(&mut super::probe_memo(&env), 7, super::Probe::Ordered);
+    super::probe_remember(&mut super::probe_memo(&env), 8, super::Probe::Unordered);
+    assert_eq!(
+        super::probe_cached(&super::probe_memo(&env), 7),
+        Some(super::Probe::Ordered),
+        "and still remembers what it was told"
+    );
+    assert_eq!(
+        super::probe_cached(&super::probe_memo(&env), 8),
+        Some(super::Probe::Unordered),
+        "the second entry did not cost the first"
+    );
+}

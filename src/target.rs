@@ -287,7 +287,11 @@ fn secret_client(
         if url.base.secure { "https" } else { "http" },
         url.base.host_header()
     );
-    let mut pool = clients.lock().expect("the endpoint's client pool");
+    // Poisoned or not. The map is read first, and a client that is not in it is built a few lines
+    // below, so what a task that died holding this lock can leave is one client rebuilt on the next
+    // call (and the cap clears the pool wholesale anyway). Locking it was a second panic on every
+    // send to a secret endpoint.
+    let mut pool = clients.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(client) = pool.get(&key) {
         return Ok(client.clone());
     }

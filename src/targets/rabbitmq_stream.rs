@@ -86,7 +86,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -394,14 +394,24 @@ enum Confirm {
 /// an unregistered id. A `std` mutex, held only for map work and never across an await.
 type Waiters = StdMutex<HashMap<u64, oneshot::Sender<Confirm>>>;
 
+/// The awaited confirms, poisoned or not. Every update of this map is one whole entry — an `insert`
+/// of a sender, or a `remove`/`drain` that takes it out to answer it — so what a task that died
+/// holding this lock can leave behind is an id whose sender is still in the map, or one that never
+/// got in. Both end the way a lost connection does: the item's own wait finds the sender dropped or
+/// runs out at the publish deadline, and `Confirm::Lost` answers it as transient. So a half-registered
+/// batch is retried, never refused, and locking is never a second panic on the publisher.
+fn lock_waiters(w: &Waiters) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<Confirm>>> {
+    w.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn resolve(waiters: &Waiters, id: u64, c: Confirm) {
-    if let Some(tx) = waiters.lock().unwrap().remove(&id) {
+    if let Some(tx) = lock_waiters(waiters).remove(&id) {
         let _ = tx.send(c);
     }
 }
 
 fn lose_all(waiters: &Waiters) {
-    let mut w = waiters.lock().unwrap();
+    let mut w = lock_waiters(waiters);
     for (_, tx) in w.drain() {
         let _ = tx.send(Confirm::Lost);
     }
@@ -621,7 +631,7 @@ impl Client {
             let mut msgs = Vec::with_capacity(idxs.len());
             let mut waits = Vec::with_capacity(idxs.len());
             {
-                let mut w = inner.waiters.lock().unwrap();
+                let mut w = lock_waiters(&inner.waiters);
                 for &i in &idxs {
                     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
                     let (tx, rx) = oneshot::channel();

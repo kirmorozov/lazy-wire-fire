@@ -131,6 +131,15 @@ fn probe_remember(memo: &mut HashMap<u32, Probe>, conn: u32, probe: Probe) {
     memo.insert(conn, probe);
 }
 
+/// The probe memo, poisoned or not. A probe is decided *before* the lock and stored by one `insert`,
+/// and an over-full memo is dropped whole, so what a task that died holding this lock can leave is a
+/// memo with one entry missing — which costs the next flush on that connection one re-probe
+/// ([`fence::probe`] creates its table and answers the same way twice). Locking it was a second panic
+/// on the job task, in a place that named nothing.
+fn probe_memo(env: &Env) -> std::sync::MutexGuard<'_, HashMap<u32, Probe>> {
+    env.probes.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `true` for the first call with this flag (the WARN of a cause is logged once per process).
 fn warn_once(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
@@ -227,7 +236,7 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
 /// cause logs one WARN per process.
 async fn commit_fence(env: &Env, conn: &mut Conn, pos: &Position) -> bool {
     let id = conn.id();
-    let known = probe_cached(&env.probes.lock().expect("probe memo"), id);
+    let known = probe_cached(&probe_memo(env), id);
     let probe = match known {
         Some(p) => p,
         None => {
@@ -241,7 +250,7 @@ async fn commit_fence(env: &Env, conn: &mut Conn, pos: &Position) -> bool {
                     Probe::Failed
                 }
             };
-            probe_remember(&mut env.probes.lock().expect("probe memo"), id, p);
+            probe_remember(&mut probe_memo(env), id, p);
             p
         }
     };

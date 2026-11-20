@@ -353,6 +353,14 @@ impl Call {
         }
     }
 
+    /// The reconnect curve, poisoned or not. `fails` is a counter and `until` one timestamp, each
+    /// written by a single assign, so what a task that died holding this lock can leave behind is a
+    /// dial that waits a little too long or a fail count off by one. Locking it was a second panic
+    /// on the way out of every failed reconnect.
+    fn lock_backoff(&self) -> std::sync::MutexGuard<'_, Backoff> {
+        self.backoff.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The stream's one warning about a server that acknowledges without a status: the
     /// verdict mapping asks for it at every such verdict, so the log says it once.
     pub(crate) fn warn_no_status(&self, url: &str) {
@@ -429,7 +437,7 @@ impl Call {
             }
             // Over: dropped here, and `Drop` stops its tasks.
         }
-        let wait = self.backoff.lock().unwrap().until;
+        let wait = self.lock_backoff().until;
         let now = tokio::time::Instant::now();
         if now < wait {
             let remaining = wait - now;
@@ -446,7 +454,7 @@ impl Call {
         let id = self.opened.fetch_add(1, Ordering::Relaxed) + 1;
         match establish(Arc::clone(&self.shared), id).await {
             Ok(live) => {
-                self.backoff.lock().unwrap().fails = 0;
+                self.lock_backoff().fails = 0;
                 *guard = Some(Arc::clone(&live));
                 Ok(live)
             }
@@ -455,7 +463,7 @@ impl Call {
                 // answered — even with UNIMPLEMENTED naming a codec lazywf must now drop —
                 // is a server that is up, and the next pass wants to meet it now.
                 if !f.demote && !f.refuse {
-                    let mut b = self.backoff.lock().unwrap();
+                    let mut b = self.lock_backoff();
                     b.fails = b.fails.saturating_add(1);
                     let step = BACKOFF_START
                         .saturating_mul(1u32 << b.fails.min(8))
@@ -591,8 +599,17 @@ impl Batch {
         }
     }
 
+    /// The answers, poisoned or not. Every write is one whole slot (`*slot = Some(v)`), and the two
+    /// sweeps answer an empty slot themselves — `lose` with the reason the stream ended, `take` with
+    /// `ACK_NEVER` — so what a task that died holding this lock can leave is a slot still empty,
+    /// which is exactly the answer the flush's own deadline would have given it. No verdict is
+    /// invented from a torn map and no flush waits on a slot nobody can fill.
+    fn lock_answers(&self) -> std::sync::MutexGuard<'_, Vec<Option<Verdict>>> {
+        self.answers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn set(&self, idx: usize, verdict: Verdict) {
-        let mut a = self.answers.lock().unwrap();
+        let mut a = self.lock_answers();
         if let Some(slot) = a.get_mut(idx) {
             if slot.is_none() {
                 *slot = Some(verdict);
@@ -601,21 +618,16 @@ impl Batch {
     }
 
     fn answered(&self) -> bool {
-        self.answers.lock().unwrap().iter().all(Option::is_some)
+        self.lock_answers().iter().all(Option::is_some)
     }
 
     fn unanswered(&self) -> usize {
-        self.answers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|v| v.is_none())
-            .count()
+        self.lock_answers().iter().filter(|v| v.is_none()).count()
     }
 
     /// The whole stream is over: whatever has no verdict has no verdict to wait for.
     fn lose(&self, why: &str) {
-        let mut a = self.answers.lock().unwrap();
+        let mut a = self.lock_answers();
         for slot in a.iter_mut() {
             if slot.is_none() {
                 *slot = Some(Verdict::Lost(why.to_string()));
@@ -624,7 +636,7 @@ impl Batch {
     }
 
     fn take(&self) -> Vec<Verdict> {
-        let mut a = self.answers.lock().unwrap();
+        let mut a = self.lock_answers();
         a.iter_mut()
             .map(|s| {
                 s.take()
@@ -658,6 +670,9 @@ const EMPTY_SLOT: Slot = Slot {
 struct Tail {
     shared: Arc<Shared>,
     state: StdMutex<State>,
+    /// Whether this stream has already warned that a task died holding the ring's lock: the
+    /// recovery says it once per stream, not once per flush that meets the poison afterwards.
+    poison_warned: AtomicBool,
     /// Rings when an answer arrives, when the stream ends, and when the window takes something
     /// back out — everyone waiting re-looks at its own state.
     wake: Notify,
@@ -697,12 +712,46 @@ impl Tail {
                 pending_bytes: 0,
             }),
             wake: Notify::new(),
+            poison_warned: AtomicBool::new(false),
             demote: AtomicBool::new(false),
         }
     }
 
+    /// The ring, for the three readers (`over_now`, `pending`, `answer`) and for [`Tail::close`],
+    /// poisoned or not. A read of a ring a panicking task left can only cost a flush its wait —
+    /// `answer` believes a slot only when its `seq` *and* its `hash` are the pair the item was sent
+    /// with, so a slot that does not match its number gives no verdict and the deadline answers the
+    /// item as lost. `close` takes this lock too, and it is the recovery from a ring nobody trusts
+    /// anymore: it must not panic on the poison it is recovering from.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A task died holding the ring's lock, so its multi-step update (slots, then `next`, then the
+    /// window counters) may have left them disagreeing. Say the stream is over instead of reserving
+    /// on top of it: `close` gives every batch in flight its reason and wakes its flush, `reserve`
+    /// answers *no room* from here on, and the next flush builds a fresh stream with its own
+    /// sequence numbers — which is why the ring is never cleared in place, on a stream that is still
+    /// live: acks are routed by `seq & RING_MASK`, so handing those numbers out again could land a
+    /// late acknowledgement in another batch's slot and count a key delivered that was not.
+    fn poisoned_ring(&self) {
+        if self
+            .poison_warned
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                endpoint = %self.shared.url,
+                "grpc: a task died holding the ring's lock; the stream is over and its items in flight are lost (they are retried)"
+            );
+        }
+        self.close(wire::moment(
+            "the ring was poisoned by a task that died holding its lock",
+        ));
+    }
+
     fn over_now(&self) -> Option<Failure> {
-        let st = self.state.lock().unwrap();
+        let st = self.lock_state();
         st.over.as_ref().map(|f| Failure {
             refuse: f.refuse,
             demote: f.demote,
@@ -711,7 +760,7 @@ impl Tail {
     }
 
     fn pending(&self) -> usize {
-        self.state.lock().unwrap().pending_items
+        self.lock_state().pending_items
     }
 
     /// Puts a flush's items in the ring and takes them out of the window, or answers `None`
@@ -724,7 +773,15 @@ impl Tail {
         // what `push` guarantees before calling: a flush of at least one item. A caller
         // that breaks that contract must meet it here, not at `st.next`.
         debug_assert!(!items.is_empty(), "an empty flush never reaches the ring");
-        let mut st = self.state.lock().unwrap();
+        let mut st = match self.state.lock() {
+            Ok(st) => st,
+            Err(poisoned) => {
+                // Let the guard go before the recovery locks the same mutex again.
+                drop(poisoned.into_inner());
+                self.poisoned_ring();
+                return None;
+            }
+        };
         if st.over.is_some() {
             return None;
         }
@@ -789,7 +846,15 @@ impl Tail {
     /// Takes a finished flush back out of the window and the ring. Answers that arrive for its
     /// items after this are the duplicates the reader ignores.
     fn forget(&self, batch: &Arc<Batch>) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = match self.state.lock() {
+            Ok(st) => st,
+            Err(poisoned) => {
+                // Let the guard go before the recovery locks the same mutex again.
+                drop(poisoned.into_inner());
+                self.poisoned_ring();
+                return;
+            }
+        };
         let mut freed = false;
         for slot in st.slots.iter_mut() {
             if slot.batch.as_ref().is_some_and(|b| Arc::ptr_eq(b, batch)) {
@@ -814,7 +879,7 @@ impl Tail {
     /// for, and every item without one is lost — never refused, whoever closed the stream.
     fn close(&self, f: Failure) {
         let batches: Vec<Arc<Batch>> = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.lock_state();
             if st.over.is_some() {
                 return;
             }
@@ -844,7 +909,7 @@ impl Tail {
             );
             return;
         }
-        let st = self.state.lock().unwrap();
+        let st = self.lock_state();
         let slot = &st.slots[(ack.seq as usize) & RING_MASK];
         let Some(batch) = slot.batch.as_ref() else {
             tracing::debug!(

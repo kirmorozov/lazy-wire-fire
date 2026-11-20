@@ -129,3 +129,30 @@ fn base_urls() {
     assert!(BaseUrl::parse("ftp://h").is_err());
     assert!(BaseUrl::parse("http://u:p@h").is_err());
 }
+
+/// A poisoned keep-alive pool still hands out a connection and still takes one back. Entries move
+/// whole — one `push`, one `pop` — so what a task that died holding this lock costs is a redial, or
+/// a stale connection that `send` already retries on a new one. It was a second panic on every send.
+#[tokio::test]
+async fn the_idle_pool_yields_a_connection_on_a_poisoned_lock() {
+    let base = BaseUrl::parse("http://ingest.example.test:8080/ingest").unwrap();
+    let tls = TlsSpec::parse(None).unwrap();
+    let client = Client::new(base, &tls).expect("a client exists without a connection");
+    let first = conn_with(b"").await;
+    let second = conn_with(b"").await;
+    client.put_back(first);
+    crate::poison::poison(&client.idle);
+    assert!(
+        client.pooled().is_some(),
+        "the connection parked before the panic is still there for the next send"
+    );
+    client.put_back(second);
+    assert!(
+        client.pooled().is_some(),
+        "and the pool still takes one back after it"
+    );
+    assert!(
+        client.pooled().is_none(),
+        "the pool drains, rather than sticking full"
+    );
+}

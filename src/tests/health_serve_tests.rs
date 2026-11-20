@@ -414,3 +414,37 @@ async fn probe_accepts_only_a_live_200() {
     task.abort();
     gated_task.abort();
 }
+
+/// A poisoned health mutex is data, not a second panic. Of all the `lock().expect` sites in the
+/// hot path this is one of the two the engine task writes (`beat`, `set_phase`, `set_status`), so
+/// a panic here was the process's last act rather than a bad answer. Every setter replaces one
+/// field whole, so the guard a panicking task left holds a real document: `/status` serves what
+/// the engine wrote, and the probe reads what it says.
+#[tokio::test]
+async fn a_poisoned_health_lock_still_serves_status_and_readyz() {
+    let h = ready(Some("tok"));
+    crate::poison::poison(&h.inner);
+    // The engine's own writes work on the other side of the poison, and the fields still answer.
+    h.beat();
+    h.set_streaming(true);
+    assert!(h.is_ready(), "a poisoned health is still ready");
+    assert_eq!(
+        h.status(),
+        json!({"rules": {"orders": "ok"}}),
+        "the document written before the panic is the one still held"
+    );
+
+    let (addr, task) = endpoint(Arc::clone(&h)).await;
+    let (head, body) = request(
+        addr,
+        &with_authorization("GET", "/status", Some("Bearer tok")),
+    )
+    .await;
+    task.abort();
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        STATUS_BODY,
+        "/status renders the pre-panic document, byte for byte"
+    );
+}

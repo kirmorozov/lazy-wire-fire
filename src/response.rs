@@ -14,7 +14,7 @@
 //! subquery, variable or function outside a deterministic set) is cached per distinct small
 //! response, so repeated answers cost no query.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{anyhow, Context, Result};
 use indexmap::IndexMap;
@@ -352,11 +352,29 @@ impl Condition {
         })
     }
 
+    /// The answer cache, poisoned or not, when this condition is deterministic and `row` is small
+    /// enough to key by. An entry is stored by one `insert`, so every entry the map holds is a
+    /// complete (row → what the database answered) pair; what a task that died holding this lock can
+    /// leave behind is an entry missing (the next `met` asks the database again) or, if the tear
+    /// landed between the eviction and the insert, one entry over the cap (the next insert evicts).
+    /// A poisoned cache therefore still answers from cache and still fills — never a second panic on
+    /// the job task, and never an answer the database did not give.
+    fn cache(&self, cacheable: bool) -> Option<MutexGuard<'_, IndexMap<Row, bool>>> {
+        if !cacheable {
+            return None;
+        }
+        Some(
+            self.cache
+                .as_ref()?
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
     /// `Err`: the database could not evaluate it.
     pub async fn met(&self, pool: &Pool, row: &Row) -> Result<bool> {
         let cacheable = self.cache.is_some() && row.size() <= CACHE_MAX_BYTES;
-        if cacheable {
-            let cache = self.cache.as_ref().expect("checked").lock().expect("cache");
+        if let Some(cache) = self.cache(cacheable) {
             if let Some(m) = cache.get(row) {
                 return Ok(*m);
             }
@@ -366,14 +384,20 @@ impl Condition {
             .exec_first(self.sql.as_str(), row.params(self.uses))
             .await?;
         let met = got.is_some();
-        if cacheable {
-            let mut cache = self.cache.as_ref().expect("checked").lock().expect("cache");
+        self.remember(cacheable, row, met);
+        Ok(met)
+    }
+
+    /// Puts the database's own answer for `row` in the cache, when this row may be cached at all.
+    /// Poisoned or not — see [`Condition::cache`]: the entry goes in by one `insert`, so a torn
+    /// moment costs an entry at most, and the next `met` asks the database about that row again.
+    fn remember(&self, cacheable: bool, row: &Row, met: bool) {
+        if let Some(mut cache) = self.cache(cacheable) {
             if cache.len() >= CACHE_ENTRIES {
                 cache.shift_remove_index(0);
             }
             cache.insert(row.clone(), met);
         }
-        Ok(met)
     }
 
     /// Runs it once with an empty answer: syntax, unknown columns and (on MySQL) bad JSON paths

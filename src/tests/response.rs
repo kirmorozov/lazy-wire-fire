@@ -241,3 +241,58 @@ fn a_long_condition_is_clipped_in_the_message() {
         "status = 200 AND body IS NULL"
     );
 }
+
+/// A poisoned condition cache answers from what the database said and still fills. Every entry is
+/// stored by one `insert`, so a torn moment can cost an entry (the next `met` asks the database
+/// again) but never an answer nobody got from the database. The pool here is unroutable on purpose:
+/// the hit must not need it, and a miss must say so instead of panicking.
+#[tokio::test]
+async fn a_poisoned_condition_cache_answers_and_fills() {
+    let c = Condition::new("JSON_EXTRACT(body, '$.ok') = true").unwrap();
+    assert!(
+        c.cache.is_some(),
+        "a deterministic condition is the cacheable kind"
+    );
+    let pool = mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x");
+    let row = Row {
+        body: Some("{\"ok\":true}".into()),
+        ..Row::default()
+    };
+    crate::poison::poison(c.cache.as_ref().unwrap());
+    c.remember(true, &row, true);
+    assert!(
+        c.met(&pool, &row).await.unwrap(),
+        "the answer the database gave is what met returns, without reaching the pool"
+    );
+    let miss = Row {
+        body: Some("{\"ok\":false}".into()),
+        ..Row::default()
+    };
+    assert!(
+        c.met(&pool, &miss).await.is_err(),
+        "a row the cache does not hold still asks the database, on a poisoned lock too"
+    );
+    // The bound is a bound: 256 entries, each one insert, evicting the oldest.
+    for i in 0..(CACHE_ENTRIES + 5) {
+        let r = Row {
+            body: Some(format!("{{\"ok\":{},\"i\":{i}}}", i % 2 == 0)),
+            ..Row::default()
+        };
+        c.remember(true, &r, i % 2 == 0);
+    }
+    let cache_len = {
+        let cache = c.cache(true).expect("deterministic, so cacheable");
+        cache.len()
+    }; // the guard goes here, before the awaits below
+    assert_eq!(cache_len, CACHE_ENTRIES, "a poisoned cache stays bounded");
+    // What the bound keeps is the newest, not the oldest: the entry written last before the poison
+    // is still the answer, and answering it needs no database.
+    let last = Row {
+        body: Some(format!("{{\"ok\":true,\"i\":{}}}", CACHE_ENTRIES + 4)),
+        ..Row::default()
+    };
+    assert!(
+        c.met(&pool, &last).await.unwrap(),
+        "the entry the eviction loop wrote last is still cached"
+    );
+}

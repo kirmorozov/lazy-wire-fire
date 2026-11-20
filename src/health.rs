@@ -65,8 +65,14 @@ impl Health {
         }
     }
 
+    /// One lock for every field below, and it is never a second panic: each setter replaces one
+    /// field whole, so a guard a task left behind by panicking still holds data. The worst a torn
+    /// moment can say is `phase` already moved while `beat` has not caught up, and that direction
+    /// only ever makes `/readyz` answer *not ready* — the conservative side. This is the lock the
+    /// engine task writes (`beat`, `set_phase`, `set_status`), so a panic here would be the last
+    /// thing the process did.
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
-        f(&mut self.inner.lock().expect("health"))
+        f(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn beat(&self) {

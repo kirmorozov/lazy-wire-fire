@@ -512,6 +512,27 @@ struct Replace {
     cache: Mutex<HashMap<String, Arc<regex::Regex>>>,
 }
 
+impl Replace {
+    /// The compiled form of `pat`, from the cache or from the regex crate. A memo, poisoned or not:
+    /// an entry is inserted whole and the cap drops the cache wholesale, so what a task that died
+    /// holding this lock can leave behind is one pattern recompiled on the next render. Locking it
+    /// was a second panic on every render.
+    fn compiled(&self, pat: &str) -> Result<Arc<regex::Regex>, RenderError> {
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = c.get(pat) {
+            return Ok(r.clone());
+        }
+        let r = Arc::new(regex::Regex::new(pat).map_err(|e| {
+            RenderErrorReason::Other(format!("replace: invalid regex `{pat}`: {e}"))
+        })?);
+        if c.len() > 256 {
+            c.clear();
+        }
+        c.insert(pat.to_string(), r.clone());
+        Ok(r)
+    }
+}
+
 impl HelperDef for Replace {
     fn call_inner<'reg: 'rc, 'rc>(
         &self,
@@ -523,22 +544,7 @@ impl HelperDef for Replace {
         let s = text(param(h, 0, "replace")?);
         let pat = text(param(h, 1, "replace")?);
         let rep = h.param(2).map(|p| text(p.value())).unwrap_or_default();
-        let re = {
-            let mut c = self.cache.lock().expect("regex cache");
-            match c.get(&pat) {
-                Some(r) => r.clone(),
-                None => {
-                    let r = Arc::new(regex::Regex::new(&pat).map_err(|e| {
-                        RenderErrorReason::Other(format!("replace: invalid regex `{pat}`: {e}"))
-                    })?);
-                    if c.len() > 256 {
-                        c.clear();
-                    }
-                    c.insert(pat.clone(), r.clone());
-                    r
-                }
-            }
-        };
+        let re = self.compiled(&pat)?;
         Ok(ScopedJson::Derived(Value::String(
             re.replace_all(&s, rep.as_str()).into_owned(),
         )))

@@ -66,3 +66,9 @@ pub mod tls;
 #[cfg(test)]
 #[path = "tests/alloc_measure.rs"]
 mod alloc_measure;
+
+/// The one way a test poisons a mutex (a task that panics while holding it), shared by the tests
+/// of the sites that treat a poisoned lock as data rather than as a second panic.
+#[cfg(test)]
+#[path = "tests/poison.rs"]
+mod poison;
