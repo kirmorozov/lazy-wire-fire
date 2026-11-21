@@ -208,8 +208,10 @@ enum Lane {
         struck: Vec<String>,
         /// The pending queries taken for this flush, each with its id (the dedup key it was
         /// inserted under, so a failed flush puts it back and completes the generation
-        /// without recomputing ids).
-        queries: Vec<(String, KeyQuery)>,
+        /// without recomputing ids). Shared with the job, which only reads them: a flush that
+        /// goes through never copies a parameter, and the copy `put_back_queries` needs
+        /// happens on the one path that takes the queries back.
+        queries: Arc<Vec<(String, KeyQuery)>>,
     },
     Reset,
 }
@@ -2831,7 +2833,10 @@ impl Engine {
             .expect("begin moved the pending ids into the generation");
         let maps: BTreeMap<key::SpaceId, buffer::IdSet> = taken.ids.into_iter().collect();
         let keys: Vec<String> = buf.keys.render(&maps);
-        let queries: Vec<(String, KeyQuery)> = buf.take_query_payloads(taken.items);
+        // Shared with the job (which reads the payloads to resolve `keys_sql`) and with the
+        // lane (which puts them back if the flush fails): one copy of every parameter set for
+        // the whole flush instead of a deep clone of it here.
+        let queries = Arc::new(buf.take_query_payloads(taken.items));
         // Only the keys with strikes are remembered (to clear them once confirmed).
         let struck = if st.strikes.is_empty() {
             Vec::new()
@@ -2845,7 +2850,7 @@ impl Engine {
             since_ts: buf.since_ts,
             first: buf.first,
             struck,
-            queries: queries.clone(),
+            queries: Arc::clone(&queries),
         });
         buf.since_ts = 0;
         buf.first = None;
@@ -2859,7 +2864,7 @@ impl Engine {
         let mrule = st.mrule.clone();
         spawn_job(tx, name, incarnation, failed, async move {
             let start = Instant::now();
-            let out = flush_job(&env, &rule, spec, keys, queries).await;
+            let out = flush_job(&env, &rule, spec, keys, &queries).await;
             // The flush duration is the job's own wall time (fence + resolve + fire); recorded
             // through the pre-resolved handle: one bucket bump, no name to the registry.
             if let Some(m) = &mrule {
@@ -3169,7 +3174,13 @@ impl Engine {
                             }
                         }
                         if keep_queries {
-                            st.buffer.put_back_queries(queries);
+                            // The job held the other handle and is finished with it, so the
+                            // usual case reclaims the payloads where they are; only a handle
+                            // that still has another owner copies, and that is this failure
+                            // path alone.
+                            let payloads =
+                                Arc::try_unwrap(queries).unwrap_or_else(|a| (*a).clone());
+                            st.buffer.put_back_queries(payloads);
                         }
                         st.buffer.hold_ts(since_ts);
                         let now = Instant::now();
@@ -3607,7 +3618,7 @@ async fn flush_job(
     rule: &Rule,
     spec: FenceSpec,
     mut keys: Vec<String>,
-    queries: Vec<(String, KeyQuery)>,
+    queries: &[(String, KeyQuery)],
 ) -> Outcome {
     let fail = |e: anyhow::Error, keys: Vec<String>| Outcome::Flush {
         fired: Fired {
@@ -3666,6 +3677,10 @@ mod stream_verdict_tests;
 #[cfg(test)]
 #[path = "tests/engine_hotpath_alloc_tests.rs"]
 mod hotpath_alloc_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_flush_alloc_tests.rs"]
+mod flush_alloc_tests;
 
 #[cfg(test)]
 #[path = "tests/engine_skip_kinds_tests.rs"]

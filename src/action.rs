@@ -404,7 +404,11 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
             .selects
             .iter()
             .map(|s| {
-                let params = params.clone();
+                // The chunk's parameters are read by every select of the chunk and never
+                // written, so they are shared (a borrowed `params`, moved into each future as
+                // a reference) rather than cloned per select: what each select does need as its
+                // own `Vec` is the positional list below, which `Params::Positional` owns.
+                let params = &params;
                 async move {
                     // Each `:keys` becomes `n` parameters.
                     let (sql, slots) = crate::sql::expand(&s.sql, |_| n);
@@ -413,13 +417,13 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
                         .prep(sql.as_str())
                         .await
                         .with_context(|| s.name.clone())?;
-                    let names: Vec<String> = stmt
-                        .columns()
-                        .iter()
-                        .map(|c| c.name_str().into_owned())
-                        .collect();
+                    // One materialization of the statement's columns, read both as names (the
+                    // plan) and as `Column`s (the conversion): what they describe cannot change
+                    // while the statement lives.
+                    let cols = stmt.columns();
+                    let names: Vec<String> =
+                        cols.iter().map(|c| c.name_str().into_owned()).collect();
                     let plan = Plan::new(&names).with_context(|| s.name.clone())?;
-                    let cols = stmt.columns().to_vec();
                     let p = if slots.is_empty() {
                         Params::Empty
                     } else {
@@ -449,8 +453,10 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
         let results: Vec<(Plan, Vec<Vec<Value>>)> =
             futures_util::future::try_join_all(futs).await?;
         let mut m = Merger::new(chunk);
-        for (plan, rows) in &results {
-            m.add(plan, rows.clone());
+        // Each select's rowset goes to the merger by value: it is the only reader left of it,
+        // so the merger takes it instead of deep-cloning every value out of it.
+        for (plan, rows) in results {
+            m.add(&plan, rows);
         }
         for w in m.warnings.iter().take(3) {
             tracing::warn!(rule = %rule.name(), "{w}");
@@ -1239,3 +1245,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tests/action_keyquery_tests.rs"]
 mod keyquery_tests;
+
+#[cfg(test)]
+#[path = "tests/loaddocs_chunk_tests.rs"]
+mod loaddocs_tests;
