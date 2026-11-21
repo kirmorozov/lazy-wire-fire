@@ -48,10 +48,15 @@ test-grpc:
 # The panic-site gate goes before the clippy runs: it is the cheap check, so a new
 # `unwrap` fails `make lint` in seconds rather than after the two clippy passes, and its
 # fixture test proves the gate cannot pass vacuously (scripts/test-check-panic-sites.sh).
+# The coverage summary's fixture test runs beside it: the table `make coverage` prints must not
+# count an inline `#[cfg(test)]` body as production lines, and scripts/test-coverage-summary.sh is
+# what proves that subtraction happens — with the same shipped script, the same exact-numbers-not
+# "it went down" style, and the pre-fix row asserted too so it cannot pass vacuously.
 lint:
 	$(CARGO) fmt --check
 	scripts/check-panic-sites.sh
 	scripts/test-check-panic-sites.sh
+	scripts/test-coverage-summary.sh
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CARGO) clippy --all-targets --features roaring -- -D warnings
 	scripts/sync-lazyview.sh --check $(if $(CI),--upstream)
