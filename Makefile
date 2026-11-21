@@ -111,6 +111,8 @@ test-e2e-all:
 # What the run talks to is the server under test and its own children: every target is an
 # in-process mock and the proxies are in-process, so this brings up `mysql84` alone — no
 # services of $(E2E_TARGETS) — and removes it again on the rule above.
+# On a host shared with another heavy suite, serialize against it: two chaos runs at once is
+# how engine children get killed and `h1`/`h2` then false-fail.
 test-chaos:
 	@set -e; \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 >/dev/null 2>&1 || true' EXIT; \
