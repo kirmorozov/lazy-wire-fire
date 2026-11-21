@@ -831,6 +831,15 @@ impl Target {
             )
             .await;
         }
+        self.send_batch_http(ep, rendered, n).await
+    }
+
+    /// The HTTP front of [`Target::send_items`], for every kind without its own
+    /// [`crate::targets`] module: parses the rendered request, refuses a transport that does not
+    /// answer per item, pre-checks the kinds that must be checked before the bytes go out, and
+    /// sends the batch. The body is the tail `send_items` used to end with, unchanged; `n` is
+    /// `keys.len()`, as the dispatcher computed it before the call.
+    async fn send_batch_http(&self, ep: usize, rendered: &str, n: usize) -> Result<Vec<Item>> {
         let Some(endpoint) = self.endpoints.get(ep) else {
             bail!("endpoint {ep} of target `{}` is gone", self.def.name);
         };
