@@ -4753,8 +4753,19 @@ async fn removed_and_added_back_mid_flush_loses_no_key() {
     })
     .await;
     gate.open();
+    // The released flush answers 503 and its result is discarded: give it the moment it needs
+    // to be processed before reading what the rule ended up reporting.
     sleep_ms(300).await;
-    let (_, _, _, err) = db.status("o").await.unwrap();
+    // Removing the rule deleted its status row, and only the engine's next persist writes it
+    // again, so a one-shot read can land on the missing row and panic on a busy host. Poll for
+    // the row's arrival, then assert what it says: `wait_for` panics on the timeout, so a row
+    // that never comes back is still a red test.
+    let (_, _, _, err) = wait_for(
+        Duration::from_secs(20),
+        "the re-added rule's status row",
+        || async { db.status("o").await },
+    )
+    .await;
     assert!(!err.as_deref().unwrap_or("").contains("dropped"), "{err:?}");
     inst.stop().await;
 }
