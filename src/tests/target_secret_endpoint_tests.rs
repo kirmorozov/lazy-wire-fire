@@ -465,3 +465,68 @@ fn the_endpoint_client_pool_yields_a_client_on_a_poisoned_lock() {
         "and the second origin is cached too, not rebuilt per call"
     );
 }
+
+/// The pool of keep-alive clients in front of a secret endpoint: one per origin the
+/// reference names, never one per URL (a pool entry cannot carry the secret part of it),
+/// and bounded — a reference that keeps naming new origins replaces the pool rather than
+/// growing it without end.
+#[test]
+fn the_pool_of_secret_clients_is_one_per_origin_and_bounded() {
+    let tls = crate::tls::TlsSpec::parse(None).unwrap();
+    let pool: Mutex<HashMap<String, Arc<HttpClient>>> = Mutex::new(HashMap::new());
+    let at = |path: &str| SecretUrl::parse(path).unwrap();
+
+    // The same origin under two URLs — a different path and a different secret query — is
+    // one client. Two clients would mean the pool keys on something that carries the secret.
+    let first = secret_client(
+        &pool,
+        &at("http://127.0.0.1:9000/services/T/B/SECMARK-4c7e"),
+        &tls,
+    )
+    .unwrap();
+    let again = secret_client(
+        &pool,
+        &at("http://127.0.0.1:9000/v1/spaces/AAA?key=SECMARK-4c7e"),
+        &tls,
+    )
+    .unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "the pool keys on the origin, not the URL"
+    );
+    assert_eq!(pool.lock().unwrap().len(), 1);
+    // The scheme is part of the origin: the same host and port on https is another client.
+    secret_client(&pool, &at("https://127.0.0.1:9000/x"), &tls).unwrap();
+    assert_eq!(pool.lock().unwrap().len(), 2);
+
+    // Up to the cap, every origin keeps its client; past it, the pool is replaced. The point
+    // of the cap is a reference rewritten on every rotation, which would otherwise grow one
+    // client and one connection per origin for the life of the process.
+    let mut origins = Vec::new();
+    for port in 9001..9016 {
+        origins.push(format!("http://127.0.0.1:{port}/hook"));
+    }
+    for origin in &origins {
+        secret_client(&pool, &at(origin), &tls).unwrap();
+    }
+    assert_eq!(pool.lock().unwrap().len(), 16, "at the cap");
+    // The same origin again does not clear: it is a hit, not a new one.
+    secret_client(&pool, &at(&origins[0]), &tls).unwrap();
+    assert_eq!(pool.lock().unwrap().len(), 16);
+    // The one past the cap: the pool starts again, and what it held is rebuilt on demand.
+    secret_client(&pool, &at("http://127.0.0.1:9100/hook"), &tls).unwrap();
+    assert_eq!(
+        pool.lock().unwrap().len(),
+        1,
+        "the pool was replaced, not grown"
+    );
+    let rebuilt = secret_client(&pool, &at(&origins[0]), &tls).unwrap();
+    assert!(
+        !Arc::ptr_eq(&rebuilt, &first),
+        "the client of a cleared origin is built again, which is the whole cost of the cap"
+    );
+    // And it is kept from here on: the next call to that origin is a hit.
+    let kept = secret_client(&pool, &at(&origins[0]), &tls).unwrap();
+    assert!(Arc::ptr_eq(&rebuilt, &kept), "the rebuilt client is pooled");
+    assert_eq!(pool.lock().unwrap().len(), 2);
+}
