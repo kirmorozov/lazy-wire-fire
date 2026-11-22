@@ -499,21 +499,22 @@ fn the_pool_of_secret_clients_is_one_per_origin_and_bounded() {
     secret_client(&pool, &at("https://127.0.0.1:9000/x"), &tls).unwrap();
     assert_eq!(pool.lock().unwrap().len(), 2);
 
-    // Up to the cap, every origin keeps its client; past it, the pool is replaced. The point
-    // of the cap is a reference rewritten on every rotation, which would otherwise grow one
-    // client and one connection per origin for the life of the process.
+    // Up to the cap, every origin keeps its client: fourteen more on top of the two above is the
+    // cap (16) exactly, and nothing has been thrown away yet. The point of the cap is a reference
+    // rewritten on every rotation, which would otherwise grow one client and one connection per
+    // origin for the life of the process.
     let mut origins = Vec::new();
-    for port in 9001..9016 {
+    for port in 9001..9015 {
         origins.push(format!("http://127.0.0.1:{port}/hook"));
     }
     for origin in &origins {
         secret_client(&pool, &at(origin), &tls).unwrap();
     }
     assert_eq!(pool.lock().unwrap().len(), 16, "at the cap");
-    // The same origin again does not clear: it is a hit, not a new one.
+    // The same origin again does not clear: a hit is answered before the cap is looked at.
     secret_client(&pool, &at(&origins[0]), &tls).unwrap();
-    assert_eq!(pool.lock().unwrap().len(), 16);
-    // The one past the cap: the pool starts again, and what it held is rebuilt on demand.
+    assert_eq!(pool.lock().unwrap().len(), 16, "a hit is not a new origin");
+    // The one past the cap: the pool starts again, whole, rather than growing by one.
     secret_client(&pool, &at("http://127.0.0.1:9100/hook"), &tls).unwrap();
     assert_eq!(
         pool.lock().unwrap().len(),

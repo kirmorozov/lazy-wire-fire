@@ -797,8 +797,9 @@ fn a_column_that_cannot_fill_a_field_without_a_recipe_says_make_them_agree() {
 #[test]
 fn a_field_the_message_holds_is_refused_as_the_wrong_type_by_name() {
     // The other arm of the same error: prost-reflect refuses a value of another type, and the
-    // message says what the field is, not merely that something was wrong.
-    let item = body();
+    // message says what the field is, not merely that something was wrong. `narrow` is the
+    // message that carries a top-level `int32 qty`; the envelope's own message does not.
+    let item = narrow();
     let qty = item.get_field_by_name("qty").expect("qty");
     let e = set_field_error(
         &item,

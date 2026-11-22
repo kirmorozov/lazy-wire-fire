@@ -877,23 +877,16 @@ fn only_the_kinds_that_answer_per_item_are_offered_the_batch_front() {
 #[tokio::test]
 async fn a_transport_that_never_answers_per_item_fails_the_target_and_not_the_keys() {
     let _env = crate::secrets::ENV_LOCK.lock().await;
+    // The password is a reference, as any credential of a row must be (`from_row` refuses a
+    // literal `vars.password`), and it is set here, under the same `ENV_LOCK`, so the reference
+    // resolves to something if the kind reads it before it is refused for the transport.
+    std::env::set_var("LWF_TEST_PW", "p");
+    let with_pw = r#"{"username":"u","password":"env:LWF_TEST_PW"}"#;
     let cases = [
         ("redis", "redis://cache.example.test:6380/0", "{}"),
-        (
-            "smtp",
-            "smtp://mail.example.test:587",
-            r#"{"username":"u","password":"p"}"#,
-        ),
-        (
-            "amqp",
-            "amqp://mq.example.test:5672/",
-            r#"{"username":"u","password":"p"}"#,
-        ),
-        (
-            "mysql",
-            "mysql://db.example.test:3306/app",
-            r#"{"username":"u","password":"p"}"#,
-        ),
+        ("smtp", "smtp://mail.example.test:587", with_pw),
+        ("amqp", "amqp://mq.example.test:5672/", with_pw),
+        ("mysql", "mysql://db.example.test:3306/app", with_pw),
     ];
     for (kind, endpoint, vars) in cases {
         let t = target(kind, endpoint, vars);

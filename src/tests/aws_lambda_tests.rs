@@ -131,7 +131,7 @@ fn raw(kind: &str, endpoints: &[&str], vars: &str) -> RawTarget {
     RawTarget {
         name: "t".into(),
         kind: Some(kind.into()),
-        endpoints: Some(endpoints.join("\n").into()),
+        endpoints: Some(endpoints.join("\n")),
         vars: Some(vars.into()),
         ..Default::default()
     }
@@ -222,10 +222,15 @@ fn the_rule_check_of_lambda_says_nothing_it_cannot_read() {
 }
 
 /// A row with no endpoint at all reaches the kind's own build, which must name what it needs
-/// rather than index into nothing.
+/// rather than index into nothing. `from_row` refuses that shape for `lambda` first ("kind
+/// lambda takes exactly one endpoint"), so the definition is loaded the legal way and then
+/// emptied by hand: what is under test is the guard behind the arity check, the one that has to
+/// speak instead of panicking if `endpoints` is ever empty by the time `build` is reached.
 #[test]
 fn a_lambda_target_without_its_endpoint_names_it() {
-    let def = TargetDef::from_row(&raw("lambda", &[], "{}")).unwrap();
+    let mut def =
+        TargetDef::from_row(&raw("lambda", &["aws-lambda://eu-west-1/orders"], "{}")).unwrap();
+    def.endpoints.clear();
     // `build`'s answer is a bundle the kind does not let be printed, so the refusal is taken
     // by hand: the Ok side has to fail the test, not just be ignored.
     let e = match build(&def) {

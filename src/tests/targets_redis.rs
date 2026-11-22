@@ -560,11 +560,14 @@ async fn a_reply_beyond_the_limits_of_a_reply_waits() {
             format!("+{}\r\n", "x".repeat(128 * 1024)),
             "reply line longer than",
         ),
-        // A bulk that declares more than the bulk limit: refused on the length, before any
-        // of its bytes are read.
-        ("$268435457\r\n".to_string(), "bulk longer than"),
+        // A bulk that declares more than the bulk limit (256 MiB): refused on the length the
+        // server declared, before any of its bytes are read.
+        (
+            "$268435457\r\n".to_string(),
+            "bulk reply of 268435457 bytes is too large",
+        ),
         // A type byte that is not one of `+ - : $ *`.
-        ("?oops\r\n".to_string(), "unknown redis reply type"),
+        ("?oops\r\n".to_string(), "unexpected redis reply type"),
     ] {
         let addr = serve_bytes(reply.as_bytes().to_vec()).await;
         let client = client_on(addr);
