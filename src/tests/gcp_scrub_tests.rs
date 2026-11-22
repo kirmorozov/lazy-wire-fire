@@ -186,11 +186,22 @@ async fn serve_token(
     (addr, got)
 }
 
-/// An ADC file of the one shape that names its own token endpoint, for `addr`.
-fn adc_file(addr: std::net::SocketAddr) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("lazywf-gcp-adc-token-{}", std::process::id()));
+/// A scratch directory of this test run under the repository's `tmp/`, the same shape the other
+/// unit tests use (`src/tests/aws_provider_tests.rs`): the ADC file a test wrote stays readable
+/// next to the rest of the test output instead of disappearing into `/tmp`.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join("unit")
+        .join(format!("gcp-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("adc.json");
+    dir
+}
+
+/// An ADC file of the one shape that names its own token endpoint, for `addr`. `tag` keeps the
+/// file of one test from being the file of another, so both can be read after the run.
+fn adc_file(tag: &str, addr: std::net::SocketAddr) -> std::path::PathBuf {
+    let file = scratch(&format!("adc-{tag}")).join("adc.json");
     std::fs::write(
         &file,
         format!(
@@ -236,7 +247,7 @@ async fn an_adc_of_its_own_asks_for_its_scopes_and_caches_the_answer() {
         r#"{"access_token":"ya29.ADC-TEST","token_type":"Bearer","expires_in":3600}"#,
     )
     .await;
-    let _adc = Adc::point_at(&adc_file(addr));
+    let _adc = Adc::point_at(&adc_file("scopes-cached", addr));
     let scope = "https://www.googleapis.com/auth/pubsub";
     let auth = Auth::with_scopes(Source::Adc, vec![scope.into()]);
 
@@ -282,7 +293,7 @@ async fn a_token_endpoint_that_refuses_names_the_service_that_failed() {
         r#"{"error":"invalid_grant","error_description":"Bad Request"}"#,
     )
     .await;
-    let _adc = Adc::point_at(&adc_file(addr));
+    let _adc = Adc::point_at(&adc_file("refused", addr));
     let auth = Auth::with_scopes(
         Source::Adc,
         vec!["https://www.googleapis.com/auth/pubsub".into()],
