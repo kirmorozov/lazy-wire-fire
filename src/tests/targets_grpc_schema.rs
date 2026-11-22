@@ -629,3 +629,230 @@ fn the_arms_that_cannot_be_reached_refuse_now() {
         .to_string();
     assert!(e.contains("string") && e.contains("sku"), "{e}");
 }
+
+// ——— the shapes the order form and the wide one both lack: the signed map-key widths,
+// a `uint32`, a message with no fields at all, and the two contract checks that a
+// deployment's own descriptor set is the one to fail ——————————————————————————————
+
+/// Signed map keys of both widths, an unsigned scalar, a plain message and an empty one.
+const NARROW: &str = r#"
+        syntax = "proto3";
+        package narrow.v1;
+        message Nested { string a = 1; }
+        message Empty {}
+        message Narrow {
+          map<int32, string> signed32 = 1;
+          map<int64, string> signed64 = 2;
+          uint32 code = 3;
+          int32 qty = 4;
+          float rate = 5;
+          string sku = 6;
+          Nested nested = 7;
+        }
+        "#;
+
+fn narrow() -> MessageDescriptor {
+    pool_of("narrow.proto", NARROW)
+        .get_message_by_name("narrow.v1.Narrow")
+        .expect("Narrow")
+}
+
+#[test]
+fn the_signed_map_key_widths_read_a_number_and_refuse_text() {
+    let m = build(
+        &narrow(),
+        &doc(json!({"signed32": {"-7": "a"}, "signed64": {"-9000000000": "b"}})),
+    )
+    .expect("a signed key of either width");
+    let Value::Map(s32) = get(&m, "signed32") else {
+        panic!("signed32 is a map")
+    };
+    assert_eq!(
+        s32.get(&MapKey::I32(-7)).unwrap(),
+        &Value::String("a".into())
+    );
+    let Value::Map(s64) = get(&m, "signed64") else {
+        panic!("signed64 is a map")
+    };
+    assert_eq!(
+        s64.get(&MapKey::I64(-9_000_000_000)).unwrap(),
+        &Value::String("b".into())
+    );
+    // Text where a signed key of either width belongs: the width is named by the refusal, so
+    // an author sees `integer` and not `non-negative integer` (which is what an unsigned key
+    // of the same digits says).
+    for (field, key) in [("signed32", "x"), ("signed64", "x")] {
+        let e = build(&narrow(), &doc(json!({field: {key: "v"}})))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!("{field}[{key}]")) && e.contains("the key is not an integer"),
+            "{field}: {e}"
+        );
+    }
+    // Out of the width of the key type: the same refusal, because the key is text.
+    let e = build(&narrow(), &doc(json!({"signed32": {"3000000000": "v"}})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("the key is not an integer"), "{e}");
+}
+
+#[test]
+fn a_map_key_of_a_type_no_map_takes_is_refused_by_name() {
+    // The one arm of the key reader no schema can reach, because protobuf allows a map key to
+    // be only text, bool or an integer: called with the field a descriptor cannot give it, it
+    // refuses with what a key may be rather than guessing.
+    let rate = narrow().get_field_by_name("rate").expect("rate");
+    let e = map_key(&rate, "1", &[".rate".to_string()])
+        .expect_err("a float is no map key type")
+        .to_string();
+    assert!(
+        e.contains(".rate[1]") && e.contains("a map key is text or a number"),
+        "{e}"
+    );
+}
+
+#[test]
+fn an_unsigned_scalar_reads_text_and_a_number_of_its_width() {
+    let m = build(&narrow(), &doc(json!({"code": "4294967295"}))).expect("text into uint32");
+    assert_eq!(get(&m, "code").as_u32(), Some(4_294_967_295));
+    let m = build(&narrow(), &doc(json!({"code": 7}))).expect("a number into uint32");
+    assert_eq!(get(&m, "code").as_u32(), Some(7));
+    // Text that is not a number of that width, and a number that is not one of it: both name
+    // the field's own kind, `uint32`, so the fix is visible in the message.
+    let e = build(&narrow(), &doc(json!({"code": "-1"})))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("is `-1`") && e.contains("a `uint32` field"),
+        "{e}"
+    );
+    let e = build(&narrow(), &doc(json!({"code": 1.5})))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("not a whole number") && e.contains("`code` is a uint32 field"),
+        "{e}"
+    );
+    // A number with a fraction fills the float field it belongs to.
+    let m = build(&narrow(), &doc(json!({"rate": 1.5}))).expect("a number into float");
+    assert_eq!(get(&m, "rate").as_f32(), Some(1.5));
+}
+
+#[test]
+fn an_object_in_a_field_that_holds_no_object_says_so() {
+    // `shape` names a JSON object in the error of a scalar field that was handed one.
+    let e = build(&narrow(), &doc(json!({"sku": {"a": 1}})))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("is an object and `sku` is a string field"),
+        "{e}"
+    );
+    // A numeric field handed a list says what it wants rather than nothing.
+    let e = build(&narrow(), &doc(json!({"code": []})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("send a number"), "{e}");
+}
+
+#[test]
+fn a_message_with_no_fields_says_it_has_none() {
+    // The error says which fields the message does have. A message with none must say so,
+    // or the author reads an empty list as a broken message.
+    let empty = pool_of("narrow.proto", NARROW)
+        .get_message_by_name("narrow.v1.Empty")
+        .expect("Empty");
+    let e = build(&empty, &doc(json!({"anything": 1})))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is not a field of `narrow.v1.Empty`"), "{e}");
+    assert!(e.contains("(it has: none)"), "{e}");
+    // The other side of the same line: a message with fields lists them, sorted.
+    let e = build(&narrow(), &doc(json!({"nope": 1})))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("it has: code, nested, qty, rate, signed32, signed64, sku"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_column_that_cannot_fill_a_field_without_a_recipe_says_make_them_agree() {
+    // Every mismatch has a hint. The ones with no specific fix (a text column into a
+    // message, which has no SQL that makes it one) still say what to do in general, and the
+    // name of the column kind is there too.
+    let e = column_errors(&narrow(), &[col("n", "nested", ValueKind::Str)]);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(
+        e[0].contains("make the column and the field agree"),
+        "{e:?}"
+    );
+    assert!(e[0].contains("text column"), "{e:?}");
+    // A JSON column is named by what it is, wherever it turns up.
+    assert_eq!(column_kind(ValueKind::Unknown), "JSON column");
+}
+
+#[test]
+fn a_field_the_message_holds_is_refused_as_the_wrong_type_by_name() {
+    // The other arm of the same error: prost-reflect refuses a value of another type, and the
+    // message says what the field is, not merely that something was wrong.
+    let item = body();
+    let qty = item.get_field_by_name("qty").expect("qty");
+    let e = set_field_error(
+        &item,
+        &qty,
+        &[".qty".to_string()],
+        SetFieldError::InvalidType {
+            field: qty.clone(),
+            value: Value::Bool(true),
+        },
+    )
+    .to_string();
+    assert!(
+        e.contains(".qty") && e.contains("is not a int32 value"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_method_of_the_wrong_answer_is_refused_by_its_own_name() {
+    // The contract check that looks at the answer: bidi, and it takes an Envelope — but it
+    // returns something else. The refusal names both what it must return and what it does.
+    let src = r#"
+        syntax = "proto3";
+        package shape.v1;
+        import "lazywf/v1/lazywf.proto";
+        message Wrong { string x = 1; }
+        service Ok { rpc Push(stream lazywf.v1.Envelope) returns (stream lazywf.v1.Acks); }
+        service WrongOut { rpc Push(stream lazywf.v1.Envelope) returns (stream Wrong); }
+        "#;
+    let p = pool_of("shape.proto", src);
+    check_method(&p, "shape.v1.Ok", "Push", None).expect("the contract shape");
+    let e = check_method(&p, "shape.v1.WrongOut", "Push", None)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("must return `lazywf.v1.Acks`"), "{e}");
+    assert!(e.contains("it returns `shape.v1.Wrong`"), "{e}");
+}
+
+#[test]
+fn an_envelope_of_its_own_that_holds_no_items_is_refused() {
+    // A deployment's descriptor set may know a message of the contract's own name. It is
+    // checked against the contract by name, and the check that the envelope holds the items
+    // is the one that must refuse it — not a panic on a missing field.
+    let src = r#"
+        syntax = "proto3";
+        package lazywf.v1;
+        message Envelope { string key = 1; }
+        message Acks {}
+        service Sink { rpc Push(stream Envelope) returns (stream Acks); }
+        "#;
+    let p = pool_of("own.proto", src);
+    let e = check_method(&p, "lazywf.v1.Sink", "Push", None)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("`items`"), "{e}");
+    assert!(e.contains("lazywf.v1.Envelope"), "{e}");
+}
