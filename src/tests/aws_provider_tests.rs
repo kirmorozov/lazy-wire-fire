@@ -331,3 +331,206 @@ async fn a_literal_where_a_reference_belongs_is_an_error() {
     let err = p.get().await.unwrap_err().to_string();
     assert!(err.contains("must be a reference"), "{err}");
 }
+
+// ——— the cache in front of the chain, and the four places a region comes from ————————————
+
+fn creds(key: &str, expiry: Option<std::time::SystemTime>) -> Credentials {
+    Credentials::new(key, "secret", None, expiry, "test")
+}
+
+#[tokio::test]
+async fn a_credential_still_good_is_handed_back_without_the_chain() {
+    let _env = Env::set(&[("AWS_EC2_METADATA_DISABLED", "true")]).await;
+    let now = std::time::SystemTime::now();
+    let secs = |ahead: u64| Some(now + std::time::Duration::from_secs(ahead));
+
+    // A permanent credential: no expiry to run out, so the cache is the answer and the
+    // chain is never built (which is the point — a target that sends continuously must not
+    // ask the chain, or the instance metadata service, on every request).
+    let p = Provider::new(None, "eu-west-1");
+    *p.cache.lock().await = Some(creds("AKIDCACHED", None));
+    assert_eq!(access_key(&p.get().await.unwrap()), "AKIDCACHED");
+    assert!(p.chain.get().is_none(), "the chain was never asked");
+
+    // Temporary credentials with their whole life ahead: the same.
+    let p = Provider::new(None, "eu-west-1");
+    *p.cache.lock().await = Some(creds("AKIDLONG", secs(3600)));
+    assert_eq!(access_key(&p.get().await.unwrap()), "AKIDLONG");
+    assert!(p.chain.get().is_none(), "the chain was never asked");
+
+    // A credential due within `REFRESH_BEFORE` is not the answer any more: the cache is
+    // walked past and the chain asked, so a token is never handed out at the moment it dies.
+    let p = Provider::new(None, "eu-west-1");
+    *p.cache.lock().await = Some(creds("AKIDDYING", secs(60)));
+    let e = p.get().await.unwrap_err();
+    assert!(
+        format!("{e:#}").contains("no AWS credentials"),
+        "the chain was asked, and with no source it says so: {e:#}"
+    );
+    assert!(p.chain.get().is_some(), "the chain was built");
+}
+
+#[tokio::test]
+async fn the_region_of_an_endpoint_is_the_url_then_the_environment_then_the_config_file() {
+    // The order the region is looked for in, one setting at a time. Each of the four is the
+    // only one that can answer in its own case, so a deployment that sets two of them is
+    // not guessing which wins.
+    let dir = scratch("region");
+    let config = dir.join("config");
+
+    // The endpoint's own region beats every setting.
+    std::fs::write(&config, "[default]\nregion = sa-east-1\n").unwrap();
+    let _env = Env::set(&[
+        ("AWS_REGION", "eu-north-1"),
+        ("AWS_DEFAULT_REGION", "ap-south-1"),
+        ("AWS_CONFIG_FILE", config.display().to_string().as_str()),
+    ])
+    .await;
+    assert_eq!(resolve_region(Some("eu-west-1")).unwrap(), "eu-west-1");
+    // Then `AWS_REGION`.
+    assert_eq!(resolve_region(None).unwrap(), "eu-north-1");
+    // Then `AWS_DEFAULT_REGION`.
+    {
+        let _env = Env::set(&[("AWS_DEFAULT_REGION", "ap-south-1")]).await;
+        assert_eq!(resolve_region(None).unwrap(), "ap-south-1");
+    }
+    // Then the profile of the shared config file: by name, and `[default]` when no profile
+    // is named.
+    {
+        let _env = Env::set(&[
+            ("AWS_CONFIG_FILE", config.display().to_string().as_str()),
+            ("AWS_PROFILE", "lwf"),
+        ])
+        .await;
+        std::fs::write(
+            &config,
+            "[default]\nregion = sa-east-1\n\n[profile lwf]\nregion = eu-central-1\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_region(None).unwrap(), "eu-central-1");
+        let _env = Env::set(&[("AWS_CONFIG_FILE", config.display().to_string().as_str())]).await;
+        assert_eq!(resolve_region(None).unwrap(), "sa-east-1");
+    }
+    // With no config file to read, the file under `HOME` is the last place asked — and a
+    // comment and a blank line and another profile's region do not answer for it.
+    {
+        let home = scratch("region-home");
+        std::env::set_var("HOME", &home);
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(
+            home.join(".aws/config"),
+            "# the shared config\n[profile other]\nregion = us-east-2\n\n[default]\nregion = us-west-1\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_region(None).unwrap(), "us-west-1");
+    }
+    // Nothing at all: the refusal is the instruction, and it names both places to put it.
+    {
+        let _env = Env::set(&[]).await;
+        std::env::set_var("HOME", scratch("region-none"));
+        let e = format!("{:#}", resolve_region(None).unwrap_err());
+        assert!(e.contains("no AWS region"), "{e}");
+        assert!(e.contains("aws-sqs://<region>"), "{e}");
+        assert!(e.contains("AWS_DEFAULT_REGION"), "{e}");
+    }
+}
+
+#[tokio::test]
+async fn a_config_line_that_is_not_a_region_is_not_one() {
+    // The same file with nothing to give: a profile that exists but says nothing, a region
+    // with an empty value, and a commented-out one all answer `not here`, which is what
+    // lets the next place be asked instead of a target failing on a blank region.
+    let text = "# region = eu-west-1\n[default]\naws_secret_access_key = x\nregion =\n[profile other]\nregion = us-east-2\n";
+    assert_eq!(config_region(text, "default"), None);
+    assert_eq!(config_region(text, "other"), Some("us-east-2".into()));
+    // A name is matched as a name: `[profile lwf]` is the profile `lwf`, and `[lwf]` is not.
+    assert_eq!(config_region("[lwf]\nregion = us-east-2\n", "lwf"), None);
+    assert_eq!(
+        config_region("[profile lwf]\nregion = us-east-2\n", "lwf"),
+        Some("us-east-2".into())
+    );
+    // And `[default]` is written both ways.
+    assert_eq!(
+        config_region("[profile default]\nregion = us-east-2\n", "default"),
+        Some("us-east-2".into())
+    );
+}
+
+fn pool() -> Pool {
+    Pool::new("mysql://u:p@127.0.0.1:1/x")
+}
+
+#[tokio::test]
+async fn an_entry_the_answer_numbers_wrong_fails_the_whole_batch() {
+    // The `Id` of an entry is how the answer says which key it talks about. An answer that
+    // numbers it outside the batch, or not at all, cannot be mapped onto keys at all: the
+    // one honest answer is that nothing was answered, so no key is dropped on it.
+    let expect = Expect::new(None).unwrap();
+    let pool = pool();
+    let items = |answer: Value, n: usize| {
+        let expect = &expect;
+        let pool = &pool;
+        async move {
+            batch_items(
+                &answer,
+                n,
+                expect,
+                pool,
+                200,
+                &[],
+                "https://sqs.eu-west-1.amazonaws.com/q",
+            )
+            .await
+        }
+    };
+
+    // A number where a string of a number belongs: the same index, read either way.
+    let got = items(
+        serde_json::json!({"Successful": [{"Id": 1, "MessageId": "m"}]}),
+        2,
+    )
+    .unwrap();
+    assert!(
+        matches!(got[1], Item::Ok),
+        "the numeric `Id` named the second item: {got:?}"
+    );
+    assert!(
+        matches!(&got[0], Item::Transient(why) if why.contains("no answer")),
+        "the item the answer never named waits: {got:?}"
+    );
+    // An `Id` that is neither.
+    let e = format!(
+        "{:#}",
+        items(serde_json::json!({"Failed": [{"Id": true}]}), 2)
+            .await
+            .unwrap_err()
+    );
+    assert!(e.contains("not one of 2"), "{e}");
+    // And one that is a number the batch does not have.
+    let e = format!(
+        "{:#}",
+        items(
+            serde_json::json!({"Failed": [{"Id": "7", "Code": "X", "Message": "y"}]}),
+            2
+        )
+        .await
+        .unwrap_err()
+    );
+    assert!(e.contains("the answer names item"), "{e}");
+    assert!(e.contains("not one of 2"), "{e}");
+    // The same in the section that answers well: a batch is read whole or not at all, so a
+    // good `Successful` entry cannot be believed past a `Failed` one that names nothing.
+    let e = format!(
+        "{:#}",
+        items(
+            serde_json::json!({
+                "Successful": [{"Id": "0", "MessageId": "m"}],
+                "Failed": [{"Id": "x", "Code": "X", "Message": "y"}],
+            }),
+            2,
+        )
+        .await
+        .unwrap_err()
+    );
+    assert!(e.contains("not one of 2"), "{e}");
+}
