@@ -513,6 +513,48 @@ fn rotation_and_table_map_retention() {
     assert_eq!(t.pos, pos("binlog.000003", 4));
 }
 
+#[test]
+fn event_ts_follows_real_events_only() {
+    // Freshness (review O-01): `Tracker::event_ts` is the source-clock timestamp of the last
+    // event that carried a usable one. A real event stamps it; a heartbeat (which a server sends
+    // only when its dump has nothing left to send) and the artificial events that open a stream
+    // (the re-sent FORMAT_DESCRIPTION / fake ROTATE, stamped at the connect instant) never move
+    // it, so the head stands where the last real change put it.
+    fn ev_at(et: u8, log_pos: u32, ts: u32, flags: u16, body: &[u8]) -> Event {
+        let mut b = header(et, 7, 19 + body.len(), log_pos, flags);
+        b[..4].copy_from_slice(&ts.to_le_bytes()); // overwrite the common-header timestamp
+        b.extend_from_slice(body);
+        read(&b)
+    }
+    let mut t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    assert_eq!(t.event_ts, 0, "nothing read yet: 0");
+
+    t.map_event(ev_at(ty::XID, 120, 1000, 0, &42u64.to_le_bytes()))
+        .unwrap();
+    assert_eq!(t.event_ts, 1000, "a real event moves the head to its ts");
+
+    t.map_event(ev_at(ty::HEARTBEAT, 9999, 2000, 0, b"binlog.000001"))
+        .unwrap();
+    assert_eq!(t.event_ts, 1000, "a heartbeat must not move the head");
+
+    t.map_event(ev_at(
+        ty::XID,
+        0,
+        3000,
+        ARTIFICIAL_FLAG,
+        &42u64.to_le_bytes(),
+    ))
+    .unwrap();
+    assert_eq!(
+        t.event_ts, 1000,
+        "an artificial event must not move the head"
+    );
+
+    t.map_event(ev_at(ty::XID, 400, 2500, 0, &7u64.to_le_bytes()))
+        .unwrap();
+    assert_eq!(t.event_ts, 2500, "the next real event moves the head again");
+}
+
 // The accessor an embedder uses to read a table's column types / metadata; it delegates to
 // Tracker::table_map, which BinlogReader::table_map is a thin wrapper over.
 #[test]
@@ -714,8 +756,9 @@ fn default_program_names_in_messages() {
         requirement_problems(Flavor::MariaDb, "ON", "row", "full", "OFF", "innodb"),
         vec![
             "binlog_storage_engine is innodb (must be unset: a binlog kept in the storage engine \
-             is only served to replicas that start from a GTID, lazyview reads it by file and \
-             position); fix: remove binlog_storage_engine from my.cnf and restart"
+             is only served to replicas that start from a GTID, and lazyview still starts by \
+             file and position whenever the saved cursor carries no GTID set — a first build \
+             never has one); fix: remove binlog_storage_engine from my.cnf and restart"
                 .to_string()
         ]
     );
@@ -868,4 +911,221 @@ fn transient_classifier_table() {
     assert!(is_transient(&anyhow::Error::new(
         mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed)
     )));
+}
+
+/// PR B: what the GTID dump's error codes become, and how the cursor's set text reaches the
+/// wire. ER_MISSING_GTID (3082) is the dump's own "position gone": the same typed answer the
+/// MissingBinlog policy already speaks. Purged-worded 1236 keeps flowing through
+/// `missing_binlog_message` (source owns its wording); an unrelated 1236 stays untyped.
+#[test]
+fn gtid_dump_error_mapping() {
+    let se = |code, msg: &str| mysql_async::ServerError {
+        code,
+        message: msg.into(),
+        state: "HY000".into(),
+    };
+    let at = Position {
+        file: "binlog.000007".into(),
+        pos: 4,
+    };
+    let gone = se(
+        3082,
+        "Cannot find the requested GTID 'aaaaaaaa-1111-2222-3333-444444444444:9' in the \
+         binary log",
+    );
+    let e = BinlogReader::map_error(mysql_async::Error::Server(gone), &at, 77);
+    assert!(
+        e.downcast_ref::<MissingBinlog>().is_some(),
+        "3082 not typed as missing: {e:#}"
+    );
+    let purged = se(
+        1236,
+        "Cannot replicate because the source purged required binary logs. Replicate the \
+         missing transactions from elsewhere.",
+    );
+    let e = BinlogReader::map_error(mysql_async::Error::Server(purged), &at, 77);
+    assert!(
+        e.downcast_ref::<MissingBinlog>().is_some(),
+        "purged-worded 1236 not typed as missing: {e:#}"
+    );
+    let other = se(
+        1236,
+        "Misconfigured source: BINLOG_FORMAT is set to STATEMENT.",
+    );
+    let e = BinlogReader::map_error(mysql_async::Error::Server(other), &at, 77);
+    assert!(
+        e.downcast_ref::<MissingBinlog>().is_none(),
+        "unrelated 1236 mistyped as missing: {e:#}"
+    );
+}
+
+/// The cursor's `g=` text → the request's SID blocks: inclusive intervals go out half-open
+/// (the server's `UUID_set_compaction` shape), gno 0 names no transaction, and a set with
+/// nothing usable is an error — never an empty GTID dump, which would mean "from my oldest
+/// binlog" to the server.
+#[test]
+fn gtid_dump_sids_wire_shape() {
+    let sids = crate::source::mysql::dump_sids(
+        "AAAAAAAA-1111-2222-3333-444444444444:1-3:5,bbbbbbbb-1111-2222-3333-444444444444:7",
+    )
+    .unwrap();
+    // A uuid on the wire is its 16 raw bytes, hyphens gone, big-endian as written.
+    let uuid = |n: u8| -> [u8; 16] {
+        [
+            n, n, n, n, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+        ]
+    };
+    assert_eq!(sids.len(), 2);
+    assert_eq!(sids[0].uuid(), uuid(0xaa));
+    assert_eq!(
+        sids[0]
+            .intervals()
+            .iter()
+            .map(|i| (i.start(), i.end()))
+            .collect::<Vec<_>>(),
+        vec![(1, 4), (5, 6)],
+    );
+    assert_eq!(sids[1].uuid(), uuid(0xbb));
+    assert_eq!(
+        sids[1]
+            .intervals()
+            .iter()
+            .map(|i| (i.start(), i.end()))
+            .collect::<Vec<_>>(),
+        vec![(7, 8)],
+    );
+    // Same uuid across groups: merged, one block.
+    let sids = crate::source::mysql::dump_sids(
+        "cccccccc-1111-2222-3333-444444444444:1-2,cccccccc-1111-2222-3333-444444444444:3",
+    )
+    .unwrap();
+    assert_eq!(sids.len(), 1);
+    assert_eq!(sids[0].intervals().len(), 1); // 1-2 and 3 coalesce
+                                              // Nothing usable: refused, not sent.
+    for bad in [
+        "",
+        "   ",
+        "not-a-uuid:1-2",
+        "dddddddd-1111-2222-3333-444444444444:",
+        "dddddddd-1111-2222-3333-444444444444:0",
+        "dddddddd-1111-2222-3333-444444444444:0-0",
+    ] {
+        assert!(
+            crate::source::mysql::dump_sids(bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+// ---- A-02: an event this build cannot decode is tagged, and is not a network fault
+
+/// The family the review names: a rows event whose `TABLE_MAP` was never seen. The error has to
+/// name the kind, the table and the position (the owner's ruling of 2026-11-16 keeps this fatal,
+/// so the one ERROR line is the whole record), and it must classify as undecodable rather than
+/// transient: the engine backs off instead of reconnecting every 200 ms on the network schedule.
+#[test]
+fn undecodable_rows_event_names_kind_table_position() {
+    let t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    let err = t.rows(7, &write_rows(240, 7, 1)).unwrap_err();
+    assert!(crate::source::is_undecodable(&err), "{err}");
+    assert!(
+        !is_transient(&err),
+        "a decoder failure is not a network fault: {err}"
+    );
+    let m = format!("{err:#}");
+    assert!(
+        m.contains(&format!(
+            "cannot decode rows(WRITE_ROWS_V1)({})",
+            ty::WRITE_ROWS_V1
+        )),
+        "{m}"
+    );
+    assert!(m.contains("table id 7"), "{m}");
+    assert!(m.contains("binlog.000001:240"), "{m}");
+    assert!(m.contains("no TABLE_MAP"), "{m}");
+}
+
+/// With a `TABLE_MAP` seen, the line names the table rather than an id an operator cannot read,
+/// and a failure of the row decode itself (not the missing map) is tagged the same way.
+#[test]
+fn undecodable_rows_event_names_the_table() {
+    let mut t = Tracker::new(Flavor::MySql, &pos("binlog.000001", 4));
+    t.map_event(table_map(100, 9, "shop", "items")).unwrap();
+    // A rows event that names another table than the id it was filed under: the decoder refuses
+    // it, and what the operator must see is the table the map was for.
+    let err = t.rows(9, &write_rows(320, 10, 1)).unwrap_err();
+    assert!(crate::source::is_undecodable(&err), "{err}");
+    assert!(!is_transient(&err), "{err}");
+    let m = format!("{err:#}");
+    assert!(m.contains("table `shop`.`items`"), "{m}");
+    assert!(m.contains("binlog.000001:320"), "{m}");
+    assert!(m.contains("not 9"), "{m}");
+}
+
+/// A mapping failure of the event itself (an event type this build refuses to read) is tagged too,
+/// with the kind and the position and no table: the bytes name none.
+#[test]
+fn undecodable_map_failure_names_kind_and_position() {
+    let mut t = Tracker::new(Flavor::MariaDb, &pos("mariadb-bin.000001", 4));
+    // MariaDB's compressed events need `binlog_commit_order_support`, which the reader refuses:
+    // a real "this build cannot read it" for the flavor it is not meant for.
+    let err = t
+        .map_event(ev(ty::MARIA_QUERY_COMPRESSED, 512, &[0; 8]))
+        .unwrap_err();
+    assert!(crate::source::is_undecodable(&err), "{err}");
+    assert!(!is_transient(&err), "{err}");
+    let m = format!("{err:#}");
+    assert!(
+        m.contains(&format!(
+            "cannot decode QUERY(compressed)({}) at mariadb-bin.000001:512",
+            ty::MARIA_QUERY_COMPRESSED
+        )),
+        "{m}"
+    );
+    assert!(m.contains("log_bin_compress"), "{m}");
+}
+
+/// The other half of the rule: nothing that means "the source went away" may read as undecodable,
+/// or a cut connection would back off on the decoder's schedule.
+#[test]
+fn a_network_fault_is_never_undecodable() {
+    let srv = |code: u16, msg: &str| {
+        anyhow::Error::new(mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: msg.into(),
+            state: "HY000".into(),
+        }))
+    };
+    for (code, msg) in [
+        (2013u16, "Lost connection to source during query"),
+        (1236, "Master has purged all binlogs for the replica"),
+        (1040, "Too many connections"),
+    ] {
+        let e = srv(code, msg);
+        assert!(
+            !crate::source::is_undecodable(&e),
+            "{code} is not the decoder"
+        );
+    }
+    for kind in [
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::TimedOut,
+    ] {
+        let e = anyhow::Error::new(mysql_async::Error::Io(mysql_async::IoError::Io(
+            std::io::Error::new(kind, "x"),
+        )));
+        assert!(
+            !crate::source::is_undecodable(&e),
+            "{kind:?} is not the decoder"
+        );
+        assert!(is_transient(&e), "{kind:?} is the network's");
+    }
+    // A dump packet that is not a readable event at all is the decoder's: invalid data.
+    let e = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "not a binlog event",
+    ));
+    assert!(crate::source::is_undecodable(&e));
+    assert!(!is_transient(&e));
 }

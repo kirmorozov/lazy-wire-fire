@@ -218,6 +218,35 @@ pub async fn gtid_covers(conn: &mut mysql_async::Conn, saved: &Cursor) -> anyhow
     }
 }
 
+/// One flavor's set text into the shared interval shape ([`mysql::GtidSet`]): the grammar is
+/// the flavor's (`mysql.rs` and `maria.rs` each own their `parse_gtid_set`), the shape is
+/// shared so the engine's comparisons need no branch.
+pub(crate) fn parse_set(flavor: Flavor, text: &str) -> mysql::GtidSet {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => mysql::parse_gtid_set(text),
+        Flavor::MariaDb => maria::parse_gtid_set(text),
+    }
+}
+
+/// Merge one stream GTID (`uuid:gno` / `uuid:tag:gno`, or `domain-server-seq`) into the
+/// consumed set — the engine's per-committed-transaction call. The grammar is the flavor's;
+/// the cost note lives with each merge (in-place interval merge, allocation only for a
+/// first-time source id). `false` = not this flavor's grammar: the set is left untouched.
+pub(crate) fn merge_gtid(flavor: Flavor, set: &mut mysql::GtidSet, gtid: &str) -> bool {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => mysql::merge_gtid(set, gtid),
+        Flavor::MariaDb => maria::merge_gtid(set, gtid),
+    }
+}
+
+/// The consumed set in the flavor's own set grammar — the `[g=…]` text a cursor carries.
+pub(crate) fn render_set(flavor: Flavor, set: &mysql::GtidSet) -> String {
+    match flavor {
+        Flavor::MySql | Flavor::Percona => mysql::render_set(set),
+        Flavor::MariaDb => maria::render_list(set),
+    }
+}
+
 /// The GTID state a source reports about itself, read once at connect (the network edge, in
 /// [`crate::binlog`]) and interpreted by the flavor modules. `None` means the server has no such
 /// variable, not that it is empty: MariaDB has no `gtid_mode`, MySQL/Percona no
@@ -475,6 +504,94 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
                 _ => false,
             }) || c.downcast_ref::<std::io::Error>().is_some_and(transient_io)
         })
+}
+
+/// A binlog event this build cannot map (review A-02): the bytes arrived and the decoder refused
+/// them, so reading again from the saved position fails on the same bytes until a fixed build
+/// runs. That is the difference from a source that is unreachable or has lost the file
+/// ([`MissingBinlog`]) — one waits for the source, the other waits for a deploy, and only the
+/// first is a network fault. The owner's ruling (2026-11-16) keeps a decode failure that exits
+/// the process fatal, so the fields below are what the one ERROR line has to name: kind, table,
+/// position.
+#[derive(Debug)]
+pub struct Undecodable {
+    /// The event kind with its raw code, e.g. `rows(UPDATE_ROWS_V1)(31)` or `TABLE_MAP(19)`.
+    pub kind: String,
+    /// The table the event names when one is known: `schema.table` when a TABLE_MAP was seen for
+    /// the id, `table id <n>` when it was not — the second is the commonest reason a rows event
+    /// cannot be decoded. `None` for a failure to map the event itself, where no table is named
+    /// by the bytes at all.
+    pub table: Option<String>,
+    /// Where the event sits in the binlog file: the position the reader keeps coming back to.
+    pub position: Position,
+    /// What the decoder said.
+    detail: String,
+}
+
+impl Undecodable {
+    /// Tags an error of the mapper with what the event was. Called only where an event failed,
+    /// never on the hot path; the message of `e` is kept whole in [`Undecodable::detail`].
+    pub(crate) fn tag(
+        e: anyhow::Error,
+        kind: String,
+        table: Option<String>,
+        at: &Position,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            table,
+            position: at.clone(),
+            detail: format!("{e:#}"),
+        })
+    }
+}
+
+impl std::fmt::Display for Undecodable {
+    /// The one line an operator of a crashing instance gets (the owner's ruling of 2026-11-16
+    /// keeps a decode failure fatal): kind, position, table when the bytes name one, and what the
+    /// decoder said. The engine logs it as it is, so no prefix of its own repeats these words.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.table {
+            Some(t) => write!(
+                f,
+                "cannot decode {} at {}: table {}, {}",
+                self.kind, self.position, t, self.detail
+            ),
+            None => write!(
+                f,
+                "cannot decode {} at {}: {}",
+                self.kind, self.position, self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Undecodable {}
+
+/// True when the stream failed because an event cannot be decoded rather than because the source
+/// went away (A-02), so the caller backs off instead of reconnecting on the network schedule.
+/// Two sources, both the decoder's own: an error the mapper tagged with [`Undecodable`], and a
+/// dump packet that is not a readable event at all — the reader reports those as an `io::Error`
+/// of the invalid-data class. A truncated read arrives as `UnexpectedEof`, which [`is_transient`]
+/// owns: a cut connection is not a decoder bug.
+pub fn is_undecodable(e: &anyhow::Error) -> bool {
+    fn undecodable_io(io: &std::io::Error) -> bool {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::Unsupported
+        )
+    }
+    e.chain().any(|c| {
+        c.downcast_ref::<Undecodable>().is_some()
+            || match c.downcast_ref::<mysql_async::Error>() {
+                Some(mysql_async::Error::Io(mysql_async::IoError::Io(io))) => undecodable_io(io),
+                _ => false,
+            }
+            || c.downcast_ref::<std::io::Error>()
+                .is_some_and(undecodable_io)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -753,5 +870,94 @@ mod tests {
         ));
         // empty saved set
         assert!(mysql::gtid_subset(&s(""), &s("0-1-100")));
+    }
+
+    /// PR C: the `[g=…]` text → the list `SET @slave_connect_state` takes. One high-water mark
+    /// per `domain-server` pair (what the server reads from a list), intervals merged first, and
+    /// nothing usable is an error — never an empty list, which the server would answer with a
+    /// dump from its oldest binlog.
+    #[test]
+    fn maria_dump_gtid_list() {
+        let list = |t: &str| maria::dump_gtid_list(t).unwrap();
+        assert_eq!(list("0-1-100"), "0-1-100");
+        // an explicit window goes out as its end: the server's list is a high-water mark too
+        assert_eq!(list("0-1-40-60"), "0-1-60");
+        // two entries of one pair merge to their highest seq, and pairs keep a stable order
+        assert_eq!(list("0-1-3,0-1-10-12"), "0-1-12");
+        assert_eq!(list("1-2-5,0-7-9,0-10-1"), "0-10-1,0-7-9,1-2-5");
+        // whitespace and a repeated pair are tolerated (the text comes from a saved cursor)
+        assert_eq!(list(" 0-1-4 , 0-1-2 "), "0-1-4");
+        // Nothing usable: refused, with words that name the GTID list.
+        for bad in ["", "   ", "not-a-list", "0-1", "0-1-x", "0-1-0", "0-1-5-3"] {
+            let e = match maria::dump_gtid_list(bad) {
+                Ok(list) => panic!("{bad:?} accepted as {list:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                format!("{e:#}").contains("GTID list"),
+                "{bad:?} refused with the wrong words: {e:#}"
+            );
+        }
+    }
+
+    /// PR D: the engine's per-transaction merge (`source::merge_gtid`) and the render back to
+    /// cursor text (`source::render_set`), per flavor. The merge accepts exactly the stream
+    /// event's spellings and refuses anything else without touching the set (the safe
+    /// under-claim); the render must round-trip through the same flavor's parse.
+    #[test]
+    fn gtid_merge_and_render_round_trip() {
+        use super::{merge_gtid, render_set};
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        // MySQL family: sequential gnos extend in place, a repeat is a no-op, a tagged event
+        // merges under its uuid, two intervals render as MySQL prints them.
+        let mut set = mysql::GtidSet::new();
+        for g in [
+            format!("{u}:1"),
+            format!("{u}:2"),
+            format!("{u}:2"),
+            format!("{u}:3:7"), // tagged: uuid:tag:gno
+            u.to_uppercase().to_string() + ":9",
+        ] {
+            assert!(merge_gtid(Flavor::MySql, &mut set, &g), "{g}");
+        }
+        let junk = [format!("{u}:x"), format!("{u}:")];
+        for bad in [
+            "".to_string(),
+            "u:1".into(),
+            "nonsense".into(),
+            junk[0].clone(),
+            junk[1].clone(),
+        ] {
+            assert!(
+                !merge_gtid(Flavor::MySql, &mut set, &bad),
+                "{bad:?} accepted"
+            );
+        }
+        let text = render_set(Flavor::MySql, &set);
+        assert_eq!(text, format!("{u}:1-2,{u}:7,{u}:9"));
+        // Render → parse is the identity on the intervals.
+        assert_eq!(mysql::parse_gtid_set(&text), set);
+        // MariaDB: the `domain-server-seq` event text merges densely per pair; the render is
+        // the explicit-window form the parse (and `SET @slave_connect_state`) reads back.
+        let mut set = mysql::GtidSet::new();
+        for g in ["0-1-1", "0-1-2", "0-1-3", "1-2-5"] {
+            assert!(merge_gtid(Flavor::MariaDb, &mut set, g), "{g}");
+        }
+        for bad in ["", "0-1", "0-1-x", "0-1-2-3", "a-b-c"] {
+            assert!(
+                !merge_gtid(Flavor::MariaDb, &mut set, bad),
+                "{bad:?} accepted"
+            );
+        }
+        assert_eq!(render_set(Flavor::MariaDb, &set), "0-1-1-3,1-2-5-5");
+        assert_eq!(
+            maria::parse_gtid_set(&render_set(Flavor::MariaDb, &set)),
+            set
+        );
+        // A reader that joined mid-stream keeps a window that does not start at 1: the render
+        // says exactly that (no high-water over-claim).
+        let mut set = mysql::GtidSet::new();
+        assert!(merge_gtid(Flavor::MariaDb, &mut set, "0-1-57"));
+        assert_eq!(render_set(Flavor::MariaDb, &set), "0-1-57-57");
     }
 }
