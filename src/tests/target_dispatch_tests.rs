@@ -370,8 +370,7 @@ async fn the_batch_front_of_a_transport_the_kind_does_not_speak_names_the_kind()
 async fn the_size_a_batch_is_cut_to_follows_the_service_that_set_it() {
     let _env = crate::secrets::ENV_LOCK.lock().await;
     let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
-    let dir = std::env::temp_dir().join(format!("lazywf-dispatch-limits-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("limits");
     let desc = dir.join("lazywf.desc");
     std::fs::write(&desc, crate::targets::grpc::contract::DESCRIPTOR).unwrap();
     std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
@@ -433,4 +432,90 @@ async fn the_size_a_batch_is_cut_to_follows_the_service_that_set_it() {
         Some(v) => std::env::set_var("LAZYWF_SECRET_DIRS", v),
         None => std::env::remove_var("LAZYWF_SECRET_DIRS"),
     }
+}
+
+/// A scratch directory of this test run under the repository's `tmp/`, the shape the other unit
+/// tests use (`src/tests/aws_provider_tests.rs`): what a test wrote stays readable next to the
+/// rest of the test output instead of disappearing into `/tmp`.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join("unit")
+        .join(format!("target-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The http bind belongs to the http kinds. A kind whose transport is another one's must be
+/// refused by name rather than have a request built it can never put on the wire: this is the
+/// arm between the http front of `http_bind` and `send`'s own dispatch by kind.
+#[tokio::test]
+async fn a_kind_that_speaks_another_transport_is_refused_the_http_bind_by_name() {
+    for (kind, endpoint) in [
+        ("redis", "redis://cache.example.test:6380/0"),
+        ("kafka", "kafka://mq.example.test:9094/orders"),
+    ] {
+        let t = target(kind, endpoint, "{}");
+        let req = RawRequest::parse("POST /h HTTP/1.1\n\n{}")
+            .unwrap()
+            .unwrap();
+        let e = match t.http_bind(&t.endpoints[0], req).await {
+            Ok(_) => panic!("a {kind} target has no http transport to bind a request to"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(e.contains("is not an http target"), "{kind}: {e}");
+        assert!(e.contains("t"), "{kind}: the refusal names the target: {e}");
+    }
+}
+
+/// Credentials that resolved to nothing are refused by the signer rather than sent: a request
+/// signed with an empty key is not an anonymous request, it is a request AWS will refuse in a
+/// way that reads like a target bug, and the tool would have paid a round trip for it.
+#[tokio::test]
+async fn credentials_that_are_empty_are_refused_before_the_signed_send() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    std::env::set_var("LWF_TEST_AWS_EMPTY_AK", "");
+    std::env::set_var("LWF_TEST_AWS_EMPTY_SK", "");
+    let t = target(
+        "sqs",
+        "aws-sqs://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34561",
+        r#"{"access_key_ref":"env:LWF_TEST_AWS_EMPTY_AK","secret_key_ref":"env:LWF_TEST_AWS_EMPTY_SK"}"#,
+    );
+    let req = RawRequest::parse("POST / HTTP/1.1\n\n{}").unwrap().unwrap();
+    let e = match t.prepare(req, "", "sqs.eu-west-1.amazonaws.com").await {
+        Ok(_) => panic!("empty credentials must not be signed and sent"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(e.contains("empty AWS credentials"), "{e}");
+}
+
+/// A credential var that is absent, not merely empty: the load path cannot produce this (the
+/// row check requires the vars each kind names), so it is written the way the engine would
+/// meet it — a def that got past that check. The answer is the var by name, never an empty
+/// claim on the wire, and never a panic on a missing map entry.
+#[tokio::test]
+async fn a_credential_var_that_is_absent_is_named_and_not_left_empty() {
+    let def = TargetDef {
+        name: "t".into(),
+        kind: Kind::HttpBearer,
+        endpoints: vec!["https://api.example.test/hook".into()],
+        tls: crate::tls::TlsSpec::parse(None).unwrap(),
+        timeout: std::time::Duration::from_secs(1),
+        expect: None,
+        vars: serde_json::Map::new(),
+    };
+    let t = Target::new(
+        def,
+        mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x"),
+        None,
+    )
+    .unwrap();
+    let req = RawRequest::parse("POST /h HTTP/1.1\n\n{}")
+        .unwrap()
+        .unwrap();
+    let e = match t.prepare(req, "", "api.example.test").await {
+        Ok(_) => panic!("a bearer target with no `token` var must not be prepared"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(e.contains("vars.token is missing"), "{e}");
 }
