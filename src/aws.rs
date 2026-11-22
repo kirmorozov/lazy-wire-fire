@@ -518,20 +518,49 @@ fn config_file_text() -> Option<String> {
 }
 
 /// `region` of `profile` in the text of a shared config file (`[default]`, `[profile <name>]`).
+///
+/// The default profile is spelled both ways in shared config files, and the AWS tools read both, so
+/// we read both too: `aws-runtime-1.10.4/src/env_config/normalize.rs:98` strips the `profile` prefix
+/// from a config-file section name, `:100` states "A profile named `profile default` takes priority
+/// over a profile named `default`", and `:126-138` discard `[default]` entirely once a
+/// `[profile default]` section exists — the prefixed one *replaces* it rather than adding to it, so a
+/// `region` left only under `[default]` does not answer then. That is priority, not first-wins: the two
+/// sections win in either order in the file. Every other profile keeps its prefix, so `[foo]` is not
+/// the profile `foo`, and one `profile` word is stripped rather than two, so
+/// `[profile profile default]` is the profile `profile default` and never the default.
 pub fn config_region(text: &str, profile: &str) -> Option<String> {
-    let wanted = if profile == "default" {
-        "default".to_string()
-    } else {
-        format!("profile {profile}")
-    };
+    if profile == "default" {
+        // Asking only the prefixed section when the file has one is what makes it win over
+        // `[default]` wherever the two sit, and it is how the SDK drops the unprefixed one.
+        let wanted = if has_section(text, "profile default") {
+            "profile default"
+        } else {
+            "default"
+        };
+        return region_of(text, wanted);
+    }
+    region_of(text, &format!("profile {profile}"))
+}
+
+/// Whether the text of a shared config file opens a `[name]` section.
+fn has_section(text: &str, name: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && !line.starts_with(';'))
+        .any(|line| section_name(line) == Some(name))
+}
+
+/// The `region` of the `[name]` section of a shared config file, or `None` when the section is
+/// absent or has no region to give — a blank or a commented-out one counts as nothing to give.
+fn region_of(text: &str, name: &str) -> Option<String> {
     let mut in_profile = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
             continue;
         }
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_profile = name.trim() == wanted;
+        if let Some(section) = section_name(line) {
+            in_profile = section == name;
             continue;
         }
         if let (true, Some((k, v))) = (in_profile, line.split_once('=')) {
@@ -541,6 +570,12 @@ pub fn config_region(text: &str, profile: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The name inside a `[bracketed]` section header, and `None` for any other line.
+fn section_name(line: &str) -> Option<&str> {
+    let name = line.strip_prefix('[')?.strip_suffix(']')?;
+    Some(name.trim())
 }
 
 /// The error code of an AWS answer: the `x-amzn-ErrorType` header, else the `__type` field of a
@@ -875,5 +910,155 @@ mod debug_tests {
         assert!(!shown.contains("SK-LITERAL-5"), "{shown}");
         assert!(!shown.contains("ST-LITERAL-6"), "{shown}");
         assert!(shown.contains("env:AK-NAME"), "{shown}");
+    }
+}
+
+#[cfg(test)]
+mod config_region_tests {
+    use super::*;
+
+    /// The acceptance case for the bug: the one spelling of the default profile this parser used to
+    /// refuse, which the user's other AWS tooling reads while `resolve_region` answered "no AWS
+    /// region" over it. PR #191 carries the same assertion, ignored, as
+    /// `the_bracketed_profile_default_spelling_of_the_default_profile_is_read_too` at
+    /// `src/tests/aws_provider_tests.rs:482`.
+    #[test]
+    fn the_prefixed_spelling_of_the_default_profile_is_read() {
+        assert_eq!(
+            config_region("[profile default]\nregion = us-east-2\n", "default"),
+            Some("us-east-2".into()),
+            "`[profile default]` is the profile `default` to aws-config, so it has to be one to us too"
+        );
+    }
+
+    #[test]
+    fn the_plain_default_section_still_answers_its_region() {
+        assert_eq!(
+            config_region("[default]\nregion = us-east-1\n", "default"),
+            Some("us-east-1".into())
+        );
+        // And nothing else in the file is asked for on its behalf.
+        assert_eq!(
+            config_region("[profile other]\nregion = eu-west-1\n", "default"),
+            None
+        );
+    }
+
+    /// Both spellings in one file is the case Q-11 rules on. The SDK drops `[default]` once
+    /// `[profile default]` exists (`normalize.rs:126-138`), so the prefixed region wins whichever of
+    /// the two the file prints first: priority, not first-wins.
+    #[test]
+    fn the_prefixed_default_beats_a_plain_default_written_before_it() {
+        let text = "[default]\nregion = us-east-1\n\n[profile default]\nregion = us-east-2\n";
+        assert_eq!(
+            config_region(text, "default"),
+            Some("us-east-2".into()),
+            "the unprefixed section loses to the prefixed one, not to whoever is read first"
+        );
+    }
+
+    #[test]
+    fn the_prefixed_default_beats_a_plain_default_written_after_it() {
+        let text = "[profile default]\nregion = us-east-2\n\n[default]\nregion = us-east-1\n";
+        assert_eq!(
+            config_region(text, "default"),
+            Some("us-east-2".into()),
+            "the order of the two sections does not decide which one wins"
+        );
+    }
+
+    /// The prefixed section replaces the plain one, it does not complete it: a `region` left under
+    /// `[default]` is not read once the file also opens `[profile default]`, because the SDK drops
+    /// the unprefixed section as a whole rather than merging the two.
+    #[test]
+    fn a_plain_default_region_is_not_read_once_the_prefixed_section_exists() {
+        let text = "[default]\nregion = us-east-1\n\n[profile default]\noutput = json\n";
+        assert_eq!(config_region(text, "default"), None);
+    }
+
+    /// The other half of the change: everything that is not `default` is exactly as it was. A named
+    /// profile is still only its prefixed spelling, so a header in the old default style stays inert.
+    #[test]
+    fn a_named_profile_still_needs_its_prefix() {
+        assert_eq!(
+            config_region("[work]\nregion = eu-central-1\n", "work"),
+            None
+        );
+        assert_eq!(
+            config_region("[profile work]\nregion = eu-central-1\n", "work"),
+            Some("eu-central-1".into())
+        );
+        // Accepting `[default]` and `[profile default]` for one name did not make a plain
+        // `[default]` answer for a named profile.
+        assert_eq!(
+            config_region("[default]\nregion = us-east-1\n", "work"),
+            None,
+            "the two accepted spellings belong to `default` alone"
+        );
+    }
+
+    /// A blank or commented-out `region` under the prefixed default is nothing to give, exactly as
+    /// it already was under `[default]`.
+    #[test]
+    fn an_empty_region_under_the_prefixed_default_is_not_a_region() {
+        assert_eq!(
+            config_region("[profile default]\nregion =\n", "default"),
+            None
+        );
+        assert_eq!(
+            config_region(
+                "[profile default]\n# region = eu-west-1\nregion =   \n",
+                "default"
+            ),
+            None
+        );
+    }
+
+    /// A commented-out section header is not a section. `has_section` drops `#` lines for the same
+    /// reason `region_of` skips them, so a commented `[profile default]` cannot become the prefixed
+    /// section that suppresses the live `[default]` sitting under it. The two helpers are separate
+    /// walks of the same text, which is exactly where an asymmetry would live: this is the witness
+    /// that they agree, rather than a reading of them.
+    #[test]
+    fn a_hash_commented_profile_default_header_does_not_suppress_the_plain_default() {
+        let text = "# [profile default]\nregion = us-east-2\n\n[default]\nregion = us-east-1\n";
+        assert_eq!(
+            config_region(text, "default"),
+            Some("us-east-1".into()),
+            "a `#` comment is not a section header, so nothing suppresses `[default]`"
+        );
+    }
+
+    /// The `;` comment character is the other spelling of the same rule, and the other one `has_section`
+    /// has to filter.
+    #[test]
+    fn a_semicolon_commented_profile_default_header_does_not_suppress_the_plain_default() {
+        let text = "; [profile default]\nregion = us-east-2\n\n[default]\nregion = us-east-1\n";
+        assert_eq!(
+            config_region(text, "default"),
+            Some("us-east-1".into()),
+            "a `;` comment is not a section header either"
+        );
+    }
+
+    /// One `profile` word is stripped and not two (`normalize.rs:33-40` splits the header once on
+    /// whitespace), so `[profile profile default]` is the profile `profile default`: it is neither
+    /// read for `default` nor does it count as the prefixed section that suppresses `[default]`.
+    #[test]
+    fn a_profile_named_like_a_prefix_does_not_become_the_default() {
+        let text = "[profile profile default]\nregion = sa-east-1\n";
+        assert_eq!(config_region(text, "default"), None);
+        assert_eq!(
+            config_region(text, "profile default"),
+            Some("sa-east-1".into()),
+            "it is a profile of its own, under the name the file gives it"
+        );
+    }
+
+    #[test]
+    fn a_profile_named_like_a_prefix_does_not_hide_the_plain_default() {
+        let text =
+            "[profile profile default]\nregion = sa-east-1\n\n[default]\nregion = us-east-1\n";
+        assert_eq!(config_region(text, "default"), Some("us-east-1".into()));
     }
 }
