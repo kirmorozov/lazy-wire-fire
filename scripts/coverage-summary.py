@@ -17,6 +17,38 @@
 #     that one file's counts. A `#[cfg(test)] mod tests;` DECLARATION subtracts nothing: its
 #     body is the first case, in src/tests/.
 #
+# WHICH WAY THE ROW MOVES — worth writing down, because a plausible-sounding rationale for the
+# opposite survived review, a green run and a merge: excluding those bodies moves the own-code row
+# DOWN, not up. A test body is run by the test suite, so what comes out of the bucket is ~99%
+# covered against a production average of ~82% — a nearly-always-covered population RAISES the
+# percentage of the bucket it sits in, so taking it away deflates the row to the honest
+# production-only figure. CI's own `coverage (informational)` job shows it; each log line arrives as
+# `jobname<TAB>step<TAB>timestamp <text>`, so strip that prefix before reading (repo
+# kirmorozov/lazy-wire-fire):
+#
+#   pre-fix   main 57596a9,  run 44945166009, job 136970765657 — own code 83.88% (15768/18799)
+#   post-fix  head 5f0c6344, run 44915281395, job 136879452875 — own code 82.45% (14104/17107)
+#
+# Those are two trees as well as two behaviours — all 4 lines of denominator difference are
+# `src/target.rs` (714 counted lines on one run, 710 on the other), which grew the http-batch
+# front of `Target::send_items` on main after the PR branched. The clean before/after is one tree
+# and one export through this script both ways: `--no-gated` 83.97% (15782/18795) against 82.45%
+# (14104/17107), down 1.52 points, with 1678 of the 1688 subtracted lines covered. The vendored
+# row is byte-identical across the two runs — the control that says nothing else was touched.
+# Percentages drift with `src/`, so the direction and the ~99%-gated versus ~82%-production gap
+# are the durable claim; a copied percentage is not.
+#
+# THE TWO COUNTS of what leaves the bucket measure different things and were conflated once. The
+# subtracted ranges are 2619 RAW source lines — blanks, comments, doc lines and braces included,
+# what `--show-gated` prints — but only 1688 llvm-cov COUNTED lines in 44 own files, because a
+# line is counted only where a segment carries a count (see `line_delta`). The 1692 that the two
+# CI tables differ by is that 1688 plus the 4 `src/target.rs` lines the runs' trees differ by. The
+# "63 own files — some 5.9K lines" of commit 0ab830c1 is neither, and no measurement of this
+# subtraction reproduces it: the only figure in that range is all of `src/` together — these own
+# files AND the vendored lazyview copies under `src/`, which this script deliberately leaves alone
+# (5876 raw gated lines, 65 files). So 5.9K is a raw whole-tree count and 1688/1692 the counted
+# lines that actually leave the own-code bucket; they do not contradict each other.
+#
 # The vendored section keeps whatever the lock lists, tests included — that copy is lazyview's
 # and its numbers are meant to read the same as lazyview's own report.
 #
