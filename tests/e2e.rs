@@ -11451,3 +11451,680 @@ async fn a_failed_reset_requested_clear_waits_five_seconds() {
     .await;
     inst.stop().await;
 }
+// --------------------------------------------------------------------------- binlog continuity at restart
+//
+// The regions here are the ones the engine runs when the binlog it stored a position in is not
+// the binlog it is being asked to read: `choose_start` (src/engine.rs:1139), `lose_continuity`
+// and `start_reset` (1227, 1240), and the resume of unfinished resets (1206-1220). What they all
+// read is `lazy_wire_fire_status` — the positions, the server identity and the per-rule reset
+// state the engine wrote on its last shutdown — so a test that stops the engine and edits its own
+// rows reaches the same arms a purged binlog or a promoted server would, without deleting a file
+// from the server every worker of this repo shares. That is a deliberate limit and it is stated
+// where it belongs: these tests prove what the engine *does* with a position it cannot honour.
+// They do not prove the server ever reports one gone — that is the source layer's
+// `is_missing_binlog` (`src/source/mod.rs:714`), reachable only by deleting a binlog file, which
+// on a shared server is barred; the chaos design proposed separately (PR-6) gives it a container of
+// its own instead.
+
+/// The `host:port` a root DSN points at, as the chaos harness reads it (`tests/chaos.rs:43`).
+fn server_host(root: &str) -> String {
+    let (_, rest) = root.split_once("://").expect("dsn scheme");
+    rest.rsplit_once('@').map_or(rest, |(_, h)| h).to_string()
+}
+
+/// The same schema reached through a proxy: credentials kept, host:port replaced
+/// (`tests/chaos.rs:49`).
+fn via(root: &str, proxy: std::net::SocketAddr, schema: &str) -> String {
+    let (scheme, rest) = root.split_once("://").expect("dsn scheme");
+    let creds = rest.rsplit_once('@').map_or("", |(c, _)| c);
+    format!("{scheme}://{creds}@{proxy}/{schema}?prefer_socket=false")
+}
+
+/// One column of the instance (`*`) status row, as the engine wrote it.
+async fn star_column(db: &Db, column: &str) -> String {
+    assert!(
+        column
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "not a column name: {column}"
+    );
+    let mut c = db.conn().await;
+    let v: Option<String> = c
+        .query_first(format!(
+            "SELECT {column} FROM lazy_wire_fire_status WHERE rule = '*'"
+        ))
+        .await
+        .unwrap();
+    quit(c).await;
+    v.unwrap_or_default()
+}
+
+/// The server's own identity, the way the engine reads it (`SELECT CAST(@@server_uuid AS CHAR)`,
+/// or the id pair on MariaDB): a test that forges a saved identity has to know what a real one is
+/// before it can tell the two apart in a WARN.
+async fn real_identity(db: &Db) -> String {
+    let mut c = db.conn().await;
+    let mariadb: String = c
+        .query_first("SELECT VERSION()")
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    let q = if mariadb.contains("MariaDB") {
+        "SELECT CAST(CONCAT(@@server_id, ':', @@gtid_domain_id) AS CHAR)"
+    } else {
+        "SELECT CAST(@@server_uuid AS CHAR)"
+    };
+    let v: Option<String> = c.query_first(q).await.unwrap();
+    quit(c).await;
+    v.unwrap_or_default()
+}
+
+/// One row of `lazy_wire_fire_status`, in the order the query below reads it. Named rather than
+/// spelled out there because a six-element tuple is what `clippy::type_complexity` is there to
+/// catch, the way `tests/common/fault.rs` names its `SampledPhase`.
+type StatusRow = (String, String, u64, String, Option<String>, Option<String>);
+
+/// Every status row as the engine wrote it: where it believes it is, what each rule's reset state
+/// is, what it last failed on, and the identity it saved. A wait that gives up prints this beside
+/// the mock's traffic — an engine parked at a position the server has moved past and an engine that
+/// is reading the stream but holding a rule's keys look the same from outside, and which of them it
+/// is decides whether a red is a test bug or a product bug.
+async fn status_dump(db: &Db) -> String {
+    let mut c = db.conn().await;
+    let rows: Vec<StatusRow> = c
+        .query(
+            "SELECT `rule`, `binlog_file`, `binlog_pos`, `reset_state`, `last_error`, \
+             `server_identity` FROM `lazy_wire_fire_status` ORDER BY `rule`",
+        )
+        .await
+        .unwrap_or_default();
+    quit(c).await;
+    rows.iter()
+        .map(|(rule, file, pos, state, err, id)| {
+            format!(
+                "{rule}@{file}:{pos} reset={state} error={error} identity={identity}",
+                error = err.as_deref().unwrap_or("-"),
+                identity = id.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// A rule with `reset_steps` and one without, both watching `shop`'s tables and both sending to
+/// the mock: the two ways a loss of continuity is handled. The step's path is its own, so an
+/// answered `/reset-<rule>` is the step and nothing else (see [`answer_log`]).
+async fn pair_of_rules(db: &Db, mock: &Mock, with_steps: &str, without_steps: &str) {
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps =
+        json!([{"once": true, "template": format!("PURGE /reset-{with_steps} HTTP/1.1\n\n")}])
+            .to_string();
+    db.exec_params(
+        &format!(
+            "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+             VALUES ('{with_steps}', 'hook', 'POST /{with_steps} HTTP/1.1\n\n{{{{join keys \",\"}}}}', ?, 50)"
+        ),
+        (steps,),
+    )
+    .await;
+    db.trigger(with_steps, "orders", Some("{{new.id}}"), None)
+        .await;
+    db.exec(&format!(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) \
+         VALUES ('{without_steps}', 'hook', 'POST /{without_steps} HTTP/1.1\n\n{{{{join keys \",\"}}}}', 50)"
+    ))
+    .await;
+    db.trigger(without_steps, "customers", Some("{{new.id}}"), None)
+        .await;
+}
+
+/// The engine wrote a position into a file the server no longer lists. At start the rule cannot
+/// resume from it, so the rule with `reset_steps` re-reads its table from scratch and the rule
+/// without them says out loud that what happened in between is not covered
+/// (`choose_start`'s `lost` list, `lose_continuity`'s two arms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_position_the_binlog_no_longer_has_resets_the_rule() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "gonepos").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    pair_of_rules(&db, &mock, "goneo", "gonec").await;
+    let log = answer_log(&mock);
+
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(20),
+        "both rules before the restart",
+        || async {
+            (answered(&log, "/reset-goneo") >= 1
+                && fired(&mock.requests(), "/goneo") == ["1"]
+                && fired(&mock.requests(), "/gonec") == ["1"])
+            .then_some(())
+        },
+    )
+    .await;
+    inst.quiet().await;
+    let reset_base = answered(&log, "/reset-goneo");
+    inst.stop().await;
+
+    // A file name this server cannot have. The instance's own row keeps a position the server
+    // does have, so it is these two rules that lost theirs and not the run as a whole.
+    let gone = "lwf-gone-binlog.000001";
+    db.exec(&format!(
+        "UPDATE lazy_wire_fire_status SET binlog_file = '{gone}', binlog_pos = 4 \
+         WHERE rule IN ('goneo','gonec')"
+    ))
+    .await;
+    let base = warn_baselines(&["rule=gonec"], &["no longer available"]);
+    // The row read below has to be one the *new* engine wrote: the row the old run left behind
+    // said `none` (the rule had never lost anything), and reading that would prove nothing.
+    // `persist` rewrites every row at start and then whenever its position moves, else every
+    // `STATUS_HEARTBEAT`, so polling for a newer row settles.
+    let after = server_now(&db).await;
+
+    let inst = Instance::ready(config(&db, &[])).await;
+    // The rule that can cover the gap does: its step is answered again, after the restart.
+    wait_for(
+        Duration::from_secs(25),
+        "the reset of goneo after the restart",
+        || async { (answered(&log, "/reset-goneo") > reset_base).then_some(()) },
+    )
+    .await;
+    // The rule that cannot says why, and names the position it lost.
+    let lost = wait_for(
+        Duration::from_secs(25),
+        "the continuity WARN of gonec",
+        || async { warn_grew(&["rule=gonec"], &["no longer available"], &base) },
+    )
+    .await;
+    assert!(
+        lost.contains(gone) && lost.contains("no reset_steps"),
+        "the WARN names neither the lost position nor what is uncovered: {lost}"
+    );
+    let recorded = wait_for(
+        Duration::from_secs(60),
+        "gonec's status row to record the loss",
+        || async {
+            status_row(&db, "gonec", &after)
+                .await
+                .map(|(_, _, s, _)| s)
+                .filter(|s| s.starts_with("missing:"))
+        },
+    )
+    .await;
+    assert!(
+        recorded.contains("no longer available"),
+        "the rule without reset_steps did not record which position is gone: {recorded}"
+    );
+
+    // The stream itself went on from the instance's position, not from the forged one: a key
+    // written now reaches both rules.
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 2)").await;
+    db.exec("INSERT INTO customers VALUES (2, 'bob')").await;
+    wait_for(
+        Duration::from_secs(20),
+        "both rules after the restart",
+        || async {
+            let r = mock.requests();
+            (fired(&r, "/goneo").contains(&"2".to_string())
+                && fired(&r, "/gonec").contains(&"2".to_string()))
+            .then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// The saved server identity is not this server's: continuity is gone for every rule, the engine
+/// starts from the current position rather than the saved one, and what the two disagreed about
+/// is covered by the reset steps — or explicitly not covered, for the rule that has none.
+///
+/// The identity column is the engine's own writing, and the test reads it back before forging it,
+/// so the comparison is not between two values nothing ever set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_server_identity_that_is_not_this_server_starts_from_now() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "idchange").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    pair_of_rules(&db, &mock, "ideto", "idetc").await;
+    let log = answer_log(&mock);
+
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers VALUES (1, 'ann')").await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(20),
+        "both rules before the restart",
+        || async {
+            (answered(&log, "/reset-ideto") >= 1
+                && fired(&mock.requests(), "/ideto") == ["1"]
+                && fired(&mock.requests(), "/idetc") == ["1"])
+            .then_some(())
+        },
+    )
+    .await;
+    inst.quiet().await;
+    let reset_base = answered(&log, "/reset-ideto");
+    let real = real_identity(&db).await;
+    let saved = wait_for(
+        Duration::from_secs(20),
+        "the instance row to carry this server's identity",
+        || async {
+            let s = star_column(&db, "server_identity").await;
+            (!s.is_empty()).then_some(s)
+        },
+    )
+    .await;
+    assert_eq!(
+        saved, real,
+        "the engine saved an identity that is not the server's"
+    );
+    inst.stop().await;
+
+    // Rows written while the engine is down, one per table so that both rules have something the
+    // binlog holds from before the engine started: they sit behind the saved position, and the
+    // point of this test is that the engine does not read them.
+    db.exec("INSERT INTO orders VALUES (9, 1, 'new', 9)").await;
+    db.exec("INSERT INTO customers VALUES (9, 'dan')").await;
+    let other = "00000000-0000-0000-0000-00000000dead";
+    db.exec(&format!(
+        "UPDATE lazy_wire_fire_status SET server_identity = '{other}' WHERE rule = '*'"
+    ))
+    .await;
+    let base = warn_baselines(&["rule=idetc"], &["the server changed"]);
+    // Same reason as in the test above: the row that must say `missing:` is one the new engine
+    // wrote, not the row the first run left behind.
+    let after = server_now(&db).await;
+
+    let inst = Instance::ready(config(&db, &[])).await;
+    let lost = wait_for(
+        Duration::from_secs(25),
+        "the continuity WARN of idetc",
+        || async { warn_grew(&["rule=idetc"], &["the server changed"], &base) },
+    )
+    .await;
+    assert!(
+        lost.contains(other) && lost.contains(&real),
+        "the WARN does not name both identities (saved {other}, this server {real}): {lost}"
+    );
+    wait_for(
+        Duration::from_secs(25),
+        "the reset of ideto after the restart",
+        || async { (answered(&log, "/reset-ideto") > reset_base).then_some(()) },
+    )
+    .await;
+    let recorded = wait_for(
+        Duration::from_secs(60),
+        "idetc's status row to record the loss",
+        || async {
+            status_row(&db, "idetc", &after)
+                .await
+                .map(|(_, _, s, _)| s)
+                .filter(|s| s.starts_with("missing: the server changed"))
+        },
+    )
+    .await;
+    assert!(
+        recorded.contains(other) && recorded.contains(&real),
+        "the row does not name both identities (saved {other}, this server {real}): {recorded}"
+    );
+
+    // From the current position means from now: what the engine missed while it was down is not
+    // replayed, and what is written now is delivered. Asked of each rule separately, because the
+    // two are handled by different arms — `ideto` re-read its table, `idetc` recorded `missing:` —
+    // and one wait over both says only that something went quiet. Written out rather than through
+    // `wait_for` so the timeout can ask the server and the engine where they each are: which of the
+    // two rules stopped delivering, and whether the stream moved, is the difference between a test
+    // bug and a product bug, and it cannot be recovered afterwards.
+    // One row in each of the two tables, because that is where the two rules live: `pair_of_rules`
+    // triggers `ideto` on `orders` and `idetc` on `customers`, so asking both for key 10 after a
+    // write to one of them would be asking `idetc` for a row the binlog never held.
+    db.exec("INSERT INTO orders VALUES (10, 1, 'new', 10)")
+        .await;
+    db.exec("INSERT INTO customers VALUES (10, 'kim')").await;
+    for path in ["/ideto", "/idetc"] {
+        let until = std::time::Instant::now() + deadline(Duration::from_secs(20));
+        loop {
+            if fired(&mock.requests(), path).contains(&"10".to_string()) {
+                break;
+            }
+            if std::time::Instant::now() > until {
+                panic!(
+                    "no key 10 on {path} after 20s: the mock saw {seen}; the engine is \
+                     ready={ready} and reports {report}; {rows}",
+                    seen = traffic(&mock, &log),
+                    ready = inst.health.is_ready(),
+                    report = inst.health.status(),
+                    rows = status_dump(&db).await,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let r = mock.requests();
+    for path in ["/ideto", "/idetc"] {
+        assert!(
+            !fired(&r, path).contains(&"9".to_string()),
+            "{path} replayed what the binlog held from before the engine started: {r:?}"
+        );
+    }
+    inst.stop().await;
+}
+
+/// A reset a previous run never finished is finished at start, and only for the rule whose status
+/// row says so: a restart is no reason to re-read every table.
+///
+/// `choose_start` decides this from `reset_state` alone, so the row is the whole trigger. The mock
+/// holds every request, which catches the resumed run in flight — its step sent, never answered —
+/// and the rule whose reset had been recorded as done is the control: it must stay done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_a_restart_interrupted_finishes_itself() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "intreset").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    for name in ["resumo", "resumkeep"] {
+        let steps =
+            json!([{"once": true, "template": format!("PURGE /reset-{name} HTTP/1.1\n\n")}])
+                .to_string();
+        db.exec_params(
+            &format!(
+                "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+                 VALUES ('{name}', 'hook', 'POST /{name} HTTP/1.1\n\n{{{{join keys \",\"}}}}', ?, 50)"
+            ),
+            (steps,),
+        )
+        .await;
+        db.trigger(name, "orders", Some("{{new.id}}"), None).await;
+    }
+    let log = answer_log(&mock);
+
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(25),
+        "both resets of the first start",
+        || async {
+            (answered(&log, "/reset-resumo") >= 1 && answered(&log, "/reset-resumkeep") >= 1)
+                .then_some(())
+        },
+    )
+    .await;
+    inst.quiet().await;
+    let base = answered(&log, "/reset-resumo");
+    inst.stop().await;
+
+    // One run interrupted, one finished: nothing else about the two rules differs.
+    db.exec("UPDATE lazy_wire_fire_status SET reset_state = 'pending: the step that never came back' WHERE rule = 'resumo'")
+        .await;
+    let mut c = db.conn().await;
+    let finished: Vec<String> = c
+        .query("SELECT reset_state FROM lazy_wire_fire_status WHERE rule = 'resumkeep'")
+        .await
+        .unwrap();
+    quit(c).await;
+    assert!(
+        finished[0].starts_with("done:"),
+        "the control rule's reset is not recorded as finished: {}",
+        finished[0]
+    );
+
+    mock.clear();
+    mock.hold_after(0);
+    // Every row read below is one this run wrote: `after` is taken before the engine comes up, so
+    // `status_row` will not hand back the rows the first run left behind (the resumed rule's row
+    // already said `pending:` before the restart, which is exactly the row that must not be
+    // mistaken for the engine noticing).
+    let after = server_now(&db).await;
+    let inst = Instance::start(config(&db, &[]));
+    // The unfinished one is picked up; the finished one is left alone.
+    let running = wait_for(
+        Duration::from_secs(60),
+        "the resumed reset in flight",
+        || async {
+            status_row(&db, "resumo", &after)
+                .await
+                .map(|(_, _, s, _)| s)
+                .filter(|s| s.starts_with("pending:") || s.starts_with("running:"))
+        },
+    )
+    .await;
+    // The control, read while the mock still holds every request: a rule that had been reset
+    // wrongly would say `pending:` or `running:` here, because its step could not be answered.
+    let kept = wait_for(
+        Duration::from_secs(60),
+        "resumkeep's own row, rewritten by this run",
+        || async {
+            status_row(&db, "resumkeep", &after)
+                .await
+                .map(|(_, _, s, _)| s)
+        },
+    )
+    .await;
+    assert!(
+        kept.starts_with("done:"),
+        "the rule whose reset had finished was reset too: {kept}"
+    );
+    assert!(
+        mock.requests().iter().any(|r| r.path == "/reset-resumo"),
+        "the resumed reset never sent its step: {}",
+        traffic(&mock, &log)
+    );
+
+    // Let the step through: the run completes and the row stops claiming a reset is going on.
+    mock.heal();
+    wait_for(
+        Duration::from_secs(60),
+        "the resumed reset of resumo to finish (its step answered, its row saying done)",
+        || async {
+            status_row(&db, "resumo", &after)
+                .await
+                .map(|(_, _, s, _)| s)
+                .filter(|s| s.starts_with("done:") && answered(&log, "/reset-resumo") > base)
+                .map(|_| ())
+        },
+    )
+    .await;
+    assert!(
+        running.starts_with("pending:") || running.starts_with("running:"),
+        "{running}"
+    );
+
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(20),
+        "keys after the resumed reset",
+        || async { (fired(&mock.requests(), "/resumo") == ["1"]).then_some(()) },
+    )
+    .await;
+    inst.quiet().await;
+    inst.stop().await;
+}
+
+/// The stream itself dies on the wire three different ways and the engine comes back from each
+/// without losing its position: a dump connection reset under it, a port that refuses the
+/// reconnect outright, and a connection that stays open but says nothing at all.
+///
+/// Only the binlog connection goes through the proxy (`binlog_dsn`), so the engine's queries,
+/// status writes and instance lock keep running while the stream is broken: what is under test is
+/// the reconnect loop, not the server. The three WARNs here carry nothing of the test's own, so
+/// each is read as a growth over a baseline (`warn_baselines` / `warn_grew`) and the claim itself
+/// rests on what the test owns — the proxy's own counters, and the key the mock answered after
+/// every fault was healed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_binlog_stream_recovers_from_wire_faults() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "streamfault").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    db.exec("INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES ('faulto', 'hook', 'POST /faulto HTTP/1.1\n\n{{join keys \",\"}}', 50)")
+        .await;
+    db.trigger("faulto", "orders", Some("{{new.id}}"), None)
+        .await;
+
+    let binp = common::fault::FaultProxy::start(&server_host(&root), "binlog", None).await;
+    let mut cfg = config(&db, &[]);
+    cfg.binlog_dsn = via(&root, binp.addr(), &db.schema);
+    let inst = Instance::ready(cfg).await;
+    db.exec("INSERT INTO orders VALUES (1, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(20),
+        "the stream through the proxy",
+        || async { (fired(&mock.requests(), "/faulto") == ["1"]).then_some(()) },
+    )
+    .await;
+    assert!(
+        binp.conns() >= 1,
+        "the engine never connected through the proxy"
+    );
+
+    // 1. The dump connection is reset while the stream is up. The reader's error says nothing
+    //    about the position, so the engine reconnects from where it stood. `conns` counts every
+    //    connection this proxy accepted, refused ones included, and only this test's engine dials
+    //    this port, so a number that grows is the engine retrying — not another test's WARN.
+    let conns = binp.conns();
+    let base = warn_baselines(&["binlog stream error"], DEAD_CONNECTION);
+    binp.cut_all();
+    let line = wait_for(Duration::from_secs(30), "the stream-error WARN", || async {
+        warn_grew(&["binlog stream error"], DEAD_CONNECTION, &base)
+    })
+    .await;
+    assert!(line.contains("reconnecting"), "{line}");
+    wait_for(
+        Duration::from_secs(30),
+        "the engine to retry the cut port",
+        || async { (binp.conns() > conns).then_some(binp.conns()) },
+    )
+    .await;
+    binp.heal();
+    db.exec("INSERT INTO orders VALUES (2, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(30),
+        "the key after the reset",
+        || async { (fired(&mock.requests(), "/faulto").contains(&"2".to_string())).then_some(()) },
+    )
+    .await;
+
+    // 2. The port refuses: the reconnect itself fails and the position is kept, so the engine
+    //    retries with the capped backoff until the port answers again.
+    let conns = binp.conns();
+    let base = warn_baselines(&["binlog connect failed"], DEAD_CONNECTION);
+    // Reset whatever connection the engine raised in the recovery above and keep refusing new
+    // ones. The engine sits in a pause after the previous fault, so arming once can miss it.
+    for _ in 0..15 {
+        binp.cut_all();
+        binp.refuse(true);
+        if warn_grew(&["binlog connect failed"], DEAD_CONNECTION, &base).is_some() {
+            break;
+        }
+        sleep_ms(200).await;
+    }
+    let line = wait_for(
+        Duration::from_secs(40),
+        "the connect-failed WARN",
+        || async { warn_grew(&["binlog connect failed"], DEAD_CONNECTION, &base) },
+    )
+    .await;
+    assert!(line.contains("retrying"), "{line}");
+    assert!(
+        binp.conns() > conns,
+        "the engine never retried the refused port ({} connections at the proxy since \
+         arming: {conns})",
+        binp.conns() - conns
+    );
+    binp.heal();
+    db.exec("INSERT INTO orders VALUES (3, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(30),
+        "the key after the refused port",
+        || async { (fired(&mock.requests(), "/faulto").contains(&"3".to_string())).then_some(()) },
+    )
+    .await;
+
+    // 3. The connection stays open and goes silent: past the silence window the engine stops
+    //    trusting it and reconnects (the window is max(3 x heartbeat, 15 s), so this phase is
+    //    the slow one and sits last; a stalled proxy still counts the connect it freezes).
+    let conns = binp.conns();
+    let base = warn_baselines(&["no binlog event or heartbeat"], &["reconnecting"]);
+    binp.stall(true);
+    let line = wait_for(
+        Duration::from_secs(90),
+        "the silence WARN (the window is max(3 x heartbeat, 15 s))",
+        || async { warn_grew(&["no binlog event or heartbeat"], &["reconnecting"], &base) },
+    )
+    .await;
+    assert!(line.contains("no binlog event or heartbeat"), "{line}");
+    wait_for(
+        Duration::from_secs(60),
+        "the engine to drop the silent connection and dial again",
+        || async { (binp.conns() > conns).then_some(binp.conns()) },
+    )
+    .await;
+    binp.heal();
+    db.exec("INSERT INTO orders VALUES (4, 1, 'new', 1)").await;
+    wait_for(
+        Duration::from_secs(40),
+        "the key after the silence",
+        || async { (fired(&mock.requests(), "/faulto").contains(&"4".to_string())).then_some(()) },
+    )
+    .await;
+
+    inst.quiet().await;
+    inst.stop().await;
+}
+
+// Two more tests of this section were written, run, and removed on what the servers answered —
+// not on doubt about the product, and not on the assertion being inconvenient. They asked a
+// replica question of the *server*: that a second dump thread registering a `server_id` an
+// incumbent already holds is turned away, MySQL with 1236 ("A slave with the same
+// server_uuid/server_id as this slave has connected to the master") and MariaDB with 4052
+// (ER_SLAVE_SAME_ID). On that answer the rest followed: the engine, refused on an id it had not
+// been given, rolls a new one (`reroll_server_id`, src/engine.rs:1943), and refused on the id its
+// operator gave it, keeps that id, says so ("another replica connects with the same server id; set
+// a unique LAZYWF_SERVER_ID", src/engine.rs:1947), and retries.
+//
+// Neither server here answers that way. Both let the newcomer register, and both dump threads then
+// read the log: the engine streamed on the duplicated id for the whole window of each test, and
+// nothing from that chain appears anywhere in either log — no 1236, no 4052, no "same server_uuid",
+// not the WARN the refusal path writes — although every line the engines of both schemas wrote is
+// in them. The positions are the ones each engine's own start banner reported, read from the log of
+// the job that ran against the server that printed them (run 45045903180: the
+// `integration (MySQL 8.4.13 (LTS), MariaDB 10.11.19 (LTS) + targets)` job for MySQL, the
+// `integration (MariaDB 10.6.28 (AWS-only))` job for MariaDB):
+//
+//   MySQL 8.4.13     rival holds the engine's id:   streamed at binlog.000003:260320
+//                    rival holds a fixed id:        streamed at binlog.000003:30817
+//   MariaDB 10.6.28  rival holds the engine's id:   streamed at mysql-bin.000002:369998
+//                    rival holds a fixed id:        streamed at mysql-bin.000002:21940
+//
+// (MariaDB 10.11.19 is not in that list, and the reason is worth keeping: `make test-e2e-all` stops
+// at the first red, and at the head that still carried these two tests only one binary run happened
+// in that job — one `test result:` line, and `binlog.000003` names and no `mysql-bin.` ones — so the
+// pair was answered by MySQL 8.4.13 and never reached 10.11.19. The four tests that do ship run
+// against 10.11.19 (the same job is green there, `96 passed; 0 failed; 2 ignored` twice over), but
+// none of them asks the server the duplicate-id question, so nothing here claims to know how
+// 10.11.19 answers it.)
+//
+// So what is untested, named and counted rather than left as a passing test that proves less than it
+// reads as: the roll on a refused unfixed id (src/engine.rs:1943), and the refusal of a fixed id
+// that keeps retrying (src/source/mod.rs:750 and src/engine.rs:1947). Both are servers that do not
+// collide, and no test can make a server collide; for them to be reachable the server would have to
+// answer `get_binlog_stream` (src/binlog/stream.rs:258) with a duplicate-id error, which is exactly
+// what it does not do. A probe that would settle what the servers do answer is designed but not
+// run: open the product's own `binlog::BinlogReader` twice with one `server_id` from the active
+// log's start with a heartbeat, take the source's own `@@server_id` from the server rather than
+// assume it, and print `SHOW REPLICAS`/`SHOW SLAVE HOSTS` before and after each attempt so the
+// server itself says which ids registered and whether the incumbent survived. It is not in the tree
+// because nothing in CI runs an `#[ignore]`d test, so it could only ever be run by hand, and a
+// witness nobody can re-run is not evidence.
+//
+// The two arms that need a purged binlog (`on_missing_binlog`, src/engine.rs:1312, and `rebase`,
+// src/engine.rs:1273) are out of a test's reach for the same kind of reason, and the reason is the
+// point: no test can cause it. A test cannot delete from the server's log, and these servers expire
+// it on their own schedule, so nothing here can put a stored coordinate behind the end of the log.
+// That is a statement about what a test on a shared server may do, not about the code — nothing here
+// says those arms are unreachable in production, and they are listed as a gap rather than tested.
