@@ -123,7 +123,7 @@ fn batch_item_failures_list_the_failed_keys() {
 
 use serde_json::{json, Map};
 
-use crate::model::{Kind, RawTarget, TargetDef};
+use crate::model::{Kind, RawTarget, RuleDef, TargetDef};
 use crate::target::Target;
 use crate::targets::lambda::{build, check, rule_errors};
 
@@ -190,11 +190,21 @@ fn the_lambda_kind_takes_exactly_one_endpoint() {
 /// `batch_max_bytes` that is not the problem.
 #[test]
 fn the_rule_check_of_lambda_says_nothing_it_cannot_read() {
-    let rule = |bytes: u64| RuleDef {
-        name: "r".into(),
-        table: "t".into(),
+    let rule = |bytes: usize| RuleDef {
+        name: "orders".into(),
+        enabled: true,
+        target: "orders".into(),
+        selects: Vec::new(),
+        snapshot_keys_sql: None,
+        template: "{{json docs}}".into(),
+        fire_per: crate::model::FirePer::Batch,
+        batch_max_keys: None,
         batch_max_bytes: Some(bytes),
-        ..Default::default()
+        debounce: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::from_secs(1),
+        reset_steps: Vec::new(),
+        reset_requested: false,
+        vars: serde_json::Map::new(),
     };
     // An endpoint the kind cannot parse: no payload limit is known, so none is refused.
     assert!(rule_errors(&rule(9_000_000), &["nonsense".into()]).is_empty());
@@ -216,7 +226,12 @@ fn the_rule_check_of_lambda_says_nothing_it_cannot_read() {
 #[test]
 fn a_lambda_target_without_its_endpoint_names_it() {
     let def = TargetDef::from_row(&raw("lambda", &[], "{}")).unwrap();
-    let e = format!("{:#}", build(&def).unwrap_err());
+    // `build`'s answer is a bundle the kind does not let be printed, so the refusal is taken
+    // by hand: the Ok side has to fail the test, not just be ignored.
+    let e = match build(&def) {
+        Ok(_) => panic!("a lambda target with no endpoint must not build"),
+        Err(e) => format!("{e:#}"),
+    };
     assert!(
         e.contains("kind lambda needs its aws-lambda:// endpoint"),
         "{e}"

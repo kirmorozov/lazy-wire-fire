@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::Kind;
 
 #[test]
 fn transient_error_replies() {
@@ -135,11 +136,15 @@ fn a_client_that_cannot_be_built_fails_the_endpoint() {
         expect: None,
         vars: Default::default(),
     };
-    let e = new(
+    // The client a built endpoint carries is not printable, so the refusal is taken by hand:
+    // the Ok side has to fail the test, not just be ignored.
+    let e = match new(
         &def(r#"{"ca":"/nonexistent/lazywf-ca.pem"}"#),
         "rediss://cache:6379/0",
-    )
-    .unwrap_err();
+    ) {
+        Ok(_) => panic!("a redis endpoint whose CA file is absent must not build"),
+        Err(e) => e,
+    };
     let msg = format!("{e:#}");
     assert!(
         msg.contains("nonexistent/lazywf-ca.pem"),

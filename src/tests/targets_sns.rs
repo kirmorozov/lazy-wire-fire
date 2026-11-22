@@ -321,7 +321,12 @@ fn a_target_with_no_endpoint_names_the_endpoint_it_needs() {
         expect: None,
         vars: Map::new(),
     };
-    let e = format!("{:#}", build(&def).unwrap_err());
+    // The built target is a bundle the kind does not let be printed, so the refusal is taken
+    // by hand: the Ok side has to fail the test, not just be ignored.
+    let e = match build(&def) {
+        Ok(_) => panic!("an sns target with no endpoint must not build"),
+        Err(e) => format!("{e:#}"),
+    };
     assert!(e.contains("kind sns needs its aws-sns:// endpoint"), "{e}");
 }
 
