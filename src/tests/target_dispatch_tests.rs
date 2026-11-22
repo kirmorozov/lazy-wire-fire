@@ -284,3 +284,153 @@ async fn a_payload_an_invoke_cannot_take_is_refused_before_it_goes_out() {
         .unwrap();
     assert!(is_rejected(&e), "{e:#} is not a refusal");
 }
+
+/// The batch front of a kind with a module of its own asks that module — but only of a
+/// transport that is what the kind speaks. The guard is there for a target that ever is not
+/// (a `Target` is built once, from its row, so today it cannot happen): its answer must be a
+/// clear failure of the target, never a refusal of the keys, which the engine would drop.
+#[tokio::test]
+async fn the_batch_front_of_a_transport_the_kind_does_not_speak_names_the_kind() {
+    let keys = vec![String::from("1"), String::from("2")];
+    let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
+    let dir = std::env::temp_dir().join(format!("lazywf-dispatch-grpc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let desc = dir.join("lazywf.desc");
+    std::fs::write(&desc, crate::targets::grpc::contract::DESCRIPTOR).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
+    let grpc_vars = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item"}}"#,
+        desc.display()
+    );
+    let cases = [
+        (
+            "kafka",
+            "kafka://mq.example.test:9094/orders",
+            "{}",
+            "is not a kafka target",
+        ),
+        (
+            "rabbitmq-stream",
+            "rabbitmq-stream://127.0.0.1:34612/orders",
+            cred_vars(),
+            "is not a rabbitmq-stream target",
+        ),
+        (
+            "servicebus",
+            "sb://127.0.0.1:34610/orders",
+            "{}",
+            "is not a servicebus target",
+        ),
+        (
+            "grpc",
+            "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push",
+            grpc_vars.as_str(),
+            "is not a grpc target",
+        ),
+    ];
+    for (kind, endpoint, vars, want) in cases {
+        let mut t = target(kind, endpoint, vars);
+        // The transport of a target the engine loads always matches its kind, so the only way
+        // to the guard is to put another kind's transport under it. A redis client asks
+        // nothing of the network when it is built, which is what makes it usable here.
+        let redis = crate::targets::redis::Client::new(
+            crate::targets::redis::RedisAddr::parse("redis://cache.example.test:6379/0").unwrap(),
+            &crate::tls::TlsSpec::parse(None).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut t)
+            .expect("the test holds the only reference")
+            .endpoints[0]
+            .transport = Transport::Redis(redis);
+        let e = t
+            .send_items(0, "POST / HTTP/1.1\n\n{}", &keys)
+            .await
+            .unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains(want), "{kind}: {msg}");
+        assert!(
+            !is_rejected(&e),
+            "{kind}: a transport that cannot answer per item says nothing about the keys, \
+             which must wait and not be dropped: {msg}"
+        );
+    }
+    match was {
+        Some(v) => std::env::set_var("LAZYWF_SECRET_DIRS", v),
+        None => std::env::remove_var("LAZYWF_SECRET_DIRS"),
+    }
+}
+
+/// The three kinds that raise their own batch limit by `vars` — a gRPC server's maximum
+/// message size, a Service Bus entity's, and a topic's `MaximumMessageSize` — say so through
+/// the one front the engine cuts a batch at. A limit read as absent means a batch the service
+/// refuses whole, so every key of it fails at once.
+#[tokio::test]
+async fn the_size_a_batch_is_cut_to_follows_the_service_that_set_it() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
+    let dir = std::env::temp_dir().join(format!("lazywf-dispatch-limits-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let desc = dir.join("lazywf.desc");
+    std::fs::write(&desc, crate::targets::grpc::contract::DESCRIPTOR).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
+    // The default of each kind: no `vars` raising it, no limit of its own to report.
+    let grpc_default = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item"}}"#,
+        desc.display()
+    );
+    let grpc = target(
+        "grpc",
+        "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push",
+        &grpc_default,
+    );
+    assert_eq!(
+        grpc.batch_bytes_limit(),
+        Some(crate::targets::grpc::MAX_MESSAGE_BYTES),
+        "the kind's own maximum"
+    );
+    let grpc_big = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item","max_message_bytes":8388608}}"#,
+        desc.display()
+    );
+    assert_eq!(
+        target(
+            "grpc",
+            "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push",
+            &grpc_big
+        )
+        .batch_bytes_limit(),
+        Some(8_388_608),
+        "a server with a raised maximum takes bigger batches"
+    );
+    assert_eq!(
+        target("servicebus", "sb://127.0.0.1:34610/orders", "{}").batch_bytes_limit(),
+        Some(crate::targets::servicebus::MAX_MESSAGE_BYTES),
+        "the kind's own maximum"
+    );
+    assert_eq!(
+        target(
+            "servicebus",
+            "sb://127.0.0.1:34610/orders",
+            r#"{"max_message_size": 1048576}"#
+        )
+        .batch_bytes_limit(),
+        Some(1_048_576),
+        "an entity with a raised maximum message size takes bigger batches"
+    );
+    assert_eq!(
+        target(
+            "sns",
+            "aws-sns://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34561",
+            r#"{"maximum_message_size": 1048576}"#
+        )
+        .batch_bytes_limit(),
+        Some(1_048_576),
+        "a topic whose MaximumMessageSize was raised takes a batch of that size"
+    );
+    match was {
+        Some(v) => std::env::set_var("LAZYWF_SECRET_DIRS", v),
+        None => std::env::remove_var("LAZYWF_SECRET_DIRS"),
+    }
+}
