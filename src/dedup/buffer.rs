@@ -87,15 +87,30 @@ impl IdSet {
     /// Removes and returns at most `n` ids: the smallest integers first, then tuples.
     pub fn take(&mut self, n: usize) -> IdSet {
         let mut out = IdSet::default();
-        let ints = self.ints.pop_smallest(n);
-        for v in ints {
-            out.ints.insert(v);
+        if n >= self.ints.len() as usize {
+            // The chunk budget covers every integer of the space (`Buffer::take` hands each space
+            // the whole remaining budget, and a generation's space is usually smaller than a
+            // chunk): move the set out instead of copying every id through the `pop_smallest`
+            // `Vec` and hashing it back in one by one.
+            out.ints = std::mem::take(&mut self.ints);
+        } else {
+            for v in self.ints.pop_smallest(n) {
+                out.ints.insert(v);
+            }
         }
         let k = (n - out.len()).min(self.keys.len());
-        let tuples: Vec<Tuple> = self.keys.iter().take(k).cloned().collect();
-        for t in tuples {
-            self.keys.remove(&t);
-            out.keys.insert(t);
+        if k == self.keys.len() {
+            // Likewise for the tuples: taking all of them is a swap, not a clone per id.
+            out.keys = std::mem::take(&mut self.keys);
+        } else {
+            // A `HashSet` cannot be mutated while it is iterated, so these `k` ids are cloned out
+            // first and only then removed one by one. Their payloads, not the `Vec`, are the cost
+            // here (measured: the same as before this change).
+            let tuples: Vec<Tuple> = self.keys.iter().take(k).cloned().collect();
+            for t in tuples {
+                self.keys.remove(&t);
+                out.keys.insert(t);
+            }
         }
         out
     }
@@ -137,6 +152,10 @@ pub struct Facts {
 
 impl Facts {
     /// One action `op` on `k`; `new`: `k` was not pending before it.
+    ///
+    /// cost: the three sets own their ids, so each insert clones the key (a `Key`, i.e. a boxed
+    /// slice for a tuple id). This is the facts path only: `Buffer::note` skips it entirely when
+    /// the target's facts flag is off, which is how lazyview runs.
     pub fn note(&mut self, k: &Key, op: Op, cascaded: bool, new: bool) {
         if new && op == Op::Insert {
             self.first_insert.insert(k.clone());
@@ -170,6 +189,9 @@ impl Facts {
 
     /// Retried id `k` back with fact `f`; `pending`: it was marked again meanwhile (its newer last
     /// action stays; the older first action is `f`'s).
+    ///
+    /// cost: a key clone per set it puts back, as in [`Facts::note`]; the facts path only, so not
+    /// lazyview's hot path.
     pub fn retry(&mut self, k: &Key, f: Fact, pending: bool) {
         if !pending {
             self.note(k, f.op, f.cascaded, true);
@@ -240,6 +262,11 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
 
     /// Marks integer id `v` of space `s`; `origin`: the replay position of the transaction that
     /// marked it. `true`: the id was not pending.
+    ///
+    /// cost: the id moves into its set, nothing of it is cloned here; the `P` clone is once per
+    /// pending window, not per event, because `origin` is carried only while the buffer has none
+    /// (`begin` takes it). The same one clone per window in [`Buffer::mark_tuple`],
+    /// [`Buffer::mark`] and [`Buffer::item`].
     pub fn mark_int(&mut self, s: SpaceId, v: u64, origin: &P) -> bool {
         let r = self.pending[s.index()].insert_int(v);
         if self.origin.is_none() {
@@ -251,6 +278,7 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
     pub fn mark_tuple(&mut self, s: SpaceId, t: Tuple, origin: &P) -> bool {
         let r = self.pending[s.index()].insert_tuple(t);
         if self.origin.is_none() {
+            // cost: one `P` per pending window, as in `mark_int`.
             self.origin = Some(origin.clone());
         }
         r
@@ -259,6 +287,7 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
     pub fn mark(&mut self, s: SpaceId, k: Key, origin: &P) -> bool {
         let r = self.pending[s.index()].insert(k);
         if self.origin.is_none() {
+            // cost: one `P` per pending window, as in `mark_int`.
             self.origin = Some(origin.clone());
         }
         r
@@ -276,6 +305,7 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
     pub fn item(&mut self, i: Item<U>, origin: &P) -> bool {
         let r = self.items.insert(i);
         if self.origin.is_none() {
+            // cost: one `P` per pending window, as in `mark_int`.
             self.origin = Some(origin.clone());
         }
         r
@@ -284,6 +314,8 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
     /// Lowers the pending origin to `origin` (retried ids, released XA transactions).
     pub fn pin(&mut self, origin: &P) {
         if self.origin.as_ref().is_none_or(|e| origin < e) {
+            // cost: a `P` per call that really lowers the origin, so once per retried id whose
+            // older origin is the new low water, not per event.
             self.origin = Some(origin.clone());
         }
     }
@@ -291,6 +323,9 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
     /// A transaction that marked ids here ended at `end` (the newest release).
     pub fn released(&mut self, end: &P) {
         if self.high.as_ref().is_none_or(|h| end > h) {
+            // cost: a `P` per target with pending ids at a boundary (`Core::ended` calls this once
+            // per touched target per event); at lazyview's instantiation that is the log-file
+            // name. The buffer owns its newest release, so it cannot borrow it.
             self.high = Some(end.clone());
         }
     }
@@ -303,6 +338,7 @@ impl<P: Ord + Clone, U: Hash + Eq + Clone> Buffer<P, U> {
         }
         let n = self.pending.len();
         let origin = self.origin.take().expect("pending ids carry their origin");
+        // cost: one `P` per generation, and only for a window that never saw a release.
         let high = self.high.take().unwrap_or_else(|| origin.clone());
         self.flight = Some(Generation {
             sets: std::mem::replace(&mut self.pending, vec![IdSet::default(); n]),

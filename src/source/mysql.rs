@@ -634,7 +634,7 @@ pub(crate) async fn read_columns(
 
 /// The MySQL / Percona table metadata: the five `information_schema` reads in MySQL spelling,
 /// string-escaped generation expressions ([`unescape_generation_expression`]) and a
-/// `COLLATION(CONVERT(...))` probe for every charset the table uses.
+/// `COLLATION(CAST(... AS CHAR CHARACTER SET ...))` probe for every charset the table uses.
 pub(crate) async fn load_table(
     conn: &mut Conn,
     schema: &str,
@@ -949,9 +949,12 @@ pub(crate) fn generated_deps(expr: &str, names: &[String]) -> Option<Vec<usize>>
     Some(deps)
 }
 
-/// The collation `CONVERT(... USING charset)` yields on this server (its default for the
-/// charset). None if unknown. The MariaDB answer, which its `character_set_collations` can
-/// override, is the flavor's own [`crate::source::maria::default_collation`].
+/// The collation `CAST(... AS CHAR CHARACTER SET charset)` yields on this server (its default for
+/// the charset). None if unknown. The MariaDB answer, which its `character_set_collations` can
+/// override, is the flavor's own [`crate::source::maria::default_collation`]. The question is asked
+/// in the shape [`crate::catalog::TEXT_PARAM_PREFIX`] binds a string in, so the answer is the
+/// collation a bound value of this charset actually carries; `CONVERT(... USING charset)` is the
+/// conversion, not the reinterpretation, and the two can differ.
 pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<Option<String>> {
     if charset.is_empty()
         || !charset
@@ -962,7 +965,7 @@ pub(crate) async fn default_collation(conn: &mut Conn, charset: &str) -> Result<
     }
     let v = conn
         .query_first::<Option<String>, _>(format!(
-            "SELECT CAST(COLLATION(CONVERT(CAST('' AS BINARY) USING {charset})) AS CHAR)"
+            "SELECT CAST(COLLATION(CAST(CAST('' AS BINARY) AS CHAR CHARACTER SET {charset})) AS CHAR)"
         ))
         .await
         .with_context(|| format!("default collation of character set {charset}"))?;
@@ -1100,6 +1103,17 @@ pub(crate) fn merge_interval(v: &mut Vec<(u64, u64)>, lo: u64, hi: u64) {
     if lo > hi {
         return;
     }
+    // Hot path (the engine merges one transaction number per committed transaction, ruling 6):
+    // a number that lands in or is adjacent to the last range — the sequential case — extends
+    // it in place: no vector rebuild, no allocation. Everything else takes the general walk.
+    if let Some(last) = v.last_mut() {
+        if lo >= last.0 && lo <= last.1.saturating_add(1) {
+            if hi > last.1 {
+                last.1 = hi;
+            }
+            return;
+        }
+    }
     let (mut lo, mut hi) = (lo, hi);
     let mut res: Vec<(u64, u64)> = Vec::with_capacity(v.len() + 1);
     let mut inserted = false;
@@ -1158,6 +1172,149 @@ pub(crate) fn gtid_subset(saved: &GtidSet, source: &GtidSet) -> bool {
     })
 }
 
+/// The part of `saved` that `source` does not cover: the named difference a clean stop shows
+/// the operator (the safety bar: name both sides, never a silent wrong resume). Ranges keep
+/// their bounds; an empty result means `saved ⊆ source`.
+pub(crate) fn gtid_missing(saved: &GtidSet, source: &GtidSet) -> GtidSet {
+    let mut out = GtidSet::new();
+    for (sid, ivals) in saved {
+        let Some(src) = source.get(sid) else {
+            out.insert(sid.clone(), ivals.clone());
+            continue;
+        };
+        let mut miss = Vec::new();
+        for &(lo, hi) in ivals {
+            let mut need = lo;
+            for &(a, b) in src {
+                if need > hi {
+                    break;
+                }
+                if b < need {
+                    continue;
+                }
+                if a > need {
+                    miss.push((need, a.saturating_sub(1).min(hi)));
+                }
+                need = b.saturating_add(1).max(need);
+            }
+            if need <= hi {
+                miss.push((need, hi));
+            }
+        }
+        if !miss.is_empty() {
+            out.insert(sid.clone(), miss);
+        }
+    }
+    out
+}
+
+/// Merges one transaction's GTID (`uuid:gno`, or `uuid:tag:gno` for a tagged event) into the
+/// set the reader has **consumed**: the engine's call per `Item::Gtid`, once per committed
+/// transaction. The last `:` separates the number (the tag sits before it), the source id is
+/// everything up to the first `:`. A known source id costs no allocation (map lookup + the
+/// in-place fast path of [`merge_interval`]); only a first-time id allocates its key. Text that
+/// is not a well-formed `sid:number` returns `false` and changes nothing — dropped, never
+/// guessed (the caller keeps its older set, which under-claims and so stays safe).
+pub(crate) fn merge_gtid(set: &mut GtidSet, gtid: &str) -> bool {
+    let Some((head, gno)) = gtid.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(gno) = gno.trim().parse::<u64>() else {
+        return false;
+    };
+    let sid = match head.split(':').next() {
+        Some(s) => s.trim().to_ascii_lowercase(),
+        None => return false,
+    };
+    if sid.is_empty() || uuid_bytes(&sid).is_none() {
+        return false;
+    }
+    match set.get_mut(sid.as_str()) {
+        Some(ivals) => merge_interval(ivals, gno, gno),
+        None => {
+            let mut ivals = Vec::with_capacity(1);
+            merge_interval(&mut ivals, gno, gno);
+            set.insert(sid, ivals);
+        }
+    }
+    true
+}
+
+/// The set as canonical MySQL/Percona text (`uuid:1-5:10,uuid2:3` — the spelling
+/// `@@GLOBAL.gtid_executed` prints): the [`Cursor`](crate::source::Cursor) `[g=…]` render, the
+/// inverse of [`parse_gtid_set`] up to interval spelling. std only (the copy-set rule).
+pub(crate) fn render_set(set: &GtidSet) -> String {
+    let mut out = String::new();
+    for (sid, ivals) in set {
+        for (lo, hi) in ivals {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(sid);
+            out.push(':');
+            out.push_str(&lo.to_string());
+            if hi > lo {
+                out.push('-');
+                out.push_str(&hi.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `xxxxxxxx-xxxx-…` (32 hex digits, hyphens optional, either case) → the 16 wire bytes; `None`
+/// for anything that is not a uuid. std only — the dump request must not drag a uuid crate into
+/// the copy set for one hex decode.
+fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
+    let digits: Option<Vec<u32>> = text
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_digit(16))
+        .collect();
+    let digits = digits?;
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in digits.chunks(2).enumerate() {
+        out[i] = ((pair[0] << 4) | pair[1]) as u8;
+    }
+    Some(out)
+}
+
+/// The SID blocks of a MySQL-family GTID dump (`COM_BINLOG_DUMP_GTID`) from the cursor's
+/// `[g=…]` text: the set lazyview has **consumed**, sent so the server starts after it.
+/// [`parse_gtid_set`] keeps the one grammar owner; this only flips the interval convention —
+/// the text's intervals are inclusive, the wire's are half-open (`uuid:1-3` goes out as
+/// `(1, 4)`, the server's `UUID_set_compaction` shape), and gno 0 names no transaction, so a
+/// `0` interval contributes nothing.
+///
+/// A text with no usable interval is an `Err`, never an empty set: an empty GTID dump asks the
+/// server for the **start of its oldest binlog**, which is never what a resume meant (the
+/// safety bar: never a silent wrong resume). The caller reports this as a cursor problem.
+pub(crate) fn dump_sids(text: &str) -> Result<Vec<mysql_async::Sid<'static>>> {
+    let set = parse_gtid_set(text);
+    let mut sids = Vec::with_capacity(set.len());
+    for (sid, ranges) in set {
+        let Some(uuid) = uuid_bytes(&sid) else {
+            bail!("the saved GTID set names a source id that is not a uuid: {sid:?}");
+        };
+        let intervals: Vec<mysql_async::GnoInterval> = ranges
+            .iter()
+            .filter(|(lo, _)| *lo > 0)
+            .map(|&(lo, hi)| mysql_async::GnoInterval::new(lo, hi.saturating_add(1)))
+            .collect();
+        if intervals.is_empty() {
+            continue; // a `uuid:` group with no transactions asks for nothing
+        }
+        sids.push(mysql_async::Sid::new(uuid).with_intervals(intervals));
+    }
+    if sids.is_empty() {
+        bail!("the saved GTID set {text:?} leaves no transaction to resume after");
+    }
+    Ok(sids)
+}
+
 /// The MySQL/Percona subset question for [`crate::source::gtid_covers`]: does this server's
 /// `@@GLOBAL.gtid_executed` include `saved`? A cursor with no set covers trivially (see
 /// [`crate::source::gtid_covers`]); a `gtid_mode=OFF` server reports an empty `executed`, so a real
@@ -1170,6 +1327,27 @@ pub(crate) async fn gtid_covers(conn: &mut Conn, saved: Option<&str>) -> Result<
     let st = crate::binlog::gtid_state(conn).await?;
     let executed = st.executed.unwrap_or_default();
     Ok(gtid_subset(&saved, &parse_gtid_set(&executed)))
+}
+
+/// Whether the node behind `conn` is a **read node** (`@@GLOBAL.read_only` or
+/// `@@GLOBAL.super_read_only` on): a role probe, not a configuration opinion. The commit-order
+/// fence row is a writer-side mechanism — on a node that refuses writes anyway, visibility is
+/// the GTID wait or the snapshot position (the engine's side of this), and the row is skipped.
+/// Two tiny queries on the connect path, cached by the caller; `super_read_only` predates some
+/// MariaDB lines, where its absence is simply "not set".
+pub(crate) async fn read_node(conn: &mut Conn) -> Result<bool> {
+    let ro: Option<Option<i8>> = conn
+        .query_first("SELECT @@GLOBAL.read_only = 1")
+        .await
+        .context("reading @@GLOBAL.read_only")?;
+    if ro.flatten().unwrap_or(0) != 0 {
+        return Ok(true);
+    }
+    let sro: Option<Option<i8>> = conn
+        .query_first("SELECT @@GLOBAL.super_read_only = 1")
+        .await
+        .unwrap_or(None);
+    Ok(sro.flatten().unwrap_or(0) != 0)
 }
 
 /// Whether the server still has the file of `at` in its log index — what a lost slot means here.
