@@ -11158,6 +11158,290 @@ async fn a_rule_change_restarts_the_reset_in_flight() {
     inst.stop().await;
 }
 
+/// `reset_requested = 1` raised while one of the rule's reset steps is in flight. The run that is
+/// already going started on its own, so its remainder is not the reset that was asked for: the rule
+/// starts it over from step 1 with the rule as it now stands — the same `start_reset` a changed
+/// rule makes (see [`a_rule_change_restarts_the_reset_in_flight`]) — and only the finished run
+/// clears the flag. The target is what tells the runs apart: step 1 arrives and is ANSWERED again
+/// after the request, where the run that was going had already left that step behind. A run that
+/// already serves the flag is not restarted again by a later reload (the flag stays 1 until the
+/// steps succeed, so restarting on every reload would be a reset that never finishes), which the
+/// second rule loaded mid-run proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_requested_while_a_step_is_in_flight_starts_the_reset_over() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "wedge").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, title VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO items VALUES (1,'a'),(2,'b')").await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    // The paths the mock ANSWERED (see [`answer_log`]) and, beside them, the bodies of the
+    // snapshot step's answered sends: what a key was delivered to, and by which run.
+    let ans: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let bulk: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (paths, bodies) = (ans.clone(), bulk.clone());
+    mock.respond(move |r| {
+        paths.lock().unwrap().push(r.path.clone());
+        if r.path == "/wd/bulk" {
+            bodies.lock().unwrap().push(r.body.clone());
+        }
+        (200, "{}".into())
+    });
+    db.target("idx", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"once": true, "template": "DELETE /wd/cache HTTP/1.1\n\n"},
+        {"for_each": "snapshot"},
+        {"once": true, "template": "DELETE /wd/tail HTTP/1.1\n\n"}
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('wedge', 'idx', 'SELECT id AS _key, title FROM items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM items', \
+         'POST /wd/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.title}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("wedge", "items", Some("{{new.id}}"), None).await;
+    // The first-start reset answers step 1 and stops there: its step 2 (the snapshot's send) is
+    // in flight, unanswered, when the flag is raised below.
+    mock.hold_after(1);
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the reset to stand at step 2",
+        || async {
+            let (_, _, rs, _) = db.status("wedge").await?;
+            (rs.contains("running: step 2/3") && answered(&ans, "/wd/cache") == 1).then_some(())
+        },
+    )
+    .await;
+    // THE premise, proven rather than assumed: the row says step 2 is running and the mock has
+    // answered this rule's step-2 send never — it is in flight when the flag goes in.
+    assert_eq!(
+        answered(&ans, "/wd/bulk"),
+        0,
+        "the snapshot step had been answered: it was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'wedge'")
+        .await;
+    // The requested reset runs the rule from step 1, so its step 1 arrives while the abandoned
+    // step 2 send is still outstanding: two arrivals on /wd/cache, one answer. Polled, because
+    // the restart owes the abandoned step its lane first; the message names the symptom this test
+    // exists for: the row keeps reporting the run that predates the request and step 1 is never
+    // sent again.
+    let mut arrived = 0;
+    let mut mid = db.status("wedge").await.expect("the status row");
+    for _ in 0..40 {
+        arrived = mock
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/wd/cache")
+            .count();
+        mid = db.status("wedge").await.expect("the status row");
+        if arrived >= 2 {
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert!(
+        arrived >= 2,
+        "`reset_requested = 1` raised while step 2 was in flight started no reset: the row still \
+         reports the run that predates the request, and step 1 was sent once in the rule's life. \
+         reset_state {:?}, last_error {:?}, arrived-and-answered {}",
+        mid.2,
+        mid.3,
+        traffic(&mock, &ans)
+    );
+    // The flag is not honoured by re-running the steps the old run had already left behind: the
+    // row says so while the request is outstanding.
+    let mid = db.status("wedge").await.expect("the status row");
+    assert!(
+        mid.2.starts_with("pending:") || mid.2.starts_with("running:"),
+        "the reset of a rule the flag was raised under is still going: {mid:?}"
+    );
+
+    // A second rule loaded now forces a reload of the whole configuration, and with it an
+    // `update_rule` for this rule while the REQUESTED run is in flight. It must not restart that
+    // one: its own first-start reset being answered proves the reload happened.
+    mock.hold_after(0);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('wedgeb', 'idx', 'POST /wd/bulk2 HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (json!([{"once": true, "template": "DELETE /wd/b-only HTTP/1.1\n\n"}]).to_string(),),
+    )
+    .await;
+    db.trigger("wedgeb", "items", Some("{{new.id}}"), None)
+        .await;
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "the other rule's reset to run",
+        || async { (answered(&ans, "/wd/b-only") >= 1).then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(30),
+        "the requested reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("wedge").await?;
+            (rs.starts_with("done:") && answered(&ans, "/wd/tail") >= 1).then_some(())
+        },
+    )
+    .await;
+    let cleared: Vec<u8> = db
+        .query("SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'wedge'")
+        .await;
+    assert_eq!(
+        cleared,
+        vec![0],
+        "the finished reset clears the flag it was asked with"
+    );
+    // The requested reset ran the whole rule, and the reload that came in the middle of it did
+    // not start it over again: step 1 answered exactly twice in the rule's life — the first
+    // start's run and the requested one — and the tail step belongs to the requested run alone.
+    assert_eq!(
+        answered(&ans, "/wd/cache"),
+        2,
+        "step 1 ran once for the first start and once for the requested reset ({})",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        answered(&ans, "/wd/tail"),
+        1,
+        "the requested run ran the steps after the one it was interrupted in, once ({})",
+        traffic(&mock, &ans)
+    );
+    // The keys of the step that was in flight when the restart came are not lost and are not
+    // counted as delivered by the run that abandoned them: the mock froze that send (it is in
+    // `requests()` and answers nothing), and the restarted run re-read the snapshot and sent the
+    // same keys again — one answered `/wd/bulk` carrying both of them, and only that one.
+    let delivered = bulk
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b.contains("1=a") && b.contains("2=b"))
+        .count();
+    assert_eq!(
+        delivered,
+        1,
+        "the snapshot keys of the abandoned step were sent again, once, by the requested run ({})",
+        traffic(&mock, &ans)
+    );
+    // And the rule works: a key after the reset is delivered.
+    db.exec("INSERT INTO items VALUES (3,'c')").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the rule firing after the reset",
+        || async {
+            let (f, p, _, _) = db.status("wedge").await?;
+            let sent = mock
+                .requests()
+                .iter()
+                .any(|r| r.path == "/wd/bulk" && r.body.contains("3=c"));
+            (sent && (f, p) >= after).then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// The same request landing while a read-only prep step (a stray listing, `st.prep`) is in
+/// flight: the run the flag supersedes still holds the rule's `prep` until that job answers, and
+/// the restarted run must not be left standing on it. The step's own result is that abandoned
+/// run's and counts for nothing; the new run lists the strays again and the reset finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_requested_while_a_prep_step_is_in_flight_finishes() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "wedgyp").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, title VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO items VALUES (1,'a'),(2,'b')").await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    db.target("idx", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"for_each": "stray", "list_template": "GET /wyp/ids HTTP/1.1\n\n",
+         "keys": "JSON_EXTRACT(body, '$.ids')", "next": "JSON_EXTRACT(body, '$.next')",
+         "template": "POST /wyp/strays HTTP/1.1\n\n{{json reset.keys}}"},
+        {"once": true, "template": "DELETE /wyp/cache HTTP/1.1\n\n"}
+    ]);
+    // The record of answers (see [`answer_log`], which answers 200 to everything and so cannot
+    // carry the listing's body) and the listing's own answer, in one responder.
+    let ans: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let l = ans.clone();
+    mock.respond(move |r| {
+        l.lock().unwrap().push(r.path.clone());
+        if r.path == "/wyp/ids" {
+            (200, r#"{"ids":["7","8"]}"#.into())
+        } else {
+            (200, "{}".into())
+        }
+    });
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('wedgyp', 'idx', 'SELECT id AS _key, title FROM items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM items', \
+         'POST /wyp/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.title}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("wedgyp", "items", Some("{{new.id}}"), None)
+        .await;
+    // Nothing is answered: the first-start reset stands in its stray listing, which is the step
+    // that holds `st.prep`.
+    mock.hold_after(0);
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the listing to be in flight",
+        || async {
+            let (_, _, rs, _) = db.status("wedgyp").await?;
+            (rs.contains("running: step 1/2")).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        answered(&ans, "/wyp/ids"),
+        0,
+        "the listing was answered: the prep step was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'wedgyp'")
+        .await;
+    sleep_ms(2_000).await;
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "the requested reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("wedgyp").await?;
+            (rs.starts_with("done:") && answered(&ans, "/wyp/cache") >= 1).then_some(())
+        },
+    )
+    .await;
+    let cleared: Vec<u8> = db
+        .query("SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'wedgyp'")
+        .await;
+    assert_eq!(
+        cleared,
+        vec![0],
+        "the finished reset clears the flag it was asked with"
+    );
+    let reqs = mock.requests();
+    assert!(
+        reqs.iter()
+            .any(|r| r.path == "/wyp/strays" && r.body.contains("7")),
+        "the strays of the listing that answered were deleted: {reqs:?}"
+    );
+    inst.stop().await;
+}
+
 /// A configuration the engine cannot read: `reload_config` fails, the WARN says so, and the
 /// retry is the 1 s one and not the 120 s poll — proven by what the engine does with a rule the
 /// server only lets it read again later. Revoking SELECT on the rule table alone (table-granular
