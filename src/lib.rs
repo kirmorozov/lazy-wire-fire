@@ -51,7 +51,10 @@ pub mod sign;
 // is the candidate); the allow is what keeps the copy unedited, and everything under
 // `src/source/**` is copy set, so it can never hide a lazywf-owned item. (Same arrangement as the
 // `dialect` seam above, and the `#![allow(dead_code)]` copy-set files write for themselves.)
-#[allow(dead_code)]
+// Since lazyview aa6e514 the fence's `gtid_wait` also reaches lazywf as a `pub(crate)` re-export in
+// `percona.rs` — rustc lints an unused import as `unused_imports`, not `dead_code`, so the allow
+// carries that too: same reason, same copy-set scope, the copy stays byte for byte.
+#[allow(dead_code, unused_imports)]
 pub mod source;
 pub mod sql;
 pub mod sqlwire;
