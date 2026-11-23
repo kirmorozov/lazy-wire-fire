@@ -468,6 +468,7 @@ async fn array_replies_are_read_well_and_malformed_ones_wait() {
         ("$-1\r\n", true, ""),                            // nil bulk
         ("*2\r\n$1\r\na\r\n*1\r\n$1\r\nb\r\n", true, ""), // nested array
         ("*abc\r\n", false, "bad array length"),
+        (":abc\r\n", false, "bad integer reply"),
         ("$x\r\n", false, "bad bulk length"),
         ("*10000001\r\n", false, "too large"),
     ] {

@@ -367,3 +367,19 @@ fn a_character_reference_that_is_none_keeps_its_ampersand() {
     // The numeric forms still work next to them.
     assert_eq!(unescape("&#65;&#x42;&#;"), "AB&#;");
 }
+
+#[test]
+fn the_five_named_character_references_are_unescaped() {
+    // The five names the table in `unescape` holds. The two that read like markup are the ones
+    // a service writes back at you — a `"` in a topic name comes home as `&quot;` — so they are
+    // asserted here by name, not left to the numeric path that the test above covers.
+    assert_eq!(unescape("&amp;&lt;&gt;&quot;&apos;"), "&<>\"'");
+    // And they are read through when the answer is parsed, not just by the helper.
+    let xml = "<PublishBatchResponse><PublishBatchResult><Successful/>\
+                   <Failed><member><Id>0</Id><Code>InvalidParameter</Code>\
+                   <Message>&quot;x&quot; &apos;y&apos; &amp;&amp;</Message>\
+                   <SenderFault>true</SenderFault></member></Failed></PublishBatchResult>\
+                   </PublishBatchResponse>";
+    let failed = batch_answer(xml.as_bytes()).unwrap()["Failed"][0].clone();
+    assert_eq!(failed["Message"], json!("\"x\" 'y' &&"));
+}
