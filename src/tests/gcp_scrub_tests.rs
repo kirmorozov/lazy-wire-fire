@@ -177,6 +177,15 @@ async fn serve_token(
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
+                // Three unchecked results, and the reason each is unchecked: the `write_all` is
+                // load-bearing — delete that one line and the suite goes red, because the test
+                // that waits for a token fails at the await (`unit tests`: 989 passed; 1 failed).
+                // `flush` is don't-care by reasoning rather than reflex: a `TcpStream` keeps no
+                // buffer of its own, so `write_all` has already handed the bytes to the kernel
+                // (deleting it left `unit tests` green at 990 passed; 0 failed). `shutdown` is
+                // don't-care to the client too, because the answer carries `Content-Length` and
+                // no reader waits for EOF; it is here so the accepted socket ends with this task
+                // instead of whenever the runtime drops it (deleting it also left the suite green).
                 let _ = s.write_all(resp.as_bytes()).await;
                 let _ = s.flush().await;
                 let _ = s.shutdown().await;
