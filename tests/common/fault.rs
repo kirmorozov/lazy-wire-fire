@@ -122,6 +122,14 @@ pub struct ProxyStat {
     /// How many server→client bytes had flowed past the arming point when the last
     /// `cut_after_bytes` fired (`0` before one has).
     pub bytes_at_cut: u64,
+    /// Connections the proxy answered with an RST because it was in `refuse`/`cut_all` — counted
+    /// where the reset is performed, the same discipline as `flap_resets`. A target seed that
+    /// claims an endpoint was down has to say what the port did about it, and "the mode was set"
+    /// is not that answer (the lesson of PR 2's mutation M2, applied to the target class).
+    pub refusals: u64,
+    /// Times `flap_refuse` has flipped the port (T5: the storm counts itself, so the seed gates
+    /// on flips it can see instead of on its own clock).
+    pub flips: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -169,6 +177,14 @@ struct Core {
     /// linger-0 drop). Counted where the reset is performed, never where it is planned.
     flap_resets: AtomicU64,
     byte_cuts: AtomicU64,
+    /// Connections answered with an RST while the proxy was `refuse`/`cut_all` (see
+    /// [`ProxyStat::refusals`]): counted where the reset is performed, like `flap_resets`.
+    refusals: AtomicU64,
+    /// Times `flap_refuse` has flipped the port (see [`ProxyStat::flips`]).
+    flips: AtomicU64,
+    /// `flap_refuse` is still running: `heal()` clears it, which is how "the test heals
+    /// permanently after 8 flips" (design §2 T5) stops the storm instead of racing it.
+    flipping: AtomicBool,
     /// How far past its arming point the last `cut_after_bytes` had relayed when it fired: the
     /// seed's proof of *where* in a group the reset landed, counted by the proxy.
     last_cut_at: AtomicU64,
@@ -209,6 +225,9 @@ impl FaultProxy {
             flap_cuts: AtomicU64::new(0),
             flap_resets: AtomicU64::new(0),
             byte_cuts: AtomicU64::new(0),
+            refusals: AtomicU64::new(0),
+            flips: AtomicU64::new(0),
+            flipping: AtomicBool::new(false),
             last_cut_at: AtomicU64::new(0),
             accepts: Mutex::new(Vec::new()),
             log,
@@ -244,7 +263,21 @@ impl FaultProxy {
                 let kind = c.mode.lock().unwrap().kind;
                 match kind {
                     // "port dead": answer the connect with an RST (the client sees a dead port).
-                    Kind::CutAll | Kind::Refuse => hard_close(cli),
+                    // Counted where the reset is performed: a seed that claims an endpoint was
+                    // down has to be able to say what the port did about it, and "the mode was
+                    // set" is not that answer (the lesson of PR 2's mutation M2, applied to the target class).
+                    // The refusal is a fault event only for `refuse`: `cut_all` is a source-class
+                    // cut whose own command line already opens that window.
+                    Kind::CutAll | Kind::Refuse => {
+                        if hard_close_counted(cli) {
+                            c.refusals.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if kind == Kind::Refuse {
+                            if let Some(l) = &c.log {
+                                l.add(format!("proxy {} refused a connection", c.label));
+                            }
+                        }
+                    }
                     // The flapping dump port: reset this connection and count it; when the last
                     // one of the storm has been reset the mode ends by itself, so the next
                     // connect is relayed ("cut every accepted connection 6 times, then let it
@@ -325,6 +358,17 @@ impl FaultProxy {
         self.core.bytes.load(Ordering::Relaxed)
     }
 
+    /// Connections this proxy answered with an RST because it was refusing — the evidence a
+    /// target seed gives when it claims an endpoint was down.
+    pub fn refusals(&self) -> u64 {
+        self.core.refusals.load(Ordering::Relaxed)
+    }
+
+    /// Flips performed by `flap_refuse` so far.
+    pub fn flips(&self) -> u64 {
+        self.core.flips.load(Ordering::Relaxed)
+    }
+
     /// What the server has sent through this proxy — the size of the binlog traffic, which is
     /// what S4 calibrates and verifies its cut point against.
     pub fn bytes_s2c(&self) -> u64 {
@@ -385,10 +429,76 @@ impl FaultProxy {
         });
     }
 
-    /// Stop serving: every new connect is answered with an RST ("port dead").
+    /// Stop serving: every new connect is answered with an RST ("port dead"), and the
+    /// connections already relayed are reset with it. The second half matters: a port that is
+    /// dead does not keep answering on a connection it opened a minute ago, and a `refuse` that
+    /// left an established keep-alive relay running would let a supposedly-down endpoint take
+    /// the action — a target seed would then pass while its own outage never landed. The engine's
+    /// own HTTP pool holds connections across actions for exactly this reason.
     pub fn refuse(&self, on: bool) {
+        if on {
+            // The same generation bump `cut_all` uses: relay tasks born before it hard-close
+            // themselves at the top of their loop.
+            self.core.gen.fetch_add(1, Ordering::Relaxed);
+        }
         self.set(if on { "refuse(true)" } else { "refuse(false)" }, |m| {
             m.kind = if on { Kind::Refuse } else { Kind::Live }
+        });
+    }
+
+    /// The flapping target port of design §2 T5: dead for `every`, alive for `every`, and so on,
+    /// `flips` times, the count kept by the proxy itself so the seed gates on flips it can
+    /// observe (`stat().flips`) instead of on a wall-clock guess. Every flip is a fault event —
+    /// that is what makes a duplicate inside the window a legitimate one (design §1 P4) rather
+    /// than an accident of timing. `heal()` ends the storm for good, which is how the seed
+    /// "heals permanently after 8 flips" without racing a task that would flip the port back.
+    pub fn flap_refuse(&self, flips: u64, every: Duration) {
+        let c = self.core.clone();
+        self.set(
+            &format!("flap_refuse({flips}, {} ms)", every.as_millis()),
+            |m| {
+                m.kind = Kind::Refuse;
+                m.cut_after_bytes = None;
+                m.latency_ms = 0;
+            },
+        );
+        c.flipping.store(true, Ordering::Relaxed);
+        if let Some(l) = &c.log {
+            l.add(format!(
+                "proxy {} flap_refuse({flips}) armed: dead for {} ms at a time",
+                c.label,
+                every.as_millis()
+            ));
+        }
+        tokio::spawn(async move {
+            for i in 0..flips {
+                // `heal()` during the storm: the seed has decided the fault is over, and a task
+                // that flipped the port back would inject a fault nobody asked for.
+                if !c.flipping.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Flip 1 is "down", flip 2 "alive", and so on: the seed knows exactly how many
+                // dead half-windows the run had, which is what T5 counts duplicates per.
+                let down = i % 2 == 0;
+                {
+                    let mut m = c.mode.lock().unwrap();
+                    m.kind = if down { Kind::Refuse } else { Kind::Live };
+                }
+                if down {
+                    // A dead port takes the established relays with it (`refuse`'s argument).
+                    c.gen.fetch_add(1, Ordering::Relaxed);
+                }
+                let n = c.flips.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(l) = &c.log {
+                    l.add(format!(
+                        "proxy {} flap_refuse flip #{n}: port {}",
+                        c.label,
+                        if down { "dead" } else { "alive" }
+                    ));
+                }
+                tokio::time::sleep(every).await;
+            }
+            c.flipping.store(false, Ordering::Relaxed);
         });
     }
 
@@ -400,6 +510,8 @@ impl FaultProxy {
     }
 
     pub fn heal(&self) {
+        // Ends a `flap_refuse` storm for good (design §2 T5: the test heals permanently).
+        self.core.flipping.store(false, Ordering::Relaxed);
         self.set("heal", |m| {
             m.kind = Kind::Live;
             m.cut_after_bytes = None;
@@ -410,14 +522,17 @@ impl FaultProxy {
 
     pub fn stat(&self) -> ProxyStat {
         let m = *self.core.mode.lock().unwrap();
+        let flipping = self.core.flipping.load(Ordering::Relaxed);
         ProxyStat {
             label: self.core.label.clone(),
             mode: match m.kind {
+                Kind::Live if flipping => "flap_refuse(alive)",
                 Kind::Live if m.cut_after_bytes.is_some() => "cut_after_bytes",
                 Kind::Live if m.latency_ms > 0 => "latency",
                 Kind::Live => "live",
                 Kind::CutAll => "cut_all",
                 Kind::Stall => "stall",
+                Kind::Refuse if flipping => "flap_refuse(dead)",
                 Kind::Refuse => "refuse",
                 Kind::Flap => "flap",
             }
@@ -430,6 +545,8 @@ impl FaultProxy {
             flap_resets: self.core.flap_resets.load(Ordering::Relaxed),
             byte_cuts: self.core.byte_cuts.load(Ordering::Relaxed),
             bytes_at_cut: self.core.last_cut_at.load(Ordering::Relaxed),
+            refusals: self.core.refusals.load(Ordering::Relaxed),
+            flips: self.core.flips.load(Ordering::Relaxed),
         }
     }
 
@@ -515,6 +632,22 @@ async fn relay(cli: TcpStream, core: Arc<Core>, my_gen: u64) {
         if mode.kind == Kind::CutAll
             || (mode.kind != Kind::CutAll && core.gen.load(Ordering::Relaxed) > my_gen)
         {
+            // A refusal takes the connections it already relayed down with it, and that counts
+            // and logs too: a seed claiming "the endpoint was down" must be able to prove it from
+            // this proxy's own counter and its own log even when the client reused a keep-alive
+            // connection instead of dialing a new one (the engine's HTTP pool does exactly that
+            // between actions, and a refusal that is invisible to the fault log makes the
+            // sampler's P4 window blind — a redelivery of the same key at a healthy endpoint has
+            // to sit behind an event, which is what T6's duplicate rule rests on).
+            if mode.kind == Kind::Refuse {
+                core.refusals.fetch_add(1, Ordering::Relaxed);
+                if let Some(l) = &core.log {
+                    l.add(format!(
+                        "proxy {} refused a connection it was already relaying",
+                        core.label
+                    ));
+                }
+            }
             hard_close(cli);
             hard_close(up);
             return;
@@ -660,6 +793,202 @@ fn close_inherited_lock_fds() {
     }
 }
 
+/// What stopping the engine child by signal found. The three cases are the h1/h2 finding
+/// (`finding-chaos-h1h2-esrch-false-fail.md`): a stop the harness caused, a product failure, and
+/// the environment taking the child — which is neither, and must never be reported as one. A
+/// seed that gets `EnvironmentKilled` returns: nothing below that point can be believed, and a
+/// FAIL there sends someone to bisect a commit that never moved.
+#[derive(Debug, Clone)]
+pub enum Stop {
+    /// The child exited with this code — 0 after the harness's SIGTERM, which is the clean
+    /// shutdown the stop-grace control (P3) and the self-tests assert.
+    Exited(i32),
+    /// The child died of a signal the harness itself sent (`kill()`, `hard_stop()`, the Drop
+    /// guard). The harness's own doing: never an environment abort, never a failure.
+    HarnessSignalled { signal: i32 },
+    /// The kernel (or something else outside this process) killed the child. `environment_aborts`
+    /// lists the seeds it took, and the harness printed the signal, the host load and the OOM
+    /// counters when it happened.
+    EnvironmentKilled { signal: i32 },
+}
+
+impl Stop {
+    /// The seed must stop here, without failing: the environment removed its child.
+    pub fn is_environment_kill(&self) -> bool {
+        matches!(self, Stop::EnvironmentKilled { .. })
+    }
+}
+
+/// SIGTERM, and the numbers the harness names in its reports. Spelled out rather than read from
+/// `libc`: a tests-only PR does not add a dependency, and `std::process` hands the number back
+/// through `ExitStatus::signal` without one.
+const SIGTERM: i32 = 15;
+const SIGNAL_NAMES: &[(i32, &str)] = &[
+    (1, "SIGHUP"),
+    (2, "SIGINT"),
+    (3, "SIGQUIT"),
+    (4, "SIGILL"),
+    (6, "SIGABRT"),
+    (7, "SIGBUS"),
+    (8, "SIGFPE"),
+    (9, "SIGKILL"),
+    (11, "SIGSEGV"),
+    (13, "SIGPIPE"),
+    (15, "SIGTERM"),
+    (24, "SIGXCPU"),
+    (25, "SIGXFSZ"),
+];
+
+fn signal_name(sig: i32) -> String {
+    SIGNAL_NAMES
+        .iter()
+        .find(|(n, _)| *n == sig)
+        .map_or_else(|| format!("signal {sig}"), |(_, n)| n.to_string())
+}
+
+/// Signals that mean the product crashed, whatever else the box was doing: an OOM killer sends
+/// SIGKILL, never SIGSEGV. A child that dies of one of these is a FAIL even if the harness never
+/// signalled it.
+fn crash_signal(sig: i32) -> bool {
+    matches!(sig, 4 | 6 | 7 | 8 | 11)
+}
+
+/// Host load and the cgroup's memory counters, as one line. Read at spawn and again on the
+/// failure path, so the report shows the move rather than asking the next reader to guess
+/// whether it was memory (the finding's second ask).
+fn host_pressure() -> String {
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|e| format!("loadavg unreadable: {e}"));
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let mem = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string() + " kB")
+        })
+        .unwrap_or_default();
+    format!("load {load} on {cores} cores, MemAvailable {mem}")
+}
+
+/// The cgroup's own out-of-memory counters (v2 `memory.events`, then the v1 file), raw: the
+/// numbers are the point, not their interpretation.
+fn oom_counters() -> String {
+    for p in [
+        "/sys/fs/cgroup/memory.events",
+        "/sys/fs/cgroup/memory.oom_control",
+        "/sys/fs/cgroup/memory/memory.oom_control",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let one = s.lines().collect::<Vec<_>>().join(" ");
+            return format!("{p}: {}", one.trim());
+        }
+    }
+    "no cgroup OOM counter file (v2 memory.events / v1 memory.oom_control)".to_string()
+}
+
+/// What the kernel said about killing processes, last few lines first. Best effort: `dmesg` is
+/// often restricted for an unprivileged user, and "could not ask" is itself the answer.
+fn dmesg_oom_lines() -> String {
+    let out = match std::process::Command::new("dmesg").output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => {
+            return format!(
+                "dmesg exited {:?}: {}",
+                o.status.code(),
+                short(&String::from_utf8_lossy(&o.stderr))
+            )
+        }
+        Err(e) => return format!("dmesg unavailable: {e}"),
+    };
+    let hits: Vec<&str> = out
+        .lines()
+        .rev()
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            low.contains("oom") || low.contains("killed process") || low.contains("out of memory")
+        })
+        .take(6)
+        .collect();
+    if hits.is_empty() {
+        "no OOM lines in dmesg".to_string()
+    } else {
+        hits.iter()
+            .map(|l| short(l))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+/// Seeds the harness skipped because the environment, not the product, took their engine child.
+/// A chaos suite that quietly stops running its self-tests is exactly the quiet failure the
+/// finding warns about, so every abort is named here, printed when it happens, and appended to
+/// `tmp/out/chaos/env-aborts.log` for the run report.
+pub fn environment_aborts() -> Vec<String> {
+    ENV_ABORTS.lock().unwrap().clone()
+}
+
+static ENV_ABORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn record_environment_abort(name: &str, report: &str) {
+    let line = format!("{name}: taken by the environment");
+    ENV_ABORTS.lock().unwrap().push(line);
+    let path = Path::new("tmp/out/chaos/env-aborts.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{report}")
+        });
+}
+
+/// SIGTERM the child, through the first route that actually *executes*. One `kill` binary on
+/// `PATH` is not something the harness may assume: the panic the h1/h2 incident printed was
+/// `ENOENT` on the program (probed: a missing executable is exactly
+/// `Os { code: 2, kind: NotFound }`), and a box without procps still has `sh`'s builtin. The
+/// exit code of the signal command is deliberately not the verdict — a dead-but-unreaped child
+/// answers `kill -TERM` with success (it is a zombie) and a reaped one with exit 1, so neither
+/// "it worked" nor "it failed" means anything here. `judge_stop` reads the child's own wait
+/// status instead.
+fn send_term(pid: u32) -> Result<String, Vec<String>> {
+    let pid = pid.to_string();
+    let mut tried = Vec::new();
+    for prog in ["kill", "/bin/kill", "/usr/bin/kill"] {
+        match std::process::Command::new(prog)
+            .args(["-TERM", &pid])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(st) => return Ok(format!("{prog} -TERM {pid} (exit {:?})", st.code())),
+            Err(e) => tried.push(format!("{prog}: {e}")),
+        }
+    }
+    match std::process::Command::new("/bin/sh")
+        .args(["-c", "kill -TERM \"$1\"", "sh", &pid])
+        .stdin(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) => Ok(format!(
+            "/bin/sh builtin kill -TERM {pid} (exit {:?})",
+            st.code()
+        )),
+        Err(e) => {
+            tried.push(format!("/bin/sh -c 'kill -TERM': {e}"));
+            Err(tried)
+        }
+    }
+}
+
 /// The engine as a real child process (design §3): one honest code path for every scenario,
 /// with real signals and real env parsing. stdout and stderr go `Stdio::from(File)` straight
 /// to `tmp/out/chaos/<test>.log` — no pipes exist, so no pipe-buffer deadlock and no drain
@@ -667,6 +996,15 @@ fn close_inherited_lock_fds() {
 pub struct Lazy {
     name: String,
     child: Arc<Mutex<Option<std::process::Child>>>,
+    /// Set the moment the harness itself SIGKILLs the child (`kill()`, `hard_stop()`, the Drop
+    /// guard). The wait status alone cannot tell "the kernel took my child" from "I took it":
+    /// both are a signal death. This flag is what lets the harness keep its own teeth — a child
+    /// that dies of the SIGTERM the harness sent is still a product failure, while a SIGKILL
+    /// nobody in this process sent is an environment fact and must never be reported as one.
+    harness_killed: Arc<AtomicBool>,
+    /// Host load and the cgroup's OOM counters as they were when this child was spawned, so the
+    /// failure path can show the *move* (the finding's "record them around the run").
+    pressure_at_spawn: String,
     vars: Vec<(String, String)>,
     pub log_path: PathBuf,
     pub health: SocketAddr,
@@ -701,6 +1039,8 @@ impl Lazy {
         let mut lazy = Lazy {
             name: name.to_string(),
             child: Arc::new(Mutex::new(None)),
+            harness_killed: Arc::new(AtomicBool::new(false)),
+            pressure_at_spawn: String::new(),
             vars,
             log_path: PathBuf::new(),
             health: ([127, 0, 0, 1], 0).into(),
@@ -712,6 +1052,10 @@ impl Lazy {
 
     fn spawn(&mut self) {
         close_inherited_lock_fds();
+        // A restart is a new child: the harness has signalled nothing to *this* one, and the
+        // pressure snapshot is taken now, next to the fault that may yet kill it.
+        self.harness_killed.store(false, Ordering::Relaxed);
+        self.pressure_at_spawn = host_pressure();
         let port = free_port();
         self.vars
             .retain(|(k, _)| k != "LAZYWF_HEALTH_ADDR" && k != "LAZYWF_SERVER_ID");
@@ -753,20 +1097,36 @@ impl Lazy {
     /// GET /readyz == 200. The deadline is generous: 60 s at the first start, >= 30 s after a
     /// kill (lock release rides on MySQL noticing the dead GET_LOCK client). A child that lost
     /// its health port to a race re-probes once on a fresh port with a fresh child.
-    pub async fn ready(&mut self, secs: u64) {
+    ///
+    /// `false`: the environment took the child before it was ever ready (the same classifier
+    /// `term` uses, so an OOM kill is not read as a product failure) — the seed returns. Every
+    /// other way it fails to start is a panic.
+    pub async fn ready(&mut self, secs: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut respawned = false;
         loop {
             if let Ok((200, _)) = http_get(self.health, "/readyz").await {
-                return;
+                return true;
             }
-            if self
+            let gone = self
                 .child
                 .lock()
                 .unwrap()
                 .as_mut()
-                .is_some_and(|c| c.try_wait().ok().flatten().is_some())
-            {
+                .and_then(|c| c.try_wait().ok().flatten());
+            if let Some(st) = gone {
+                // Same classifier as `term`: the child that vanished before it was ever ready
+                // can have been taken by the kernel too, and that is an environment fact, not a
+                // product failure. Everything else about a child that will not start stays a
+                // panic.
+                let stop = self.judge_stop(
+                    st,
+                    Ok("none: the child was already gone when the harness looked".to_string()),
+                    "before ready",
+                );
+                if stop.is_environment_kill() {
+                    return false;
+                }
                 panic!(
                     "the lazywf child {} exited before ready:\n{}",
                     self.name,
@@ -850,7 +1210,21 @@ impl Lazy {
             .unwrap_or(-1)
     }
 
+    /// SIGKILL the child without reaping it: the shape of `hard_stop`, which kills and then waits,
+    /// split in two so a harness self-test can watch the harness's own kill arrive and judge it.
+    /// Nothing outside `h3_environment_kill_is_not_a_product_failure` has a reason to use this.
+    pub fn kill_no_wait(&self) {
+        self.harness_killed.store(true, Ordering::Relaxed);
+        let mut c = self.child.lock().unwrap();
+        if let Some(child) = c.as_mut() {
+            let _ = child.kill();
+        }
+    }
+
     fn hard_stop(&self) {
+        // Before the signal, not after: the wait below can be the last thing this child does, and
+        // a death it causes must never be read as the kernel taking it.
+        self.harness_killed.store(true, Ordering::Relaxed);
         let mut c = self.child.lock().unwrap();
         if let Some(child) = c.as_mut() {
             let _ = child.kill();
@@ -858,20 +1232,138 @@ impl Lazy {
         }
     }
 
-    /// SIGTERM through `kill -TERM <pid>`, then wait; asserts exit 0 within the stop grace.
-    pub async fn term(&self) -> i32 {
-        let pid = self
-            .child
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("child running")
-            .id()
-            .to_string();
-        std::process::Command::new("kill")
-            .args(["-TERM", &pid])
-            .status()
-            .expect("kill -TERM");
+    /// What a wait status means, given which signals this harness sent. `how` names the moment
+    /// it was read ("SIGTERM", "before ready") so the panic and the abort report both say what
+    /// the seed was doing.
+    ///
+    /// Panics — a product failure — on a nonzero exit, on a child that dies *of* the SIGTERM the
+    /// harness sent instead of running its handler, and on any crash signal. Returns
+    /// [`Stop::EnvironmentKilled`] only for a signal death this process never caused and that is
+    /// not a crash: the shape the finding asks for, where an OOM kill reads as the environment
+    /// and not as a regression.
+    ///
+    /// Public for `h3_environment_kill_is_not_a_product_failure`, which feeds it wait statuses it
+    /// built itself (`ExitStatusExt::from_raw`) next to the real deaths: a crash *signal* cannot be
+    /// injected reliably from a test process (a blocked `SIGSEGV` inherited across `posix_spawn`
+    /// leaves the child alive and the seed with no verdict), while the classification of the wait
+    /// status is what the finding is actually about.
+    pub fn judge_stop(
+        &self,
+        st: std::process::ExitStatus,
+        sent: Result<String, Vec<String>>,
+        how: &str,
+    ) -> Stop {
+        use std::os::unix::process::ExitStatusExt;
+        let sent_note = match &sent {
+            Ok(r) => format!("the signal: {r}"),
+            Err(r) => format!("NO SIGNAL ROUTE EXECUTED: {}", r.join("; ")),
+        };
+        if let Some(code) = st.code() {
+            if code == 0 {
+                if let Some(l) = &self.log {
+                    l.add(format!("child {} terminated ({how}, exit 0)", self.name));
+                }
+                return Stop::Exited(0);
+            }
+            panic!(
+                "the lazywf child {} exited {code} on {how} ({}):\n{}",
+                self.name,
+                sent_note,
+                self.tail(20).join("\n")
+            );
+        }
+        let sig = match st.signal() {
+            Some(s) => s,
+            None => {
+                return self.environment_abort(
+                    how,
+                    None,
+                    format!(
+                        "its wait status carried neither an exit code nor a signal ({sent_note}): \
+                         the harness cannot say what stopped the child"
+                    ),
+                )
+            }
+        };
+        let name = signal_name(sig);
+        if crash_signal(sig) {
+            panic!(
+                "the lazywf child {} died of {name} ({sig}) on {how} ({}): a crash signal is the \
+                 product's own doing whatever else the box is doing:\n{}",
+                self.name,
+                sent_note,
+                self.tail(20).join("\n")
+            );
+        }
+        if self.harness_killed.load(Ordering::Relaxed) {
+            if let Some(l) = &self.log {
+                l.add(format!(
+                    "child {} stopped by the harness: {name}",
+                    self.name
+                ));
+            }
+            return Stop::HarnessSignalled { signal: sig };
+        }
+        if sig == SIGTERM {
+            // The only SIGTERM in this test is the one this harness sent, and the child did not
+            // survive it: the shutdown handler did not run. That is the product's own path and
+            // the self-tests exist to keep it honest, so it stays a FAIL.
+            panic!(
+                "the lazywf child {} died of {name} ({sig}) on {how} ({}) instead of running its \
+                 SIGTERM handler and exiting 0:\n{}",
+                self.name,
+                sent_note,
+                self.tail(20).join("\n")
+            );
+        }
+        self.environment_abort(
+            how,
+            Some(sig),
+            format!("died of {name} ({sig}), a signal this harness never sent"),
+        )
+    }
+
+    /// The loud environment abort the finding asks for: named, with the signal, the host load
+    /// and the OOM counters, recorded so a dropped self-test cannot pass for the wrong reason —
+    /// and returned, never panicked, because the product did nothing wrong here.
+    fn environment_abort(&self, how: &str, sig: Option<i32>, why: String) -> Stop {
+        let mut lines = vec![
+            format!(
+                "!!! CHAOS ENVIRONMENT ABORT — {} (pid {}): the engine child {}",
+                self.name,
+                self.pid(),
+                why
+            ),
+            format!("    the seed was: {how}"),
+            format!("    host pressure at spawn : {}", self.pressure_at_spawn),
+            format!("    host pressure now      : {}", host_pressure()),
+            format!("    cgroup OOM counters    : {}", oom_counters()),
+            format!("    kernel OOM lines       : {}", dmesg_oom_lines()),
+            format!("    child log              : {}", self.log_path.display()),
+        ];
+        lines.extend(self.tail(15).iter().map(|l| format!("      | {l}")));
+        lines.push(format!(
+            "    SKIPPED-BY-ENVIRONMENT {} — this seed never reached its asserts. It is not a \
+             product failure and it is not a pass either: re-run it when the box has room.",
+            self.name
+        ));
+        let report = lines.join("\n");
+        eprintln!("{report}\n");
+        if let Some(l) = &self.log {
+            l.add(format!("ENVIRONMENT ABORT {}: {why}", self.name));
+        }
+        record_environment_abort(&self.name, &report);
+        Stop::EnvironmentKilled {
+            signal: sig.unwrap_or(0),
+        }
+    }
+
+    /// Watch the child die without sending it anything, and judge what killed it. `term` is the
+    /// ordinary path (SIGTERM, then the verdict from the child's own wait status); this is the
+    /// classifier on its own, for the harness self-test that signals the child itself and needs
+    /// to know what the harness makes of the death.
+    pub async fn wait_stop(&self, how: &str) -> Stop {
+        let sent = Ok("none: the seed watched the child die".to_string());
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let st = self
@@ -881,23 +1373,62 @@ impl Lazy {
                 .as_mut()
                 .and_then(|c| c.try_wait().ok().flatten());
             if let Some(st) = st {
-                let code = st.code().unwrap_or(-1);
-                assert_eq!(
-                    code, 0,
-                    "the lazywf child {} exited {code} on SIGTERM",
-                    self.name
-                );
-                if let Some(l) = &self.log {
-                    l.add(format!("child {} terminated (SIGTERM, exit 0)", self.name));
-                }
-                return code;
+                return self.judge_stop(st, sent, how);
             }
             assert!(
                 Instant::now() < deadline,
-                "the child {} did not exit after SIGTERM",
+                "the child {} was still running 15 s after {how}",
                 self.name
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// SIGTERM the child and read *its own wait status* — not the exit code of the signal
+    /// command, which means nothing here (see [`send_term`]).
+    ///
+    /// What stays a FAIL on purpose: a nonzero exit, a child still running past the stop grace,
+    /// and a child that dies of the SIGTERM instead of handling it. `h1`/`h2` stop their child
+    /// this way, so the guard they test keeps its teeth; only a death by a signal this process
+    /// never sent leaves the seed as [`Stop::EnvironmentKilled`], and a seed that gets it returns.
+    pub async fn term(&self) -> Stop {
+        let pid = self
+            .child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("child running")
+            .id();
+        let sent = send_term(pid);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let st = loop {
+            let st = self
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten());
+            if st.is_some() {
+                break st;
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        match st {
+            Some(st) => self.judge_stop(st, sent, "SIGTERM"),
+            None => match &sent {
+                Ok(route) => panic!(
+                    "the child {} did not exit after SIGTERM ({route})",
+                    self.name
+                ),
+                Err(routes) => self.environment_abort(
+                    "SIGTERM",
+                    None,
+                    format!("no signal route could be executed: {}", routes.join("; ")),
+                ),
+            },
         }
     }
 
