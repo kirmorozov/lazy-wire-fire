@@ -380,3 +380,36 @@ services:
     environment: { MARIADB_ROOT_PASSWORD: root }
     ports: ["127.0.0.1:34132:3306"]
     healthcheck: { test: ["CMD", "mariadb", "--protocol=TCP", "-h127.0.0.1", "-uroot", "-proot", "-e", "SELECT 1"], interval: 2s, retries: 60 }
+
+  # ---- profile `fences`: servers started with the settings the visibility fence branches on --
+  # The tests that need them (tests/e2e.rs, `fence_*`) skip when the port answers nothing;
+  # start them with
+  #   docker compose -f docker-compose.test.yml --profile fences up -d --wait mysql80-noorder mariadb1011-nobin
+  # Nothing here is a runtime `SET GLOBAL`: the answers are what the server was STARTED with.
+  #
+  # MySQL 8.0 with binlog_order_commits OFF (it cannot coexist with GTIDs, so GTIDs stay off, as
+  # on `mysql80`): the commit-fence probe answers Unordered and flushes fall back to
+  # LAZYWF_VISIBILITY_DELAY_MS — the one server whose probe sees the variable present and OFF.
+  mysql80-noorder:
+    image: mysql:8.0.46
+    network_mode: bridge
+    profiles: ["fences"]
+    command: ["--server-id=1", "--log-bin=binlog", "--binlog-row-metadata=FULL",
+              "--binlog-order-commits=OFF", "--max-connections=500",
+              "--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    environment: { MYSQL_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34185:3306"]
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-proot", "--silent"], interval: 2s, retries: 60 }
+
+  # MariaDB 10.11 with no binary log at all: it reports no `binlog_snapshot_%` pair (empty file),
+  # so the watermark flavor rules the consistent-snapshot fence out and the fence memoizes that
+  # (see `action::fence` and its `snapshot_fence`). No engine runs here (no row events to read);
+  # only direct fence calls do.
+  mariadb1011-nobin:
+    image: mariadb:10.11.19
+    network_mode: bridge
+    profiles: ["fences"]
+    command: ["--server-id=1", "--max-connections=500", "--innodb-buffer-pool-size=128M"]
+    environment: { MARIADB_ROOT_PASSWORD: root }
+    ports: ["127.0.0.1:34191:3306"]
+    healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
