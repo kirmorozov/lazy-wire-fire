@@ -55,6 +55,24 @@ impl Drop for Env {
     }
 }
 
+/// `Env::set` for one case of a test that only asks where the region and the credentials come
+/// from: the case's own variables plus a credential pair and the metadata-off flag, so the case
+/// can never leave the process. A credentials question asked while `ENV_LOCK` is held is not a
+/// slow test, it is every env-dependent unit test on the box waiting behind it.
+async fn env_with_creds(vars: &[(&str, &str)]) -> Env {
+    const CREDENTIALS: [(&str, &str); 3] = [
+        ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+    let mut all = vars.to_vec();
+    all.extend_from_slice(&CREDENTIALS);
+    Env::set(&all).await
+}
+
 /// A scratch directory of this test run under the repository's `tmp/`.
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -330,4 +348,237 @@ async fn a_literal_where_a_reference_belongs_is_an_error() {
     );
     let err = p.get().await.unwrap_err().to_string();
     assert!(err.contains("must be a reference"), "{err}");
+}
+
+// ——— the cache in front of the chain, and the four places a region comes from ————————————
+
+fn creds(key: &str, expiry: Option<std::time::SystemTime>) -> Credentials {
+    Credentials::new(key, "secret", None, expiry, "test")
+}
+
+#[tokio::test]
+async fn a_credential_still_good_is_handed_back_without_the_chain() {
+    let _env = Env::set(&[("AWS_EC2_METADATA_DISABLED", "true")]).await;
+    let now = std::time::SystemTime::now();
+    let secs = |ahead: u64| Some(now + std::time::Duration::from_secs(ahead));
+
+    // A permanent credential: no expiry to run out, so the cache is the answer and the
+    // chain is never built (which is the point — a target that sends continuously must not
+    // ask the chain, or the instance metadata service, on every request).
+    let p = Provider::new(None, "eu-west-1");
+    *p.cache.lock().await = Some(creds("AKIDCACHED", None));
+    assert_eq!(access_key(&p.get().await.unwrap()), "AKIDCACHED");
+    assert!(p.chain.get().is_none(), "the chain was never asked");
+
+    // Temporary credentials with their whole life ahead: the same.
+    let p = Provider::new(None, "eu-west-1");
+    *p.cache.lock().await = Some(creds("AKIDLONG", secs(3600)));
+    assert_eq!(access_key(&p.get().await.unwrap()), "AKIDLONG");
+    assert!(p.chain.get().is_none(), "the chain was never asked");
+
+    // A credential due within `REFRESH_BEFORE` is not the answer any more: the cache is
+    // walked past and the chain asked, so a token is never handed out at the moment it dies.
+    let p = Provider::new(None, "eu-west-1");
+    *p.cache.lock().await = Some(creds("AKIDDYING", secs(60)));
+    let e = p.get().await.unwrap_err();
+    assert!(
+        format!("{e:#}").contains("no AWS credentials"),
+        "the chain was asked, and with no source it says so: {e:#}"
+    );
+    assert!(p.chain.get().is_some(), "the chain was built");
+}
+
+#[tokio::test]
+async fn the_region_of_an_endpoint_is_the_url_then_the_environment_then_the_config_file() {
+    // The order the region is looked for in, one setting at a time. Each of the four is the
+    // only one that can answer in its own case, so a deployment that sets two of them is
+    // not guessing which wins. One `Env` per case, never a second inside the first: `Env`
+    // holds `ENV_LOCK`, which is not reentrant, so a nested one waits forever on the guard
+    // the same test is still holding — and every other env-dependent unit test waits too.
+    let dir = scratch("region");
+    let config = dir.join("config");
+    std::fs::write(&config, "[default]\nregion = sa-east-1\n").unwrap();
+
+    // The endpoint's own region beats every setting, and `AWS_REGION` beats the two below it.
+    {
+        let _env = env_with_creds(&[
+            ("AWS_REGION", "eu-north-1"),
+            ("AWS_DEFAULT_REGION", "ap-south-1"),
+            ("AWS_CONFIG_FILE", config.display().to_string().as_str()),
+        ])
+        .await;
+        assert_eq!(resolve_region(Some("eu-west-1")).unwrap(), "eu-west-1");
+        assert_eq!(resolve_region(None).unwrap(), "eu-north-1");
+    }
+    // Then `AWS_DEFAULT_REGION`.
+    {
+        let _env = env_with_creds(&[("AWS_DEFAULT_REGION", "ap-south-1")]).await;
+        assert_eq!(resolve_region(None).unwrap(), "ap-south-1");
+    }
+    // Then the named profile of the shared config file.
+    {
+        std::fs::write(
+            &config,
+            "[default]\nregion = sa-east-1\n\n[profile lwf]\nregion = eu-central-1\n",
+        )
+        .unwrap();
+        let _env = env_with_creds(&[
+            ("AWS_CONFIG_FILE", config.display().to_string().as_str()),
+            ("AWS_PROFILE", "lwf"),
+        ])
+        .await;
+        assert_eq!(resolve_region(None).unwrap(), "eu-central-1");
+    }
+    // And `[default]` when no profile is named.
+    {
+        let _env =
+            env_with_creds(&[("AWS_CONFIG_FILE", config.display().to_string().as_str())]).await;
+        assert_eq!(resolve_region(None).unwrap(), "sa-east-1");
+    }
+    // With no `AWS_CONFIG_FILE` to read, the file under `HOME` is the last place asked — and a
+    // comment and a blank line and another profile's region do not answer for it.
+    {
+        let _env = env_with_creds(&[]).await;
+        let home = scratch("region-home");
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(
+            home.join(".aws/config"),
+            "# the shared config\n[profile other]\nregion = us-east-2\n\n[default]\nregion = us-west-1\n",
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+        assert_eq!(resolve_region(None).unwrap(), "us-west-1");
+    }
+    // Nothing at all: the refusal is the instruction, and it names both places to put it.
+    {
+        let _env = env_with_creds(&[]).await;
+        std::env::set_var("HOME", scratch("region-none"));
+        let e = format!("{:#}", resolve_region(None).unwrap_err());
+        assert!(e.contains("no AWS region"), "{e}");
+        assert!(e.contains("aws-sqs://<region>"), "{e}");
+        assert!(e.contains("AWS_DEFAULT_REGION"), "{e}");
+    }
+}
+
+#[tokio::test]
+async fn a_config_line_that_is_not_a_region_is_not_one() {
+    // The same file with nothing to give: a profile that exists but says nothing, a region
+    // with an empty value, and a commented-out one all answer `not here`, which is what
+    // lets the next place be asked instead of a target failing on a blank region.
+    let text = "# region = eu-west-1\n[default]\naws_secret_access_key = x\nregion =\n[profile other]\nregion = us-east-2\n";
+    assert_eq!(config_region(text, "default"), None);
+    assert_eq!(config_region(text, "other"), Some("us-east-2".into()));
+    // A name is matched as a name: `[profile lwf]` is the profile `lwf`, and `[lwf]` is not.
+    assert_eq!(config_region("[lwf]\nregion = us-east-2\n", "lwf"), None);
+    assert_eq!(
+        config_region("[profile lwf]\nregion = us-east-2\n", "lwf"),
+        Some("us-east-2".into())
+    );
+}
+
+/// The one spelling of the default profile our parser does not read, kept in the tree as the
+/// acceptance criterion for the fix rather than dropped with the PR. See the ignore reason.
+#[test]
+#[ignore = "product bug (PR #191): config_region at src/aws.rs:521 accepts only [default] for the default profile, while the aws-config we depend on reads [profile default] and lets it override [default] (aws-runtime-1.10.4/src/env_config/normalize.rs:98 strips the profile prefix, :100 and :126-136 give the prefixed one priority)"]
+fn the_bracketed_profile_default_spelling_of_the_default_profile_is_read_too() {
+    // `aws-config` — in our tree as `aws_runtime::env_config`, re-exported by
+    // `aws-config-1.13.2/src/profile.rs:24` — normalizes a config file's section names by
+    // stripping the prefix (`aws-runtime-1.10.4/src/env_config/normalize.rs:98`: "When the
+    // profile is a config file, strip `profile` and trim whitespace (`profile foo` => `foo`)"),
+    // and `default` is no exception: :100 says "A profile named `profile default` takes priority
+    // over a profile named `default`", and :126-136 drops `[default]` with
+    // `profile `[default]` ignored because `[profile default]` was found which takes priority`.
+    // Ours takes the other branch for this one name — src/aws.rs:521-526 is
+    // `if profile == "default" { "default" } else { format!("profile {profile}") }`, so the
+    // prefix that is required for every other profile is forbidden for this one. The consequence
+    // is a user-visible start failure: a shared config whose only `region` sits under
+    // `[profile default]`, which the user's other AWS tooling reads, answers `not here` here, and
+    // `resolve_region` refuses with "no AWS region: give it in the endpoint". A dependency update
+    // cannot fix that: `config_region` is a hand-written parser and nothing asks `aws-runtime`.
+    // Un-ignore this when the parser accepts the form; the expectation is the AWS one, not ours.
+    assert_eq!(
+        config_region("[profile default]\nregion = us-east-2\n", "default"),
+        Some("us-east-2".into()),
+        "`[profile default]` is the profile `default` to aws-config, so it has to be one to us too"
+    );
+}
+
+fn pool() -> Pool {
+    Pool::new("mysql://u:p@127.0.0.1:1/x")
+}
+
+#[tokio::test]
+async fn an_entry_the_answer_numbers_wrong_fails_the_whole_batch() {
+    // The `Id` of an entry is how the answer says which key it talks about. An answer that
+    // numbers it outside the batch, or not at all, cannot be mapped onto keys at all: the
+    // one honest answer is that nothing was answered, so no key is dropped on it.
+    let expect = Expect::new(None).unwrap();
+    let pool = pool();
+    let items = |answer: Value, n: usize| {
+        let expect = &expect;
+        let pool = &pool;
+        async move {
+            batch_items(
+                &answer,
+                n,
+                expect,
+                pool,
+                200,
+                &[],
+                "https://sqs.eu-west-1.amazonaws.com/q",
+            )
+            .await
+        }
+    };
+
+    // A number where a string of a number belongs: the same index, read either way.
+    let got = items(
+        serde_json::json!({"Successful": [{"Id": 1, "MessageId": "m"}]}),
+        2,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(got[1], Item::Ok),
+        "the numeric `Id` named the second item: {got:?}"
+    );
+    assert!(
+        matches!(&got[0], Item::Transient(why) if why.contains("no answer")),
+        "the item the answer never named waits: {got:?}"
+    );
+    // An `Id` that is neither.
+    let e = format!(
+        "{:#}",
+        items(serde_json::json!({"Failed": [{"Id": true}]}), 2)
+            .await
+            .unwrap_err()
+    );
+    assert!(e.contains("not one of 2"), "{e}");
+    // And one that is a number the batch does not have.
+    let e = format!(
+        "{:#}",
+        items(
+            serde_json::json!({"Failed": [{"Id": "7", "Code": "X", "Message": "y"}]}),
+            2
+        )
+        .await
+        .unwrap_err()
+    );
+    assert!(e.contains("the answer names item"), "{e}");
+    assert!(e.contains("not one of 2"), "{e}");
+    // The same in the section that answers well: a batch is read whole or not at all, so a
+    // good `Successful` entry cannot be believed past a `Failed` one that names nothing.
+    let e = format!(
+        "{:#}",
+        items(
+            serde_json::json!({
+                "Successful": [{"Id": "0", "MessageId": "m"}],
+                "Failed": [{"Id": "x", "Code": "X", "Message": "y"}],
+            }),
+            2,
+        )
+        .await
+        .unwrap_err()
+    );
+    assert!(e.contains("not one of 2"), "{e}");
 }

@@ -284,3 +284,238 @@ async fn a_payload_an_invoke_cannot_take_is_refused_before_it_goes_out() {
         .unwrap();
     assert!(is_rejected(&e), "{e:#} is not a refusal");
 }
+
+/// The batch front of a kind with a module of its own asks that module — but only of a
+/// transport that is what the kind speaks. The guard is there for a target that ever is not
+/// (a `Target` is built once, from its row, so today it cannot happen): its answer must be a
+/// clear failure of the target, never a refusal of the keys, which the engine would drop.
+#[tokio::test]
+async fn the_batch_front_of_a_transport_the_kind_does_not_speak_names_the_kind() {
+    let keys = vec![String::from("1"), String::from("2")];
+    let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
+    let dir = std::env::temp_dir().join(format!("lazywf-dispatch-grpc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let desc = dir.join("lazywf.desc");
+    std::fs::write(&desc, crate::targets::grpc::contract::DESCRIPTOR).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
+    let grpc_vars = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item"}}"#,
+        desc.display()
+    );
+    let cases = [
+        (
+            "kafka",
+            "kafka://mq.example.test:9094/orders",
+            "{}",
+            "is not a kafka target",
+        ),
+        (
+            "rabbitmq-stream",
+            "rabbitmq-stream://127.0.0.1:34612/orders",
+            cred_vars(),
+            "is not a rabbitmq-stream target",
+        ),
+        (
+            "servicebus",
+            "sb://127.0.0.1:34610/orders",
+            "{}",
+            "is not a servicebus target",
+        ),
+        (
+            "grpc",
+            "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push",
+            grpc_vars.as_str(),
+            "is not a grpc target",
+        ),
+    ];
+    for (kind, endpoint, vars, want) in cases {
+        let mut t = target(kind, endpoint, vars);
+        // The transport of a target the engine loads always matches its kind, so the only way
+        // to the guard is to put another kind's transport under it. A redis client asks
+        // nothing of the network when it is built, which is what makes it usable here.
+        let redis = crate::targets::redis::Client::new(
+            crate::targets::redis::RedisAddr::parse("redis://cache.example.test:6379/0").unwrap(),
+            &crate::tls::TlsSpec::parse(None).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut t)
+            .expect("the test holds the only reference")
+            .endpoints[0]
+            .transport = Transport::Redis(redis);
+        let e = t
+            .send_items(0, "POST / HTTP/1.1\n\n{}", &keys)
+            .await
+            .unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains(want), "{kind}: {msg}");
+        assert!(
+            !is_rejected(&e),
+            "{kind}: a transport that cannot answer per item says nothing about the keys, \
+             which must wait and not be dropped: {msg}"
+        );
+    }
+    match was {
+        Some(v) => std::env::set_var("LAZYWF_SECRET_DIRS", v),
+        None => std::env::remove_var("LAZYWF_SECRET_DIRS"),
+    }
+}
+
+/// The three kinds that raise their own batch limit by `vars` — a gRPC server's maximum
+/// message size, a Service Bus entity's, and a topic's `MaximumMessageSize` — say so through
+/// the one front the engine cuts a batch at. A limit read as absent means a batch the service
+/// refuses whole, so every key of it fails at once.
+#[tokio::test]
+async fn the_size_a_batch_is_cut_to_follows_the_service_that_set_it() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
+    let dir = scratch("limits");
+    let desc = dir.join("lazywf.desc");
+    std::fs::write(&desc, crate::targets::grpc::contract::DESCRIPTOR).unwrap();
+    std::env::set_var("LAZYWF_SECRET_DIRS", &dir);
+    // The default of each kind: no `vars` raising it, no limit of its own to report.
+    let grpc_default = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item"}}"#,
+        desc.display()
+    );
+    let grpc = target(
+        "grpc",
+        "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push",
+        &grpc_default,
+    );
+    assert_eq!(
+        grpc.batch_bytes_limit(),
+        Some(crate::targets::grpc::MAX_MESSAGE_BYTES),
+        "the kind's own maximum"
+    );
+    let grpc_big = format!(
+        r#"{{"descriptor_set":"file:{}","item_type":"lazywf.v1.Item","max_message_bytes":8388608}}"#,
+        desc.display()
+    );
+    assert_eq!(
+        target(
+            "grpc",
+            "grpcs://ingest.example.test:9000/lazywf.v1.Sink/Push",
+            &grpc_big
+        )
+        .batch_bytes_limit(),
+        Some(8_388_608),
+        "a server with a raised maximum takes bigger batches"
+    );
+    assert_eq!(
+        target("servicebus", "sb://127.0.0.1:34610/orders", "{}").batch_bytes_limit(),
+        Some(crate::targets::servicebus::MAX_MESSAGE_BYTES),
+        "the kind's own maximum"
+    );
+    assert_eq!(
+        target(
+            "servicebus",
+            "sb://127.0.0.1:34610/orders",
+            r#"{"max_message_size": 1048576}"#
+        )
+        .batch_bytes_limit(),
+        Some(1_048_576),
+        "an entity with a raised maximum message size takes bigger batches"
+    );
+    assert_eq!(
+        target(
+            "sns",
+            "aws-sns://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34561",
+            r#"{"maximum_message_size": 1048576}"#
+        )
+        .batch_bytes_limit(),
+        Some(1_048_576),
+        "a topic whose MaximumMessageSize was raised takes a batch of that size"
+    );
+    match was {
+        Some(v) => std::env::set_var("LAZYWF_SECRET_DIRS", v),
+        None => std::env::remove_var("LAZYWF_SECRET_DIRS"),
+    }
+}
+
+/// A scratch directory of this test run under the repository's `tmp/`, the shape the other unit
+/// tests use (`src/tests/aws_provider_tests.rs`): what a test wrote stays readable next to the
+/// rest of the test output instead of disappearing into `/tmp`.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join("unit")
+        .join(format!("target-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The http bind belongs to the http kinds. A kind whose transport is another one's must be
+/// refused by name rather than have a request built it can never put on the wire: this is the
+/// arm between the http front of `http_bind` and `send`'s own dispatch by kind.
+#[tokio::test]
+async fn a_kind_that_speaks_another_transport_is_refused_the_http_bind_by_name() {
+    for (kind, endpoint) in [
+        ("redis", "redis://cache.example.test:6380/0"),
+        ("kafka", "kafka://mq.example.test:9094/orders"),
+    ] {
+        let t = target(kind, endpoint, "{}");
+        let req = RawRequest::parse("POST /h HTTP/1.1\n\n{}")
+            .unwrap()
+            .unwrap();
+        let e = match t.http_bind(&t.endpoints[0], req).await {
+            Ok(_) => panic!("a {kind} target has no http transport to bind a request to"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(e.contains("is not an http target"), "{kind}: {e}");
+        assert!(e.contains("t"), "{kind}: the refusal names the target: {e}");
+    }
+}
+
+/// Credentials that resolved to nothing are refused by the signer rather than sent: a request
+/// signed with an empty key is not an anonymous request, it is a request AWS will refuse in a
+/// way that reads like a target bug, and the tool would have paid a round trip for it.
+#[tokio::test]
+async fn credentials_that_are_empty_are_refused_before_the_signed_send() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    std::env::set_var("LWF_TEST_AWS_EMPTY_AK", "");
+    std::env::set_var("LWF_TEST_AWS_EMPTY_SK", "");
+    let t = target(
+        "sqs",
+        "aws-sqs://eu-west-1/123456789012/orders?endpoint=http://127.0.0.1:34561",
+        r#"{"access_key_ref":"env:LWF_TEST_AWS_EMPTY_AK","secret_key_ref":"env:LWF_TEST_AWS_EMPTY_SK"}"#,
+    );
+    let req = RawRequest::parse("POST / HTTP/1.1\n\n{}").unwrap().unwrap();
+    let e = match t.prepare(req, "", "sqs.eu-west-1.amazonaws.com").await {
+        Ok(_) => panic!("empty credentials must not be signed and sent"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(e.contains("empty AWS credentials"), "{e}");
+}
+
+/// A credential var that is absent, not merely empty: the load path cannot produce this (the
+/// row check requires the vars each kind names), so it is written the way the engine would
+/// meet it — a def that got past that check. The answer is the var by name, never an empty
+/// claim on the wire, and never a panic on a missing map entry.
+#[tokio::test]
+async fn a_credential_var_that_is_absent_is_named_and_not_left_empty() {
+    let def = TargetDef {
+        name: "t".into(),
+        kind: Kind::HttpBearer,
+        endpoints: vec!["https://api.example.test/hook".into()],
+        tls: crate::tls::TlsSpec::parse(None).unwrap(),
+        timeout: std::time::Duration::from_secs(1),
+        expect: None,
+        vars: serde_json::Map::new(),
+    };
+    let t = Target::new(
+        def,
+        mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x"),
+        None,
+    )
+    .unwrap();
+    let req = RawRequest::parse("POST /h HTTP/1.1\n\n{}")
+        .unwrap()
+        .unwrap();
+    let e = match t.prepare(req, "", "api.example.test").await {
+        Ok(_) => panic!("a bearer target with no `token` var must not be prepared"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(e.contains("vars.token is missing"), "{e}");
+}

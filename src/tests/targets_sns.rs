@@ -255,3 +255,131 @@ fn an_entry_line_must_name_a_field_and_a_number() {
         "{e}"
     );
 }
+
+#[test]
+fn a_batch_of_no_keys_says_so_before_the_request() {
+    // The guard the engine should never reach — it asks for a batch only when it holds keys —
+    // and the one answer that keeps every key: a batch that was never sent has refused nobody.
+    assert_eq!(
+        entries_ok(b"Action=PublishBatch", 0, false).unwrap_err(),
+        "no keys: a batch sends no PublishBatch"
+    );
+    // Even a body that would otherwise pass is not sent for nothing.
+    assert_eq!(
+        entries_ok(body(&[("0", "m")]).as_bytes(), 0, true).unwrap_err(),
+        "no keys: a batch sends no PublishBatch"
+    );
+}
+
+#[test]
+fn the_endpoint_names_the_shape_it_takes() {
+    // Neither of the two shapes, and the message is the only thing telling the author what to
+    // write: both forms, with the endpoint shown back.
+    for s in [
+        "aws-sns://123456789012",
+        "aws-sns://eu-west-1/123456789012/orders/extra",
+        "aws-sns://",
+    ] {
+        let e = format!("{:#}", SnsUrl::parse(s).unwrap_err());
+        assert!(
+            e.contains(s),
+            "{s}: the refusal must show the endpoint: {e}"
+        );
+        assert!(
+            e.contains("aws-sns://<account-id>/<topic-name>")
+                || e.contains("the path has an empty segment"),
+            "{s}: {e}"
+        );
+    }
+    // A region that is a region, and one that is not: the two shapes are told apart, and the
+    // bad one is named.
+    assert_eq!(
+        SnsUrl::parse("aws-sns://eu-west-1/123456789012/orders")
+            .unwrap()
+            .region
+            .as_deref(),
+        Some("eu-west-1")
+    );
+    let e = format!(
+        "{:#}",
+        SnsUrl::parse("aws-sns://EU-West-1/123456789012/orders").unwrap_err()
+    );
+    assert!(e.contains("`EU-West-1` is not an AWS region name"), "{e}");
+    assert!(e.contains("eu-west-1"), "{e}");
+}
+
+#[test]
+fn a_target_with_no_endpoint_names_the_endpoint_it_needs() {
+    // `build` reads the one endpoint the kind takes; a row with none must fail with what to
+    // write, not with an index panic.
+    let def = TargetDef {
+        name: "t".into(),
+        kind: Kind::Sns,
+        endpoints: vec![],
+        tls: crate::tls::TlsSpec::parse(None).unwrap(),
+        timeout: std::time::Duration::from_secs(1),
+        expect: None,
+        vars: Map::new(),
+    };
+    // The built target is a bundle the kind does not let be printed, so the refusal is taken
+    // by hand: the Ok side has to fail the test, not just be ignored.
+    let e = match build(&def) {
+        Ok(_) => panic!("an sns target with no endpoint must not build"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(e.contains("kind sns needs its aws-sns:// endpoint"), "{e}");
+}
+
+#[test]
+fn a_document_cut_off_mid_element_ends_the_scan() {
+    // A response cut off by a closed connection: the scan stops at the first element it cannot
+    // finish rather than reading past the end of the buffer — a tag that never opens its `>`,
+    // and a value that never gets its closing tag.
+    assert_eq!(
+        children("<MessageId>m</MessageId><Code>oops"),
+        vec![("MessageId".to_string(), "m".to_string())],
+        "the element without a closing tag ends the scan"
+    );
+    assert_eq!(
+        children("<MessageId>m</MessageId><Code"),
+        vec![("MessageId".to_string(), "m".to_string())],
+        "a tag cut off before its `>` ends the scan"
+    );
+    // What that means for an answer: nothing can be trusted, so it is an error the keys wait
+    // out rather than a per-entry answer that would drop some of them.
+    let truncated = ANSWER.split_once("<Failed>").unwrap().0.to_string();
+    let e = format!("{:#}", batch_answer(truncated.as_bytes()).unwrap_err());
+    assert!(e.contains("not a PublishBatchResult"), "{e}");
+}
+
+#[test]
+fn a_character_reference_that_is_none_keeps_its_ampersand() {
+    // `&#;` names no code point: it is not a reference, so the text keeps it exactly as the
+    // service wrote it — the same rule as a `&` that begins nothing.
+    let xml = "<PublishBatchResponse><PublishBatchResult><Successful/>\
+                   <Failed><member><Id>0</Id><Code>InvalidParameter</Code>\
+                   <Message>price &#; 0 &#x;</Message>\
+                   <SenderFault>true</SenderFault></member></Failed></PublishBatchResult>\
+                   </PublishBatchResponse>";
+    let failed = batch_answer(xml.as_bytes()).unwrap()["Failed"][0].clone();
+    assert_eq!(failed["Message"], json!("price &#; 0 &#x;"));
+    assert_eq!(unescape("&#;&#x;"), "&#;&#x;");
+    // The numeric forms still work next to them.
+    assert_eq!(unescape("&#65;&#x42;&#;"), "AB&#;");
+}
+
+#[test]
+fn the_five_named_character_references_are_unescaped() {
+    // The five names the table in `unescape` holds. The two that read like markup are the ones
+    // a service writes back at you — a `"` in a topic name comes home as `&quot;` — so they are
+    // asserted here by name, not left to the numeric path that the test above covers.
+    assert_eq!(unescape("&amp;&lt;&gt;&quot;&apos;"), "&<>\"'");
+    // And they are read through when the answer is parsed, not just by the helper.
+    let xml = "<PublishBatchResponse><PublishBatchResult><Successful/>\
+                   <Failed><member><Id>0</Id><Code>InvalidParameter</Code>\
+                   <Message>&quot;x&quot; &apos;y&apos; &amp;&amp;</Message>\
+                   <SenderFault>true</SenderFault></member></Failed></PublishBatchResult>\
+                   </PublishBatchResponse>";
+    let failed = batch_answer(xml.as_bytes()).unwrap()["Failed"][0].clone();
+    assert_eq!(failed["Message"], json!("\"x\" 'y' &&"));
+}

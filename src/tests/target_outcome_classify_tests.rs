@@ -865,3 +865,115 @@ fn only_the_kinds_that_answer_per_item_are_offered_the_batch_front() {
         );
     }
 }
+
+// ——— the batch front of a transport that answers nothing per item, and the answer
+// that numbers its entries wrong ————————————————————————————————————————————————————
+
+/// The batch front belongs to the kinds whose answer names every entry. Asked for it on a
+/// transport that cannot answer per item, the answer is a clear failure of the target — never
+/// a refusal of the keys, which the engine would drop. The engine only ever asks after
+/// [`Target::reports_items`] said yes, so this guard speaks about a wrong call, not about a
+/// key: which is exactly why it must not be a refusal either.
+#[tokio::test]
+async fn a_transport_that_never_answers_per_item_fails_the_target_and_not_the_keys() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    // The password is a reference, as any credential of a row must be (`from_row` refuses a
+    // literal `vars.password`), and it is set here, under the same `ENV_LOCK`, so the reference
+    // resolves to something if the kind reads it before it is refused for the transport.
+    std::env::set_var("LWF_TEST_PW", "p");
+    let with_pw = r#"{"username":"u","password":"env:LWF_TEST_PW"}"#;
+    let cases = [
+        ("redis", "redis://cache.example.test:6380/0", "{}"),
+        ("smtp", "smtp://mail.example.test:587", with_pw),
+        ("amqp", "amqp://mq.example.test:5672/", with_pw),
+        ("mysql", "mysql://db.example.test:3306/app", with_pw),
+    ];
+    for (kind, endpoint, vars) in cases {
+        let t = target(kind, endpoint, vars);
+        let e = t
+            .send_items(0, "POST / HTTP/1.1\n\n{}", &keys(&["1", "2"]))
+            .await
+            .unwrap_err();
+        assert!(
+            !is_rejected(&e),
+            "{kind}: the keys did nothing to deserve being dropped: {}",
+            chain(&e)
+        );
+        assert!(
+            chain(&e).contains("does not answer per item"),
+            "{kind}: {:#}",
+            e
+        );
+    }
+}
+
+/// A rendered request the parser cannot read is the render's fault, and a render is a
+/// property of the key: unlike a transport that cannot answer per item, this one is a refusal,
+/// so a broken template costs the key its place in the lane instead of holding it forever.
+#[tokio::test]
+async fn a_render_the_batch_front_cannot_parse_is_a_refusal() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    set_aws_env();
+    for rendered in ["nonsense", "GET / HTTP/1.1\nHeaderWithNoColon\n\n{}"] {
+        let (addr, got) = serve(200, "{}").await;
+        let t = sqs(addr);
+        let e = t
+            .send_items(0, rendered, &keys(&["1", "2"]))
+            .await
+            .unwrap_err();
+        assert!(
+            is_rejected(&e),
+            "a render the parser refuses is the key's own fault: {:#}",
+            e
+        );
+        assert!(
+            chain(&e).contains("the rendered request"),
+            "{rendered}: {:#}",
+            e
+        );
+        assert!(got.lock().unwrap().is_empty(), "nothing reached the wire");
+    }
+}
+
+/// The `Id` of an entry is how a batch answer says which key it means. An answer that writes
+/// it as a number, or writes one that is not in the batch, cannot be mapped onto keys at all:
+/// the honest answer is that nothing was answered, so no key is dropped on it.
+#[tokio::test]
+async fn an_aws_batch_answer_that_numbers_its_entries_wrong_answers_none_of_them() {
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    set_aws_env();
+    // A numeric `Id` is the index it means: the batch is answered.
+    let (addr, _) = serve(
+        200,
+        r#"{"Successful":[{"Id":1,"MessageId":"m"}],"Failed":[]}"#,
+    )
+    .await;
+    let items = sqs(addr)
+        .send_items(0, "POST / HTTP/1.1\n\nAction=x", &keys(&["1", "2"]))
+        .await
+        .unwrap();
+    assert_eq!(items[1], Item::Ok, "the numeric Id named the second key");
+    assert!(
+        matches!(&items[0], Item::Transient(why) if why.contains("no answer")),
+        "the key the answer never named waits: {items:?}"
+    );
+    // An `Id` the batch does not contain: the whole answer is refused, so no key of it is
+    // believed — and no key of it is dropped either.
+    for answer in [
+        r#"{"Successful":[],"Failed":[{"Id":"7","Code":"X","Message":"y","SenderFault":true}]}"#,
+        r#"{"Successful":[{"Id":true,"MessageId":"m"}],"Failed":[]}"#,
+        r#"{"Successful":[{"Id":"0","MessageId":"m"}],"Failed":[{"Id":"x","Code":"X","Message":"y"}]}"#,
+    ] {
+        let (addr, _) = serve(200, answer).await;
+        let e = sqs(addr)
+            .send_items(0, "POST / HTTP/1.1\n\nAction=x", &keys(&["1", "2"]))
+            .await
+            .unwrap_err();
+        let msg = chain(&e);
+        assert!(msg.contains("not one of 2"), "{answer}: {msg}");
+        assert!(
+            !is_rejected(&e),
+            "{answer}: an answer that cannot be read says nothing about the keys: {msg}"
+        );
+    }
+}
