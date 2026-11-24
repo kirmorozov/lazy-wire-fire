@@ -4210,6 +4210,146 @@ async fn pg_target_stray_listing_reads_typed_rows() {
     inst.stop().await;
 }
 
+/// A stray listing whose template renders nothing is a **failed** listing, not an empty one.
+/// `targets/sql.rs`'s pg branch of `fetch` refuses a blank statement (`:97-100`), the engine
+/// keeps the reset open over it and says why in `last_error` and in one `WARN`, and the attempt
+/// costs nothing: with the template fixed, the very same strays are listed and deleted. A blank
+/// render that passed for an empty listing would report a reset done and leave the rows behind
+/// with nothing to point at, which is what these assertions tell apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_target_a_listing_that_renders_nothing_costs_a_retry() {
+    const PG: &str = "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink";
+    let (admin, conn) = match tokio_postgres::connect(PG, tokio_postgres::NoTls).await {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("no PostgreSQL on 127.0.0.1:34432: skipping");
+            return;
+        }
+    };
+    tokio::spawn(conn);
+    // Three rows: two strays and one key the snapshot also knows (`3`), which is why it must
+    // survive the reset as well.
+    admin
+        .batch_execute(
+            "DROP TABLE IF EXISTS covpg_blank;
+             CREATE TABLE covpg_blank (what text PRIMARY KEY);
+             INSERT INTO covpg_blank VALUES ('b1'), ('b2'), ('3');",
+        )
+        .await
+        .unwrap();
+
+    let root = need_db!();
+    let db = Db::fresh(&root, "covpgblk").await;
+    db.exec("CREATE TABLE covpg_items (id BIGINT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO covpg_items VALUES (3,'c')").await;
+    tables(&db).await;
+    std::env::set_var("LWF_TEST_PG_PW", "pgpw");
+    db.target(
+        "pgblank",
+        "pgsql",
+        "127.0.0.1:34432/sink",
+        None,
+        r#"{"username": "postgres", "password": "env:LWF_TEST_PG_PW"}"#,
+    )
+    .await;
+    let stray = |list: &str| {
+        json!([
+            {"for_each": "snapshot"},
+            {"for_each": "stray",
+             "list_template": list,
+             "keys": "JSON_EXTRACT(body, '$[*].what')",
+             "template": "DELETE FROM covpg_blank WHERE what \
+               IN ({{#each docs}}{{#unless @first}}, {{/unless}}{{sql_quote key}}{{/each}})"}
+        ])
+    };
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('pgb', 'pgblank', 'key', \
+         'SELECT id AS _key, name, NULL AS _op FROM covpg_items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM covpg_items', \
+         '{{#each docs}}INSERT INTO covpg_blank (what) VALUES ({{sql_quote key}}) \
+          ON CONFLICT (what) DO NOTHING{{/each}}', ?, 100)",
+        (stray("{{! a listing that renders nothing at all !}}").to_string(),),
+    )
+    .await;
+    db.trigger("pgb", "covpg_items", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    async fn rows(admin: &tokio_postgres::Client) -> Vec<String> {
+        admin
+            .query("SELECT what FROM covpg_blank ORDER BY what", &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    }
+
+    wait_for(
+        Duration::from_secs(60),
+        "the blank listing reported itself",
+        || async {
+            warnings()
+                .into_iter()
+                .filter(|l| l.starts_with("WARN") && l.contains("pgb"))
+                .any(|l| {
+                    l.contains("listing the target's keys failed")
+                        && l.contains("the list template rendered nothing")
+                })
+                .then_some(())
+        },
+    )
+    .await;
+    let s = wait_for(
+        Duration::from_secs(30),
+        "the rule's `last_error` names the blank render",
+        || async {
+            let s = db.status("pgb").await?;
+            let e = s.3.clone()?;
+            (e.contains("the list template rendered nothing") && e.contains("listing page 0"))
+                .then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        !s.2.starts_with("done"),
+        "a failed listing is not a reset that finished: {s:?}"
+    );
+    // Nothing was listed, so nothing was deleted: a render of nothing did not pass for the
+    // statement running and finding no strays.
+    assert_eq!(
+        rows(&admin).await,
+        ["3", "b1", "b2"],
+        "all of them still there"
+    );
+
+    // The same rule, a listing that renders. The strays the failed listing could not name are
+    // all still there to be found: the failure struck nothing off.
+    db.exec_params(
+        "UPDATE lazy_wire_fire_rule SET reset_steps = ? WHERE name = 'pgb'",
+        (stray("SELECT what FROM covpg_blank").to_string(),),
+    )
+    .await;
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'pgb'")
+        .await;
+    wait_for(
+        Duration::from_secs(90),
+        "the strays deleted once the listing rendered",
+        || async { (rows(&admin).await == ["3"]).then_some(()) },
+    )
+    .await;
+    wait_for(Duration::from_secs(30), "the reset done", || async {
+        db.status("pgb")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .map(|_| ())
+    })
+    .await;
+    inst.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // `sqs` targets, against ElasticMQ (`LAZYWF_TEST_SQS`, e.g. http://127.0.0.1:34561; the
 // `sqs` compose profile). The tests read the queues back through the same SQS JSON API.
