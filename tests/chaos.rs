@@ -6,7 +6,10 @@
 //! rest of the source class (stall, flapping, a cut inside a 50 000-row group, and an XA whose
 //! COMMIT lands across a cut and across a kill); T2–T6 add the target class. P2
 //! `sigkill_during_reset` interrupts a snapshot reset mid-step and requires it to start over
-//! after the restart, P3 `graceful_sigterm` is the cheap shutdown control (exit 0 within the
+//! after the restart, P2b `sigkill_during_requested_reset_resumes_the_saved_step` kills a
+//! requested reset at a later step and requires the restarted child to resume there — the
+//! finished steps answered no more, the interrupted one re-walked whole — P3
+//! `graceful_sigterm` is the cheap shutdown control (exit 0 within the
 //! stop grace, running actions finished, position saved for the next child), and C1
 //! `target_down_while_source_flaps` is the combined outage that proves "outage ≠ data loss"
 //! end to end. `h1` and `h2`
@@ -3349,12 +3352,17 @@ async fn h3_environment_kill_is_not_a_product_failure() {
 
 /// The engine's own reset-progress line, as it is persisted in the status row's
 /// `reset_state` column while a `for_each` step walks its batches (`src/engine.rs`):
-/// `running: step <i>/<n> <name>: <done>/<total> keys: <reason>`. Returns
+/// `running: step <i>/<n> fp<digest> <name>: <done>/<total> keys: <reason>`. Returns
 /// `(step, steps, name, done, total)`.
 fn reset_progress(state: &str) -> Option<(u32, u32, String, u64, u64)> {
     let rest = state.strip_prefix("running: step ")?;
     let (step, tail) = rest.split_once('/')?;
     let (steps, tail) = tail.split_once(' ')?;
+    // Between the counter and the step name sits the fingerprint digest token
+    // (`fp<8 hex>`, see `resume_requested_reset`); step names in this suite never
+    // look like it, so a line that carries none is a parse failure, not a silent
+    // mis-parse of the name.
+    let (_, tail) = tail.split_once(' ')?;
     let (name, tail) = tail.split_once(": ")?;
     let (done, rest) = tail.split_once('/')?;
     let (total, _) = rest.split_once(" keys:")?;
@@ -3665,6 +3673,278 @@ async fn p2_sigkill_during_reset() {
     assert_no_undelivered(&lazy2);
     lazy2.kill();
     sp.stop();
+}
+
+// ------------------------------------------------------------------------ P2b reset resume
+
+/// P2b (the resume half of P2): the same operator request and the same SIGKILL, but a rule
+/// whose reset is four steps — an announcement and three `for_each` snapshot steps of 10
+/// batches each over the 1 000 `items` keys (`batch_max_keys` = 100), each step posting to
+/// its own path. The kill is gated on the PERSISTED row standing on `running: step 3/4
+/// fp<digest> snapB: …` with that step's own calls advancing: a step advances only on
+/// answered chunks
+/// (`on_done`), and a persisted line never runs ahead of the walk, so at that gate the
+/// announcement and `snapA` were answered to their last batch. The restarted child must
+/// continue the run there — no further `/reset-announce` and no further `/snapA` call from
+/// it (the two counters that a walk-from-step-1 recovery moves: this is the assertion that
+/// reads red on main), the interrupted `snapB` re-walked whole because its key set died with
+/// the process (at-least-once), `snapC` run, the row finishing `done:` with the flag cleared
+/// by the engine, and every `items` key delivered at least once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2b_sigkill_during_requested_reset_resumes_the_saved_step() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_p2b").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("p2b-reset");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+
+    // Four steps, three of them chunked: the two chunk counts the resumed child must not
+    // repeat are the finished step's own (10 `/snapA` calls per walk), and the count it must
+    // owe in full is the interrupted step's (10 more `/snapB` calls).
+    let total = 1_000;
+    let batch = 100u32;
+    let chunks = (total / batch) as usize;
+    let steps = serde_json::json!([
+        {
+            "name": "announce",
+            "once": true,
+            "template": "POST /reset-announce HTTP/1.1\n\n"
+        },
+        {
+            "name": "snapA",
+            "for_each": "snapshot",
+            "template": "POST /snapA HTTP/1.1\n\n{{join keys \",\"}}"
+        },
+        {
+            "name": "snapB",
+            "for_each": "snapshot",
+            "template": "POST /snapB HTTP/1.1\n\n{{join keys \",\"}}"
+        },
+        {
+            "name": "snapC",
+            "for_each": "snapshot",
+            "template": "POST /snapC HTTP/1.1\n\n{{join keys \",\"}}"
+        }
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, snapshot_keys_sql, \
+         batch_max_keys, reset_steps, debounce_ms) VALUES (?, ?, ?, ?, ?, ?, 100)",
+        (
+            "snapr",
+            "hook",
+            "POST /hook HTTP/1.1\n\n{{join keys \",\"}}",
+            "SELECT id AS _key FROM items",
+            batch,
+            steps.to_string(),
+        ),
+    )
+    .await;
+    db.trigger("snapr", "items", Some("{{new.id}}"), None).await;
+
+    bulk_items(&db, 1, total).await;
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "p2b_sigkill_during_requested_reset",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+
+    // P2's precondition, taken the same way: the engine genuinely live, the first start's
+    // reset drained to `done:` with every step answered, and no reset in progress — an old
+    // `running:` row would turn the fault below into a resume nobody asked for.
+    wait_for(
+        Duration::from_secs(120),
+        "the first start's reset to finish (row `done:`, every step answered)",
+        || async {
+            let r = db.status("snapr").await.unwrap_or_default();
+            let walked = mock_path_hits(&mock, "/reset-announce") >= 1
+                && mock_path_hits(&mock, "/snapA") >= chunks
+                && mock_path_hits(&mock, "/snapB") >= chunks
+                && mock_path_hits(&mock, "/snapC") >= chunks;
+            (r.2.starts_with("done:") && walked).then_some(())
+        },
+    )
+    .await;
+    let before = db.status("snapr").await.expect("row after the first drain");
+    assert!(
+        !before.2.starts_with("running") && !before.2.starts_with("pending"),
+        "a reset was already in progress before the fault: reset_state = {:?}",
+        before.2
+    );
+
+    // The operator's lever, pulled the normal way, with the mock slow enough that the walk
+    // is a window the kill can be seen to land inside.
+    mock.delay(300, 3000);
+    log.add("operator requests a reset: reset_requested = 1");
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'snapr'")
+        .await;
+
+    // The gate: the persisted row itself standing on step 3/4 — the third step's listing and
+    // batches are the only thing that can put it there — with that step's calls at the mock
+    // advancing. The row is written by the engine's own persist (every answered chunk marks
+    // it dirty), so this is a condition, not a sleep.
+    let snapb0 = mock_path_hits(&mock, "/snapB");
+    let (state_at_gate, snapb_at_gate) = wait_for(
+        Duration::from_secs(120),
+        "the persisted row to stand on `running: step 3/4 fp… snapB` with the step's calls advancing",
+        || async {
+            let r = db.status("snapr").await.unwrap_or_default();
+            let hits = mock_path_hits(&mock, "/snapB");
+            let inside = r.2.starts_with("running: step 3/4 ") && r.2.contains(" snapB: ");
+            (inside && hits > snapb0).then(|| (r.2.clone(), hits))
+        },
+    )
+    .await;
+    // The line a waiting chunk leaves in memory (the loop-top form, `drive_reset`) is what
+    // the persist cadence usually catches; accept it, and require the counts only when the
+    // batches form is what stood. Between the counter and the name sits the fingerprint
+    // digest token, so the name is matched as a word, not right after the counter.
+    assert!(
+        state_at_gate.starts_with("running: step 3/4 ")
+            && state_at_gate.contains(" snapB: ")
+            && reset_progress(&state_at_gate).is_none_or(|(step, n, name, _done, tot)| step == 3
+                && n == 4
+                && name == "snapB"
+                && tot == total as u64),
+        "the gate row must be the step-3 progress line of a full walk: {state_at_gate:?}"
+    );
+    assert_eq!(
+        reset_flag(&db, "snapr").await,
+        Some(1),
+        "the kill must happen while the operator's flag is still set — the engine clears \
+         it only when the reset finishes"
+    );
+    // What the gate has proven about the steps before it, read as counters: the requested
+    // run answered the announcement and all 10 `snapA` batches (its walk passed them — a
+    // step advances only on answered chunks).
+    let ann_frozen = mock_path_hits(&mock, "/reset-announce");
+    let snapa_frozen = mock_path_hits(&mock, "/snapA");
+    let snapc_gate = mock_path_hits(&mock, "/snapC");
+    assert_eq!(
+        snapa_frozen,
+        2 * chunks,
+        "the requested run had not answered the finished step's 10 batches at the gate \
+         ({snapa_frozen} `/snapA` calls, counting the first start's walk): the gate row did \
+         not stand on step 3 of a walk that had passed snapA"
+    );
+    assert_eq!(
+        ann_frozen, 2,
+        "the requested run had not answered the announcement at the gate: {ann_frozen}"
+    );
+
+    log.add(format!(
+        "killing child 1 mid-snapB (row `{state_at_gate}`, step calls at the gate: \
+         /snapA={snapa_frozen} /snapB={snapb_at_gate} /snapC={snapc_gate})"
+    ));
+    lazy.kill();
+
+    // The restart finds the flag still 1 and the row still on the interrupted step: the run
+    // that was serving that request continues at its step.
+    let mut lazy2 = Lazy::start(
+        "p2b_sigkill_during_requested_reset",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy2, 60);
+    assert!(
+        !lazy2.log_lines_matching("reset steps start").is_empty(),
+        "the restarted child started no reset at all: the rule row still said \
+         reset_requested = 1 and the status row still said `running:`, so it had to \
+         ({:?})",
+        db.status("snapr").await.map(|r| r.2)
+    );
+    assert!(
+        !lazy2
+            .log_lines_matching("starting from the saved positions")
+            .is_empty(),
+        "the restarted child did not boot on the saved positions: {:?}",
+        lazy2.log_path
+    );
+    wait_for(
+        Duration::from_secs(180),
+        "the resumed reset to finish (status row `done:`)",
+        || async {
+            let r = db.status("snapr").await.unwrap_or_default();
+            r.2.starts_with("done:").then_some(())
+        },
+    )
+    .await;
+    assert!(
+        !lazy2.log_lines_matching("reset steps done").is_empty(),
+        "the status row says done but the child never logged it: {:?}",
+        lazy2.log_path
+    );
+    wait_for(
+        Duration::from_secs(30),
+        "the engine to clear the operator's reset_requested flag after finishing",
+        || async { (reset_flag(&db, "snapr").await == Some(0)).then_some(()) },
+    )
+    .await;
+
+    // THE proof, both read on counters the gate froze: the finished steps were not re-walked
+    // (a walk-from-step-1 recovery moves both of these), and the interrupted step re-ran
+    // whole. The chunk counts across the kill drop to the remaining steps, not the full one.
+    let snapa_after = mock_path_hits(&mock, "/snapA");
+    assert_eq!(
+        snapa_after, snapa_frozen,
+        "the restarted child re-sent the finished snapA step: {snapa_frozen} `/snapA` calls \
+         stood answered at the kill, {snapa_after} after the reset finished — the row still \
+         carried the request the saved run was serving, so its steps before the interrupted \
+         one had been target-confirmed and owe no second send"
+    );
+    let ann_after = mock_path_hits(&mock, "/reset-announce");
+    assert_eq!(
+        ann_after, ann_frozen,
+        "the restarted child re-sent the finished announcement step: {ann_frozen} calls at \
+         the kill, {ann_after} after"
+    );
+    let snapb_after = mock_path_hits(&mock, "/snapB");
+    assert!(
+        snapb_after >= snapb_at_gate + chunks,
+        "the interrupted step must be re-sent whole from its beginning ({chunks} batches): \
+         {snapb_at_gate} `/snapB` calls at the gate, {snapb_after} at done"
+    );
+    let snapc_after = mock_path_hits(&mock, "/snapC");
+    assert!(
+        snapc_after >= snapc_gate + chunks,
+        "the step after the interrupted one never ran: {snapc_gate} `/snapC` calls at the \
+         gate, {snapc_after} at done"
+    );
+    // The line the resume itself prints (`add_rule`, engine.rs), read last so the chunk
+    // counts above are what fails a walk-from-step-1 recovery.
+    assert!(
+        !lazy2
+            .log_lines_matching("reset steps resume at step")
+            .is_empty(),
+        "the restarted child logged no resume of the saved run: {:?}",
+        lazy2.log_path
+    );
+    assert_all_keys(&mock, 1, total, "P2b snapshot rows");
+    eprintln!(
+        "P2b: killed mid-snapB at `{state_at_gate}`; the restarted child resumed at step 3 \
+         (finished steps added 0 calls: /reset-announce {ann_frozen}->{ann_after}, /snapA \
+         {snapa_frozen}->{snapa_after}; interrupted + trailing steps answered {} /snapB and \
+         {} /snapC calls across the kill)",
+        snapb_after - snapb_at_gate,
+        snapc_after - snapc_gate
+    );
+    assert_no_undelivered(&lazy);
+    assert_no_undelivered(&lazy2);
+    lazy2.kill();
 }
 
 // ------------------------------------------------------------------------ P3 SIGTERM

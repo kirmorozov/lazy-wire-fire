@@ -88,6 +88,7 @@ src/engine.rs	matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
 src/engine.rs	reg.set_binlog_lag(self.stream_lag_ms() as f64 / 1000.0);
 src/engine.rs	rules.get_mut(name).expect("present").buffer.locate(k);	2
 src/engine.rs	st.counters.select_ms = fired.select_time.as_millis() as u64;
+src/engine.rs	format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 src/health.rs	buf.extend_from_slice(&chunk[..n]);
 src/http.rs	Some((i, _)) => format!("{}…", &s[..i]),
 src/http.rs	Some(i) => (&rest[..i], &rest[i + 1..]),

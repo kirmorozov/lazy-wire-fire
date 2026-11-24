@@ -658,3 +658,121 @@ fn an_unfinished_reset_names_its_reason() {
         );
     }
 }
+
+/// The recognizer a boot into a still-standing request reads through: the saved line that lets
+/// it continue the requested run at the step it died in, and every line that keeps the walk
+/// starting over from step 1 — including a line whose digest no longer matches the loaded rule.
+#[test]
+fn a_saved_requested_run_resumes_only_from_what_the_line_vouches_for() {
+    let steps = || {
+        vec![
+            model::ResetStep {
+                name: "announce".into(),
+                kind: StepKind::Once,
+                template: None,
+            },
+            model::ResetStep {
+                name: "snapA".into(),
+                kind: StepKind::Snapshot,
+                template: None,
+            },
+            model::ResetStep {
+                name: "snapB".into(),
+                kind: StepKind::Snapshot,
+                template: None,
+            },
+        ]
+    };
+    // The rule the finished steps ran under, and the token `drive_reset` wrote with it: the
+    // walk continues only on a line whose token digests exactly this fingerprint.
+    const FP: &str = "target|steps|template";
+    let tok = format!("fp{}", fingerprint_digest(FP));
+    // The two lines `drive_reset` writes for a live step, carrying a reason only a run that
+    // serves the request writes: the walk continues at the step it was interrupted in.
+    assert_eq!(
+        resume_requested_reset(
+            &format!("running: step 3/3 {tok} snapB: reset_requested"),
+            &steps(),
+            FP
+        ),
+        Some(2),
+        "the line a step begins on names the step to continue from"
+    );
+    assert_eq!(
+        resume_requested_reset(
+            &format!("running: step 3/3 {tok} snapB: 250/1000 keys: reset_requested"),
+            &steps(),
+            FP
+        ),
+        Some(2),
+        "the batches line continues at the same step the loop-top line would"
+    );
+    assert_eq!(
+        resume_requested_reset(
+            &format!(
+                "running: step 2/3 {tok} snapA: reset_requested raised again while the finished reset was being cleared"
+            ),
+            &steps(),
+            FP
+        ),
+        Some(1),
+        "the re-run raised again in the clear window is a requested run too"
+    );
+    // The same step names under a different fingerprint — the step bodies, their listing SQL,
+    // a template or the target moved while the process was down — start the walk over: the
+    // finished steps ran under a contract the loaded rule no longer stands behind, exactly
+    // the drift `Engine::update_rule` restarts a live run for.
+    assert_eq!(
+        resume_requested_reset(
+            &format!("running: step 3/3 {tok} snapB: reset_requested"),
+            &steps(),
+            "target|steps|a DIFFERENT template"
+        ),
+        None,
+        "same step names, edited def: the finished steps are not this def's"
+    );
+    // A line from before the token existed vouches for nothing: it starts over too.
+    assert_eq!(
+        resume_requested_reset("running: step 3/3 snapB: reset_requested", &steps(), FP),
+        None,
+        "a line written without the digest token is no proof of the def it ran under"
+    );
+    // Everything else starts the walk over: no step was reached (or the line says nothing to
+    // trust), the run was not the request's own (its carry-over wordings are not the two a
+    // requested run writes), the def moved while the process was down, or the shape is odd.
+    // The tokened shapes carry the right digest, so each fails for its own reason, not the
+    // token's; `fpdeadbeef` is the one another rule's (or a re-hashed build's) line.
+    for state in [
+        "pending: reset_requested",
+        "running: step 2/3 snapA: continuity lost at binlog 4",
+        "running: step 2/3 snapA: reset_requested (resumed after restart)",
+        "running: step 2/3 snapA: reset_requested (resumed after the rule was added again)",
+        "running: step 2/3 snapA: reset_requested; restarted after the rule changed",
+        "running: step 2/3 snapA: 100/1000 keys: reset_requested (resumed after restart)",
+        "running: step 2/2 snapA: reset_requested",
+        "running: step 2/3 snapC: reset_requested",
+        "running: step 0/3 snapA: reset_requested",
+        "running: step 4/3 snapB: reset_requested",
+        "running: step 2/3",
+        "done: 2026-11-24T00:00:00Z",
+        "none",
+        "",
+        "running: step 2/3 fpdeadbeef snapA: reset_requested",
+        &format!("running: step 2/3 {tok} snapZ: reset_requested"),
+        &format!("running: step 2/4 {tok} snapA: reset_requested"),
+        // With the token in place these fail for their reason: a run that carries over a
+        // restart word is a run that already restarted, and one listing keys under a
+        // continuity reason was never the request's own.
+        &format!("running: step 2/3 {tok} snapA: reset_requested (resumed after restart)"),
+        &format!("running: step 2/3 {tok} snapA: reset_requested (resumed after the rule was added again)"),
+        &format!("running: step 2/3 {tok} snapA: reset_requested; restarted after the rule changed"),
+        &format!("running: step 2/3 {tok} snapA: 100/1000 keys: reset_requested (resumed after restart)"),
+        &format!("running: step 2/3 {tok} snapA: continuity lost at binlog 4"),
+    ] {
+        assert_eq!(
+            resume_requested_reset(state, &steps(), FP),
+            None,
+            "{state:?} is no saved run a restart may skip finished steps for"
+        );
+    }
+}
