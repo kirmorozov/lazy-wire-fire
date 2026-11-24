@@ -453,3 +453,221 @@ fn rule_load_checks() {
     // A raised limit raises the rule's allowance with it.
     assert!(rule_errors(&def(FirePer::Batch, Some(2_000_000)), 2_097_152).is_empty());
 }
+
+// ——— what the rendered action decides before the broker is asked ——————————————————
+//
+// `items_of` reads the rendered request and the produce body of a batch (`send_items`) or of a
+// `once` step (`send`) before it touches a connection. Every one of these refusals is about the
+// render, so they answer the same way with no broker behind the endpoint at all: the port below
+// is never connected to, and a test that reached it would fail with a connection error rather
+// than the message it asserts.
+
+/// A client of `endpoint`, built and never connected.
+fn client(endpoint: &str) -> Client {
+    let def = TargetDef::from_row(&raw(endpoint, None, "{}")).unwrap();
+    Client::new(&def, endpoint).unwrap().1
+}
+
+fn keys(ks: &[&str]) -> Vec<String> {
+    ks.iter().map(|k| k.to_string()).collect()
+}
+
+fn no_expect() -> Expect {
+    Expect::new(None).unwrap()
+}
+
+/// A pool no test here uses: without an `expect` condition, `Expect::row` answers without
+/// asking the database, so an unroutable DSN is long enough.
+fn pool() -> Pool {
+    mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x")
+}
+
+fn chain(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+/// One produce body of `n` records, record i carrying its value.
+fn body(n: usize) -> String {
+    let recs: Vec<String> = (0..n).map(|i| format!(r#"{{"value": {i}}}"#)).collect();
+    format!(r#"{{"records": [{}]}}"#, recs.join(", "))
+}
+
+/// Only `POST /` is a produce. Any other request line says "this is not a produce" about the
+/// whole action — a refusal (the render will not change by itself), not a wait.
+#[tokio::test]
+async fn only_a_post_to_the_root_is_a_produce() {
+    let c = client("kafka://127.0.0.1:1/orders");
+    for (rendered, why) in [
+        (
+            format!("GET / HTTP/1.1\n\n{}", body(1)),
+            "GET / is not POST /",
+        ),
+        (
+            format!("POST /hooks HTTP/1.1\n\n{}", body(1)),
+            "POST /hooks is not POST /",
+        ),
+    ] {
+        for batch in [true, false] {
+            let e = if batch {
+                send_items(&c, &rendered, &keys(&["1"]), &no_expect(), &pool())
+                    .await
+                    .unwrap_err()
+            } else {
+                send(&c, &rendered, &no_expect(), &pool())
+                    .await
+                    .unwrap_err()
+            };
+            assert!(
+                crate::target::is_rejected(&e),
+                "a request line that is not a produce refuses: {}",
+                chain(&e)
+            );
+            let m = chain(&e);
+            assert!(m.contains("kafka targets only produce"), "{m}");
+            assert!(m.contains(why), "{m}");
+        }
+    }
+}
+
+/// A render that is not a request at all, and a body that is not a produce: both name the
+/// render, both refuse, and neither opens a connection.
+#[tokio::test]
+async fn a_render_that_is_not_a_produce_names_the_part_that_failed() {
+    let c = client("kafka://127.0.0.1:1/orders");
+    // Not a request line.
+    let e = send_items(
+        &c,
+        "POST /a HTTP/1.1 extra\n\n{}",
+        &keys(&["1"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    let m = chain(&e);
+    assert!(m.contains("the rendered request"), "{m}");
+    assert!(m.contains("extra words"), "{m}");
+
+    // A request whose body is not a produce body.
+    let e = send_items(
+        &c,
+        "POST / HTTP/1.1\n\nnot json",
+        &keys(&["1"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    let m = chain(&e);
+    assert!(m.contains("the produce body"), "{m}");
+
+    // The `once` step answers the same way for the same reason.
+    let e = send(&c, "POST / HTTP/1.1\n\nnot json", &no_expect(), &pool())
+        .await
+        .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    assert!(chain(&e).contains("the produce body"), "{}", chain(&e));
+}
+
+/// Nothing rendered sends nothing: the batch's items are all ok (there was no answer to have,
+/// and no key may be struck for it) and the `once` step is skipped, not refused.
+#[tokio::test]
+async fn a_render_of_nothing_sends_nothing() {
+    let c = client("kafka://127.0.0.1:1/orders");
+    let items = send_items(&c, "  \n ", &keys(&["1", "2"]), &no_expect(), &pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        items,
+        vec![Item::Ok, Item::Ok],
+        "a blank render is not a send"
+    );
+    assert_eq!(
+        send(&c, "", &no_expect(), &pool()).await.unwrap(),
+        Sent::Skipped,
+        "a blank `once` render is skipped"
+    );
+    // An empty produce body with no keys: parsed, and nothing to publish.
+    assert_eq!(
+        send(
+            &c,
+            "POST / HTTP/1.1\n\n{\"records\": []}",
+            &no_expect(),
+            &pool()
+        )
+        .await
+        .unwrap(),
+        Sent::Skipped
+    );
+    let items = send_items(
+        &c,
+        "POST / HTTP/1.1\n\n{\"records\": []}",
+        &[],
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap();
+    assert!(items.is_empty(), "no keys, no items: {items:?}");
+}
+
+/// A `once` step has no keys, and record i takes key i: a `once` render that lists records
+/// names records nothing can be keyed to, so it refuses the action (the render will not change
+/// by itself) rather than publish them unkeyed.
+#[tokio::test]
+async fn a_once_step_has_no_keys_so_it_cannot_list_records() {
+    let c = client("kafka://127.0.0.1:1/orders");
+    let e = send(
+        &c,
+        &format!("POST / HTTP/1.1\n\n{}", body(1)),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        crate::target::is_rejected(&e),
+        "a `once` render that lists records refuses: {}",
+        chain(&e)
+    );
+    let m = chain(&e);
+    assert!(m.contains("the produce body"), "{m}");
+    assert!(m.contains("1 records for 0 keys"), "{m}");
+    // The same mismatch in a batch: the records must answer every key of the action.
+    let e = send_items(
+        &c,
+        &format!("POST / HTTP/1.1\n\n{}", body(1)),
+        &keys(&["1", "2"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    assert!(chain(&e).contains("1 records for 2 keys"), "{}", chain(&e));
+}
+
+/// A broker that cannot be reached says nothing about the records: the call fails as a wait
+/// (never a refusal, which would strike every key of the batch), and the message says so.
+#[tokio::test]
+async fn a_broker_that_never_answers_waits_and_says_why() {
+    let c = client("kafka://127.0.0.1:1/orders");
+    let e = send_items(
+        &c,
+        &format!("POST / HTTP/1.1\n\n{}", body(2)),
+        &keys(&["1", "2"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !crate::target::is_rejected(&e),
+        "an unreachable broker is not a verdict on the records: {}",
+        chain(&e)
+    );
+    let m = chain(&e);
+    assert!(m.contains("127.0.0.1:1"), "the endpoint is named: {m}");
+}

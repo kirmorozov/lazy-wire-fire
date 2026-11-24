@@ -867,6 +867,259 @@ async fn valkey_target() {
     .await;
 }
 
+// ——— the verdict one Redis reply earns its key —————————————————————————————————————————
+//
+// A Redis action is one command, so the reply IS the answer about that key: the target's `expect`
+// judges it and nothing else. What the reply positively says decides the verdict — a reply the
+// check will not have is that key's refusal, and its neighbours of the same flush are delivered
+// and never sent again; a reply the check cannot be answered for at all (the database itself
+// refuses the comparison) is nobody's refusal: the key waits, is sent again, and lands once the
+// check can be answered. A DB of its own (`/7`, `/8`) keeps these tests off the keys `redis_rules`
+// flushes.
+
+/// A reply the target's `expect` will not have is that key's refusal alone: the keys whose
+/// replies the check accepted are delivered once and never sent again, only the key whose command
+/// answered wrongly is struck until it is dropped, and `last_error` says which command on which
+/// endpoint, with the check that would not have it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_an_expect_the_reply_will_not_vouch_for_is_refused_alone() {
+    use lazy_wire_fire::targets::redis::{Client, RedisAddr, Reply};
+    use lazy_wire_fire::tls::TlsSpec;
+    let root = need_db!();
+    let db = Db::fresh(&root, "redis_expect_verdict").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+    let endpoint = "127.0.0.1:34379/7";
+    std::env::set_var("LWF_TEST_RWD_PW", "redispw");
+    let redis = Client::new(
+        RedisAddr::parse(endpoint).unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        None,
+        Some("redispw".into()),
+    )
+    .unwrap();
+    let t = Duration::from_secs(3);
+    let cmd = |a: &[&str]| a.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+
+    // `SET` answers `OK`, so those keys pass. Key 2 pushes onto a list, which answers a COUNT: the
+    // answer is about that command, the check will not have it, and the list counts the attempts.
+    db.target(
+        "cache",
+        "redis",
+        endpoint,
+        Some("text = 'OK'"),
+        &json!({"password": "env:LWF_TEST_RWD_PW"}).to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('rwd_docs', 'cache', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, name FROM customers WHERE id IN (:keys)",
+            r#"{{#each docs}}{{#if (eq key "2")}}LPUSH rwd:seen 2{{else}}SET rwd:{{key}} {{redis_quote (json doc)}}{{/if}}{{/each}}"#,
+        ),
+    )
+    .await;
+    db.trigger("rwd_docs", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
+        .await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "key 2 refused by `expect` and dropped",
+        || async {
+            let (f, p, _, last) = db.status("rwd_docs").await?;
+            let last = last?;
+            (last.contains("key `2` refused 5 times, dropped") && (f, p) >= start).then_some(last)
+        },
+    )
+    .await;
+    // The verdict names the item: the command, the endpoint, and the check that was not met.
+    assert!(
+        err.contains("LPUSH on redis://127.0.0.1:34379/7: "),
+        "{err}"
+    );
+    assert!(err.contains("`expect` not met"), "{err}");
+    assert!(err.contains("text = 'OK'"), "{err}");
+    // …and it is about key 2 only: the other two keys are nowhere in the drop line.
+    assert!(!err.contains("key `1`"), "{err}");
+    assert!(!err.contains("key `3`"), "{err}");
+
+    // The keys whose replies the check accepted are in Redis, once, with their documents.
+    for (k, name) in [("1", "Ann"), ("3", "Cy")] {
+        let v = wait_for(Duration::from_secs(15), &format!("SET rwd:{k}"), || async {
+            match redis
+                .command(&cmd(&["GET", &format!("rwd:{k}")]), t)
+                .await
+                .ok()?
+            {
+                Reply::Bulk(Some(b)) => Some(String::from_utf8(b).unwrap()),
+                _ => None,
+            }
+        })
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&v).unwrap(),
+            json!({"name": name})
+        );
+    }
+    // A refused key is sent again on every attempt, so its command ran on the server each time:
+    // the refusal is the ANSWER's verdict on the record, not a send that was skipped.
+    let attempts = wait_for(Duration::from_secs(15), "key 2 sent five times", || async {
+        match redis.command(&cmd(&["LLEN", "rwd:seen"]), t).await.ok()? {
+            Reply::Int(n) if n >= 5 => Some(n),
+            _ => None,
+        }
+    })
+    .await;
+    assert_eq!(attempts, 5, "one refusal per attempt, no more");
+    inst.stop().await;
+}
+
+/// A reply the check cannot be answered for at all — the comparison itself fails in the database,
+/// over that reply's own text — is not that key's refusal: the key waits, is sent again, and is
+/// delivered once the check can be answered. Nothing is struck and nothing is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_a_reply_the_expect_cannot_be_answered_for_waits_and_lands() {
+    use lazy_wire_fire::targets::redis::{Client, RedisAddr, Reply};
+    use lazy_wire_fire::tls::TlsSpec;
+    let root = need_db!();
+    let db = Db::fresh(&root, "redis_expect_error").await;
+    db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    tables(&db).await;
+    let endpoint = "127.0.0.1:34379/8";
+    std::env::set_var("LWF_TEST_RWE_PW", "redispw");
+    let redis = Client::new(
+        RedisAddr::parse(endpoint).unwrap(),
+        &TlsSpec::parse(None).unwrap(),
+        None,
+        Some("redispw".into()),
+    )
+    .unwrap();
+    let t = Duration::from_secs(3);
+    let cmd = |a: &[&str]| a.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+    // The script answers the bulk `(` (and notes that it ran): a `(` is no regular expression, so
+    // the check below cannot be answered for that reply.
+    redis.command(&cmd(&["DEL", "rwe:seen"]), t).await.unwrap();
+    let seen = || async {
+        match redis.command(&cmd(&["LLEN", "rwe:seen"]), t).await.ok()? {
+            Reply::Int(n) => Some(n),
+            _ => None,
+        }
+    };
+
+    // `text IS NULL` covers the sample row of the load-time check; `^[A-Z0-9]+$` is what an `OK`
+    // answer satisfies; the last term asks MySQL to match an empty string against the reply AS A
+    // PATTERN — which for the `(` of key 2 the database itself refuses, so the check cannot be
+    // answered for that reply. `COALESCE(NULLIF(…, ''), '^$')` keeps the load-time check of the
+    // sample row (whose `text` is empty) answerable: an empty reply is matched as `^$`, not as the
+    // empty pattern MySQL refuses with "Illegal argument to a regular expression".
+    db.target(
+        "cache",
+        "redis",
+        endpoint,
+        Some(
+            "text IS NULL OR text REGEXP '^[A-Z0-9]+$' \
+             OR '' NOT REGEXP COALESCE(NULLIF(JSON_UNQUOTE(text), ''), '^$')",
+        ),
+        &json!({"password": "env:LWF_TEST_RWE_PW"}).to_string(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('rwe_docs', 'cache', 'key', ?, ?, 100)",
+        (
+            "SELECT id AS _key, name FROM customers WHERE id IN (:keys)",
+            r#"{{#each docs}}{{#if (eq key "2")}}EVAL "redis.call('LPUSH','rwe:seen','2') return '('" 0{{else}}SET rwe:{{key}} {{redis_quote (json doc)}}{{/if}}{{/each}}"#,
+        ),
+    )
+    .await;
+    db.trigger("rwe_docs", "customers", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
+        .await;
+    // The check died over that reply: `last_error` carries the command and the endpoint of the
+    // item the check could not be answered for (the wording of the server's own refusal is the
+    // database's, so it is not asserted here — it is in the text that is printed with a failure).
+    let err = wait_for(
+        Duration::from_secs(90),
+        "key 2 left waiting by a reply the check cannot answer",
+        || async {
+            let (_, _, _, last) = db.status("rwe_docs").await?;
+            let last = last?;
+            (last.contains("EVAL on redis://127.0.0.1:34379/8") && last.contains("`expect`"))
+                .then_some(last)
+        },
+    )
+    .await;
+    assert!(err.contains("EVAL on redis://127.0.0.1:34379/8"), "{err}");
+    assert!(err.contains("`expect`"), "{err}");
+    // It waits: the key is sent again and again rather than refused, so nothing of it is given up.
+    let before = wait_for(
+        Duration::from_secs(30),
+        "key 2 sent more than once",
+        || async {
+            let n = seen().await?;
+            (n >= 2).then_some(n)
+        },
+    )
+    .await;
+    assert!(before >= 2, "the unjudgeable key was sent {before} times");
+    let dropped = warn_lines(&["undelivered", "rwe_docs"]);
+    assert!(
+        dropped.is_empty(),
+        "an unjudgeable reply dropped a key: {dropped:?}"
+    );
+
+    // The neighbours of the flush are not held hostage by it: their replies answered, their
+    // documents are in Redis.
+    for (k, name) in [("1", "Ann"), ("3", "Cy")] {
+        let v = wait_for(Duration::from_secs(15), &format!("SET rwe:{k}"), || async {
+            match redis
+                .command(&cmd(&["GET", &format!("rwe:{k}")]), t)
+                .await
+                .ok()?
+            {
+                Reply::Bulk(Some(b)) => Some(String::from_utf8(b).unwrap()),
+                _ => None,
+            }
+        })
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&v).unwrap(),
+            json!({"name": name})
+        );
+    }
+
+    // And the wait was the whole of it: once the check can be answered again, the key that was
+    // waiting goes through and the position moves on.
+    db.exec("UPDATE lazy_wire_fire_target SET `expect` = 'text IS NOT NULL' WHERE name = 'cache'")
+        .await;
+    let (_, _, _, last) = wait_for(
+        Duration::from_secs(60),
+        "the waiting key delivered once the check answers",
+        || async {
+            let s = db.status("rwe_docs").await?;
+            ((s.0.clone(), s.1) >= (start.0.clone(), start.1) && seen().await? > before)
+                .then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        !last.as_deref().unwrap_or("").contains("refused 5 times"),
+        "the waiting key was given up after all: {last:?}"
+    );
+    inst.stop().await;
+}
+
 /// A TCP stand-in in front of a Redis: `cut` aborts the live connections and refuses new ones
 /// until `heal`, so the engine sees its connection drop, as it does when Redis restarts.
 struct Flaky {
@@ -4426,28 +4679,40 @@ fn kinesis_creds() -> String {
     .to_string()
 }
 
-/// A customers table, and the rule `stream` that puts each changed row to `stream` (one
-/// PutRecords per flush, `PartitionKey` = the row's key). The target's endpoint names the stream
-/// and the region, and sends to the store at `endpoint`.
-async fn kinesis_rule(db: &Db, endpoint: &str, stream: &str, selects: &str) {
+/// A customers table, and the rule `rule` that puts each changed row to `stream` (one PutRecords
+/// per flush, `PartitionKey` = the row's key). The target's endpoint names the stream and the
+/// region, and sends to the store at `endpoint`. `expect` is the target's answer check, run per
+/// record with that record as `body`.
+///
+/// The rule, target and trigger all take `rule` as their name: a test that reads a WARN line of
+/// its own — the `undelivered` line of §"the verdict of one record" carries `rule` and no schema —
+/// passes a name no other test in this file uses, and finds its own line and only that one.
+async fn kinesis_rule(
+    db: &Db,
+    rule: &str,
+    endpoint: &str,
+    stream: &str,
+    selects: &str,
+    expect: Option<&str>,
+) {
     db.exec("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(50), active TINYINT NOT NULL DEFAULT 1)")
         .await;
     tables(db).await;
     db.target(
-        "stream",
+        rule,
         "kinesis",
         &format!("aws-kinesis://us-east-1/{stream}?endpoint={endpoint}"),
-        Some("JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL"),
+        expect,
         &kinesis_creds(),
     )
     .await;
     db.exec_params(
         "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, batch_max_keys, selects, template, debounce_ms) \
-         VALUES ('stream', 'stream', 'batch', 500, ?, ?, 100)",
-        (selects, KINESIS_PUT),
+         VALUES (?, ?, 'batch', 500, ?, ?, 100)",
+        (rule, rule, selects, KINESIS_PUT),
     )
     .await;
-    db.trigger("stream", "customers", Some("{{new.id}}"), None)
+    db.trigger(rule, "customers", Some("{{new.id}}"), None)
         .await;
 }
 
@@ -4462,9 +4727,11 @@ async fn kinesis_every_changed_key_arrives_as_a_record() {
     let db = Db::fresh(&root, "kin_every").await;
     kinesis_rule(
         &db,
+        "stream",
         &endpoint,
         &stream,
         "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+        Some("JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL"),
     )
     .await;
     let inst = Instance::ready(config(&db, &[])).await;
@@ -4504,9 +4771,11 @@ async fn kinesis_delete_arrives_as_op_delete() {
     let db = Db::fresh(&root, "kin_delete").await;
     kinesis_rule(
         &db,
+        "stream",
         &endpoint,
         &stream,
         "SELECT c.id AS _key, c.id, c.name, IF(c.active, NULL, 'delete') AS _op FROM customers c WHERE c.id IN (:keys)",
+        Some("JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL"),
     )
     .await;
     let inst = Instance::ready(config(&db, &[])).await;
@@ -4538,6 +4807,393 @@ async fn kinesis_delete_arrives_as_op_delete() {
         .collect();
     assert_eq!(upserts.len(), 2);
     assert!(upserts.iter().all(|(k, _)| k == "1" || k == "2"));
+    inst.stop().await;
+}
+
+// ——— the verdict of one record of a `PutRecords` answer ————————————————————————————
+//
+// A `PutRecords` answer speaks by position, and the kind turns each position into that record's
+// own verdict. The store stand-in here (the same in-process `Mock` the `lambda` section uses)
+// answers a request record by record, so each key of a batch gets the answer the test scripts
+// for it — and the assertions are about the keys, one by one: what the answer said about *that*
+// record, and what the engine then did with *that* key. An answer that names a record refuses
+// that record; an answer that says nothing about it — a short `Records` array, a code that means
+// "not now", an `expect` the database cannot be asked about — never refuses anything.
+
+/// The records of a `PutRecords` request the stand-in saw, in the order they went out.
+fn kin_records(r: &Req) -> Vec<(String, String)> {
+    let v: Value = serde_json::from_str(&r.body).expect("a PutRecords body");
+    v["Records"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|x| {
+            (
+                x["PartitionKey"].as_str().unwrap_or("").to_string(),
+                x["Data"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Every key of every `PutRecords` request the stand-in saw, in request order.
+fn kin_calls(mock: &Mock) -> Vec<Vec<String>> {
+    mock.requests()
+        .iter()
+        .map(|r| kin_records(r).into_iter().map(|(k, _)| k).collect())
+        .collect()
+}
+
+/// How many requests carried `key`.
+fn kin_sends(calls: &[Vec<String>], key: &str) -> usize {
+    calls.iter().filter(|c| c.iter().any(|k| k == key)).count()
+}
+
+/// The stored answer of a record: `SequenceNumber` there, so the target's `expect` finds it.
+fn kin_stored(data: &str) -> Value {
+    json!({"SequenceNumber": "1", "Data": data})
+}
+
+/// `expect` of these tests: a record counts as sent only when the answer gave it a sequence
+/// number, checked per record with that record as `body`.
+const KIN_EXPECT: &str = "JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL";
+
+/// `expect` of the unjudgeable test: the check matches one field of the answer against another,
+/// so an answer that carries a pattern the database itself refuses makes the check unanswerable
+/// for THAT record — and for no other, since it is the record that is `body` here.
+const KIN_BAD_EXPECT: &str =
+    "JSON_UNQUOTE(JSON_EXTRACT(body, '$.seq')) REGEXP JSON_UNQUOTE(JSON_EXTRACT(body, '$.pat'))";
+
+/// A record the answer stored but will not vouch for (no `SequenceNumber`): `expect` speaks
+/// about that record and refuses it alone, while its neighbours of the same batch are confirmed
+/// and never sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinesis_a_stored_record_expect_will_not_have_is_refused_alone() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    mock.respond(|r| {
+        let out: Vec<Value> = kin_records(r)
+            .iter()
+            .map(|(k, d)| {
+                if k == "2" {
+                    // Stored, but the answer gives nothing `expect` may check: the record's own
+                    // verdict is "not confirmed", and only the database says so.
+                    json!({"Data": d})
+                } else {
+                    kin_stored(d)
+                }
+            })
+            .collect();
+        (200, json!({"Records": out}).to_string())
+    });
+    let db = Db::fresh(&root, "kin_expect").await;
+    kinesis_rule(
+        &db,
+        "kin_expect",
+        &mock.url(),
+        "lwf_kin_expect",
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+        Some(KIN_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
+        .await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "key 2 refused by `expect` and dropped",
+        || async {
+            let (f, p, _, last) = db.status("kin_expect").await?;
+            let last = last?;
+            (last.contains("key `2` refused 5 times, dropped") && (f, p) >= start).then_some(last)
+        },
+    )
+    .await;
+    // What the answer decided, in the engine's own words: the record's place in the batch, the
+    // status, and that it was `expect` that would not have it.
+    assert!(err.contains("record 0: status 200"), "{err}");
+    assert!(err.contains("`expect` not met"), "{err}");
+    assert!(err.contains(KIN_EXPECT), "{err}");
+    let calls = kin_calls(&mock);
+    assert_eq!(
+        kin_sends(&calls, "2"),
+        5,
+        "refused once per attempt: {calls:?}"
+    );
+    assert_eq!(
+        kin_sends(&calls, "1"),
+        1,
+        "a confirmed neighbour resent: {calls:?}"
+    );
+    assert_eq!(
+        kin_sends(&calls, "3"),
+        1,
+        "a confirmed neighbour resent: {calls:?}"
+    );
+    assert!(
+        calls[0].join(",") == "1,2,3",
+        "the first flush carried the batch: {calls:?}"
+    );
+    for c in &calls[1..] {
+        assert_eq!(
+            c,
+            &vec!["2".to_string()],
+            "a retry carried a confirmed key: {calls:?}"
+        );
+    }
+    // The key was given up for the reason the answer gave, in the log line that says so. That
+    // line carries no schema, so this test's rule name is what attributes it (see `warn_lines`).
+    let dropped = warn_lines(&[
+        "undelivered",
+        "rule=kin_expect",
+        "key=2",
+        "`expect` not met",
+        KIN_EXPECT,
+    ]);
+    assert_eq!(
+        dropped.len(),
+        1,
+        "the `expect` refusal is not in the log: {dropped:?}"
+    );
+    assert!(dropped[0].contains("strikes=5"), "{:?}", dropped[0]);
+    inst.stop().await;
+}
+
+/// A record the answer refuses by its own code, while its neighbours go through: the code is
+/// about that record, so only that key is struck and dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinesis_an_error_code_answer_refuses_only_the_record_it_names() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    mock.respond(|r| {
+        let out: Vec<Value> = kin_records(r)
+            .iter()
+            .map(|(k, d)| {
+                if k == "2" {
+                    json!({"ErrorCode": "ValidationException",
+                           "ErrorMessage": "the record is too big"})
+                } else {
+                    kin_stored(d)
+                }
+            })
+            .collect();
+        (200, json!({"Records": out}).to_string())
+    });
+    let db = Db::fresh(&root, "kin_code").await;
+    kinesis_rule(
+        &db,
+        "kin_code",
+        &mock.url(),
+        "lwf_kin_code",
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+        Some(KIN_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
+        .await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "key 2 refused by its error code and dropped",
+        || async {
+            let (f, p, _, last) = db.status("kin_code").await?;
+            let last = last?;
+            (last.contains("key `2` refused 5 times, dropped") && (f, p) >= start).then_some(last)
+        },
+    )
+    .await;
+    // The answer's own code and message, with the record's position in the batch it died in —
+    // by the fifth attempt only that record is left, so it is position 0.
+    assert!(
+        err.contains("record 0: ValidationException: the record is too big"),
+        "{err}"
+    );
+    let calls = kin_calls(&mock);
+    assert_eq!(
+        kin_sends(&calls, "2"),
+        5,
+        "refused once per attempt: {calls:?}"
+    );
+    assert_eq!(
+        kin_sends(&calls, "1"),
+        1,
+        "a confirmed neighbour resent: {calls:?}"
+    );
+    assert_eq!(
+        kin_sends(&calls, "3"),
+        1,
+        "a confirmed neighbour resent: {calls:?}"
+    );
+    // The reason the answer gave for THAT record is what the key was given up for, in the line
+    // that says so; the rule name attributes it (that line carries no schema).
+    let dropped = warn_lines(&[
+        "undelivered",
+        "rule=kin_code",
+        "key=2",
+        "ValidationException",
+        "the record is too big",
+    ]);
+    assert_eq!(dropped.len(), 1, "the code is not in the log: {dropped:?}");
+    assert!(dropped[0].contains("strikes=5"), "{:?}", dropped[0]);
+    inst.stop().await;
+}
+
+/// A record the answer does not mention at all — a `Records` array short of the batch — is not a
+/// refusal: the record is not known to be in, so the key waits and is sent again, and the store
+/// gets it once the answer covers it. Nothing is dropped and no key is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinesis_a_record_the_answer_omits_is_sent_again_and_lands() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    let short_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let short_once = short_once.clone();
+        mock.respond(move |r| {
+            let recs = kin_records(r);
+            let mut out: Vec<Value> = recs.iter().map(|(_, d)| kin_stored(d)).collect();
+            // The first answer is one record short: the last position of the batch is left with
+            // no answer at all, which says nothing about whether that record went in. `swap`
+            // hands back the `true` of the first request only, so exactly one answer is short.
+            if out.len() > 1 && short_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                out.pop();
+            }
+            (200, json!({"Records": out}).to_string())
+        });
+    }
+    let db = Db::fresh(&root, "kin_short").await;
+    kinesis_rule(
+        &db,
+        "kin_short",
+        &mock.url(),
+        "lwf_kin_short",
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+        Some(KIN_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
+        .await;
+    // Every key lands: the position the short answer left unanswered comes back once more.
+    wait_for(
+        Duration::from_secs(90),
+        "the unasked key sent again",
+        || async {
+            let sent: usize = kin_calls(&mock).iter().map(|c| c.len()).sum();
+            (sent >= 4).then_some(())
+        },
+    )
+    .await;
+    sleep_ms(1500).await;
+    let calls = kin_calls(&mock);
+    let first = &calls[0];
+    assert_eq!(first.len(), 3, "one batch of three: {calls:?}");
+    let unanswered = first.last().expect("a last record").clone();
+    assert_eq!(
+        kin_sends(&calls, &unanswered),
+        2,
+        "the record the answer omitted is sent exactly again: {calls:?}"
+    );
+    for k in first.iter().take(first.len() - 1) {
+        assert_eq!(kin_sends(&calls, k), 1, "an answered key resent: {calls:?}");
+    }
+    assert!(
+        calls.len() == 2 && calls[1] == vec![unanswered.clone()],
+        "the retry carried only the unanswered key: {calls:?}"
+    );
+    let (f, p, _, last) = db.status("kin_short").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= start,
+        "the position did not move on: {f}:{p}"
+    );
+    assert!(
+        last.as_deref().unwrap_or("").contains("no answer"),
+        "the transient verdict is not in `last_error`: {last:?}"
+    );
+    // Nothing was given up for a key the answer said nothing about: no `undelivered` line of this
+    // rule at all (the rule name attributes a line that carries no schema).
+    let dropped = warn_lines(&["undelivered", "rule=kin_short"]);
+    assert!(
+        dropped.is_empty(),
+        "a short answer dropped a key: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+/// An `expect` the database cannot answer for one record is not that record's refusal either:
+/// the whole call fails as a wait, the message says which record the check died on, and every
+/// key of the batch — the ones the answer had confirmed included — goes out again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kinesis_a_record_whose_expect_cannot_be_judged_waits_for_the_whole_batch() {
+    let root = need_db!();
+    let mock = Mock::start().await;
+    // `pat` is the pattern the check matches `seq` with: for key 2 the answer carries a pattern
+    // MySQL itself refuses, so the check cannot be answered for that record.
+    fn pat(k: &str) -> &'static str {
+        if k == "2" {
+            "("
+        } else {
+            "^s"
+        }
+    }
+    mock.respond(|r| {
+        let out: Vec<Value> = kin_records(r)
+            .iter()
+            .map(|(k, d)| json!({"SequenceNumber": "1", "Data": d, "seq": "s1", "pat": pat(k)}))
+            .collect();
+        (200, json!({"Records": out}).to_string())
+    });
+    let db = Db::fresh(&root, "kin_bad_expect").await;
+    kinesis_rule(
+        &db,
+        "kin_bad_expect",
+        &mock.url(),
+        "lwf_kin_bad_expect",
+        "SELECT c.id AS _key, c.id, c.name FROM customers c WHERE c.id IN (:keys)",
+        Some(KIN_BAD_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
+        .await;
+    // The batch fails as a wait, and names the record the check died on and why.
+    let err = wait_for(
+        Duration::from_secs(90),
+        "the unjudgeable record fails the batch",
+        || async {
+            let last = db.status("kin_bad_expect").await?.3?;
+            (last.contains("record ") && last.contains("REGEXP")).then_some(last)
+        },
+    )
+    .await;
+    // The message names the item the check died on: which record of the batch, at which endpoint.
+    assert!(err.contains("record 1 of"), "{err}");
+    assert!(err.contains(&mock.url()), "{err}");
+    assert!(err.contains("evaluating `expect`"), "{err}");
+    assert!(err.contains(KIN_BAD_EXPECT), "{err}");
+    assert!(
+        err.contains("regular expression"),
+        "the database's own reason is missing: {err}"
+    );
+    // Nothing was refused: no key struck, no key dropped, and a key the answer had confirmed
+    // goes out again — an unknown answer cannot confirm anything.
+    let dropped = warn_lines(&["undelivered", "rule=kin_bad_expect"]);
+    assert!(
+        dropped.is_empty(),
+        "an unjudgeable answer dropped a key: {dropped:?}"
+    );
+    wait_for(
+        Duration::from_secs(60),
+        "the whole batch sent again",
+        || async {
+            let calls = kin_calls(&mock);
+            (calls.len() >= 2 && calls[1].len() == 3).then_some(())
+        },
+    )
+    .await;
     inst.stop().await;
 }
 
@@ -8825,6 +9481,215 @@ Content-Type: application/json
     keys.sort();
     keys.dedup();
     assert_eq!(keys, ["1", "3"], "the neighbours went through: {keys:?}");
+    inst.stop().await;
+}
+
+/// The confirm the broker answers per record is checked per record: the record whose own confirm
+/// `expect` will not have is the ONLY one the answer refuses — the message names its place in the
+/// batch and the check that would not have it, and no other record of that publish is struck or
+/// resent. A stream confirm names the record it belongs to by its publishing id (the publisher's
+/// own counter, per connection), so the check holds the records to an id above 1: the first record
+/// of the batch is the one the answer refuses. It waits, is sent again, and is confirmed the
+/// second time — the refusal was the answer's verdict on that one record, not on the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_expect_refuses_only_the_record_it_names() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_expect_verdict").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let stream = "lwf.rabbitmq_stream_expect_verdict";
+    make_stream(&broker, stream).await;
+    let read = StreamRead::setup(stream).await;
+
+    // The three records of one publish are confirmed with publishing ids 1, 2, 3 (the publisher's
+    // own counter, per connection). The check holds every record to an id above 1, so the answer
+    // refuses the first record of the batch and vouches for the other two.
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{broker}/{stream}"),
+        Some("JSON_EXTRACT(body, '$.publishing_id') > 1"),
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('rms_expect', 'bus', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("rms_expect", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1), (3, 'C-3', 7)")
+        .await;
+    // The answer's verdict, in the engine's own words: WHICH record of the batch the confirm
+    // refused, at which stream, with the check that would not have it. The line carries no schema,
+    // so the rule name (`rms_expect`, this test's own) is what attributes it.
+    let refused = wait_for(
+        Duration::from_secs(90),
+        "record 0 refused by `expect`",
+        || async {
+            let r = warn_lines(&[
+                "flush failed",
+                "rule=rms_expect",
+                "record 0 of",
+                &format!("rabbitmq-stream://{broker}/{stream}"),
+                "`expect` not met",
+                "publishing_id",
+            ]);
+            (!r.is_empty()).then_some(r)
+        },
+    )
+    .await;
+    assert!(
+        refused[0].contains("retrying"),
+        "a refused record waits, it is not a failed send: {:?}",
+        refused[0]
+    );
+    // The verdict is about that record and no other: no line of this rule refuses record 1 or 2.
+    for other in ["record 1 of", "record 2 of"] {
+        let named = warn_lines(&["flush failed", "rule=rms_expect", other]);
+        assert!(named.is_empty(), "the answer refused {other}: {named:?}");
+    }
+    // A refused record is a strike, not a lost key: five refusals would have dropped it, and the
+    // answer only refused this one, so it is never given up.
+    let dropped = warn_lines(&["undelivered", "rule=rms_expect"]);
+    assert!(
+        dropped.is_empty(),
+        "the refused record was given up: {dropped:?}"
+    );
+    let (f, p, _, _) = db.status("rms_expect").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= start,
+        "the position did not move on: {f}:{p}"
+    );
+
+    // Four publishes for three records: the record the answer refused went out again, and the two
+    // it vouched for went exactly once each.
+    read.at_least(4).await;
+    sleep_ms(1000).await;
+    let got = read.got.lock().unwrap().clone();
+    let n = |k: &str| got.iter().filter(|r| r.key.as_deref() == Some(k)).count();
+    assert_eq!(n("1"), 2, "the refused record sent again: {got:?}");
+    assert_eq!(n("2"), 1, "a confirmed neighbour resent: {got:?}");
+    assert_eq!(n("3"), 1, "a confirmed neighbour resent: {got:?}");
+    let r = got.iter().find(|r| r.key.as_deref() == Some("3")).unwrap();
+    assert_eq!(
+        r.value,
+        json!({"key": "3", "op": "upsert", "doc": {"sku": "C-3", "qty": 7}})
+    );
+    inst.stop().await;
+}
+
+/// A publish the broker never confirms within the target's own time limit is not a refusal of the
+/// records: nothing says they are not in, so every record of the batch waits and is sent again,
+/// and the keys arrive once the confirm is allowed to come back. Nothing is struck, nothing is
+/// dropped — a late answer is the target's, not the record's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rabbitmq_stream_a_confirm_that_never_arrives_waits_and_is_sent_again() {
+    let root = need_db!();
+    let Some(broker) = rabbitmq_stream_broker() else {
+        return eprintln!("LAZYWF_TEST_RABBITMQ_STREAM not set: skipping");
+    };
+    let db = Db::fresh(&root, "rabbitmq_stream_confirm_lost").await;
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(&db).await;
+    let stream = "lwf.rabbitmq_stream_confirm_lost";
+    make_stream(&broker, stream).await;
+    let read = StreamRead::setup(stream).await;
+
+    // The kind's own confirm timeout, and a proxy that holds every byte of the broker's answer
+    // long past it: the publishes go out, the confirms come back too late to be seen.
+    const CONFIRM_MS: u64 = 1_200;
+    let px = common::fault::FaultProxy::start(&broker, "rmqs-confirm", None).await;
+    let via = px.addr();
+    db.target(
+        "bus",
+        "rabbitmq-stream",
+        &format!("rabbitmq-stream://{via}/{stream}"),
+        Some(RMQS_EXPECT),
+        &rabbitmq_stream_vars(),
+    )
+    .await;
+    db.exec(&format!(
+        "UPDATE lazy_wire_fire_target SET timeout_ms = {CONFIRM_MS} WHERE name = 'bus'"
+    ))
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES ('orders', 'bus', 'batch', ?, ?, 100)",
+        (
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            RMQS_PUT,
+        ),
+    )
+    .await;
+    db.trigger("orders", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // One publish over the live proxy first: the connection and its publisher exist before the
+    // fault, so the wait below is about the CONFIRM and nothing else.
+    db.exec("INSERT INTO orders VALUES (0, 'W-0', 1)").await;
+    read.at_least(1).await;
+    let start = binlog_end(&db).await;
+
+    px.latency(3_000);
+    db.exec("INSERT INTO orders VALUES (1, 'A-1', 3), (2, 'B-2', 1)")
+        .await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "both records left without a confirm",
+        || async {
+            let (_, _, _, last) = db.status("orders").await?;
+            let last = last?;
+            (last.contains("no publish confirm within") && last.contains("record 1 of"))
+                .then_some(last)
+        },
+    )
+    .await;
+    // The answer that never came, in the kind's own words: which record of the batch it is about,
+    // which stream, and that the wait ran out.
+    assert!(err.contains(stream), "{err}");
+    assert!(err.contains("the connection may be gone"), "{err}");
+    // A late answer is no reason to give a key up: nothing is struck and nothing dropped.
+    let dropped = warn_lines(&["refused 5 times", stream]);
+    assert!(
+        dropped.is_empty(),
+        "a late confirm dropped a key: {dropped:?}"
+    );
+
+    // …and when the confirm may come back, the same keys arrive: the engine sent them again, and
+    // the flush commits. A duplicate is legitimate here (the record may have been in all along);
+    // what may not happen is a key that is never delivered.
+    px.heal();
+    let got = read.at_least(3).await;
+    for k in ["1", "2"] {
+        assert!(
+            got.iter().any(|r| r.key.as_deref() == Some(k)),
+            "the key of a lost confirm never arrived: {got:?}"
+        );
+    }
+    let (f, p, _, last) = db.status("orders").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= (start.0.clone(), start.1),
+        "the flush never committed: {f}:{p}"
+    );
+    assert!(
+        !last.as_deref().unwrap_or("").contains("refused 5 times"),
+        "a lost confirm was answered as a refusal: {last:?}"
+    );
     inst.stop().await;
 }
 

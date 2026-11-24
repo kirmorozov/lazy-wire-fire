@@ -357,3 +357,222 @@ async fn confirm_waiters_settle_their_items_on_a_poisoned_lock() {
     );
     assert!(lock_waiters(&w).is_empty(), "and the map is empty again");
 }
+
+// ——— what the rendered action decides before the broker is asked ——————————————————
+//
+// `items_of` reads the rendered request and the publish body of a batch (`send_items`) or of a
+// `once` step (`send`) before it opens a connection. These refusals are about the render, so the
+// dead endpoint below answers them: a test that reached the broker would fail with a connection
+// error instead of the message it asserts.
+
+/// A client of `endpoint`, built and never connected.
+fn client(endpoint: &str) -> Client {
+    let def = TargetDef::from_row(&raw(endpoint, None, CREDS)).unwrap();
+    Client::new(&def, endpoint).unwrap().1
+}
+
+fn keys(ks: &[&str]) -> Vec<String> {
+    ks.iter().map(|k| k.to_string()).collect()
+}
+
+fn no_expect() -> Expect {
+    Expect::new(None).unwrap()
+}
+
+/// A pool no test here uses: without an `expect` condition, `Expect::row` answers without
+/// asking the database, so an unroutable DSN is long enough.
+fn pool() -> Pool {
+    mysql_async::Pool::new("mysql://u:p@127.0.0.1:1/x")
+}
+
+fn chain(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+/// One publish body of `n` records, each with a routing key of its own.
+fn body(n: usize) -> String {
+    let recs: Vec<Value> = (0..n)
+        .map(|i| json!({"value": i, "routing_key": format!("k{i}")}))
+        .collect();
+    json!({"records": recs}).to_string()
+}
+
+/// Only `POST /` is a publish; any other request line refuses the whole action.
+#[tokio::test]
+async fn only_a_post_to_the_root_is_a_publish() {
+    let c = client("rabbitmq-stream://127.0.0.1:1/orders");
+    for (rendered, why) in [
+        (
+            format!("GET / HTTP/1.1\n\n{}", body(1)),
+            "GET / is not POST /",
+        ),
+        (
+            format!("POST /in HTTP/1.1\n\n{}", body(1)),
+            "POST /in is not POST /",
+        ),
+    ] {
+        for batch in [true, false] {
+            let e = if batch {
+                send_items(&c, &rendered, &keys(&["1"]), &no_expect(), &pool())
+                    .await
+                    .unwrap_err()
+            } else {
+                send(&c, &rendered, &no_expect(), &pool())
+                    .await
+                    .unwrap_err()
+            };
+            assert!(
+                crate::target::is_rejected(&e),
+                "a request line that is not a publish refuses: {}",
+                chain(&e)
+            );
+            let m = chain(&e);
+            assert!(m.contains("rabbitmq-stream targets only publish"), "{m}");
+            assert!(m.contains(why), "{m}");
+        }
+    }
+}
+
+/// A render that is not a request, and a body that is not a publish body: each names the part
+/// that failed, and neither opens a connection.
+#[tokio::test]
+async fn a_render_that_is_not_a_publish_names_the_part_that_failed() {
+    let c = client("rabbitmq-stream://127.0.0.1:1/orders");
+    let e = send_items(
+        &c,
+        "POST /a HTTP/1.1 extra\n\n{}",
+        &keys(&["1"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    let m = chain(&e);
+    assert!(m.contains("the rendered request"), "{m}");
+    assert!(m.contains("extra words"), "{m}");
+
+    let e = send_items(
+        &c,
+        "POST / HTTP/1.1\n\nnot json",
+        &keys(&["1"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    let m = chain(&e);
+    assert!(m.contains("the publish body"), "{m}");
+
+    // The `once` step reads its render the same way.
+    let e = send(&c, "POST / HTTP/1.1\n\nnot json", &no_expect(), &pool())
+        .await
+        .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    assert!(chain(&e).contains("the publish body"), "{}", chain(&e));
+}
+
+/// Nothing rendered publishes nothing: every item of the batch is ok (there was no answer to
+/// have, and no key may be struck for it) and the `once` step is skipped, not refused.
+#[tokio::test]
+async fn a_render_of_nothing_publishes_nothing() {
+    let c = client("rabbitmq-stream://127.0.0.1:1/orders");
+    let items = send_items(&c, "  \n ", &keys(&["1", "2"]), &no_expect(), &pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        items,
+        vec![Item::Ok, Item::Ok],
+        "a blank render is not a publish"
+    );
+    assert_eq!(
+        send(&c, "", &no_expect(), &pool()).await.unwrap(),
+        Sent::Skipped,
+        "a blank `once` render is skipped"
+    );
+    assert_eq!(
+        send(
+            &c,
+            "POST / HTTP/1.1\n\n{\"records\": []}",
+            &no_expect(),
+            &pool()
+        )
+        .await
+        .unwrap(),
+        Sent::Skipped
+    );
+    let items = send_items(
+        &c,
+        "POST / HTTP/1.1\n\n{\"records\": []}",
+        &[],
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap();
+    assert!(items.is_empty(), "no keys, no items: {items:?}");
+}
+
+/// A `once` step has no keys, and record i takes key i: a `once` render that lists records
+/// names records nothing can be keyed to, so it refuses the action rather than publish them
+/// unkeyed — the same rule `Action::parse` states for a batch.
+#[tokio::test]
+async fn a_once_step_has_no_keys_so_it_cannot_list_records() {
+    let c = client("rabbitmq-stream://127.0.0.1:1/orders");
+    let e = send(
+        &c,
+        &format!("POST / HTTP/1.1\n\n{}", body(1)),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        crate::target::is_rejected(&e),
+        "a `once` render that lists records refuses: {}",
+        chain(&e)
+    );
+    let m = chain(&e);
+    assert!(m.contains("the publish body"), "{m}");
+    assert!(m.contains("1 records for 0 keys"), "{m}");
+    let e = send_items(
+        &c,
+        &format!("POST / HTTP/1.1\n\n{}", body(1)),
+        &keys(&["1", "2"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+    assert!(chain(&e).contains("1 records for 2 keys"), "{}", chain(&e));
+}
+
+/// A broker that cannot be reached says nothing about the records: the call fails as a wait
+/// (never a refusal, which would strike every key of the batch), naming the endpoint.
+#[tokio::test]
+async fn a_broker_that_never_answers_waits_and_says_why() {
+    // The connect resolves the password reference, so the variable has to exist; the lock is
+    // the one every unit test that writes the environment takes.
+    let _env = crate::secrets::ENV_LOCK.lock().await;
+    std::env::set_var("LWF_TEST_RMQSTREAM_PW", "s3cret");
+    let c = client("rabbitmq-stream://127.0.0.1:1/orders");
+    let e = send_items(
+        &c,
+        &format!("POST / HTTP/1.1\n\n{}", body(2)),
+        &keys(&["1", "2"]),
+        &no_expect(),
+        &pool(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !crate::target::is_rejected(&e),
+        "an unreachable broker is not a verdict on the records: {}",
+        chain(&e)
+    );
+    let m = chain(&e);
+    assert!(m.contains("127.0.0.1:1"), "the endpoint is named: {m}");
+    assert!(m.contains("connecting failed"), "{m}");
+}
