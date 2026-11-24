@@ -227,7 +227,12 @@ triggers. To filter for dropped keys in a log pipeline, match the top-level `tar
   never breaks container health.
 * `SELECT * FROM lazy_wire_fire_status`: positions, lag, `reset_state`, `last_error`.
 * `UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = …` re-runs a rule's reset
-  steps; the tool sets it back to 0 when they succeeded.
+  steps; the tool sets it back to 0 when they succeeded. A 1 raised while a reset that started on
+  its own is still running starts those steps over from the first one, and the keys of the step it
+  stood in go out again (at-least-once, like every step); a 1 raised while a finished reset waits
+  to clear the flag runs them again instead of being erased. Writing 1 over a leftover 1 makes no
+  row event, so it is not a request: raise the flag again once `reset_state` says `done`
+  ([Reset steps](docs/reference.md#reset-steps)).
 * A new rule's first reset runs its reset steps in the background; a `for_each: snapshot` step
   reads every key of `snapshot_keys_sql`, so on a large source the destination matches only as
   that goes. Watch it in the `reset` field of `/status` (`pending: …`, `running: step i/n …`,
