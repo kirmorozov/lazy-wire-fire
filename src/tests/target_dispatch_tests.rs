@@ -291,6 +291,11 @@ async fn a_payload_an_invoke_cannot_take_is_refused_before_it_goes_out() {
 /// clear failure of the target, never a refusal of the keys, which the engine would drop.
 #[tokio::test]
 async fn the_batch_front_of_a_transport_the_kind_does_not_speak_names_the_kind() {
+    // The whole test moves `LAZYWF_SECRET_DIRS`, which the grpc `Target::new` reads: it is
+    // process-wide, so `ENV_LOCK` is held as long as it is set, as in every other test
+    // that sets it — without it the var moves under a concurrent grpc load and its
+    // descriptor set reads as outside the secret directories.
+    let _env = crate::secrets::ENV_LOCK.lock().await;
     let keys = vec![String::from("1"), String::from("2")];
     let was = std::env::var("LAZYWF_SECRET_DIRS").ok();
     let dir = std::env::temp_dir().join(format!("lazywf-dispatch-grpc-{}", std::process::id()));
