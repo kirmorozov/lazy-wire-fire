@@ -161,12 +161,16 @@ fn typed_row(first: bool) -> Vec<Option<Vec<u8>>> {
 struct Peer {
     port: u16,
     answer: std::sync::Arc<std::sync::Mutex<Answer>>,
-    /// Connections that completed startup: how often `PgClient` had to open one, which is how
-    /// a test sees the pooled connection being dropped after a transient and kept after a
-    /// refusal.
+    /// Sessions that got as far as a startup packet: how often `PgClient` had to open one, which
+    /// is how a test sees the pooled connection being dropped after a transient and kept after a
+    /// refusal — and the packet is where the client's parameters, and so a user or none, are
+    /// chosen.
     opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Every statement the client was asked to run, in order.
     statements: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The parameters of the startup packet, as the client sent them: what the session says it
+    /// is (the database, `application_name`, and — when the endpoint names one — the user).
+    startup: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -180,12 +184,14 @@ impl Peer {
             answer: std::sync::Arc::new(std::sync::Mutex::new(Answer::Done)),
             opens: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             statements: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            startup: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let (a, o, s, stop) = (
+        let (a, o, s, su, stop) = (
             peer.answer.clone(),
             peer.opens.clone(),
             peer.statements.clone(),
+            peer.startup.clone(),
             peer.stop.clone(),
         );
         let born = std::time::Instant::now();
@@ -205,8 +211,8 @@ impl Peer {
                         // opens its replacement while the old one is still being read, and a
                         // peer that served connections one at a time would not answer the new
                         // startup until the old handler gave up.
-                        let (a, o, st) = (a.clone(), o.clone(), s.clone());
-                        std::thread::spawn(move || serve(sock, &a, &o, &st));
+                        let (a, o, st, su) = (a.clone(), o.clone(), s.clone(), su.clone());
+                        std::thread::spawn(move || serve(sock, &a, &o, &st, &su));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(20))
@@ -230,8 +236,29 @@ impl Peer {
         self.statements.lock().unwrap().clone()
     }
 
+    /// The parameters of the last startup packet the peer read.
+    fn startup(&self) -> Vec<(String, String)> {
+        self.startup.lock().unwrap().clone()
+    }
+
     /// A client of this peer, on the plain protocol the `Disabled` tls mode uses.
     fn client(&self) -> PgClient {
+        self.with_credentials(Credentials {
+            user: Some("lwf".into()),
+            password: Some("lwf".into()),
+        })
+    }
+
+    /// A client whose endpoint names neither a user nor a password: what an endpoint
+    /// without `vars.username`/`vars.password` gives the client.
+    fn anonymous(&self) -> PgClient {
+        self.with_credentials(Credentials {
+            user: None,
+            password: None,
+        })
+    }
+
+    fn with_credentials(&self, creds: Credentials) -> PgClient {
         PgClient::new(
             SqlAddr {
                 host: "127.0.0.1".into(),
@@ -239,10 +266,7 @@ impl Peer {
                 db: "cov".into(),
             },
             &TlsSpec::parse(None).unwrap(),
-            Credentials {
-                user: Some("lwf".into()),
-                password: Some("lwf".into()),
-            },
+            creds,
         )
     }
 }
@@ -372,6 +396,7 @@ fn serve(
     answer: &std::sync::Mutex<Answer>,
     opens: &std::sync::atomic::AtomicUsize,
     statements: &std::sync::Mutex<Vec<String>>,
+    startup: &std::sync::Mutex<Vec<(String, String)>>,
 ) {
     use std::io::Write;
     let mut s = sock;
@@ -396,7 +421,28 @@ fn serve(
                     return;
                 }
             }
-            196_608 => break,
+            196_608 => {
+                // The startup packet: the protocol version and then NUL-separated key/value
+                // pairs, ended by an empty key. What the session says it is — the database,
+                // `application_name`, and the user only when the endpoint named one.
+                let mut params = Vec::new();
+                let mut rest = &b[4..];
+                while !rest.is_empty() && rest[0] != 0 {
+                    let Some(k) = rest.iter().position(|c| *c == 0) else {
+                        break;
+                    };
+                    let key = String::from_utf8_lossy(&rest[..k]).into_owned();
+                    rest = &rest[k + 1..];
+                    let Some(v) = rest.iter().position(|c| *c == 0) else {
+                        break;
+                    };
+                    let value = String::from_utf8_lossy(&rest[..v]).into_owned();
+                    rest = &rest[v + 1..];
+                    params.push((key, value));
+                }
+                *startup.lock().unwrap() = params;
+                break;
+            }
             _ => return,
         }
     }
@@ -966,6 +1012,167 @@ async fn postgres_listing_errors_keep_or_drop_the_connection_by_class() {
     assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/cov: db error");
     c.rows("SELECT * FROM items", t).await.expect("retried");
     assert_eq!(peer.opens(), before + 1, "the refusal kept it");
+}
+
+/// `open`'s two credential arms: what the session says it is when the endpoint names a user
+/// and a password, and when it names neither. The rest of the packet is the client's own in
+/// both cases — the address's database, `application_name=lazywf`, UTF-8 — and a nameless
+/// endpoint sends no name of lazywf's invention: with nothing to send, the library asks the
+/// operating system who this is (as `psql` without `-U` does), so a missing credential stays
+/// the server's question to answer. A process in which even *that* lookup answers nothing says
+/// the same thing from the other side — the peer saw no session at all, where a name of ours
+/// would have gone straight through — and the test says so aloud instead of pretending.
+#[tokio::test]
+async fn postgres_the_session_names_what_the_endpoint_named() {
+    let peer = Peer::start();
+    let t = Duration::from_secs(10);
+    let said =
+        |p: &[(String, String)], k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+    peer.client()
+        .exec("SELECT 1", t)
+        .await
+        .expect("an endpoint with credentials opens");
+    let named = peer.startup();
+    assert_eq!(said(&named, "user").as_deref(), Some("lwf"), "{named:?}");
+    assert_eq!(
+        said(&named, "database").as_deref(),
+        Some("cov"),
+        "{named:?}"
+    );
+    assert_eq!(
+        said(&named, "application_name").as_deref(),
+        Some("lazywf"),
+        "{named:?}"
+    );
+    assert_eq!(
+        said(&named, "client_encoding").as_deref(),
+        Some("UTF8"),
+        "{named:?}"
+    );
+
+    // The same peer, an endpoint with neither `vars.username` nor `vars.password`. The name in
+    // that packet cannot come from lazywf, and both ways it can arrive say so: the session
+    // reaches the peer as the *operating system's* user — or the library cannot resolve one at
+    // all, and nothing reaches the peer, which a name of our own invention would have done.
+    let anon_client = peer.anonymous();
+    let mut arrived = false;
+    let mut last: Option<anyhow::Error> = None;
+    for _ in 0..5 {
+        match anon_client.exec("SELECT 1", t).await {
+            Ok(_) => {
+                arrived = true;
+                last = None;
+                break;
+            }
+            Err(e) => {
+                // Ask the peer, not the error text, whether the session ever got there. A
+                // failure that never reached it is the library going to the operating system
+                // for a name and being answered with nothing — `getpwuid_r` has been seen to do
+                // that in a process holding the whole suite's sockets. Anything the peer did
+                // see is an answer about the endpoint, and is read as one.
+                last = Some(e);
+                if peer.opens() > 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    if !arrived {
+        let e = last.expect("the nameless session was tried");
+        let text = format!("{e:#}");
+        eprintln!("the operating system would not name this process ({text})");
+        // The same answer from the other side, and proved rather than assumed: nothing reached
+        // the peer, the failure is the client's own and spoken before it said anything, and the
+        // session this test named above was accepted and read back.
+        assert_eq!(
+            peer.opens(),
+            1,
+            "the nameless session never reached the peer: {text}"
+        );
+        let te = e.downcast_ref::<tokio_postgres::Error>();
+        assert!(
+            te.is_some_and(|te| te.as_db_error().is_none() && !te.is_closed()),
+            "the failure is the client's own, not a server's answer: {text}"
+        );
+        assert!(!crate::target::is_rejected(&e), "not a refusal: {text}");
+        return;
+    }
+    let anon = peer.startup();
+    assert_eq!(said(&anon, "database").as_deref(), Some("cov"), "{anon:?}");
+    assert_eq!(
+        said(&anon, "application_name").as_deref(),
+        Some("lazywf"),
+        "{anon:?}"
+    );
+    assert_eq!(
+        said(&anon, "client_encoding").as_deref(),
+        Some("UTF8"),
+        "{anon:?}"
+    );
+    // The same parameters, and the same values — except the user, which is no longer one we
+    // were given: not the other session's credential, not lazywf's own name, and not a blank.
+    let keys = |p: &[(String, String)]| p.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+    assert_eq!(keys(&anon), keys(&named), "the same packet shape: {anon:?}");
+    let who =
+        said(&anon, "user").unwrap_or_else(|| panic!("the packet still names someone: {anon:?}"));
+    assert!(!who.is_empty(), "the library's own fallback name: {anon:?}");
+    assert_ne!(who, "lwf", "lazywf did not invent it: {anon:?}");
+    assert_ne!(who, "lazywf", "nor is it our own name: {anon:?}");
+    assert_ne!(who, "cov", "nor the database's: {anon:?}");
+    assert_eq!(peer.opens(), 2, "one session per endpoint shape");
+    assert_eq!(
+        peer.statements()
+            .iter()
+            .filter(|s| s.as_str() == "SELECT 1")
+            .count(),
+        2,
+        "and both ran the statement after the pins"
+    );
+}
+
+/// The same `open` path with no credential *and* no server: the session is nameless and never
+/// even reaches the peer, so the only answer available is the client's own. It must be the
+/// client's own and a transient one — a listing that cannot open a connection retries, and a
+/// statement is never refused for something the server never heard.
+#[tokio::test]
+async fn postgres_a_nameless_endpoint_that_cannot_be_reached_is_not_a_refusal() {
+    let peer = Peer::start();
+    // Held bound and never listened, as above: the kernel refuses at once and no other test's
+    // peer can take the port between the bind and the connect.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = held.local_addr().unwrap().port();
+    let c = PgClient::new(
+        SqlAddr {
+            host: "127.0.0.1".into(),
+            port,
+            db: "cov".into(),
+        },
+        &TlsSpec::parse(None).unwrap(),
+        Credentials {
+            user: None,
+            password: None,
+        },
+    );
+    let e = c
+        .exec("SELECT 1", Duration::from_secs(10))
+        .await
+        .expect_err("nothing listens on the port");
+    drop(held);
+    let text = format!("{e:#}");
+    assert_eq!(
+        peer.opens(),
+        0,
+        "a session the client could not open: {text}"
+    );
+    let te = e.downcast_ref::<tokio_postgres::Error>();
+    assert!(
+        te.is_some_and(|te| te.as_db_error().is_none() && te.code().is_none() && !te.is_closed()),
+        "the client's own words, not a server's: {text}"
+    );
+    assert!(!crate::target::is_rejected(&e), "not a refusal: {text}");
 }
 
 #[test]
