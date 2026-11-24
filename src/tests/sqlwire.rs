@@ -46,15 +46,20 @@ fn mysql_connection_level_errors_are_transient() {
 #[tokio::test]
 async fn postgres_connection_failure_is_transient() {
     // A port nothing listens on: the connect fails before any server answers, and the
-    // error carries no SQLSTATE, so it is classed as transient.
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
+    // error carries no SQLSTATE, so it is classed as transient. The port is held open by
+    // a socket that is bound but never listens: dropping a listener and connecting after
+    // it would let another test's fake peer take the freed port between the two, and a
+    // peer that accepts without answering makes the startup handshake hang — the wait
+    // here is refused by the kernel (ECONNREFUSED) at once and cannot be raced.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = held.local_addr().unwrap().port();
     let conn = format!("host=127.0.0.1 port={port} connect_timeout=2");
     let err = match tokio_postgres::connect(&conn, tokio_postgres::NoTls).await {
         Ok(_) => panic!("nothing listens on the port"),
         Err(e) => e,
     };
+    drop(held);
     assert!(err.code().is_none());
     assert!(pg_transient(&err));
 }
