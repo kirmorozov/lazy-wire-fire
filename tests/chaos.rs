@@ -421,6 +421,24 @@ fn assert_keys(mock: &Mock, want: &BTreeSet<String>, what: &str) {
     );
 }
 
+/// Whether `mock` has read in full a request whose `{{join keys ","}}` body carries every key
+/// of `want`. A read request is what a `delay`-mode answer is made of (the mock answers every
+/// request it reads), so this is the mock's own record of "this round reached the target" —
+/// the condition T2 gates each round on. Unlike a firings counter, it cannot be satisfied by
+/// an earlier round's retry, and it does not assume how many requests the engine's debounce
+/// chose to make.
+fn mock_seen_keys(mock: &Mock, want: &BTreeSet<String>) -> bool {
+    mock.requests().iter().any(|r| {
+        let got: BTreeSet<&str> = r
+            .body
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        want.iter().all(|k| got.contains(k.as_str()))
+    })
+}
+
 /// (deliveries, keys that arrived more than once) for a seed's own report. P4's rule is the
 /// sampler's; the seed only has to say out loud what the run really delivered, because "no
 /// duplicates" claimed without a number is exactly how a lost fault hides (mutation M1).
@@ -486,6 +504,13 @@ async fn wait_rule_error(db: &Db, rule: &str, needle: &str, secs: u64) -> String
 /// pinned below its first unconfirmed checkpoint while `/status` still shows pending keys and
 /// `last_error` names the client timeout, and after `heal()` the backlog drains inside the bound
 /// with every `(key, version)` key delivered and no key struck.
+///
+/// Each round waits for its own keys to be read at the mock before the next round is written:
+/// the rule's 100 ms debounce runs from the LAST mark, so a server that answers the harness's
+/// writes quickly lets several commits coalesce into one generation — the engine's designed
+/// behavior, and one request carries only one firing. Counting firings after a bulk write of
+/// all rounds made that legitimate coalescing look like "the fault never fired" (the original
+/// flake, seen on MariaDB 10.11 only, where the harness's own write path is fastest).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t2_target_slow() {
     let root = need_db!();
@@ -538,17 +563,26 @@ async fn t2_target_slow() {
             keys.clone(),
             &mock,
         );
-        want_a.push(keys);
+        want_a.push(keys.clone());
         cps_a.push(cp);
+        // The fault is a fact at the mock before the seed believes anything about the stage, and
+        // before the next round is written: this round's keys have to have reached the mock, and
+        // the record is the mock's own. Gating inside the loop is also what keeps the rounds
+        // separate on the wire: the rule's debounce is measured from the LAST mark
+        // (`due = (last + debounce).min(first + max_delay)` in src/engine.rs), so when the server
+        // answers the harness's writes fast all three commits land inside one debounce window
+        // and coalesce into a single generation — one request, one firing. That is the engine's
+        // designed behavior (it is the very debounce T2 exists to exercise), not a fault: a bulk
+        // write followed by a wait for three firings reads it as "the fault never fired", which
+        // is this seed's MariaDB flake. A round written after the previous one was seen at the
+        // mock always starts an empty buffer and so a generation of its own.
+        wait_for(
+            Duration::from_secs(60),
+            &format!("T2 stage A round {round}: the mock reading a request with this round's keys"),
+            || async { mock_seen_keys(&mock, &keys).then_some(()) },
+        )
+        .await;
     }
-    // The fault is a fact at the mock before the seed believes anything about the stage: every
-    // round has to have been answered 400 ms late, and the count is the mock's own.
-    wait_for(
-        Duration::from_secs(60),
-        "T2 stage A: the mock answering 400 ms after the requests",
-        || async { (mock.delay_firings() >= 3).then_some(()) },
-    )
-    .await;
     drain(&sp, &lazy, &db, "slow", cps_a[2].clone(), 90).await;
     let fired_a = mock.delay_firings();
     let late_a = mock.late_answers();
@@ -582,8 +616,21 @@ async fn t2_target_slow() {
             keys.clone(),
             &mock,
         );
-        want_b.push(keys);
+        want_b.push(keys.clone());
         cps_b.push(cp);
+        // The same per-round gate as stage A: with `delay(4000)` armed, every request the mock
+        // reads is answered past the client's 3 000 ms timeout, so a read request is this
+        // round's fault event in the making. The gate keeps the three late answers counted
+        // below owed to three rounds, not to one coalesced burst of them and its retries.
+        wait_for(
+            Duration::from_secs(60),
+            &format!(
+                "T2 stage B round {}: the mock reading a request with this round's keys",
+                round - 3
+            ),
+            || async { mock_seen_keys(&mock, &keys).then_some(()) },
+        )
+        .await;
     }
     wait_for(
         Duration::from_secs(90),
