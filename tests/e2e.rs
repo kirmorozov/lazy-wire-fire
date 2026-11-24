@@ -3924,6 +3924,686 @@ async fn sql_target_one_statement() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The Postgres line of `sqlwire`: how the classes the *server* answers with arrive, and what they
+// cost the pooled connection. Proved against the compose PostgreSQL (`postgres` service,
+// 127.0.0.1:34432) in our own `covpg_*` tables. The classes a running server will not produce on
+// request — 53… insufficient resources, 58… system error, the 08 connection family, 40001
+// serialization failure, a mid-query TCP cut — are proved over an in-process peer that answers
+// with the same `ErrorResponse`s, in `src/tests/sqlwire.rs`. Nothing here stops, reconfigures or
+// loads a server: no global setting is touched, only our own sessions and tables.
+
+/// Is the server still serving that backend? The one witness to whether the pooled connection was
+/// kept or dropped that cannot be fooled by a client-side lie.
+async fn backend_alive(admin: &tokio_postgres::Client, pid: i32) -> bool {
+    admin
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND datname = 'sink'",
+            &[&pid],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0)
+        > 0
+}
+
+/// Which backend the client's pooled connection is talking to, as the server itself answers it.
+async fn pg_pid(c: &lazy_wire_fire::sqlwire::PgClient) -> i32 {
+    let rows = c
+        .rows("SELECT pg_backend_pid() AS pid", Duration::from_secs(10))
+        .await
+        .unwrap();
+    rows[0]["pid"].as_i64().unwrap() as i32
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_target_reports_the_class_it_reached() {
+    const PG: &str = "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink";
+    let (admin, conn) = match tokio_postgres::connect(PG, tokio_postgres::NoTls).await {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("no PostgreSQL on 127.0.0.1:34432: skipping");
+            return;
+        }
+    };
+    tokio::spawn(conn);
+    // The witnesses read from the admin session, which the closures below borrow: a
+    // `tokio_postgres::Client` is not `Clone`, so they share one reference rather than a copy.
+    let admin = &admin;
+    admin
+        .batch_execute(
+            "DROP TABLE IF EXISTS covpg_lock, covpg_dup, covpg_wal, covpg_typed;
+             CREATE TABLE covpg_lock (id bigint PRIMARY KEY);
+             INSERT INTO covpg_lock VALUES (7), (11), (12), (13);
+             CREATE TABLE covpg_dup (id text PRIMARY KEY);
+             INSERT INTO covpg_dup VALUES ('taken');
+             CREATE TABLE covpg_wal (id bigserial PRIMARY KEY, blob text);
+             CREATE TABLE covpg_typed (t text, i2 int2, i4 int4, i8 int8, f8 float8, b bool,
+                                       n numeric, nan float8, z timestamptz);
+             INSERT INTO covpg_typed
+                 VALUES ('plain é text', -7, 400, 9007199254740993, -2.25, true, 12.34, 'NaN',
+                         '2026-11-23T00:00:00Z');
+             INSERT INTO covpg_typed (t) VALUES (NULL);",
+        )
+        .await
+        .unwrap();
+
+    // A pooled client of the product's own: one per claim that needs a session of its own.
+    fn pool() -> lazy_wire_fire::sqlwire::PgClient {
+        lazy_wire_fire::sqlwire::PgClient::new(
+            lazy_wire_fire::sqlwire::SqlAddr {
+                host: "127.0.0.1".into(),
+                port: 34432,
+                db: "sink".into(),
+            },
+            &lazy_wire_fire::tls::TlsSpec::parse(None).unwrap(),
+            lazy_wire_fire::sqlwire::Credentials {
+                user: Some("postgres".into()),
+                password: Some("pgpw".into()),
+            },
+        )
+    }
+    let client = pool();
+    let t = Duration::from_secs(10);
+    // Another session, for the locks and the cancels — never the one under test.
+    async fn other() -> tokio_postgres::Client {
+        let (c, conn) = tokio_postgres::connect(PG, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        c
+    }
+
+    // A statement the server refuses *as a statement*: the SQLSTATE and the server's own words in
+    // the text, a refusal the engine counts as a strike — and the pooled connection survives it,
+    // so the next statement runs on the very same backend.
+    let p = pg_pid(&client).await;
+    let e = client
+        .exec("INSERT INTO covpg_dup VALUES ('taken')", t)
+        .await
+        .expect_err("the key is taken");
+    assert_eq!(
+        format!("{e:#}"),
+        r#"postgres 127.0.0.1/sink: 23505: duplicate key value violates unique constraint "covpg_dup_pkey""#
+    );
+    assert!(
+        lazy_wire_fire::target::is_rejected(&e),
+        "a duplicate key is the statement's fault: {e:#}"
+    );
+    assert!(
+        backend_alive(admin, p).await,
+        "a refusal costs nothing but the answer"
+    );
+    assert_eq!(
+        pg_pid(&client).await,
+        p,
+        "and the next statement reuses the connection"
+    );
+
+    // A lock that will not come, asked for with `NOWAIT`: 55P03 is not the statement's fault (the
+    // key stays buffered rather than struck) and the session that waited on it is dropped, so the
+    // retry does not walk into a backend the server may still be busy with.
+    let locker = other().await;
+    locker
+        .batch_execute("BEGIN; UPDATE covpg_lock SET id = id WHERE id = 7;")
+        .await
+        .unwrap();
+    let p = pg_pid(&client).await;
+    let e = client
+        .exec(
+            "SELECT id FROM covpg_lock WHERE id = 7 FOR UPDATE NOWAIT",
+            t,
+        )
+        .await
+        .expect_err("row 7 is locked");
+    assert_eq!(
+        format!("{e:#}"),
+        r#"postgres 127.0.0.1/sink: 55P03: could not obtain lock on row in relation "covpg_lock""#
+    );
+    assert!(
+        !lazy_wire_fire::target::is_rejected(&e),
+        "a lock is not the statement's fault: {e:#}"
+    );
+    wait_for(
+        Duration::from_secs(10),
+        "the backend a transient cost",
+        || async { (!backend_alive(admin, p).await).then_some(()) },
+    )
+    .await;
+    locker.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(
+        client
+            .exec(
+                "SELECT id FROM covpg_lock WHERE id = 7 FOR UPDATE NOWAIT",
+                t
+            )
+            .await
+            .unwrap(),
+        1,
+        "the same statement runs once the lock is free"
+    );
+    assert_ne!(pg_pid(&client).await, p, "and on another backend");
+
+    // A real deadlock, with our own statement the one the server rolls back. The other session
+    // holds a row; our session holds a session advisory lock and waits for that row; the other
+    // session then asks for the advisory lock we hold. The wait is a cycle, and the server ends
+    // one of the two transactions to break it: the session that *finds* the cycle — the one that
+    // blocks last — is not the one it rolls back, so the other side asks only after we are queued,
+    // and our statement is the victim. Both sides are ordinary sessions of our own: nothing global
+    // is set, nothing is stopped or reconfigured.
+    let mut attempts = Vec::new();
+    let mut ours_died = false;
+    for _ in 0..3 {
+        // A session of the product's own for this attempt: the blocked statement holds the pool's
+        // one connection, and the attempt's assertions are about that pool.
+        let c = pool();
+        // The budget is also what this session's `statement_timeout` is pinned to, so it has to be
+        // well above the second the server takes to notice the cycle.
+        let w = Duration::from_secs(20);
+        c.exec("SELECT pg_advisory_unlock_all()", w)
+            .await
+            .expect("a first statement on the session");
+        let p = pg_pid(&c).await;
+        let rival = other().await;
+        rival
+            .batch_execute("BEGIN; UPDATE covpg_lock SET id = id WHERE id = 13;")
+            .await
+            .expect("the other side takes the row");
+        c.exec("BEGIN", w).await.expect("a transaction block");
+        c.exec("SELECT pg_advisory_lock(5002)", w)
+            .await
+            .expect("the advisory lock is free");
+        // We block on the row. The `Client` goes with the statement, and comes back with it.
+        let ours = tokio::spawn(async move {
+            let r = c
+                .exec("SELECT id FROM covpg_lock WHERE id = 13 FOR UPDATE", w)
+                .await
+                .map(|_| "ran".to_string())
+                .map_err(|e| (format!("{e:#}"), lazy_wire_fire::target::is_rejected(&e)));
+            (c, r)
+        });
+        wait_for(
+            Duration::from_secs(15),
+            "we wait for the other side's row",
+            || async {
+                (admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 \
+                           AND state = 'active' AND wait_event_type = 'Lock' \
+                           AND wait_event = 'transactionid' \
+                           AND query LIKE '%covpg_lock WHERE id = 13 FOR UPDATE%'",
+                        &[&p],
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+                    == 1)
+                    .then_some(())
+            },
+        )
+        .await;
+        // Now the other side asks for our advisory lock: it is the one that finds the cycle. It
+        // stays connected (its row lock held) until the answer has been read.
+        let (let_go, held_until) = tokio::sync::oneshot::channel::<()>();
+        let asked = tokio::spawn(async move {
+            let r = rival
+                .batch_execute("SELECT pg_advisory_lock(5002);")
+                .await
+                .map(|_| "ran".to_string())
+                .map_err(|e| {
+                    e.as_db_error()
+                        .map_or_else(|| e.to_string(), |d| d.code().code().to_string())
+                });
+            let _ = held_until.await;
+            let _ = rival
+                .batch_execute("ROLLBACK; SELECT pg_advisory_unlock_all();")
+                .await;
+            r
+        });
+        let (c, ours) = ours.await.expect("our statement came back");
+        let _ = let_go.send(());
+        let theirs = match tokio::time::timeout(Duration::from_secs(20), asked).await {
+            Ok(Ok(Ok(s))) => s,
+            Ok(Ok(Err(s))) => s,
+            Ok(Err(_)) => "join".into(),
+            Err(_) => "the other side stayed blocked".into(),
+        };
+        let text = ours.as_ref().map_or_else(|(t, _)| t.clone(), |s| s.clone());
+        match text.as_str() {
+            "postgres 127.0.0.1/sink: 40P01: deadlock detected" => {
+                let (_, rejected) =
+                    ours.expect_err("the deadlock our statement was rolled back for");
+                // The server's decision, not the statement's: no strike.
+                assert!(!rejected, "a deadlock is not the statement's fault: {text}");
+                // And the session it rolled back is not pooled any more: the same statement runs
+                // again, on another backend.
+                wait_for(
+                    Duration::from_secs(10),
+                    "the backend the deadlock cost",
+                    || async { (!backend_alive(admin, p).await).then_some(()) },
+                )
+                .await;
+                assert_eq!(c.exec("SELECT 13", w).await.unwrap(), 1);
+                assert_ne!(pg_pid(&c).await, p, "the retry is another backend");
+                ours_died = true;
+                break;
+            }
+            _ => {
+                // The server ended the other transaction this time: our statement ran, and the
+                // session still sits in its block holding the advisory lock, so let it go and try
+                // again.
+                c.exec("ROLLBACK", w).await.expect("end the block");
+                c.exec("SELECT pg_advisory_unlock_all()", w)
+                    .await
+                    .expect("release the advisory lock");
+                attempts.push(format!("ours {text:?}, theirs {theirs:?}"));
+            }
+        }
+    }
+    assert!(
+        ours_died,
+        "the server never made our statement the deadlock victim: {attempts:?}"
+    );
+
+    // A statement the server cancels for us (57014): transient by class — the wait was the
+    // server's, not the statement's — and the session is dropped all the same.
+    let p = pg_pid(&client).await;
+    let watcher = {
+        // A spawn needs ownership, and a `Client` cannot be cloned: the watcher watches from a
+        // session of its own.
+        let spy = other().await;
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let n: i64 = spy
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity \
+                         WHERE pid = $1 AND state = 'active' AND query LIKE 'SELECT pg_sleep%'",
+                        &[&p],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if n == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            spy.query_one("SELECT pg_cancel_backend($1)", &[&p])
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+        })
+    };
+    let e = client
+        .exec("SELECT pg_sleep(5)", t)
+        .await
+        .expect_err("the sleep was cancelled");
+    assert!(watcher.await.unwrap(), "the cancel was accepted");
+    assert_eq!(
+        format!("{e:#}"),
+        "postgres 127.0.0.1/sink: 57014: canceling statement due to user request"
+    );
+    assert!(
+        !lazy_wire_fire::target::is_rejected(&e),
+        "a cancel is not the statement's fault: {e:#}"
+    );
+    wait_for(
+        Duration::from_secs(10),
+        "the backend the cancel cost",
+        || async { (!backend_alive(admin, p).await).then_some(()) },
+    )
+    .await;
+
+    // The caller's own budget, not the server's: the statement is blocked elsewhere and the
+    // session's `statement_timeout` (pinned to the first call's budget, 10 s) is far above it, so
+    // the only clock that can end the wait is the one the action was given.
+    let blocker = other().await;
+    blocker
+        .batch_execute("BEGIN; UPDATE covpg_lock SET id = id WHERE id = 13;")
+        .await
+        .unwrap();
+    let p = pg_pid(&client).await;
+    let e = client
+        .exec(
+            "SELECT id FROM covpg_lock WHERE id = 13 FOR UPDATE",
+            Duration::from_millis(400),
+        )
+        .await
+        .expect_err("the row stays locked");
+    assert_eq!(format!("{e:#}"), "no answer within 400 ms");
+    assert!(
+        !lazy_wire_fire::target::is_rejected(&e),
+        "a timeout is not a refusal: {e:#}"
+    );
+    blocker.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(client.exec("SELECT 13", t).await.unwrap(), 1);
+    assert_ne!(
+        pg_pid(&client).await,
+        p,
+        "the session still busy with the abandoned statement is gone"
+    );
+
+    // The listing path, which is what a stray step reads. The class still decides whether the
+    // pooled connection survives, but the text is the client's own words: `rows` formats the
+    // `tokio_postgres::Error`, whose `Display` for a server error is the flat "db error", so the
+    // SQLSTATE the statement path names is lost here — and nothing on this path is a refusal.
+    let p = pg_pid(&client).await;
+    let e = client
+        .rows("SELECT * FROM covpg_missing", t)
+        .await
+        .expect_err("there is no such table");
+    assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/sink: db error");
+    assert!(
+        !lazy_wire_fire::target::is_rejected(&e),
+        "a listing's refusal never strikes: {e:#}"
+    );
+    assert_eq!(pg_pid(&client).await, p, "and it keeps the connection");
+    let locker = other().await;
+    locker
+        .batch_execute("BEGIN; UPDATE covpg_lock SET id = id WHERE id = 11;")
+        .await
+        .unwrap();
+    let p = pg_pid(&client).await;
+    let e = client
+        .rows(
+            "SELECT id FROM covpg_lock WHERE id = 11 FOR UPDATE NOWAIT",
+            t,
+        )
+        .await
+        .expect_err("row 11 is locked");
+    assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/sink: db error");
+    wait_for(
+        Duration::from_secs(10),
+        "the backend a transient listing cost",
+        || async { (!backend_alive(admin, p).await).then_some(()) },
+    )
+    .await;
+    locker.batch_execute("COMMIT").await.unwrap();
+
+    // `pg_value`, with the server's own binary encodings: every mapping it makes, an int8 past
+    // what an `f64` route would keep, and the shapes that come out `null` — a type no branch
+    // accepts (numeric, timestamptz), a float8 the JSON has no number for (NaN), and a NULL.
+    assert_eq!(
+        client
+            .rows("SELECT * FROM covpg_typed ORDER BY i8 NULLS LAST", t)
+            .await
+            .unwrap(),
+        json!([
+            {
+                "t": "plain é text", "i2": -7, "i4": 400, "i8": 9_007_199_254_740_993i64,
+                "f8": -2.25, "b": true, "n": null, "nan": null, "z": null,
+            },
+            {
+                "t": null, "i2": null, "i4": null, "i8": null, "f8": null, "b": null,
+                "n": null, "nan": null, "z": null,
+            }
+        ])
+    );
+}
+
+/// The other half of the pg line: `targets::sql`'s listing, the half an engine action reaches — a
+/// stray step's `list_template` is a SELECT and its `keys` read the rows. The rows come through
+/// `pg_value`, so the keys are only the right ones if an int8 an `f64` would round arrives exactly:
+/// the two strays here, 2^53 and 2^53+1, are one key to a float route and two to this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_target_stray_listing_reads_typed_rows() {
+    const PG: &str = "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink";
+    let (admin, conn) = match tokio_postgres::connect(PG, tokio_postgres::NoTls).await {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("no PostgreSQL on 127.0.0.1:34432: skipping");
+            return;
+        }
+    };
+    tokio::spawn(conn);
+    admin
+        .batch_execute(
+            "DROP TABLE IF EXISTS covpg_strays, covpg_sent;
+             CREATE TABLE covpg_strays (what text PRIMARY KEY, i8 bigint);
+             INSERT INTO covpg_strays VALUES
+                 ('k1', 1), ('k2', 2), ('k3', 3),
+                 ('k9007199254740992', 9007199254740992),
+                 ('k9007199254740993', 9007199254740993);
+             CREATE TABLE covpg_sent (what text PRIMARY KEY, i8 text);",
+        )
+        .await
+        .unwrap();
+
+    let root = need_db!();
+    let db = Db::fresh(&root, "covpgsrc").await;
+    db.exec("CREATE TABLE covpg_items (id BIGINT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO covpg_items VALUES (1,'a'),(2,'b'),(3,'c')")
+        .await;
+    tables(&db).await;
+    std::env::set_var("LWF_TEST_PG_PW", "pgpw");
+    db.target(
+        "pglist",
+        "pgsql",
+        "127.0.0.1:34432/sink",
+        None,
+        r#"{"username": "postgres", "password": "env:LWF_TEST_PG_PW"}"#,
+    )
+    .await;
+    let steps = json!([
+        {"for_each": "snapshot"},
+        {"for_each": "stray",
+         "list_template": "SELECT what, i8 FROM covpg_strays",
+         "keys": "JSON_EXTRACT(body, '$[*].i8')",
+         "template": "DELETE FROM covpg_strays WHERE what \
+           IN ({{#each docs}}{{#unless @first}}, {{/unless}}concat('k', {{sql_quote key}}){{/each}})"}
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('pgl', 'pglist', 'key', \
+         'SELECT id AS _key, name, NULL AS _op FROM covpg_items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM covpg_items', \
+         '{{#each docs}}INSERT INTO covpg_sent (what, i8) \
+          VALUES (concat(''k'', {{sql_quote key}}), {{sql_quote key}}) \
+          ON CONFLICT (what) DO UPDATE SET i8 = EXCLUDED.i8{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("pgl", "covpg_items", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    async fn listed(admin: &tokio_postgres::Client, what: &str) -> Vec<String> {
+        admin
+            .query(&format!("SELECT what FROM {what} ORDER BY what"), &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    }
+    wait_for(Duration::from_secs(60), "the strays deleted", || async {
+        (listed(&admin, "covpg_strays").await == ["k1", "k2", "k3"]).then_some(())
+    })
+    .await;
+    // The three documents of the source table went to the same target on the way: a listing the
+    // engine reads, and statements it writes, over one connection.
+    db.exec("UPDATE covpg_items SET name = 'z' WHERE id IN (1, 2, 3)")
+        .await;
+    wait_for(Duration::from_secs(60), "the documents sent", || async {
+        (listed(&admin, "covpg_sent").await == ["k1", "k2", "k3"]).then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(15), "reset done", || async {
+        db.status("pgl")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .map(|_| ())
+    })
+    .await;
+    // Both big int8s were listed as keys of their own, and so both were deleted: a float route
+    // would have folded them into one key and left the other row behind.
+    assert_eq!(listed(&admin, "covpg_strays").await, ["k1", "k2", "k3"]);
+    let n: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM covpg_sent WHERE i8 IN ('1','2','3')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 3, "the documents went to the pg target too");
+    assert!(
+        db.status("pgl").await.unwrap().3.is_none(),
+        "the rule said nothing wrong: {:?}",
+        db.status("pgl").await
+    );
+    let struck: Vec<String> = warnings()
+        .into_iter()
+        .filter(|l| l.starts_with("WARN") && l.contains("pgl"))
+        .collect();
+    assert!(
+        struck.is_empty(),
+        "the pg listing or its deletes were refused: {struck:?}"
+    );
+    inst.stop().await;
+}
+
+/// A stray listing whose template renders nothing is a **failed** listing, not an empty one.
+/// `targets/sql.rs`'s pg branch of `fetch` refuses a blank statement (`:97-100`), the engine
+/// keeps the reset open over it and says why in `last_error` and in one `WARN`, and the attempt
+/// costs nothing: with the template fixed, the very same strays are listed and deleted. A blank
+/// render that passed for an empty listing would report a reset done and leave the rows behind
+/// with nothing to point at, which is what these assertions tell apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_target_a_listing_that_renders_nothing_costs_a_retry() {
+    const PG: &str = "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink";
+    let (admin, conn) = match tokio_postgres::connect(PG, tokio_postgres::NoTls).await {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("no PostgreSQL on 127.0.0.1:34432: skipping");
+            return;
+        }
+    };
+    tokio::spawn(conn);
+    // Three rows: two strays and one key the snapshot also knows (`3`), which is why it must
+    // survive the reset as well.
+    admin
+        .batch_execute(
+            "DROP TABLE IF EXISTS covpg_blank;
+             CREATE TABLE covpg_blank (what text PRIMARY KEY);
+             INSERT INTO covpg_blank VALUES ('b1'), ('b2'), ('3');",
+        )
+        .await
+        .unwrap();
+
+    let root = need_db!();
+    let db = Db::fresh(&root, "covpgblk").await;
+    db.exec("CREATE TABLE covpg_items (id BIGINT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO covpg_items VALUES (3,'c')").await;
+    tables(&db).await;
+    std::env::set_var("LWF_TEST_PG_PW", "pgpw");
+    db.target(
+        "pgblank",
+        "pgsql",
+        "127.0.0.1:34432/sink",
+        None,
+        r#"{"username": "postgres", "password": "env:LWF_TEST_PG_PW"}"#,
+    )
+    .await;
+    let stray = |list: &str| {
+        json!([
+            {"for_each": "snapshot"},
+            {"for_each": "stray",
+             "list_template": list,
+             "keys": "JSON_EXTRACT(body, '$[*].what')",
+             "template": "DELETE FROM covpg_blank WHERE what \
+               IN ({{#each docs}}{{#unless @first}}, {{/unless}}{{sql_quote key}}{{/each}})"}
+        ])
+    };
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('pgb', 'pgblank', 'key', \
+         'SELECT id AS _key, name, NULL AS _op FROM covpg_items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM covpg_items', \
+         '{{#each docs}}INSERT INTO covpg_blank (what) VALUES ({{sql_quote key}}) \
+          ON CONFLICT (what) DO NOTHING{{/each}}', ?, 100)",
+        (stray("{{! a listing that renders nothing at all !}}").to_string(),),
+    )
+    .await;
+    db.trigger("pgb", "covpg_items", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    async fn rows(admin: &tokio_postgres::Client) -> Vec<String> {
+        admin
+            .query("SELECT what FROM covpg_blank ORDER BY what", &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    }
+
+    wait_for(
+        Duration::from_secs(60),
+        "the blank listing reported itself",
+        || async {
+            warnings()
+                .into_iter()
+                .filter(|l| l.starts_with("WARN") && l.contains("pgb"))
+                .any(|l| {
+                    l.contains("listing the target's keys failed")
+                        && l.contains("the list template rendered nothing")
+                })
+                .then_some(())
+        },
+    )
+    .await;
+    let s = wait_for(
+        Duration::from_secs(30),
+        "the rule's `last_error` names the blank render",
+        || async {
+            let s = db.status("pgb").await?;
+            let e = s.3.clone()?;
+            (e.contains("the list template rendered nothing") && e.contains("listing page 0"))
+                .then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        !s.2.starts_with("done"),
+        "a failed listing is not a reset that finished: {s:?}"
+    );
+    // Nothing was listed, so nothing was deleted: a render of nothing did not pass for the
+    // statement running and finding no strays.
+    assert_eq!(
+        rows(&admin).await,
+        ["3", "b1", "b2"],
+        "all of them still there"
+    );
+
+    // The same rule, a listing that renders. The strays the failed listing could not name are
+    // all still there to be found: the failure struck nothing off.
+    db.exec_params(
+        "UPDATE lazy_wire_fire_rule SET reset_steps = ? WHERE name = 'pgb'",
+        (stray("SELECT what FROM covpg_blank").to_string(),),
+    )
+    .await;
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'pgb'")
+        .await;
+    wait_for(
+        Duration::from_secs(90),
+        "the strays deleted once the listing rendered",
+        || async { (rows(&admin).await == ["3"]).then_some(()) },
+    )
+    .await;
+    wait_for(Duration::from_secs(30), "the reset done", || async {
+        db.status("pgb")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .map(|_| ())
+    })
+    .await;
+    inst.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // `sqs` targets, against ElasticMQ (`LAZYWF_TEST_SQS`, e.g. http://127.0.0.1:34561; the
 // `sqs` compose profile). The tests read the queues back through the same SQS JSON API.
 
