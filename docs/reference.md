@@ -1300,7 +1300,7 @@ cannot exceed the target's entity message size, 262144 (256 KiB) by default, rai
 `vars.max_message_size` up to 104857600 ([Service Bus targets](#service-bus-targets)) |
 | `debounce_ms`, `max_delay_ms` | default 1000 and 5000: fire when nothing was marked for `debounce_ms`, at the latest `max_delay_ms` after the oldest pending change |
 | `reset_steps` | JSON array, [below](#reset-steps) |
-| `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded |
+| `reset_requested` | set to 1 to run the reset steps; set back to 0 when they succeeded. A 1 raised while a reset that started on its own is still running starts it over from step 1; one raised while a finished reset waits to clear the flag runs them again instead of being cleared. Writing 1 over a leftover 1 is no request — [Reset steps](#reset-steps) |
 | `vars` | JSON object, `vars` in templates |
 
 `:keys` becomes a list of parameters (padded to a power of two with the last key, so use it
@@ -1522,7 +1522,22 @@ only when its own message says the requested position cannot be served: a purged
 binlog file, a position outside the file, or GTIDs the position needs are gone. Any other 1236
 keeps the position: the dump is retried with the capped backoff, the server's message is logged
 as a WARN and shown as `stream_error` on `/status` until the stream delivers events again
-([Status](#status)). An interrupted reset starts over after a restart.
+([Status](#status)). An interrupted reset starts over after a restart, and a reset interrupted by
+disabling the rule comes back when the rule is enabled again: it is taken up the way one
+interrupted by a process death is, and its steps run from the first one.
+
+A `reset_requested` raised under a reset that is already running is not folded into it: a run
+that started on its own (continuity lost, a new rule) starts over from step 1 as the requested
+run, and the keys of the step it stood in go out again — at-least-once, as every step is, so
+nothing is lost. A run that already serves the flag is left to finish: the flag stays 1 until the
+steps succeed, so restarting on every reload would be a reset that never ends. A request raised
+while a finished reset waits to write the flag back to 0 is honoured too — the engine saw the
+write of that rule's row (every write that leaves the flag at 1 makes a row event), so it runs the
+steps again for that rule alone rather than erasing the ask. Two things this does not cover: a
+write whose row event has not arrived by the time the engine's own clear lands is still erased, and
+a 1 written over a leftover 1 changes nothing, so it makes no row event and is no request. An
+operator who raised the flag during a run raises it again once the rule's `reset_state` says
+`done`.
 
 ```json
 [
