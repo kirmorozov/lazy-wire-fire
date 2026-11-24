@@ -976,10 +976,11 @@ async fn postgres_rows_map_the_types_pg_value_knows() {
 }
 
 /// What a listing reports when the server answers with an error, for a transient class and
-/// for a refusal: the pooled connection tells them apart, because the text cannot — `rows`
-/// formats the client's own `Display`, which for a server error is the flat words `db error`.
-/// (The product note goes to lwf-super with the report: a failed listing is undiagnosable from
-/// `last_error` as it stands, where a failed statement names its SQLSTATE.)
+/// for a refusal: the same answer the statement path gives — the client's own `Display` for a
+/// server error is the flat words `db error`, so `rows` reads the SQLSTATE and the server's
+/// message off `as_db_error`, exactly as `exec` does, and only a class that speaks about the
+/// statement comes back as a `Rejected`. The pooled connection still tells the two apart: the
+/// transient one costs the session, the refusal costs nothing but the answer.
 #[tokio::test]
 async fn postgres_listing_errors_keep_or_drop_the_connection_by_class() {
     let peer = Peer::start();
@@ -987,7 +988,8 @@ async fn postgres_listing_errors_keep_or_drop_the_connection_by_class() {
     let t = Duration::from_secs(10);
     c.exec("SELECT 1", t).await.expect("the peer is up");
 
-    // Transient: the waiting connection goes, and the next listing runs on a fresh one.
+    // Transient: "not now" is not the statement's fault, the waiting connection goes, and the
+    // next listing runs on a fresh one.
     peer.answer(Answer::Error(
         "55P03",
         "canceling statement due to lock timeout",
@@ -997,19 +999,35 @@ async fn postgres_listing_errors_keep_or_drop_the_connection_by_class() {
         .await
         .expect_err("the listing failed");
     peer.answer(Answer::Done);
-    assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/cov: db error");
+    let text = format!("{e:#}");
+    assert!(
+        !crate::target::is_rejected(&e),
+        "55P03 is not the statement's fault: {text}"
+    );
+    assert_eq!(
+        text, "postgres 127.0.0.1/cov: 55P03: canceling statement due to lock timeout",
+        "the listing names the class it reached and what the server said, as `exec` does"
+    );
     let before = peer.opens();
     c.rows("SELECT * FROM items", t).await.expect("retried");
     assert_eq!(peer.opens(), before + 1, "the transient listing dropped it");
 
-    // A refusal keeps it: the statement was the problem, not the connection.
+    // A refusal is the statement's own fault, keeps the session, and says so in its class.
     peer.answer(Answer::Error("42P01", "relation \"items\" does not exist"));
     let e = c
         .rows("SELECT * FROM missing", t)
         .await
         .expect_err("the listing failed");
     peer.answer(Answer::Done);
-    assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/cov: db error");
+    let text = format!("{e:#}");
+    assert!(
+        crate::target::is_rejected(&e),
+        "42P01 is the statement's fault: {text}"
+    );
+    assert_eq!(
+        text, "postgres 127.0.0.1/cov: 42P01: relation \"items\" does not exist",
+        "the refusal names its SQLSTATE and the server's words, as `exec` does"
+    );
     c.rows("SELECT * FROM items", t).await.expect("retried");
     assert_eq!(peer.opens(), before + 1, "the refusal kept it");
 }

@@ -498,6 +498,31 @@ impl PgClient {
         Ok(client)
     }
 
+    /// The one answer to a statement or a listing the server failed: what the error costs
+    /// the pooled session is the class's doing (a transient one drops it, so the retry
+    /// opens a fresh one; a refusal keeps it), and the error names the SQLSTATE and the
+    /// server's own words, so a failed listing reads exactly as a failed statement does.
+    /// Only a class that speaks about the statement itself comes back as a
+    /// [`crate::target::Rejected`]; anything unknown stays transient.
+    fn failed(
+        &self,
+        guard: &mut Option<tokio_postgres::Client>,
+        e: tokio_postgres::Error,
+    ) -> anyhow::Error {
+        let transient = pg_transient(&e);
+        if transient {
+            *guard = None;
+        }
+        let detail = e.as_db_error().map_or_else(
+            || e.to_string(),
+            |d| format!("{}: {}", d.code().code(), d.message()),
+        );
+        classify(
+            transient,
+            format!("postgres {}/{}: {detail}", self.addr.host, self.addr.db),
+        )
+    }
+
     /// Runs the statement (extended protocol: one statement only); returns the affected rows.
     pub async fn exec(&self, sql: &str, timeout: Duration) -> Result<u64> {
         let mut guard = self.client.lock().await;
@@ -507,20 +532,7 @@ impl PgClient {
         let client = guard.as_ref().expect("open");
         match tokio::time::timeout(timeout, client.execute(sql, &[])).await {
             Ok(Ok(n)) => Ok(n),
-            Ok(Err(e)) => {
-                let transient = pg_transient(&e);
-                if transient {
-                    *guard = None;
-                }
-                let detail = e.as_db_error().map_or_else(
-                    || e.to_string(),
-                    |d| format!("{}: {}", d.code().code(), d.message()),
-                );
-                Err(classify(
-                    transient,
-                    format!("postgres {}/{}: {detail}", self.addr.host, self.addr.db),
-                ))
-            }
+            Ok(Err(e)) => Err(self.failed(&mut guard, e)),
             Err(_) => {
                 *guard = None;
                 Err(anyhow!("no answer within {} ms", timeout.as_millis()))
@@ -529,6 +541,7 @@ impl PgClient {
     }
 
     /// Runs a query (extended protocol: one statement only); returns its rows as objects.
+    /// A failed listing is answered exactly as a failed statement is (see [`Self::failed`]).
     pub async fn rows(&self, sql: &str, timeout: Duration) -> Result<Value> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
@@ -537,12 +550,7 @@ impl PgClient {
         let client = guard.as_ref().expect("open");
         let rows = match tokio::time::timeout(timeout, client.query(sql, &[])).await {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                if pg_transient(&e) {
-                    *guard = None;
-                }
-                bail!("postgres {}/{}: {e}", self.addr.host, self.addr.db);
-            }
+            Ok(Err(e)) => return Err(self.failed(&mut guard, e)),
             Err(_) => {
                 *guard = None;
                 bail!("no answer within {} ms", timeout.as_millis());
