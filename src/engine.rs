@@ -1670,12 +1670,24 @@ impl Engine {
             }
             _ => {}
         }
+        let request = rule.def.reset_requested && !st.pending_clear;
+        // The run in flight, seen before this request folds into it: a run that started on its own
+        // (`requested` false) and is still going does not become the requested reset by having the
+        // flag raised under it — its remainder runs the steps the rule was already running, and
+        // the flag would then be cleared as if the reset that was asked for had run. Such a run
+        // starts over from step 1, the way a changed rule restarts it below. A run that already
+        // serves the request is left alone: the flag stays 1 until the steps succeed, so restarting
+        // on every reload would be a reset that never finishes.
+        let superseded = request
+            && st
+                .reset
+                .as_ref()
+                .is_some_and(|r| r.fingerprint == rule.fingerprint && !r.requested);
         let restart = st
             .reset
             .as_ref()
             .filter(|r| r.fingerprint != rule.fingerprint)
-            .map(|r| (r.reason.clone(), r.requested));
-        let request = rule.def.reset_requested && !st.pending_clear;
+            .map(|r| (r.reason.clone(), r.requested || request));
         let running = st.reset.is_some();
         if let (Some(run), true) = (st.reset.as_mut(), request) {
             run.requested = true;
@@ -1688,7 +1700,7 @@ impl Engine {
                 format!("{reason}; restarted after the rule changed"),
                 requested,
             );
-        } else if request && !running {
+        } else if request && (!running || superseded) {
             self.start_reset(name, "reset_requested".into(), true);
         }
     }
