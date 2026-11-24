@@ -67,7 +67,7 @@ servers:
 servers-down:
 	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease \
 	  --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
-	  --profile kafka --profile eventbridge --profile sns --profile pgsrc down -v
+	  --profile kafka --profile eventbridge --profile sns --profile pgsrc --profile fences down -v
 
 # The integration servers and test threads; override them to run against other servers.
 E2E_DSN ?= mysql://root:root@127.0.0.1:34184

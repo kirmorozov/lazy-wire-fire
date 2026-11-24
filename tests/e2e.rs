@@ -7577,10 +7577,25 @@ async fn commit_fence_writes_per_flush_and_moves_no_position() {
         .query_first("SELECT @@GLOBAL.gtid_mode")
         .await
         .unwrap_or(None);
+    let oc: Option<String> = c
+        .query_first("SELECT @@GLOBAL.binlog_order_commits")
+        .await
+        .unwrap_or(None);
     c.disconnect().await.ok();
     if mode.as_deref() != Some("OFF") {
         eprintln!(
             "gtid_mode is not OFF (MySQL without GTIDs only): skipping the commit fence test"
+        );
+        return;
+    }
+    // The `mysql80-noorder` variant (compose profile `fences`) is MySQL 8.0 without GTIDs too,
+    // but commits there are NOT in binlog order: the probe answers Unordered and the fence
+    // writes nothing on purpose (the `commit_fence_not_ordered_waits_the_delay` test reads that
+    // server directly), so the full suite running on it skips this per-boundary-write check.
+    if oc.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("OFF")) {
+        eprintln!(
+            "binlog_order_commits is OFF (the no-order variant): the commit fence writes no rows \
+             here by design: skipping the commit fence test"
         );
         return;
     }
@@ -7677,6 +7692,1091 @@ async fn commit_fence_writes_per_flush_and_moves_no_position() {
         (1..50).contains(&burst),
         "{burst} fence writes for a burst of 50 rows"
     );
+    inst.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The visibility fence's own arms, and a reset step that fails and tries again (coverage PR-3).
+//
+// `action::fence` decides, per flush, which of four waits the flush pays: a GTID set the server
+// has to report executed, the flavor's consistent-snapshot position when that position is a
+// watermark of committed transactions, one autocommit row of the commit fence when the server
+// commits in binlog order, and `LAZYWF_VISIBILITY_DELAY_MS` when none of those apply. Every one of
+// them is an answer about the SERVER's start-up configuration, so a test of an arm needs a server
+// started with that setting — never a `SET GLOBAL` on a shared server. Three of the four are
+// reachable on the run's own server (GTIDs are on there, and a direct call can name any GTID set);
+// the two that are not — `binlog_order_commits=OFF`, and a MariaDB with no binary log to report a
+// snapshot position from — are compose services of the `fences` profile (`mysql80-noorder` on
+// 34185, `mariadb1011-nobin` on 34191) and their tests say so and skip when the port answers
+// nothing:
+//
+// ```text
+// docker compose -p lazywf-test -f docker-compose.test.yml --profile fences \
+//   up -d --wait mysql80-noorder mariadb1011-nobin
+// ```
+//
+// Where an arm is reachable on the run's own server the test calls `action::fence` directly: the
+// wait does not read the binlog or the rule, and `Env`, `Env::new` and `fence` are `pub` — asking
+// it about a position, rather than driving a whole engine to a flush and hoping the flush lands on
+// the arm under test, is how the arms are separated at all.
+
+/// The fence table name the engine installs at startup (`model::FENCE`), installed here for a
+/// direct `action::fence` call. `fence::set_table` is a `OnceLock` whose first call wins, and both
+/// set the same name, so the order of an engine test and a direct call in one process cannot
+/// matter.
+fn fence_table() {
+    lazy_wire_fire::fence::set_table(lazy_wire_fire::model::FENCE);
+}
+
+/// An `action::Env` for a direct `action::fence` call on `dsn`: the five arguments the engine
+/// builds for its own flushes, with one pool serving both accounts (a fence reads only server
+/// state and its own table). The caller is done with it: `pool.disconnect().await`.
+fn fence_env(
+    dsn: &str,
+    flavor: lazy_wire_fire::source::Flavor,
+    delay: Duration,
+) -> lazy_wire_fire::action::Env {
+    fence_table();
+    let pool = mysql_async::Pool::new(mysql_async::Opts::from_url(dsn).unwrap());
+    lazy_wire_fire::action::Env::new(pool.clone(), pool, flavor, delay, 4)
+}
+
+/// One direct `action::fence` call for the boundary `(file, pos)`, with GTID set `gtid`: the
+/// result as text and how long the wait took. The elapsed time is what tells a fence that waited
+/// for the server from one that gave up and slept `LAZYWF_VISIBILITY_DELAY_MS`, so a test sets the
+/// delay far from the arm's own timing and reads this.
+async fn fence_call(
+    env: &lazy_wire_fire::action::Env,
+    file: &str,
+    pos: u64,
+    gtid: Option<String>,
+) -> (Result<(), String>, Duration) {
+    let started = std::time::Instant::now();
+    let r = lazy_wire_fire::action::fence(
+        env,
+        &lazy_wire_fire::action::FenceSpec {
+            gtid,
+            pos: lazy_wire_fire::source::Position {
+                file: file.to_string(),
+                pos,
+            },
+        },
+    )
+    .await;
+    (r.map_err(|e| format!("{e:#}")), started.elapsed())
+}
+
+/// The flavor of the server behind `db`, as the engine detects it at connect: `VERSION()` plus
+/// `@@GLOBAL.version_comment`, which is how Percona tells itself from MySQL.
+async fn server_flavor(db: &Db) -> lazy_wire_fire::source::Flavor {
+    let mut c = db.conn().await;
+    let version: String = c.query_first("SELECT VERSION()").await.unwrap().unwrap();
+    let comment: Option<String> = c
+        .query_first("SELECT @@GLOBAL.version_comment")
+        .await
+        .unwrap_or(None);
+    quit(c).await;
+    lazy_wire_fire::source::Flavor::from_version_comment(&version, comment.as_deref().unwrap_or(""))
+}
+
+/// A root DSN for `port` on the same host the run's server is on: the fence variants are compose
+/// services of the same file, started with different arguments.
+fn root_at(root: &str, port: u16) -> String {
+    let (head, _) = root
+        .rsplit_once(':')
+        .expect("a root DSN of the form scheme://user:pw@host:port");
+    format!("{head}:{port}")
+}
+
+/// A server of compose's `fences` profile, and the four answers about itself the fence branches on.
+/// `None`: nothing answers at that port (`make servers` and CI do not start the profile) or the
+/// server there is not the flavor the test is written for — in both cases the test says so and
+/// skips rather than asserting against a server it did not start.
+struct Variant {
+    root: String,
+    flavor: lazy_wire_fire::source::Flavor,
+    log_bin: String,
+    gtid_mode: String,
+    order_commits: String,
+}
+
+impl Variant {
+    /// The same server as a `Db` of its own, in schema `lwf_<name>` (the harness drops the schema
+    /// names it can read from `Db::fresh` calls in `tests/`, so this one is cleaned up too).
+    async fn db(&self, name: &str) -> Db {
+        Db::fresh(&self.root, name).await
+    }
+}
+
+/// Reads a `fences`-profile server up on `port`: whether it is MariaDB (`mariadb`) or not, and
+/// what it says about `log_bin`, `gtid_mode` and `binlog_order_commits` (empty for a variable the
+/// server does not have, as MariaDB has no `binlog_order_commits`).
+async fn variant(root: &str, port: u16, mariadb: bool) -> Option<Variant> {
+    let cand = root_at(root, port);
+    if !server_up(&cand).await {
+        return None;
+    }
+    let dsn = format!("{cand}/?prefer_socket=false");
+    let mut c = mysql_async::Conn::new(mysql_async::Opts::from_url(&dsn).ok()?)
+        .await
+        .ok()?;
+    let version: Option<String> = c.query_first("SELECT VERSION()").await.unwrap_or(None);
+    let log_bin: Option<String> = c
+        .query_first("SELECT @@GLOBAL.log_bin")
+        .await
+        .unwrap_or(None);
+    let gtid_mode: Option<String> = c
+        .query_first("SELECT @@GLOBAL.gtid_mode")
+        .await
+        .unwrap_or(None);
+    let order_commits: Option<String> = c
+        .query_first("SELECT @@GLOBAL.binlog_order_commits")
+        .await
+        .unwrap_or(None);
+    let comment: Option<String> = c
+        .query_first("SELECT @@GLOBAL.version_comment")
+        .await
+        .unwrap_or(None);
+    quit(c).await;
+    let version = version?;
+    if version.to_lowercase().contains("mariadb") != mariadb {
+        return None;
+    }
+    Some(Variant {
+        root: cand,
+        flavor: lazy_wire_fire::source::Flavor::from_version_comment(
+            &version,
+            comment.as_deref().unwrap_or(""),
+        ),
+        log_bin: log_bin.unwrap_or_default(),
+        gtid_mode: gtid_mode.unwrap_or_default(),
+        order_commits: order_commits.unwrap_or_default(),
+    })
+}
+
+/// Whether any server answers at `root` within 3 s.
+async fn server_up(root: &str) -> bool {
+    let dsn = format!("{root}/?prefer_socket=false");
+    let Ok(opts) = mysql_async::Opts::from_url(&dsn) else {
+        return false;
+    };
+    match tokio::time::timeout(Duration::from_secs(3), mysql_async::Conn::new(opts)).await {
+        Ok(Ok(c)) => {
+            quit(c).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A MariaDB with the binary log on, to fence on: the run's own server when the suite runs against
+/// MariaDB, and the compose `mariadb1011` service (34111) when it runs against MySQL and that
+/// service is up — which `make servers` and the coverage job both leave up. `None`: nothing to
+/// fence on in this process, so the test skips.
+async fn mariadb_root(root: &str) -> Option<String> {
+    for cand in [root.to_string(), root_at(root, 34111)] {
+        if !server_up(&cand).await {
+            continue;
+        }
+        let dsn = format!("{cand}/?prefer_socket=false");
+        let Ok(mut c) = mysql_async::Conn::new(mysql_async::Opts::from_url(&dsn).ok()?).await
+        else {
+            continue;
+        };
+        let version: Option<String> = c.query_first("SELECT VERSION()").await.unwrap_or(None);
+        let log_bin: Option<String> = c
+            .query_first("SELECT @@GLOBAL.log_bin")
+            .await
+            .unwrap_or(None);
+        quit(c).await;
+        let committed_log = log_bin.as_deref() == Some("1");
+        if version.is_some_and(|v| v.to_lowercase().contains("mariadb")) && committed_log {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// `SHOW GLOBAL STATUS LIKE '<name>'` as a number; absent or unparsable: 0. `name` is a literal of
+/// the test, so the statement holds nothing but the test's own text.
+async fn global_status(db: &Db, name: &str) -> u64 {
+    let mut c = db.conn().await;
+    let rows: Vec<(String, String)> = c
+        .query(format!(
+            "SHOW GLOBAL STATUS LIKE '{}'",
+            name.replace('\'', "''")
+        ))
+        .await
+        .unwrap_or_default();
+    quit(c).await;
+    rows.into_iter()
+        .next()
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The account of a fence test: a name of its own, the grants its arm needs, and a DSN to it. The
+/// fence reads `@@GLOBAL` variables (no privilege), counts its own table in `information_schema`
+/// (any grant on the schema makes the schema visible) and then creates or writes the fence table —
+/// which is the privilege a test withholds to make the arm fail.
+async fn fence_user(db: &Db, user: &str, pw: &str, root: &str, grants: &str) -> String {
+    db.exec(&format!("DROP USER IF EXISTS '{user}'@'%'")).await;
+    db.exec(&format!("CREATE USER '{user}'@'%' IDENTIFIED BY '{pw}'"))
+        .await;
+    db.exec(&format!(
+        "GRANT {grants} ON `{}`.* TO '{user}'@'%'",
+        db.schema
+    ))
+    .await;
+    let (scheme, rest) = root.split_once("://").unwrap();
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    format!(
+        "{scheme}://{user}:{pw}@{host}/{}/?prefer_socket=false",
+        db.schema
+    )
+}
+
+/// The GTID wait says no. `action::fence` asks the server to wait 5 s for the transaction the
+/// flush covers; the answer `1` means it gave up, and the fence refuses the flush rather than let
+/// a read start before the transaction it covers is visible — the rule's position does not move,
+/// so the flush runs again and no key is lost. The set here is one no server has ever executed
+/// (a UUID nobody generated), which is the same answer a transaction still in flight gives, and it
+/// is the only arm of the wait the suite can name: the `0` arm (visible) is what every flush of
+/// every MySQL test on this server already pays, so it is not proved twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_bails_when_a_gtid_never_becomes_visible() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fegtid").await;
+    let flavor = server_flavor(&db).await;
+    let mode: Option<String> = {
+        let mut c = db.conn().await;
+        let m: Option<String> = c
+            .query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .unwrap_or(None);
+        quit(c).await;
+        m
+    };
+    if !flavor.is_mysql_family() || mode.as_deref() != Some("ON") {
+        eprintln!(
+            "not a MySQL-family server with GTIDs on ({flavor:?} / {mode:?}): the GTID wait is \
+             only that server's: skipping"
+        );
+        return;
+    }
+    let (file, pos) = binlog_end(&db).await;
+    // A delay longer than the wait's own 5 s: nothing here can look like the fallback.
+    let env = fence_env(&db.dsn, flavor, Duration::from_secs(30));
+    let never = "11111111-2222-3333-4444-555555555555:1".to_string();
+    let (r, took) = fence_call(&env, &file, pos, Some(never.clone())).await;
+    env.pool.disconnect().await.ok();
+    let err = r.expect_err("a transaction no server has executed does not become visible");
+    assert!(err.contains("not visible after 5 s"), "{err}");
+    assert!(
+        err.contains("11111111-2222-3333-4444-555555555555"),
+        "the line names the transaction it waited for: {err}"
+    );
+    assert!(
+        took >= Duration::from_secs(4),
+        "the server's own 5 s wait, not a quick refusal: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(20),
+        "it gave up at the wait's deadline, not at the 30 s delay: {took:?}"
+    );
+    assert_eq!(
+        fence_count(&db).await,
+        0,
+        "the GTID arm decides before the commit fence's table is ever made"
+    );
+}
+
+/// A GTID set the server will not parse is not a flush the fence can approve by waiting: the
+/// statement errors (ER 1772 for a malformed set), the fence notes that at DEBUG — it is the
+/// server's answer, not a fault of the rule — and goes on to the commit fence, which writes one
+/// row per flush boundary and none at all for a boundary it has already fenced. The three calls are
+/// the three arms of `commit_fence`'s write: a new boundary writes, the same boundary again is
+/// `already_fenced`, the next boundary writes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_falls_to_the_commit_fence_on_a_malformed_gtid() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fegbad").await;
+    let flavor = server_flavor(&db).await;
+    let (mode, oc) = {
+        let mut c = db.conn().await;
+        let mode: Option<String> = c
+            .query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .unwrap_or(None);
+        let oc: Option<String> = c
+            .query_first("SELECT @@GLOBAL.binlog_order_commits")
+            .await
+            .unwrap_or(None);
+        quit(c).await;
+        (mode, oc)
+    };
+    if !flavor.is_mysql_family() || mode.as_deref() != Some("ON") {
+        eprintln!("not a MySQL-family server with GTIDs on: skipping the malformed-GTID test");
+        return;
+    }
+    let ordered = oc
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("ON"));
+    if !ordered {
+        eprintln!(
+            "binlog_order_commits is {oc:?}: this test reads the commit fence's writes, which \
+             need ordered commits: skipping"
+        );
+        return;
+    }
+    let (file, p1) = binlog_end(&db).await;
+    let env = fence_env(&db.dsn, flavor, Duration::from_secs(2));
+    let bad = "this is not a gtid set".to_string();
+
+    let (r, _) = fence_call(&env, &file, p1, Some(bad.clone())).await;
+    assert!(
+        r.is_ok(),
+        "the fence took over from the unusable wait: {r:?}"
+    );
+    assert_eq!(
+        fence_count(&db).await,
+        1,
+        "the boundary is fenced by one row of the fence table"
+    );
+
+    // The same boundary again: the probe is remembered for the connection and the boundary is the
+    // one already fenced, so this call touches neither the table nor the delay.
+    let (r, took) = fence_call(&env, &file, p1, Some(bad.clone())).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert!(
+        took < Duration::from_millis(1500),
+        "already fenced: neither a second write nor the 2 s delay: {took:?}"
+    );
+    assert_eq!(fence_count(&db).await, 1, "one write per boundary");
+
+    // A new boundary writes again.
+    db.tick().await;
+    let (f2, p2) = binlog_end(&db).await;
+    let (r, _) = fence_call(&env, &f2, p2, Some(bad)).await;
+    assert!(r.is_ok(), "{r:?}");
+    env.pool.disconnect().await.ok();
+    assert_eq!(
+        fence_count(&db).await,
+        2,
+        "the next boundary is a write of its own"
+    );
+}
+
+/// A probe the server refuses is not a flush the engine loses: the account may read the schema and
+/// the server's variables but not create, so `fence::probe`'s `CREATE TABLE` is refused (ER 1142),
+/// the fence remembers the connection as one it cannot fence on, says why once, and the flush waits
+/// `LAZYWF_VISIBILITY_DELAY_MS` instead. The refusal is the point: a fence that could not be exact
+/// degrades to the delay rather than failing the flush or pretending to be exact. The boundary is
+/// asked for with no GTID set — the answer a MySQL server without GTIDs gives every transaction, and
+/// equivalent to the malformed set of the test above: either way the flush reaches the commit fence
+/// because the exact wait was not available, and what the fence then does with the connection does
+/// not depend on which of the two brought it here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_probe_failure_falls_back_to_the_delay() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "feprobe").await;
+    let flavor = server_flavor(&db).await;
+    if !flavor.is_mysql_family() {
+        eprintln!(
+            "MariaDB fences on its snapshot position, never on the commit fence: skipping the \
+             probe-failure test"
+        );
+        return;
+    }
+    let user = "lwf_feprobe";
+    let dsn = fence_user(&db, user, "probe-pw", &root, "SELECT").await;
+    logs();
+    let (file, pos) = binlog_end(&db).await;
+    let env = fence_env(&dsn, flavor, Duration::from_millis(400));
+    let (r, took) = fence_call(&env, &file, pos, None).await;
+    let w = warn_lines(&["commit fence probe failed", "lwf_feprobe"]);
+    env.pool.disconnect().await.ok();
+    db.exec(&format!("DROP USER '{user}'@'%'")).await;
+
+    assert!(
+        r.is_ok(),
+        "an inexact fence is a delay, not a failed flush: {r:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(400),
+        "the flush paid LAZYWF_VISIBILITY_DELAY_MS: {took:?}"
+    );
+    assert_eq!(
+        w.len(),
+        1,
+        "one WARN for the refused probe, naming the account: {w:?}"
+    );
+    assert!(w[0].contains("CREATE"), "the probe failed on: {}", w[0]);
+    assert!(w[0].contains("1142"), "the server's own refusal: {}", w[0]);
+    assert_eq!(
+        fence_count(&db).await,
+        0,
+        "the probe that was refused created no table"
+    );
+}
+
+/// The write of an exact fence failing, rather than the probe: the fence table is there (created by
+/// the account that administers the schema, so the probe sees it and answers that commits are
+/// ordered), and it is the fence's own `INSERT` the server refuses (ER 1142). Two calls at one
+// boundary say two things: both paid the delay, because a fence whose write was refused did NOT
+/// mark the boundary fenced — the next flush must try again rather than trust a binlog event that
+/// was never written — and the WARN for the cause is one line, whatever the number of flushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_write_failure_falls_back_to_the_delay() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fewrite").await;
+    let flavor = server_flavor(&db).await;
+    if !flavor.is_mysql_family() {
+        eprintln!("not the MySQL family: the commit fence is not this server's: skipping");
+        return;
+    }
+    let oc = {
+        let mut c = db.conn().await;
+        let oc: Option<String> = c
+            .query_first("SELECT @@GLOBAL.binlog_order_commits")
+            .await
+            .unwrap_or(None);
+        quit(c).await;
+        oc
+    };
+    let ordered = oc
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("ON"));
+    if !ordered {
+        eprintln!(
+            "binlog_order_commits is {oc:?}: the write of the commit fence is only reached where \
+             commits are in binlog order: skipping"
+        );
+        return;
+    }
+    db.exec(&format!(
+        "CREATE TABLE {} (`id` VARCHAR(64) NOT NULL PRIMARY KEY, `n` BIGINT UNSIGNED NOT NULL) \
+         ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        lazy_wire_fire::model::FENCE
+    ))
+    .await;
+    let user = "lwf_fewrite";
+    // CREATE, so the probe is satisfied by the table that is already there, and nothing else: the
+    // fence's own row change is what the account is refused.
+    let dsn = fence_user(&db, user, "write-pw", &root, "CREATE").await;
+    logs();
+    let (file, pos) = binlog_end(&db).await;
+    let env = fence_env(&dsn, flavor, Duration::from_millis(400));
+    let (r1, t1) = fence_call(&env, &file, pos, None).await;
+    let (r2, t2) = fence_call(&env, &file, pos, None).await;
+    let w = warn_lines(&["commit fence write failed", "lwf_fewrite"]);
+    env.pool.disconnect().await.ok();
+    db.exec(&format!("DROP USER '{user}'@'%'")).await;
+
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "a refused write degrades: {r1:?} / {r2:?}"
+    );
+    assert!(
+        t1 >= Duration::from_millis(400) && t2 >= Duration::from_millis(400),
+        "both flushes waited the delay: a refused write leaves the boundary unfenced: {t1:?} / {t2:?}"
+    );
+    assert_eq!(w.len(), 1, "one WARN per cause, not one per flush: {w:?}");
+    assert!(w[0].contains("1142"), "the server's own refusal: {}", w[0]);
+    assert_eq!(
+        fence_count(&db).await,
+        0,
+        "the refused write left the fence table empty"
+    );
+}
+
+/// MariaDB's own fence: its consistent-snapshot position is a watermark of committed
+/// transactions, so `action::fence` opens a snapshot and reads the pair back, and the flush may
+/// read as soon as that pair has reached the boundary it covers. Three calls, one Env: a boundary
+/// the server has passed is visible at once (the pair is read, the memo records that the server
+/// reports it, and the delay — set longer here than the loop's whole 5 s — is never slept); a
+/// boundary the server will never reach is refused at the loop's deadline, naming the position; and
+/// a boundary reached afterwards is fenced again at once, which is what the memoization of the
+/// server's answer buys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mariadb_snapshot_fence_waits_and_bails() {
+    let root = need_db!();
+    let Some(mari) = mariadb_root(&root).await else {
+        eprintln!(
+            "no MariaDB with the binary log on answers (this run is against MySQL and nothing is \
+             listening on the mariadb1011 service's port 34111): skipping"
+        );
+        return;
+    };
+    let db = Db::fresh(&mari, "fesnap").await;
+    let flavor = server_flavor(&db).await;
+    if flavor != lazy_wire_fire::source::Flavor::MariaDb {
+        eprintln!("{flavor:?} at {mari}: the snapshot fence is MariaDB's: skipping");
+        return;
+    }
+    let env = fence_env(&db.dsn, flavor, Duration::from_secs(30));
+
+    // (a) The position the server is at is visible to a snapshot started now.
+    let (file, pos) = binlog_end(&db).await;
+    let (r, took) = fence_call(&env, &file, pos, None).await;
+    assert!(r.is_ok(), "the server's own position is visible: {r:?}");
+    assert!(
+        took < Duration::from_secs(2),
+        "the snapshot said so, not the 30 s delay: {took:?}"
+    );
+
+    // (b) A position past the end of the binlog: the loop asks until its 5 s are up and says what
+    // it was waiting for. An `Err` is the whole point — the delay path answers `Ok`, so a fence
+    // that had fallen back would have hidden the unreachable position.
+    let (file, _) = binlog_end(&db).await;
+    let (r, took) = fence_call(&env, &file, u64::MAX / 4, None).await;
+    let err = r.expect_err("a position the server has not reached is not visible");
+    assert!(err.contains("not visible after 5 s"), "{err}");
+    assert!(err.contains(&file), "the line names the position: {err}");
+    assert!(
+        took >= Duration::from_secs(4) && took < Duration::from_secs(10),
+        "the loop's own deadline, not the 30 s delay and not a quick give-up: {took:?}"
+    );
+
+    // (c) The server's answer is remembered: a reachable boundary after the failure is fenced at
+    // once, so the failure did not put the connection out of use.
+    db.tick().await;
+    let (f2, p2) = binlog_end(&db).await;
+    let (r, took) = fence_call(&env, &f2, p2, None).await;
+    env.pool.disconnect().await.ok();
+    assert!(r.is_ok(), "the fence is still fencing: {r:?}");
+    assert!(
+        took < Duration::from_secs(2),
+        "the position, the pair and the memo again: {took:?}"
+    );
+}
+
+/// A server that reports no consistent-snapshot pair has ruled itself out as a fence: MariaDB
+/// without the binary log answers the pair with an empty file, and the fence notes that once
+/// (`snapshot_fence = 2`) and stops opening snapshots for the life of the instance. The evidence is
+/// the server's own counter: the first fence opened a transaction (`Com_begin` moved) and the
+/// second opened none at all, while both paid the delay it fell back to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_fence_falls_back_when_the_server_reports_no_pair() {
+    let root = need_db!();
+    let Some(v) = variant(&root, 34191, true).await else {
+        eprintln!(
+            "nothing answers as a MariaDB on 34191 (compose profile `fences`, service \
+             `mariadb1011-nobin`: make servers does not start it): skipping"
+        );
+        return;
+    };
+    if v.log_bin != "0" {
+        eprintln!("the server on 34191 has log_bin = {}: skipping", v.log_bin);
+        return;
+    }
+    let db = v.db("feno").await;
+    let env = fence_env(&db.dsn, v.flavor, Duration::from_secs(1));
+    // What the boundary is does not matter to this arm: the server's answer about the snapshot is
+    // the empty file that rules the fence out before the position is compared.
+    let begins = global_status(&db, "Com_begin").await;
+    let (r, took) = fence_call(&env, "mysql-bin.000001", 4, None).await;
+    assert!(r.is_ok(), "the fence degrades to the delay: {r:?}");
+    assert!(
+        took >= Duration::from_secs(1),
+        "no pair, so the delay: {took:?}"
+    );
+    let after_first = global_status(&db, "Com_begin").await;
+    assert!(
+        after_first > begins,
+        "the loop opened a transaction before the empty pair gave the answer away: \
+         {begins} -> {after_first}"
+    );
+
+    // The second fence of the same instance asks the server nothing: no transaction is opened.
+    let (r, took) = fence_call(&env, "mysql-bin.000001", 4, None).await;
+    env.pool.disconnect().await.ok();
+    assert!(r.is_ok(), "{r:?}");
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_secs(4),
+        "the delay only, and not the 5 s of a loop the memo closed: {took:?}"
+    );
+    assert_eq!(
+        global_status(&db, "Com_begin").await,
+        after_first,
+        "the second fence opened no transaction at all: the server's answer is remembered"
+    );
+}
+
+/// The commit fence on the one server whose probe sees `binlog_order_commits` present and `OFF`
+/// (MySQL started without it, which cannot coexist with GTIDs — so this server has neither). With
+/// commits not in binlog order, a row of the fence would return before the transactions it is
+/// supposed to have waited for are committed, so the fence writes nothing at all, says why once, and
+/// the flush waits the delay. The absence is what is proved: no fence table in this schema, and no
+/// wait that could have been the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_fence_not_ordered_waits_the_delay() {
+    let root = need_db!();
+    let Some(v) = variant(&root, 34185, false).await else {
+        eprintln!(
+            "nothing answers as MySQL on 34185 (compose profile `fences`, service \
+             `mysql80-noorder`: make servers does not start it): skipping"
+        );
+        return;
+    };
+    if v.gtid_mode != "OFF"
+        || !(v.order_commits == "0" || v.order_commits.eq_ignore_ascii_case("OFF"))
+    {
+        eprintln!(
+            "the server on 34185 says gtid_mode = {} / binlog_order_commits = {}: skipping",
+            v.gtid_mode, v.order_commits
+        );
+        return;
+    }
+    let db = v.db("fenord").await;
+    let (file, pos) = binlog_end(&db).await;
+    logs();
+    let env = fence_env(&db.dsn, v.flavor, Duration::from_secs(1));
+    // The WARN of this cause names no schema and no account (it is about a server variable), so the
+    // test attributes it by what it owns: the count of that line before and after a call of its
+    // own, on a server no other test of this file reads.
+    let before = warn_lines(&["binlog_order_commits is OFF"]).len();
+    let (r, took) = fence_call(&env, &file, pos, None).await;
+    let after = warn_lines(&["binlog_order_commits is OFF"]).len();
+    env.pool.disconnect().await.ok();
+
+    assert!(
+        r.is_ok(),
+        "unordered commits are the fence's no, not a failed flush: {r:?}"
+    );
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_secs(4),
+        "the delay, and neither the GTID nor the snapshot loop: {took:?}"
+    );
+    assert!(
+        after > before,
+        "one WARN saying why there is no commit fence: {before} -> {after} lines"
+    );
+    assert_eq!(
+        fence_count(&db).await,
+        0,
+        "commits out of binlog order: a fence row would be a lie, so none is written"
+    );
+}
+
+/// A reset step the target refuses is not a reset that gave up. A `500` is a transient failure, so
+/// the step stays the step it was — the reset does not skip ahead and does not start over from a
+/// step that already ran — and the same step is sent again after the reset's backoff. What the
+/// target sees is the evidence: the refused request twice, the first answer a refusal, the second
+/// the one that counted; and the run continues through the steps after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_reset_step_retries_with_backoff() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fstp").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("INSERT INTO items VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    // The first request for the `once` step is refused; the step's second attempt is answered.
+    // Arrivals and answers are counted apart: a refusal arrived, it was never delivered.
+    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answered_ok = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (a, o) = (arrived.clone(), answered_ok.clone());
+    mock.respond(move |r| {
+        if r.path == "/fstp/c" {
+            if a.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return (500, "not now".into());
+            }
+            o.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        (200, "{}".into())
+    });
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"once": true, "template": "POST /fstp/c HTTP/1.1\n\n"},
+        {"for_each": "snapshot"}
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('fstp', 'hook', 'SELECT id AS _key, v FROM items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM items', \
+         'POST /fstp/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.v}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("fstp", "items", Some("{{new.id}}"), None).await;
+    logs();
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    let warn = wait_for(
+        Duration::from_secs(30),
+        "the refused step logged as failed and retried",
+        || async {
+            warn_lines(&["fstp", "reset step 1 failed", "retrying"])
+                .first()
+                .cloned()
+        },
+    )
+    .await;
+    assert!(
+        warn.contains("status 500"),
+        "the line says what the target answered: {warn}"
+    );
+    let (_, _, _, err) = wait_for(
+        Duration::from_secs(15),
+        "the status row holding the refusal",
+        || async {
+            let s = db.status("fstp").await?;
+            (s.3.as_ref()?.contains("status 500")).then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("status 500")),
+        "the status row says what the step answered: {err:?}"
+    );
+
+    wait_for(
+        Duration::from_secs(30),
+        "the reset done with every key of the snapshot sent",
+        || async {
+            let (f, _, state, _) = db.status("fstp").await?;
+            if !f.is_empty() && state.starts_with("done") {
+                let all: String = mock
+                    .requests()
+                    .iter()
+                    .filter(|r| r.path == "/fstp/bulk")
+                    .map(|r| r.body.clone())
+                    .collect();
+                (1..=5)
+                    .all(|k| all.contains(&format!("{k}={k}")))
+                    .then_some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await;
+    let reqs = mock.requests();
+    let once = reqs.iter().filter(|r| r.path == "/fstp/c").count();
+    assert_eq!(
+        once, 2,
+        "the refused step arrived twice, once refused once answered"
+    );
+    assert_eq!(
+        answered_ok.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "and the step was answered exactly once"
+    );
+    let first_bulk = reqs
+        .iter()
+        .position(|r| r.path == "/fstp/bulk" && r.body.contains("5=5"));
+    let last_once = reqs.iter().rposition(|r| r.path == "/fstp/c");
+    assert!(
+        first_bulk.is_some() && last_once.is_some_and(|l| l < first_bulk.unwrap()),
+        "the retried `once` step still precedes the snapshot step: {reqs:?}"
+    );
+    inst.stop().await;
+}
+
+/// The snapshot step's own key read failing: the keys come from a SQL statement the configuration
+/// defines, and when the server cannot run it the step does not report an empty snapshot — an empty
+/// snapshot would let the reset finish and clear the flag with nothing fired. The engine notes the
+/// read failed, keeps the step, and runs it again after the backoff; here the statement reads a
+/// view whose base table has gone, and the reset finishes once the table is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_keys_read_failure_retries_the_step() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fsnap").await;
+    db.exec("CREATE TABLE snap (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("INSERT INTO snap VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await;
+    db.exec("CREATE VIEW v_snap AS SELECT id, v FROM snap")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"for_each": "snapshot"}]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('fsnap', 'hook', 'SELECT id AS _key, v FROM v_snap WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM v_snap', \
+         'POST /fsnap/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.v}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("fsnap", "snap", Some("{{new.id}}"), None).await;
+    logs();
+    let inst = Instance::ready(config(&db, &[])).await;
+    let delivered = || {
+        let all: String = mock
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/fsnap/bulk")
+            .map(|r| r.body.clone())
+            .collect();
+        all
+    };
+    wait_for(Duration::from_secs(30), "the first reset done", || async {
+        let (_, _, state, _) = db.status("fsnap").await?;
+        (state.starts_with("done") && (1..=5).all(|k| delivered().contains(&format!("{k}={k}"))))
+            .then_some(())
+    })
+    .await;
+
+    // The base table of the view is gone. Replacing a table the rule reads is itself a reason the
+    // engine gives the rule to run its reset again (it cannot know from row events what the
+    // statement now reads), so the step runs with nothing else asked of it.
+    inst.quiet().await;
+    mock.clear();
+    db.exec("DROP TABLE snap").await;
+    let warn = wait_for(
+        Duration::from_secs(30),
+        "the snapshot key read failing",
+        || async {
+            warn_lines_in(&db, &["reading the snapshot keys failed"])
+                .first()
+                .cloned()
+        },
+    )
+    .await;
+    // Which words the server uses for a view whose base table is gone is the server's own: MySQL
+    // says the view references invalid tables (1356), MariaDB names the missing base table (1146).
+    // What is the test's own is the schema (`warn_lines_in`) and this rule's view or table.
+    assert!(
+        warn.contains("snap") && (warn.contains("1356") || warn.contains("1146")),
+        "the server's own words about the statement it could not run: {warn}"
+    );
+    let (_, _, _, err) = wait_for(
+        Duration::from_secs(15),
+        "the status row holding the reason",
+        || async {
+            let s = db.status("fsnap").await?;
+            s.3.as_deref()?.contains("snap").then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("snap")),
+        "the status row holds the reason: {err:?}"
+    );
+
+    // The step is still there: with the table back, the same reset finishes.
+    db.exec("CREATE TABLE snap (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("INSERT INTO snap VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await;
+    wait_for(
+        Duration::from_secs(30),
+        "the reset done after the table came back",
+        || async {
+            let (_, _, state, _) = db.status("fsnap").await?;
+            (state.starts_with("done")
+                && (1..=5).all(|k| delivered().contains(&format!("{k}={k}"))))
+            .then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// The stray step's listing failing is a step failure of its own: the target answered the list
+/// request with a `500`, so the engine does not call the empty listing a set of no strays (that
+/// would end the reset with nothing deleted) — it notes the listing failed and runs the step again.
+/// The retry is what makes the two keys that are the target's and nobody's get their delete: the
+/// listing that succeeded is the second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stray_listing_failure_retries_the_step() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fstray").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("INSERT INTO items VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    let listed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let l = listed.clone();
+    mock.respond(move |r| {
+        if r.path.starts_with("/fstray/_ids") {
+            if l.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return (500, "the index is down".into());
+            }
+            return (200, r#"{"ids":["1","98","99"],"next":null}"#.into());
+        }
+        (200, "{}".into())
+    });
+    db.target("idx", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"for_each": "snapshot"},
+        {"for_each": "stray", "list_template": "GET /fstray/_ids HTTP/1.1\n\n",
+         "keys": "JSON_EXTRACT(body, '$.ids')",
+         "template": "POST /fstray/strays HTTP/1.1\n\n{{json reset.keys}}"}
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('fstray', 'idx', 'SELECT id AS _key, v FROM items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM items', \
+         'POST /fstray/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.v}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("fstray", "items", Some("{{new.id}}"), None)
+        .await;
+    logs();
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    let warn = wait_for(
+        Duration::from_secs(30),
+        "the listing failing once",
+        || async {
+            warn_lines(&["fstray", "listing the target's keys failed", "retrying"])
+                .first()
+                .cloned()
+        },
+    )
+    .await;
+    assert!(
+        warn.contains("status 500"),
+        "what the target answered: {warn}"
+    );
+    let (_, _, _, err) = wait_for(
+        Duration::from_secs(15),
+        "the status row holding it",
+        || async {
+            let s = db.status("fstray").await?;
+            s.3.as_ref()?.contains("status 500").then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("status 500")),
+        "the status row says what the listing answered: {err:?}"
+    );
+
+    let strays = wait_for(
+        Duration::from_secs(30),
+        "the strays of the listing that worked",
+        || async {
+            let reqs = mock.requests();
+            let r = reqs.iter().find(|r| r.path == "/fstray/strays")?;
+            let keys: Vec<String> = serde_json::from_str(&r.body).ok()?;
+            (!keys.is_empty()).then_some(keys)
+        },
+    )
+    .await;
+    assert_eq!(
+        strays,
+        vec!["98".to_string(), "99".to_string()],
+        "the two keys the snapshot does not have, and only those"
+    );
+    assert!(
+        listed.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the listing was asked again after the refusal"
+    );
+    wait_for(Duration::from_secs(15), "the reset done", || async {
+        let (_, _, state, _) = db.status("fstray").await?;
+        state.starts_with("done").then_some(())
+    })
+    .await;
+    inst.stop().await;
+}
+
+/// The documents of a snapshot batch, read from a select the configuration defines, failing: the
+/// keys are known (they come from a table of their own), the rows behind them are not, and the
+/// difference matters — a batch whose reads failed has no confirmed keys, so nothing of it counts as
+/// done and the keys go back for the retry. The table the documents are read from is a table of the
+/// rule, so replacing it is the reason the steps run again; the WARN names the step that failed, and
+/// with the table back every key is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_doc_read_failure_retries_the_snapshot_step() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "fdocs").await;
+    db.exec("CREATE TABLE keys_tbl (id INT PRIMARY KEY)").await;
+    db.exec("INSERT INTO keys_tbl VALUES (1),(2),(3),(4),(5)")
+        .await;
+    db.exec("CREATE TABLE docs_tbl (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("INSERT INTO docs_tbl VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, "{}".into()));
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"for_each": "snapshot"}]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('fdocs', 'hook', 'SELECT id AS _key, v FROM docs_tbl WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM keys_tbl', \
+         'POST /fdocs/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.v}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("fdocs", "docs_tbl", Some("{{new.id}}"), None)
+        .await;
+    logs();
+    let inst = Instance::ready(config(&db, &[])).await;
+    let delivered = || {
+        mock.requests()
+            .iter()
+            .filter(|r| r.path == "/fdocs/bulk")
+            .map(|r| r.body.clone())
+            .collect::<String>()
+    };
+    wait_for(Duration::from_secs(30), "the first reset done", || async {
+        let (_, _, state, _) = db.status("fdocs").await?;
+        (state.starts_with("done") && (1..=5).all(|k| delivered().contains(&format!("{k}={k}"))))
+            .then_some(())
+    })
+    .await;
+
+    // The table the documents are read from is gone, which is itself the reason the engine runs
+    // the steps again; the read of the batch is what fails now, not the read of the keys.
+    inst.quiet().await;
+    mock.clear();
+    db.exec("DROP TABLE docs_tbl").await;
+    let warn = wait_for(
+        Duration::from_secs(30),
+        "the document read failing",
+        || async {
+            warn_lines_in(&db, &["fdocs", "reset step 1 failed"])
+                .first()
+                .cloned()
+        },
+    )
+    .await;
+    assert!(
+        warn.contains("lwf_fdocs.docs_tbl"),
+        "the server names the table it could not read: {warn}"
+    );
+    let (_, _, _, err) = wait_for(
+        Duration::from_secs(15),
+        "the status row holding the reason",
+        || async {
+            let s = db.status("fdocs").await?;
+            s.3.as_deref()?.contains("docs_tbl").then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("docs_tbl")),
+        "the status row holds the reason: {err:?}"
+    );
+
+    db.exec("CREATE TABLE docs_tbl (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.exec("INSERT INTO docs_tbl VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await;
+    wait_for(
+        Duration::from_secs(40),
+        "every key delivered after the table came back",
+        || async {
+            let (_, _, state, _) = db.status("fdocs").await?;
+            (state.starts_with("done")
+                && (1..=5).all(|k| delivered().contains(&format!("{k}={k}"))))
+            .then_some(())
+        },
+    )
+    .await;
     inst.stop().await;
 }
 
@@ -11695,6 +12795,290 @@ async fn a_rule_change_restarts_the_reset_in_flight() {
         },
     )
     .await;
+    inst.stop().await;
+}
+
+/// `reset_requested = 1` raised while one of the rule's reset steps is in flight. The run that is
+/// already going started on its own, so its remainder is not the reset that was asked for: the rule
+/// starts it over from step 1 with the rule as it now stands — the same `start_reset` a changed
+/// rule makes (see [`a_rule_change_restarts_the_reset_in_flight`]) — and only the finished run
+/// clears the flag. The target is what tells the runs apart: step 1 arrives and is ANSWERED again
+/// after the request, where the run that was going had already left that step behind. A run that
+/// already serves the flag is not restarted again by a later reload (the flag stays 1 until the
+/// steps succeed, so restarting on every reload would be a reset that never finishes), which the
+/// second rule loaded mid-run proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_requested_while_a_step_is_in_flight_starts_the_reset_over() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "wedge").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, title VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO items VALUES (1,'a'),(2,'b')").await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    // The paths the mock ANSWERED (see [`answer_log`]) and, beside them, the bodies of the
+    // snapshot step's answered sends: what a key was delivered to, and by which run.
+    let ans: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let bulk: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (paths, bodies) = (ans.clone(), bulk.clone());
+    mock.respond(move |r| {
+        paths.lock().unwrap().push(r.path.clone());
+        if r.path == "/wd/bulk" {
+            bodies.lock().unwrap().push(r.body.clone());
+        }
+        (200, "{}".into())
+    });
+    db.target("idx", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"once": true, "template": "DELETE /wd/cache HTTP/1.1\n\n"},
+        {"for_each": "snapshot"},
+        {"once": true, "template": "DELETE /wd/tail HTTP/1.1\n\n"}
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('wedge', 'idx', 'SELECT id AS _key, title FROM items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM items', \
+         'POST /wd/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.title}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("wedge", "items", Some("{{new.id}}"), None).await;
+    // The first-start reset answers step 1 and stops there: its step 2 (the snapshot's send) is
+    // in flight, unanswered, when the flag is raised below.
+    mock.hold_after(1);
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the reset to stand at step 2",
+        || async {
+            let (_, _, rs, _) = db.status("wedge").await?;
+            (rs.contains("running: step 2/3") && answered(&ans, "/wd/cache") == 1).then_some(())
+        },
+    )
+    .await;
+    // THE premise, proven rather than assumed: the row says step 2 is running and the mock has
+    // answered this rule's step-2 send never — it is in flight when the flag goes in.
+    assert_eq!(
+        answered(&ans, "/wd/bulk"),
+        0,
+        "the snapshot step had been answered: it was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'wedge'")
+        .await;
+    // The requested reset runs the rule from step 1, so its step 1 arrives while the abandoned
+    // step 2 send is still outstanding: two arrivals on /wd/cache, one answer. Polled, because
+    // the restart owes the abandoned step its lane first; the message names the symptom this test
+    // exists for: the row keeps reporting the run that predates the request and step 1 is never
+    // sent again.
+    let mut arrived = 0;
+    let mut mid = db.status("wedge").await.expect("the status row");
+    for _ in 0..40 {
+        arrived = mock
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/wd/cache")
+            .count();
+        mid = db.status("wedge").await.expect("the status row");
+        if arrived >= 2 {
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert!(
+        arrived >= 2,
+        "`reset_requested = 1` raised while step 2 was in flight started no reset: the row still \
+         reports the run that predates the request, and step 1 was sent once in the rule's life. \
+         reset_state {:?}, last_error {:?}, arrived-and-answered {}",
+        mid.2,
+        mid.3,
+        traffic(&mock, &ans)
+    );
+    // The flag is not honoured by re-running the steps the old run had already left behind: the
+    // row says so while the request is outstanding.
+    let mid = db.status("wedge").await.expect("the status row");
+    assert!(
+        mid.2.starts_with("pending:") || mid.2.starts_with("running:"),
+        "the reset of a rule the flag was raised under is still going: {mid:?}"
+    );
+
+    // A second rule loaded now forces a reload of the whole configuration, and with it an
+    // `update_rule` for this rule while the REQUESTED run is in flight. It must not restart that
+    // one: its own first-start reset being answered proves the reload happened.
+    mock.hold_after(0);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('wedgeb', 'idx', 'POST /wd/bulk2 HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (json!([{"once": true, "template": "DELETE /wd/b-only HTTP/1.1\n\n"}]).to_string(),),
+    )
+    .await;
+    db.trigger("wedgeb", "items", Some("{{new.id}}"), None)
+        .await;
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "the other rule's reset to run",
+        || async { (answered(&ans, "/wd/b-only") >= 1).then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(30),
+        "the requested reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("wedge").await?;
+            (rs.starts_with("done:") && answered(&ans, "/wd/tail") >= 1).then_some(())
+        },
+    )
+    .await;
+    let cleared: Vec<u8> = db
+        .query("SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'wedge'")
+        .await;
+    assert_eq!(
+        cleared,
+        vec![0],
+        "the finished reset clears the flag it was asked with"
+    );
+    // The requested reset ran the whole rule, and the reload that came in the middle of it did
+    // not start it over again: step 1 answered exactly twice in the rule's life — the first
+    // start's run and the requested one — and the tail step belongs to the requested run alone.
+    assert_eq!(
+        answered(&ans, "/wd/cache"),
+        2,
+        "step 1 ran once for the first start and once for the requested reset ({})",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        answered(&ans, "/wd/tail"),
+        1,
+        "the requested run ran the steps after the one it was interrupted in, once ({})",
+        traffic(&mock, &ans)
+    );
+    // The keys of the step that was in flight when the restart came are not lost and are not
+    // counted as delivered by the run that abandoned them: the mock froze that send (it is in
+    // `requests()` and answers nothing), and the restarted run re-read the snapshot and sent the
+    // same keys again — one answered `/wd/bulk` carrying both of them, and only that one.
+    let delivered = bulk
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b.contains("1=a") && b.contains("2=b"))
+        .count();
+    assert_eq!(
+        delivered,
+        1,
+        "the snapshot keys of the abandoned step were sent again, once, by the requested run ({})",
+        traffic(&mock, &ans)
+    );
+    // And the rule works: a key after the reset is delivered.
+    db.exec("INSERT INTO items VALUES (3,'c')").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the rule firing after the reset",
+        || async {
+            let (f, p, _, _) = db.status("wedge").await?;
+            let sent = mock
+                .requests()
+                .iter()
+                .any(|r| r.path == "/wd/bulk" && r.body.contains("3=c"));
+            (sent && (f, p) >= after).then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// The same request landing while a read-only prep step (a stray listing, `st.prep`) is in
+/// flight: the run the flag supersedes still holds the rule's `prep` until that job answers, and
+/// the restarted run must not be left standing on it. The step's own result is that abandoned
+/// run's and counts for nothing; the new run lists the strays again and the reset finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_requested_while_a_prep_step_is_in_flight_finishes() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "wedgyp").await;
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, title VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO items VALUES (1,'a'),(2,'b')").await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    db.target("idx", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"for_each": "stray", "list_template": "GET /wyp/ids HTTP/1.1\n\n",
+         "keys": "JSON_EXTRACT(body, '$.ids')", "next": "JSON_EXTRACT(body, '$.next')",
+         "template": "POST /wyp/strays HTTP/1.1\n\n{{json reset.keys}}"},
+        {"once": true, "template": "DELETE /wyp/cache HTTP/1.1\n\n"}
+    ]);
+    // The record of answers (see [`answer_log`], which answers 200 to everything and so cannot
+    // carry the listing's body) and the listing's own answer, in one responder.
+    let ans: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let l = ans.clone();
+    mock.respond(move |r| {
+        l.lock().unwrap().push(r.path.clone());
+        if r.path == "/wyp/ids" {
+            (200, r#"{"ids":["7","8"]}"#.into())
+        } else {
+            (200, "{}".into())
+        }
+    });
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('wedgyp', 'idx', 'SELECT id AS _key, title FROM items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM items', \
+         'POST /wyp/bulk HTTP/1.1\n\n{{#each docs}}{{key}}={{doc.title}};{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("wedgyp", "items", Some("{{new.id}}"), None)
+        .await;
+    // Nothing is answered: the first-start reset stands in its stray listing, which is the step
+    // that holds `st.prep`.
+    mock.hold_after(0);
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the listing to be in flight",
+        || async {
+            let (_, _, rs, _) = db.status("wedgyp").await?;
+            (rs.contains("running: step 1/2")).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        answered(&ans, "/wyp/ids"),
+        0,
+        "the listing was answered: the prep step was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'wedgyp'")
+        .await;
+    sleep_ms(2_000).await;
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "the requested reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("wedgyp").await?;
+            (rs.starts_with("done:") && answered(&ans, "/wyp/cache") >= 1).then_some(())
+        },
+    )
+    .await;
+    let cleared: Vec<u8> = db
+        .query("SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'wedgyp'")
+        .await;
+    assert_eq!(
+        cleared,
+        vec![0],
+        "the finished reset clears the flag it was asked with"
+    );
+    let reqs = mock.requests();
+    assert!(
+        reqs.iter()
+            .any(|r| r.path == "/wyp/strays" && r.body.contains("7")),
+        "the strays of the listing that answered were deleted: {reqs:?}"
+    );
     inst.stop().await;
 }
 

@@ -15,16 +15,35 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use common::fault::{
-    drain, sweep_ran, sweep_xa_once, xa_recover_lwf, FaultLog, FaultProxy, Lazy, Sampler, XaGuard,
-    XaPin,
+    drain, environment_aborts, sweep_ran, sweep_xa_once, xa_recover_lwf, FaultLog, FaultProxy,
+    Lazy, Sampler, Stop, XaGuard, XaPin,
 };
 use common::*;
 use mysql_async::prelude::*;
+
+/// Brings the engine child to ready and ends the seed when the *environment* took it. `ready`
+/// has already printed the signal, the host load and the OOM counters and recorded the abort in
+/// `tmp/out/chaos/env-aborts.log`; every other way a child fails to start stays a panic inside
+/// `ready`. A seed whose child is gone can assert nothing, and reporting the kernel's OOM kill as
+/// a product failure is how a suite sends someone to bisect a commit that never moved.
+macro_rules! ready_or_skip {
+    ($lazy:expr, $secs:expr) => {{
+        if !$lazy.ready($secs).await {
+            eprintln!(
+                "SKIPPED BY ENVIRONMENT at {}:{} — the harness's child was taken; see \
+                 tmp/out/chaos/env-aborts.log",
+                file!(),
+                line!()
+            );
+            return;
+        }
+    }};
+}
 
 /// The design's `chaos_shop`: `shop()` tables plus the `items` table whose version column
 /// serves P4's (key, version) check for the later churn scenarios.
@@ -204,7 +223,7 @@ async fn s1_source_cut_mid_stream() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -297,7 +316,7 @@ async fn t1_target_down() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -371,6 +390,832 @@ async fn t1_target_down() {
     sp.stop();
 }
 
+// ---------------------------------------------------------------------- T2 slow target
+
+/// `id:version` keys for a churn load: a row that comes back with a new version is a *new* key,
+/// which is what keeps the sampler's P4 check hard for a load that repeats (design §2 T2).
+fn version_keys(from: u32, to: u32, v: u32) -> BTreeSet<String> {
+    (from..=to).map(|i| format!("{i}:{v}")).collect()
+}
+
+fn union_keys(sets: &[BTreeSet<String>]) -> BTreeSet<String> {
+    sets.iter().flatten().cloned().collect()
+}
+
+/// Every key of `want` has to have reached `mock` at least once (P1's delivery side, for the
+/// keyed loads whose keys are not a plain range).
+fn assert_keys(mock: &Mock, want: &BTreeSet<String>, what: &str) {
+    let got = mock.keys_received();
+    let missing: Vec<&String> = want.iter().filter(|k| !got.contains(*k)).collect();
+    assert!(
+        missing.is_empty(),
+        "{what}: {} of {} keys were never delivered (e.g. {:?})",
+        missing.len(),
+        want.len(),
+        missing.iter().take(8).collect::<Vec<_>>()
+    );
+}
+
+/// (deliveries, keys that arrived more than once) for a seed's own report. P4's rule is the
+/// sampler's; the seed only has to say out loud what the run really delivered, because "no
+/// duplicates" claimed without a number is exactly how a lost fault hides (mutation M1).
+fn delivery_report(mock: &Mock) -> (usize, usize) {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, keys) in mock.deliveries() {
+        for k in keys {
+            *seen.entry(k).or_insert(0) += 1;
+        }
+    }
+    let repeated = seen.values().filter(|n| **n > 1).count();
+    (seen.values().sum(), repeated)
+}
+
+/// One re-update of the whole churn range: one statement, so one transaction and one group.
+async fn bump_items(db: &Db, from: u32, to: u32) {
+    db.exec(&format!(
+        "UPDATE items SET v = v + 1 WHERE id BETWEEN {from} AND {to}"
+    ))
+    .await;
+}
+
+/// The churn rule: keyed on `(id, v)`, body `{{join keys ","}}`, so the mock's request log shows
+/// every key of every version the engine believed it had sent.
+async fn version_rule(db: &Db, rule: &str, target: &str) {
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, 'POST /hook HTTP/1.1\n\n{{join keys \",\"}}', 100)",
+        (rule, target),
+    )
+    .await;
+    db.trigger(rule, "items", Some("{{new.id}}:{{new.v}}"), None)
+        .await;
+}
+
+/// The rule's own `last_error`, once it says `needle`. Gating on the text (rather than on
+/// "some error appeared") is what makes the fault's *shape* an assertion: an outage that shows
+/// up as the wrong error is a different bug, and a mutant that breaks the error path would see
+/// this wait time out with the text it did get.
+async fn wait_rule_error(db: &Db, rule: &str, needle: &str, secs: u64) -> String {
+    wait_for(
+        Duration::from_secs(secs),
+        &format!("rule {rule}'s last_error to name `{needle}`"),
+        || async {
+            db.status(rule)
+                .await
+                .and_then(|(_, _, _, e)| e)
+                .filter(|e| e.contains(needle))
+        },
+    )
+    .await
+}
+
+/// T2 (design §2): the target answers, but late. 300 `items` rows are re-updated six times —
+/// 1 800 events, 300 distinct `(key, version)` keys per round — in two stages. Stage A answers
+/// 400 ms after the request, inside the target's own 3 000 ms timeout: late, but in time, so
+/// everything is still delivered. Stage B answers 4 000 ms after it, past that timeout: the mock
+/// does write an answer, and no answer of that kind may be believed (`Mock::late_answers` counts
+/// them and they are never deliveries, design §1 P4), so the rule's position has to stay below
+/// the checkpoint of everything stage B left unconfirmed until the heal.
+///
+/// Asserted: the slow stage fires *at the mock* (an armed mode is not a fired one), stage A
+/// delivers its keys, nothing is late inside the client's own timeout, stage B leaves the row
+/// pinned below its first unconfirmed checkpoint while `/status` still shows pending keys and
+/// `last_error` names the client timeout, and after `heal()` the backlog drains inside the bound
+/// with every `(key, version)` key delivered and no key struck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t2_target_slow() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_t2").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("t2-slow");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("slow", "http", &mock.url(), None, "{}").await;
+    version_rule(&db, "slow", "slow").await;
+    let rows: Vec<String> = (1..=300).map(|i| format!("({i}, 1, 'x', 1)")).collect();
+    db.exec(&format!("INSERT INTO items VALUES {}", rows.join(",")))
+        .await;
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "t2_target_slow",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_log(&lazy.log_path);
+
+    // ---- Stage A: 400 ms, inside the target's 3 000 ms timeout: late, but in time.
+    mock.delay(400, 3000);
+    let mut cps_a: Vec<(String, u64)> = Vec::new();
+    let mut want_a: Vec<BTreeSet<String>> = Vec::new();
+    for round in 1..=3u32 {
+        bump_items(&db, 1, 300).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        let keys = version_keys(1, 300, round + 1);
+        sp.add_phase(
+            "slow",
+            &format!("stage A round {round} (v={})", round + 1),
+            cp.clone(),
+            keys.clone(),
+            &mock,
+        );
+        want_a.push(keys);
+        cps_a.push(cp);
+    }
+    // The fault is a fact at the mock before the seed believes anything about the stage: every
+    // round has to have been answered 400 ms late, and the count is the mock's own.
+    wait_for(
+        Duration::from_secs(60),
+        "T2 stage A: the mock answering 400 ms after the requests",
+        || async { (mock.delay_firings() >= 3).then_some(()) },
+    )
+    .await;
+    drain(&sp, &lazy, &db, "slow", cps_a[2].clone(), 90).await;
+    let fired_a = mock.delay_firings();
+    let late_a = mock.late_answers();
+    assert!(
+        fired_a >= 3,
+        "T2 stage A: the slow stage never fired at the mock (delay_firings={fired_a}): the mode \
+         was armed and nothing answered late, so this half of the seed tested nothing"
+    );
+    assert_eq!(
+        late_a, 0,
+        "T2 stage A: 400 ms is inside the target's own 3 000 ms timeout, so nothing may be \
+         counted late (late_answers={late_a}): the harness would be calling a delivered key lost"
+    );
+    assert_keys(&mock, &union_keys(&want_a), "T2 stage A");
+    sp.check();
+
+    // ---- Stage B: 4 000 ms, past the 3 000 ms timeout: the mock answers, and the engine has
+    // already given up on the answer, so it is a fault event and not a delivery.
+    mock.delay(4000, 3000);
+    let mut cps_b: Vec<(String, u64)> = Vec::new();
+    let mut want_b: Vec<BTreeSet<String>> = Vec::new();
+    for round in 4..=6u32 {
+        bump_items(&db, 1, 300).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        let keys = version_keys(1, 300, round + 1);
+        sp.add_phase(
+            "slow",
+            &format!("stage B round {} (v={})", round - 3, round + 1),
+            cp.clone(),
+            keys.clone(),
+            &mock,
+        );
+        want_b.push(keys);
+        cps_b.push(cp);
+    }
+    wait_for(
+        Duration::from_secs(90),
+        "T2 stage B: the mock answering past the client's own timeout",
+        || async { (mock.late_answers() >= 3).then_some(()) },
+    )
+    .await;
+    // The rule is visibly behind (an observed condition, then the heal).
+    wait_pending(&lazy, "slow", 30).await;
+    let (f, p, _, _) = db.status("slow").await.expect("slow rule row");
+    assert!(
+        (f.clone(), p) < cps_b[0],
+        "the slow rule reached {f}:{p} while stage B's first checkpoint {}:{} is still \
+         unconfirmed: an answer the client had already given up on was credited as a delivery",
+        cps_b[0].0,
+        cps_b[0].1
+    );
+    let err = wait_rule_error(&db, "slow", "no complete response within 3000 ms", 60).await;
+    log.add(format!(
+        "stage B observed pinned at {f}:{p} with {} late answers, healing the target",
+        mock.late_answers()
+    ));
+    mock.heal();
+    // Drain bound: the retry backoff is capped at 10 s, and every late stage costs the engine one
+    // more 4 s wait before the heal takes effect.
+    drain(&sp, &lazy, &db, "slow", cps_b[2].clone(), 120).await;
+    sp.check();
+    let mut all = want_a.clone();
+    all.extend(want_b.iter().cloned());
+    assert_keys(&mock, &union_keys(&all), "T2 target");
+    let (delivered, repeated) = delivery_report(&mock);
+    eprintln!(
+        "T2: 1800 events / 1800 (key, version) keys, delay firings={} late answers={} \
+         deliveries={} repeated keys={} (the late stage alone owes {} timeouts), \
+         last_error={err}",
+        mock.delay_firings(),
+        mock.late_answers(),
+        delivered,
+        repeated,
+        mock.late_answers()
+    );
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
+}
+
+// ------------------------------------------------------------------ T3 target 5xx burst
+
+/// T3 (design §2): the mock answers the first 6 requests with `500 Internal Server Error` while
+/// 1 000 orders land in 4 phases. A 5xx is a *transient* failure and not a refusal — an unmet
+/// `expect` becomes `Fail::Transient` in `send_all`, so a bad status may never strike a key and
+/// may never let the position pass a checkpoint whose keys were refused. The burst is counted at
+/// the mock (`=500 fired` in the harness fault log) rather than trusted because it was armed, and
+/// the same keys come back on the retry, so the duplicate rule is the sampler's (P4) and every
+/// refusal it sees is a fault event in that log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t3_target_5xx_burst() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_t3").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("t3-burst");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("burst", "http", &mock.url(), None, "{}").await;
+    join_rule(&db, "burst", "burst", "orders").await;
+    mock.respond_nth(6, 500);
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "t3_target_5xx_burst",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_log(&lazy.log_path);
+
+    let mut cps: Vec<(String, u64)> = Vec::new();
+    for phase in 0..4u32 {
+        let (from, to) = (1 + phase * 250, (phase + 1) * 250);
+        bulk_orders(&db, from, to).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        sp.add_phase(
+            "burst",
+            &format!("phase {}", phase + 1),
+            cp.clone(),
+            keyset(from, to),
+            &mock,
+        );
+        cps.push(cp);
+    }
+
+    // The burst happened, exactly six times, at the mock — not "the mode was armed".
+    wait_for(
+        Duration::from_secs(60),
+        "T3: the mock refusing six requests with 500",
+        || async { (log.count("=500 fired") >= 6).then_some(()) },
+    )
+    .await;
+    assert_eq!(
+        log.count("=500 fired"),
+        6,
+        "T3: respond_nth(6, 500) refused {} requests; the mode is one-shot per request, so any \
+         other number means the burst the seed reports is not the burst the mock performed",
+        log.count("=500 fired")
+    );
+    // A 500 is transient and the rule says so, in the status row an operator would read.
+    let err = wait_rule_error(&db, "burst", "status 500", 60).await;
+    // P2 while the burst is unconfirmed: the sampler has watched every sample since the writes.
+    sp.check();
+    log.add(format!(
+        "burst observed: 6 refusals, last_error={err}, waiting for the drain"
+    ));
+    drain(&sp, &lazy, &db, "burst", cps[3].clone(), 90).await;
+    sp.check();
+    // The burst ended where it was armed, read a second time at the end of the run. The single
+    // read above is taken at one instant, and mutation M2 found that out: with `answered` never
+    // advancing it passed (the gate hands the seed the moment six refusals exist, and the counter
+    // still said six), and only the drain's own timeout killed the run. A second read at the end
+    // is what makes "six, and then it stopped" a claim the seed can actually make.
+    assert_eq!(
+        log.count("=500 fired"),
+        6,
+        "T3: by the end of the run the mock had refused {} requests with 500, not the 6 that \
+         `respond_nth(6, 500)` arms: the mode is one-shot per request and stops at six, so the \
+         fault the seed reports is not the fault the mock performed",
+        log.count("=500 fired")
+    );
+    assert_all_keys(&mock, 1, 1000, "T3 target");
+    let (delivered, repeated) = delivery_report(&mock);
+    eprintln!(
+        "T3: 1000 write-once keys, deliveries={delivered} (repeated keys={repeated}), {} requests \
+         at the mock of which 6 were refused with 500, last_error={err}",
+        mock.requests().len()
+    );
+    // P5: a 5xx is not a key's fault, so nothing may have been given up on.
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
+}
+
+// ---------------------------------------------------------- T4 target cut mid answer
+
+/// T4 (design §2): the mock answers the first 5 requests with a response head and *half* the
+/// body, then resets the connection. `Content-Length` promised more than the client got, so the
+/// engine's read fails in the middle of an answer it had already begun to read — the child log
+/// says `POST http://127.0.0.1:PORT: Connection reset by peer`, with no `connecting to` in front
+/// of it, which is exactly the difference between this seed and a dead port (a refused endpoint
+/// reads `connecting to HOST:PORT: …`, src/http.rs, and the EOF twin of this error is
+/// `connection closed inside the response body`, src/http.rs:436). A connection error is
+/// transient: no strike, no position past an unconfirmed checkpoint, and every key arrives after
+/// the heal. The cuts are counted where the reset is performed (`Mock::cut_firings`), and a half
+/// answer is never a delivery (design §1 P4), so a phase cannot close on a lie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t4_target_cut_mid_answer() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_t4").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("t4-cut");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("cut", "http", &mock.url(), None, "{}").await;
+    join_rule(&db, "cut", "cut", "orders").await;
+    // Arming before the child starts: the mode is in place before the engine's first flush, so
+    // the five cuts are five flushes and not a race with the first one.
+    mock.cut_mid_answer(5);
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "t4_target_cut_mid_answer",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_log(&lazy.log_path);
+
+    let mut cps: Vec<(String, u64)> = Vec::new();
+    for phase in 0..2u32 {
+        let (from, to) = (1 + phase * 100, (phase + 1) * 100);
+        bulk_orders(&db, from, to).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        sp.add_phase(
+            "cut",
+            &format!("phase {}", phase + 1),
+            cp.clone(),
+            keyset(from, to),
+            &mock,
+        );
+        cps.push(cp);
+    }
+
+    // The five half answers are a fact at the mock: counted at the reset, not at the arming.
+    wait_for(
+        Duration::from_secs(60),
+        "T4: the mock cutting five answers in mid-body",
+        || async { (mock.cut_firings() >= 5).then_some(()) },
+    )
+    .await;
+    assert_eq!(
+        mock.cut_firings(),
+        5,
+        "T4: cut_mid_answer(5) fired {} times; the mode stops at n, so any other number means \
+         the fault the seed reports is not the fault the mock performed",
+        mock.cut_firings()
+    );
+    // And the engine's side of it: the read failed *inside* an answer whose head had already
+    // arrived. The bare reset is what the client reports (the kernel discards what linger-0 had
+    // not sent); the two forms this error has in src/http.rs are this and
+    // `connection closed inside the response body`, and neither is the `connecting to` form a
+    // dead port produces — that distinction is what separates this seed from T1/T5/T6, so both
+    // halves of it are asserted rather than one.
+    let err = wait_rule_error(&db, "cut", "Connection reset by peer", 60).await;
+    assert!(
+        !err.contains("connecting to"),
+        "T4: the rule reports `{err}`: a reset at the connect is an endpoint that is not there, \
+         while this seed is about an answer that stops in the middle (the mock counted {} such \
+         half answers, so the two stories are distinguishable and this one was not tested)",
+        mock.cut_firings()
+    );
+    sp.check();
+    log.add(format!(
+        "5 half answers observed, last_error={err}, waiting for the drain"
+    ));
+    drain(&sp, &lazy, &db, "cut", cps[1].clone(), 90).await;
+    sp.check();
+    assert_all_keys(&mock, 1, 200, "T4 target");
+    let (delivered, repeated) = delivery_report(&mock);
+    eprintln!(
+        "T4: 200 write-once keys, deliveries={delivered} (repeated keys={repeated} across the 5 \
+         half answers), cut firings={}, last_error={err}",
+        mock.cut_firings()
+    );
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
+}
+
+// ---------------------------------------------------------------- T5 target flapping
+
+/// T5 (design §2): the target's port dies and lives again 8 times at 400 ms and then heals
+/// permanently, while 1 000 orders land in 4 phases. The storm counts its own flips inside the
+/// proxy (`FaultProxy::flips`) and every flip writes a fault-log event, so the seed gates on
+/// flips it can observe rather than on a wall-clock guess, and a duplicate inside the window has
+/// the event P4 demands. A refusal resets the connections the proxy was already relaying, so a
+/// keep-alive pool cannot make the outage fictional, and the refusals are counted where the reset
+/// is performed (`FaultProxy::refusals`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t5_target_flapping() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_t5").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("t5-flap");
+    let tprog = FaultProxy::start(&mock.addr.to_string(), "target-flap", Some(log.clone())).await;
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target(
+        "flap",
+        "http",
+        &format!("http://{}/hook", tprog.addr()),
+        None,
+        "{}",
+    )
+    .await;
+    join_rule(&db, "flap", "flap", "orders").await;
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "t5_target_flapping",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_proxy(&tprog);
+    sp.add_log(&lazy.log_path);
+
+    tprog.flap_refuse(8, Duration::from_millis(400));
+    let mut cps: Vec<(String, u64)> = Vec::new();
+    for phase in 0..4u32 {
+        let (from, to) = (1 + phase * 250, (phase + 1) * 250);
+        bulk_orders(&db, from, to).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        sp.add_phase(
+            "flap",
+            &format!("phase {}", phase + 1),
+            cp.clone(),
+            keyset(from, to),
+            &mock,
+        );
+        cps.push(cp);
+    }
+
+    // The storm is the gate: 8 flips, half of them the port dead, all of them logged.
+    wait_for(
+        Duration::from_secs(60),
+        "T5: the target port flipping 8 times",
+        || async { (tprog.flips() >= 8).then_some(()) },
+    )
+    .await;
+    assert_eq!(
+        tprog.flips(),
+        8,
+        "T5: flap_refuse(8) flipped {} times: the storm the seed reports is not the storm the \
+         proxy ran",
+        tprog.flips()
+    );
+    assert_eq!(
+        log.count("flap_refuse flip #"),
+        8,
+        "T5: {} of the 8 flips wrote a fault-log event; without them a duplicate in the window \
+         would be an accident of timing rather than a legitimate redelivery (P4)",
+        log.count("flap_refuse flip #")
+    );
+    // The engine's own pool was held across the flips, so at least one connection had to be
+    // refused service: counted where the reset is performed, in the accept loop and in the relay
+    // loop alike.
+    assert!(
+        tprog.refusals() >= 1,
+        "T5: the port died 4 times for 400 ms each while the engine kept retrying, and not one \
+         connection was refused (refusals=0): the outage never touched the wire"
+    );
+    // The engine's side of the storm, in the row an operator reads. The harness proxy accepts and
+    // then resets, so a refused connect is `connecting to HOST:PORT: Connection reset by peer`
+    // (src/http.rs) — the message has to name the port this seed took down.
+    let err = wait_rule_error(&db, "flap", "Connection reset by peer", 60).await;
+    assert!(
+        err.contains(&tprog.addr().to_string()),
+        "T5: the rule's last_error is `{err}`: it does not name the target's port ({}) whose \
+         port the storm killed, so nothing here ties the outage the seed made to the outage the \
+         rule reported",
+        tprog.addr()
+    );
+    sp.check();
+    log.add(format!(
+        "storm over: {} flips, {} refused connections, last_error={err}",
+        tprog.flips(),
+        tprog.refusals()
+    ));
+    // `heal()` ends the storm for good (design §2: heals permanently after 8 flips) — a task
+    // still flipping would inject a fault nobody asked for into the drain.
+    tprog.heal();
+    drain(&sp, &lazy, &db, "flap", cps[3].clone(), 120).await;
+    sp.check();
+    assert_all_keys(&mock, 1, 1000, "T5 target");
+    let (delivered, repeated) = delivery_report(&mock);
+    eprintln!(
+        "T5: 1000 write-once keys, deliveries={delivered} (repeated keys={repeated} inside the \
+         flap window), flips={}, refusals={}, last_error={err}",
+        tprog.flips(),
+        tprog.refusals()
+    );
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
+}
+
+// ------------------------------------------------- T6 one of two endpoints down
+
+/// T6 (design §2): a target with two endpoints, where the second one's port is taken down after
+/// the first phase has flowed cleanly to both of them. `send_all` sends to every endpoint at once
+/// and the action is confirmed only when all of them answer (src/action.rs), so the healthy
+/// endpoint *does* take the keys and the whole action still fails: a healthy sibling endpoint
+/// cannot carry a rule whose other endpoint never answered. Asserted: the clean baseline both
+/// endpoints answer phase 1 and the row persists its confirmation before the fault, with nothing
+/// refused; the dead port then refuses and logs it (its own counter and its own log lines, not the
+/// mode string), the rule's `last_error` names the dead endpoint and not the healthy one, the
+/// position stays below the first checkpoint b could not confirm while `/status` still owes keys,
+/// and after the heal both endpoints have every one of the 1000 keys and no key was struck.
+///
+/// Reported, not asserted: how many times the *healthy* endpoint was redelivered during the
+/// outage. That is the product's designed shape (the fan-out above), and the harness cannot
+/// witness it either: a retry that reuses a pooled connection is refused inside the client's own
+/// connect/write path, so no accept reaches the proxy to be counted or logged, and registering
+/// a's keys as a sampler phase would have P4 demand a fault event that no component ever
+/// produced. The duplicate rule is therefore carried by b's phases, where it is sound — b is
+/// silent all outage and answers each key exactly once after the heal — and the reason a's side
+/// is reported rather than asserted is written where the phases are registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t6_target_one_of_two_endpoints_down() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_t6").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let a = Mock::start().await;
+    a.set_fault_log(log.clone());
+    a.tag("t6-endpoint-a");
+    let b = Mock::start().await;
+    b.set_fault_log(log.clone());
+    b.tag("t6-endpoint-b");
+    let bprog = FaultProxy::start(&b.addr.to_string(), "endpoint-b", Some(log.clone())).await;
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    // Both endpoints of one target: the engine fans out to both and needs both to confirm.
+    db.target(
+        "two",
+        "http",
+        &format!("http://{}/hook,http://{}/hook", a.addr, bprog.addr()),
+        None,
+        "{}",
+    )
+    .await;
+    join_rule(&db, "two", "two", "orders").await;
+    // The outage is armed *after* phase 1 has flowed to both endpoints and its confirmation is
+    // read back from the status row. Two things depend on that order:
+    //
+    // * the harness's own — `refuse(true)` is only believed by an engine that is already holding a
+    //   keep-alive connection to the port, because that is the case it has to survive: the refusal
+    //   bumps the proxy's generation, which takes down the connections it was already relaying
+    //   (`relay` compares its own generation against the proxy's). Arming it before the child
+    //   exists means no such connection is ever born, the bump decides nothing, and the seed would
+    //   pass with or without it. Here, b's generation goes up while a live relay is serving the
+    //   engine's pool, and the mutant that drops the bump is the difference between the next
+    //   actions failing and everything going green.
+    // * and the sampler's — the phases registered below are watched from a moment when their keys
+    //   are still owed, which is only meaningful if they were not already all delivered.
+    //
+    // Phase 1 is therefore *not* a fault phase and has no sampler phase of its own: its keys must
+    // arrive cleanly (asserted below), and the first fault event happens after them.
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "t6_target_one_of_two_endpoints_down",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_proxy(&bprog);
+    sp.add_log(&lazy.log_path);
+
+    let mut cps: Vec<(String, u64)> = Vec::new();
+
+    // ---- Phase 1, both endpoints alive. No sampler phase, no fault: this is the baseline that
+    // makes the rest of the seed mean something. Both mocks have the whole set, and the status row
+    // has *persisted* the confirmation, so the engine is proved capable of fanning out and
+    // confirming before anything is taken away from it — and its HTTP pool is proved to be holding
+    // a live relay to b, which is what makes `refuse`'s generation bump below a load-bearing
+    // statement rather than an unused line.
+    bulk_orders(&db, 1, 250).await;
+    let cp1 = binlog_end(&db).await;
+    db.tick().await;
+    cps.push(cp1.clone());
+    let want1 = keyset(1, 250);
+    wait_for(
+        Duration::from_secs(60),
+        "T6 phase 1: both endpoints answering the first 250 keys",
+        || async {
+            (a.keys_received().len() >= 250 && b.keys_received().len() >= 250).then_some(())
+        },
+    )
+    .await;
+    assert_keys(&a, &want1, "T6 phase 1 at endpoint a");
+    assert_keys(&b, &want1, "T6 phase 1 at endpoint b");
+    wait_for(
+        Duration::from_secs(60),
+        "T6 phase 1: the confirmation persisted in the status row",
+        || async {
+            match db.status("two").await {
+                Some((f, p, _, _)) if (f.as_str(), p) >= (cp1.0.as_str(), cp1.1) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await;
+    // Nothing has been refused yet, so everything the next lines claim about the outage is the
+    // outage's doing and not the state the seed started in.
+    assert_eq!(
+        bprog.refusals(),
+        0,
+        "T6: endpoint b's port had refused {} connections before the seed took it down, so the \
+         baseline is not clean and the outage cannot be attributed",
+        bprog.refusals()
+    );
+
+    // ---- Take the second endpoint down, with a live relay in hand.
+    log.add(format!(
+        "T6: phase 1 confirmed on both endpoints ({} keys at b), taking endpoint b's port down",
+        b.keys_received().len()
+    ));
+    bprog.refuse(true);
+
+    for phase in 1..4u32 {
+        let (from, to) = (1 + phase * 250, (phase + 1) * 250);
+        bulk_orders(&db, from, to).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        // The fault phases are registered against the *dead* endpoint, and that choice is the point.
+        // P2 asks "while these keys have not reached that mock, the rule's position must stay
+        // below this checkpoint" — with b refusing, that is the live assertion this seed needs for
+        // the whole outage. P4's "a second delivery needs a fault event in between" then watches
+        // b's deliveries too, where it is sound: b is silent during the outage and answers every
+        // key once after the heal. It cannot watch a's, because `send_all` fans out and the
+        // action only confirms when both endpoints answer, so a redelivery at the healthy a is
+        // the expected shape — and the proxy cannot log an event for each of them: a retry that
+        // reuses a pooled connection is refused inside the client's own connect/write path, and
+        // no accept ever reaches the proxy to be counted or logged. A seed that registered a's
+        // phases would therefore fail on a redelivery the harness has no way to explain, which is
+        // a harness gap, not a product bug — so a's side is asserted by its own counters below
+        // and reported, and the duplicate rule here is carried by b.
+        sp.add_phase(
+            "two",
+            &format!("phase {} (endpoint b)", phase + 1),
+            cp.clone(),
+            keyset(from, to),
+            &b,
+        );
+        cps.push(cp);
+    }
+
+    // One endpoint is dead, and the port itself says so — counted where the reset is performed,
+    // and written to the fault log so that P4 has an event to point at.
+    wait_for(
+        Duration::from_secs(60),
+        "T6: endpoint b's port refusing connections",
+        || async { (bprog.refusals() >= 1).then_some(()) },
+    )
+    .await;
+    assert!(
+        log.count("proxy endpoint-b refused a connection") >= 1,
+        "T6: the port refused {} connections and wrote {} fault-log events for them: a refusal \
+         nobody logged is a refusal P4 cannot explain (the counters and the log are written at the \
+         same place on purpose, and this is the assert that notices if one of them moves)",
+        bprog.refusals(),
+        log.count("proxy endpoint-b refused a connection")
+    );
+    // The outage is the rule's own reason for not moving, and it names the dead endpoint.
+    let err = wait_rule_error(&db, "two", "Connection reset by peer", 60).await;
+    assert!(
+        err.contains(&bprog.addr().to_string()),
+        "T6: the rule's last_error is `{err}`: it does not name the dead endpoint \
+         ({}) the seed took down, so an operator reading the row could not find the outage",
+        bprog.addr()
+    );
+    assert!(
+        !err.contains(&a.addr.to_string()),
+        "T6: the rule's last_error is `{err}`: the healthy endpoint is reported as failing \
+         too, which is what the other half of the invariant forbids"
+    );
+    // The whole action fails, so nothing is confirmed: the position stays below the first
+    // checkpoint the engine could not confirm on *both* endpoints (phase 1's own checkpoint is
+    // already behind it, which is what the clean baseline above proved), and `/status` still owes
+    // keys.
+    wait_pending(&lazy, "two", 30).await;
+    let (f, p, _, _) = db.status("two").await.expect("two rule row");
+    assert!(
+        (f.clone(), p) < cps[1],
+        "the rule reached {f}:{p} while endpoint b was down and checkpoint {}:{} was unconfirmed: \
+         a healthy sibling endpoint cannot carry a rule whose other endpoint never answered",
+        cps[1].0,
+        cps[1].1
+    );
+    sp.check();
+    log.add(format!(
+        "endpoint b down: {} refused connections, rule pinned at {f}:{p}, healing b",
+        bprog.refusals()
+    ));
+    bprog.heal();
+    drain(&sp, &lazy, &db, "two", cps[3].clone(), 120).await;
+    sp.check();
+    assert_all_keys(&a, 1, 1000, "T6 endpoint a");
+    assert_all_keys(&b, 1, 1000, "T6 endpoint b");
+    let (delivered_a, repeated_a) = delivery_report(&a);
+    let (delivered_b, repeated_b) = delivery_report(&b);
+    eprintln!(
+        "T6: 1000 write-once keys, endpoint a deliveries={delivered_a} (repeated \
+         {repeated_a}), endpoint b deliveries={delivered_b} (repeated {repeated_b}), b's port \
+         refused {} connections while it was down, last_error={err}",
+        bprog.refusals()
+    );
+    // Both endpoints answered every key: `send_all` has no notion of one endpoint covering
+    // for the other, so a rule is confirmed only when both of them have the whole set.
+    assert_eq!(
+        a.keys_received().len(),
+        1000,
+        "T6: endpoint a received {} distinct keys, not the 1000 the rule sent",
+        a.keys_received().len()
+    );
+    assert_eq!(
+        b.keys_received().len(),
+        1000,
+        "T6: endpoint b received {} distinct keys, not the 1000 the rule sent",
+        b.keys_received().len()
+    );
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
+}
+
 // --------------------------------------------------------------------------- P1 process
 
 /// P1 (design §2): the mock answers nothing (accept-and-freeze) so the phase-2 flush can never
@@ -405,7 +1250,7 @@ async fn p1_sigkill_mid_flush() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy1.ready(60).await;
+    ready_or_skip!(lazy1, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -486,7 +1331,7 @@ async fn p1_sigkill_mid_flush() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy2.ready(60).await;
+    ready_or_skip!(lazy2, 60);
     sp.add_log(&lazy2.log_path);
     drain(&sp, &lazy2, &db, "o", cp2.clone(), 75).await;
     sp.check();
@@ -789,7 +1634,7 @@ async fn s2_source_stall() {
         probe_env.push(("RUST_LOG", "debug"));
     }
     let mut lazy = Lazy::start("s2_source_stall", &db, &probe_env, Some(log.clone()));
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -1092,7 +1937,7 @@ async fn s3_source_flapping() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -1268,7 +2113,7 @@ async fn s4_source_cut_during_big_txn() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -1515,7 +2360,7 @@ async fn s5_source_cut_around_xa() {
         &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_proxy(&mainp);
     sp.add_proxy(&binp);
@@ -1792,7 +2637,7 @@ async fn s5_source_cut_around_xa() {
         // Healed, so streaming is what the child should be doing again: `/status` is what `drain`
         // polls, and a child that stays non-ready from here on (ready = active AND streaming,
         // src/health.rs:87) is a real failure rather than a fault the seed asked for.
-        lazy.ready(60).await;
+        ready_or_skip!(lazy, 60);
         let refused1 = log.count("=500 fired");
         wait_for(
             Duration::from_secs(60),
@@ -1957,7 +2802,7 @@ async fn h1_sampler_pin_floor_still_bites() {
         &[],
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_log(&lazy.log_path);
 
@@ -1978,8 +2823,15 @@ async fn h1_sampler_pin_floor_still_bites() {
          spent, and an accepted regression would prove nothing"
     );
 
-    // Stop the child first: a row the engine still owns cannot stay forged.
-    lazy.term().await;
+    // Stop the child first: a row the engine still owns cannot stay forged. If the environment
+    // took the child instead (an OOM kill on a loaded box), `term` says so loudly — the signal,
+    // the host load, the OOM counters — and this self-test returns without a verdict: that is not
+    // a product failure, and `fault::environment_aborts()` plus `tmp/out/chaos/env-aborts.log`
+    // keep it from being a silent pass either.
+    if lazy.term().await.is_environment_kill() {
+        eprintln!("H1: SKIPPED BY ENVIRONMENT — the harness's child was taken; see tmp/out/chaos/env-aborts.log");
+        return;
+    }
     let (saved_file, saved_pos, _, _) = db
         .status("h")
         .await
@@ -2125,7 +2977,7 @@ async fn h2_sampler_checkpoint_check_still_bites() {
         &[],
         Some(log.clone()),
     );
-    lazy.ready(60).await;
+    ready_or_skip!(lazy, 60);
     let sp = Sampler::start(&db, log.clone());
     sp.add_log(&lazy.log_path);
 
@@ -2206,8 +3058,13 @@ async fn h2_sampler_checkpoint_check_still_bites() {
         sp.open_phases()
     );
 
-    // Forge to exactly the checkpoint, with the child gone so nobody writes the row back.
-    lazy.term().await;
+    // Forge to exactly the checkpoint, with the child gone so nobody writes the row back. The
+    // same rule as in h1: an environment kill is announced and the self-test returns, it is
+    // never reported as a product failure — and never dropped quietly either.
+    if lazy.term().await.is_environment_kill() {
+        eprintln!("H2: SKIPPED BY ENVIRONMENT — the harness's child was taken; see tmp/out/chaos/env-aborts.log");
+        return;
+    }
     log.add(format!(
         "h2: forging the rule row up to the checkpoint {cp:?} with its 10 keys still missing"
     ));
@@ -2266,4 +3123,172 @@ async fn instance_row(db: &Db) -> Option<(String, u64)> {
 fn parse_pos(s: &str) -> Option<(String, u64)> {
     let (f, p) = s.rsplit_once(':')?;
     Some((f.to_string(), p.parse().ok()?))
+}
+
+// -------------------------------------------------------------------- h3 harness self-test
+
+/// Signals a pid from *outside* this process, through `/bin/sh`'s builtin so a box without procps
+/// can still run it (the h1/h2 incident was an `ENOENT` on the `kill` *program*, so the seed that
+/// tests what a foreign signal looks like must not depend on that program either). The harness
+/// never learns about this signal, which is exactly the point: an OOM kill and this are the same
+/// event to the harness, and what it makes of them is what `h3` is about.
+fn signal_from_outside(pid: u32, sig: &str) {
+    let cmd = format!("kill -{sig} {pid}");
+    match std::process::Command::new("/bin/sh")
+        .args(["-c", &cmd])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(st) => panic!(
+            "h3: `{cmd}` exited {st:?}: the seed cannot inject the fault it is about to assert \
+             about, so it has no verdict to report"
+        ),
+        Err(e) => panic!("h3: nothing here could signal a pid from outside the harness: {e}"),
+    }
+}
+
+/// h3, the harness self-test the h1/h2 finding asked for (`exited -1 on SIGTERM` was the suite
+/// reporting the *box* as a product regression). A chaos suite that reports an OOM kill as a
+/// regression sends someone to bisect a commit that never moved, and a harness that avoids that by
+/// calling every signal death an environment abort stops reporting crashes — so both halves are
+/// asserted, against real children of the real binary where a real child is what carries the
+/// meaning and against wait statuses built by hand where a real signal could not be delivered
+/// reliably from a test process:
+///
+/// * a SIGKILL from outside the harness — the shape of an OOM kill, and of anything else this
+///   process did not do — ends as [`Stop::EnvironmentKilled`], is named by [`environment_aborts`],
+///   and is written to `tmp/out/chaos/env-aborts.log`, because a dropped self-test must not be
+///   able to pass for the wrong reason either;
+/// * the same SIGKILL *sent by the harness* (`kill_no_wait`, the kill half of `hard_stop`) ends as
+///   [`Stop::HarnessSignalled`] and adds nothing to that list: the harness keeping its own teeth is
+///   what makes the first bullet a classifier and not a mute;
+/// * a wait status of signal 11, of exit code 9, and of exit 0 are judged panic, panic and
+///   [`Stop::Exited(0)`] — the crash and the nonzero exit still fail the seed, the clean shutdown
+///   still passes it, and so neither of the two bullets above is bought by a classifier that
+///   simply fails (or excuses) everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h3_environment_kill_is_not_a_product_failure() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_h3").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    // Counted by seed name rather than by length: the suite runs two seeds at a time, and
+    // another seed's environment kill is not this one's evidence.
+    let aborts_for = |name: &str| {
+        environment_aborts()
+            .iter()
+            .filter(|l| l.contains(name))
+            .count()
+    };
+
+    // (a) A death this process did not cause: the environment's, and not a product failure.
+    let mut foreign = Lazy::start("h3_environment_kill", &db, &[], Some(log.clone()));
+    ready_or_skip!(foreign, 60);
+    let pid = foreign.pid();
+    log.add(format!(
+        "h3: SIGKILLing {pid} from outside the harness (the shape of an OOM kill)"
+    ));
+    signal_from_outside(pid, "KILL");
+    let stop = foreign.wait_stop("watched by the seed").await;
+    assert!(
+        matches!(stop, Stop::EnvironmentKilled { signal: 9 }),
+        "h3: a SIGKILL the harness never sent was judged {stop:?}: this is the shape the finding \
+         reported as `exited -1 on SIGTERM`, and a seed that fails on it sends someone to bisect \
+         a commit that never moved"
+    );
+    assert_eq!(
+        aborts_for("h3_environment_kill"),
+        1,
+        "h3: an environment kill was not recorded exactly once for this seed ({} were): a \
+         self-test the environment took has to be visible in the run report, not only on the \
+         console",
+        aborts_for("h3_environment_kill")
+    );
+    let recorded = std::fs::read_to_string("tmp/out/chaos/env-aborts.log").unwrap_or_default();
+    assert!(
+        recorded.contains("h3_environment_kill") && recorded.contains("cgroup OOM counters"),
+        "h3: tmp/out/chaos/env-aborts.log does not carry the abort with the numbers that explain \
+         it (the signal, the host load, the OOM counters), so a reader after the run could not \
+         tell an environment kill from a regression"
+    );
+
+    // (b) The same signal from the harness itself is the harness's own doing — never an abort.
+    let mut ours = Lazy::start("h3_harness_kill", &db, &[], Some(log.clone()));
+    ready_or_skip!(ours, 60);
+    ours.kill_no_wait();
+    let stop = ours.wait_stop("the harness's own SIGKILL").await;
+    assert!(
+        matches!(stop, Stop::HarnessSignalled { signal: 9 }),
+        "h3: the harness's own SIGKILL was judged {stop:?}: a classifier that calls this an \
+         environment abort too has stopped distinguishing the box from the product, and every \
+         seed that kills its child would be skipped instead of checked"
+    );
+    assert_eq!(
+        aborts_for("h3_harness_kill"),
+        0,
+        "h3: the harness's own kill was recorded as an environment abort: the two halves of the \
+         classifier have collapsed into one"
+    );
+
+    // (c) A crash is the product's own doing, whatever else the box is doing. The last three
+    // verdicts come from wait statuses the seed built itself (`ExitStatusExt::from_raw`) rather
+    // than from a real signal: the first attempt at this seed injected a genuine `kill -SEGV` at a
+    // genuine child and watched it keep streaming for the full 15 s of the watch
+    // (tmp/out/lwf-worker-chaos-pr3/h3-run2.log), so a fault that does not land leaves the seed
+    // with no verdict to make its point with — whatever the reason it did not land, which this
+    // seed does not claim to know. The finding is about the classifier, and the classifier is a
+    // function of the wait status, so the wait status is what is asserted, on (b)'s child and
+    // beside the two deaths that really happened.
+    use std::os::unix::process::ExitStatusExt;
+    let said = |st: std::process::ExitStatus| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ours.judge_stop(
+                st,
+                Ok("synthetic: the seed built this wait status".to_string()),
+                "a crash signal",
+            )
+        }))
+    };
+    let segv = said(std::process::ExitStatus::from_raw(11));
+    let err = match segv {
+        Err(e) => e,
+        Ok(stop) => panic!(
+            "h3: a child that died of SIGSEGV was judged {stop:?} instead of failing the seed: a \
+             SIGSEGV is not something an OOM killer does, so it is the product's own doing even on \
+             a box that is on fire"
+        ),
+    };
+    assert!(
+        err.downcast_ref::<String>()
+            .is_some_and(|m| m.contains("SIGSEGV")),
+        "h3: the crash death failed the seed for the wrong reason ({err:?}): the report has to \
+         name the signal, because \"the child died\" alone is how this whole class was misread \
+         before"
+    );
+    let nonzero = said(std::process::ExitStatus::from_raw(9 << 8));
+    assert!(
+        nonzero.is_err(),
+        "h3: a child that exited 9 was judged without failing the seed: a nonzero exit is the \
+         product's own verdict and no environment story excuses it"
+    );
+    // And the positive control: exit 0 after the stop is what a clean shutdown looks like. Without
+    // this the two asserts above could be satisfied by a classifier that fails everything.
+    let clean = ours.judge_stop(
+        std::process::ExitStatus::from_raw(0),
+        Ok("synthetic: the seed built this wait status".to_string()),
+        "SIGTERM",
+    );
+    assert!(
+        matches!(clean, Stop::Exited(0)),
+        "h3: exit 0 on SIGTERM was judged {clean:?}: a classifier that cannot call the clean \
+         stop clean is not classifying anything"
+    );
+    eprintln!(
+        "h3: foreign SIGKILL -> EnvironmentKilled, harness SIGKILL -> HarnessSignalled, SIGSEGV \
+         -> panic naming the signal ({} abort recorded for this seed)",
+        aborts_for("h3_environment_kill")
+    );
 }

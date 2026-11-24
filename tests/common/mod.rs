@@ -604,6 +604,22 @@ enum MockFault {
         status: u16,
         answered: usize,
     },
+    /// Answer every request `ms` after it arrives (design §3's `delay`, T2's two stages: slow but
+    /// answering, then slower than the client's timeout). Every firing is a fault event; an answer
+    /// that lands *after* `over` — the target's own `timeout_ms` — is not a delivery, because the
+    /// engine had already given up on it. Counting one would let the sampler close a phase whose
+    /// confirmation never happened, which is the lie P4 exists to prevent.
+    Delay {
+        ms: u64,
+        over: u64,
+    },
+    /// T4's `cut_mid_answer`: the request is read in full, the response goes out as the head plus
+    /// half the body, and the connection is reset — for the first `n` requests. A cut answer is a
+    /// fault event, never a delivery (design §1 P4).
+    CutMidAnswer {
+        n: usize,
+        fired: usize,
+    },
 }
 
 struct MockState {
@@ -614,6 +630,14 @@ struct MockState {
     /// Full 2xx answers only (P4's delivery record): when the mock answered, and which keys
     /// (`{{join keys ","}}` bodies split on the documented separator) that answer carried.
     deliveries: Vec<(Instant, BTreeSet<String>)>,
+    /// Answers written after the client's own timeout had passed (`delay` mode): they happened,
+    /// and they are not deliveries. Reported by [`Mock::late_answers`].
+    late: u64,
+    /// Times `cut_mid_answer` has fired. Counted where the reset is performed, so a seed that
+    /// claims five half-answers can show five.
+    cuts: u64,
+    /// Times the `delay` mode has answered slowly.
+    delays: u64,
     fault_log: Option<fault::FaultLog>,
     tag: String,
 }
@@ -640,6 +664,9 @@ impl Mock {
             headers: Box::new(|_| Vec::new()),
             fault: MockFault::Live,
             deliveries: Vec::new(),
+            late: 0,
+            cuts: 0,
+            delays: 0,
             fault_log: None,
             tag: "mock".into(),
         }));
@@ -725,6 +752,11 @@ impl Mock {
                                             // respond_nth answers every request (some with 5xx):
                                             // nothing is ever held by it.
                                             MockFault::RespondNth { .. } => false,
+                                            // The two target-class modes answer late or answer
+                                            // half: neither ever freezes a request the way
+                                            // `hold_after` does.
+                                            MockFault::Delay { .. } => false,
+                                            MockFault::CutMidAnswer { .. } => false,
                                             MockFault::Live => false,
                                         }
                                     };
@@ -761,6 +793,10 @@ impl Mock {
                                     .map(|k| k.trim().to_string())
                                     .filter(|k| !k.is_empty())
                                     .collect();
+                                // The tag/method/path the two target-class modes name in their fault-log lines. Taken
+                                // here, while `req` still exists: the handler block below moves
+                                // it into the request log.
+                                let described = format!("{} {}", req.method, req.path);
                                 let (status, body, extra) = {
                                     let mut g = st.lock().unwrap();
                                     let (mut status, body) = (g.handler)(&req);
@@ -798,6 +834,92 @@ impl Mock {
                                     }
                                     (status, body, extra)
                                 };
+                                // The two target-class modes fire here: after the request has been read in full and
+                                // recorded, before any byte of the answer goes out. Both register
+                                // the firing in the harness fault log (design §3), which is what
+                                // makes a duplicate inside their window a legitimate one, and
+                                // neither is ever a delivery (design §1 P4).
+                                let (delay_ms, over_ms, cut_now) = {
+                                    let g = st.lock().unwrap();
+                                    match &g.fault {
+                                        MockFault::Delay { ms, over } => (*ms, *over, false),
+                                        MockFault::CutMidAnswer { n, fired } => (0, 0, *fired < *n),
+                                        _ => (0, 0, false),
+                                    }
+                                };
+                                if cut_now {
+                                    let bytes = body.as_bytes();
+                                    // At least one byte: a half of an empty body would be a clean
+                                    // head-only answer, and T4 is about a body that stops short.
+                                    let half = (bytes.len() / 2).max(1);
+                                    let head = format!(
+                                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n",
+                                        bytes.len()
+                                    );
+                                    // ONE lock, one scope, and it closes before the first await
+                                    // (the held-request path above says why): the guard must not
+                                    // live across a `write_all`.
+                                    {
+                                        let mut g = st.lock().unwrap();
+                                        if let MockFault::CutMidAnswer { fired, .. } = &mut g.fault
+                                        {
+                                            *fired += 1;
+                                        }
+                                        g.cuts += 1;
+                                        let msg = format!(
+                                            "mock {} cut_mid_answer fired: {described} answered \
+                                             with the head and {half}/{} body bytes, then RST",
+                                            g.tag,
+                                            bytes.len()
+                                        );
+                                        if let Some(l) = &g.fault_log {
+                                            l.add(msg);
+                                        }
+                                    }
+                                    // Head and half the body, then a reset: the client must see a
+                                    // broken *connection* in the middle of a body it was told to
+                                    // expect. A clean FIN would be a short answer, and T4 is about
+                                    // the IO error, not about a truncated document.
+                                    let _ = s.write_all(head.as_bytes()).await;
+                                    let _ = s.write_all(&bytes[..half]).await;
+                                    let _ = s.flush().await;
+                                    // The half body has to be on the wire before the reset: a
+                                    // linger-0 close discards what the kernel has not sent yet,
+                                    // and a client that saw nothing would report a dead port
+                                    // rather than the mid-body cut the seed is about.
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    // #[allow]: linger-0 never blocks (as in the held-request path).
+                                    #[allow(deprecated)]
+                                    let _ = s.set_linger(Some(Duration::ZERO));
+                                    return;
+                                }
+                                let mut late = false;
+                                if delay_ms > 0 {
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    // Past the client's own timeout the answer is a fault event,
+                                    // not a delivery: the engine had already given up and will
+                                    // retry, and counting this would let the sampler close a phase
+                                    // whose confirmation never happened.
+                                    late = delay_ms > over_ms;
+                                    let mut g = st.lock().unwrap();
+                                    g.delays += 1;
+                                    if late {
+                                        g.late += 1;
+                                    }
+                                    let msg = format!(
+                                        "mock {} delay({delay_ms}) fired: {described} answered \
+                                         {delay_ms} ms after it arrived{}",
+                                        g.tag,
+                                        if late {
+                                            " — past the client's timeout, so not a delivery"
+                                        } else {
+                                            ""
+                                        }
+                                    );
+                                    if let Some(l) = &g.fault_log {
+                                        l.add(msg);
+                                    }
+                                }
                                 let resp = format!(
                             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
                             body.len()
@@ -805,7 +927,7 @@ impl Mock {
                                 if s.write_all(resp.as_bytes()).await.is_err() {
                                     return;
                                 }
-                                if (200..300).contains(&status) {
+                                if (200..300).contains(&status) && !late {
                                     // A delivery: the request the mock answered 2xx *in full*.
                                     st.lock().unwrap().deliveries.push((Instant::now(), keys));
                                 }
@@ -895,6 +1017,53 @@ impl Mock {
         if let Some(l) = &g.fault_log {
             l.add(format!("mock {} respond_nth({n}, {status}) armed", g.tag));
         }
+    }
+
+    /// Answer every request `ms` after it arrives — design §3's `delay`, and T2's two stages: an
+    /// `ms` under the target's timeout answers late but in time, an `ms` over it answers after the
+    /// engine has given up. `timeout_ms` is the target row's own `timeout_ms`, and an answer later
+    /// than that is a fault event and *not* a delivery: the client had already gone, so treating it
+    /// as delivered would let the sampler close a phase no one ever confirmed.
+    pub fn delay(&self, ms: u64, timeout_ms: u64) {
+        let mut g = self.state.lock().unwrap();
+        g.fault = MockFault::Delay {
+            ms,
+            over: timeout_ms,
+        };
+        if let Some(l) = &g.fault_log {
+            l.add(format!(
+                "mock {} delay({ms} ms, client timeout {timeout_ms} ms) armed",
+                g.tag
+            ));
+        }
+    }
+
+    /// Design §3's `cut_mid_answer` (T4): for the next `n` requests, send the response head and
+    /// half the body, then reset the connection. A half answer is a connection error on the
+    /// client's side, which is the whole point of the seed; it is a fault event, never a delivery.
+    pub fn cut_mid_answer(&self, n: usize) {
+        let mut g = self.state.lock().unwrap();
+        g.fault = MockFault::CutMidAnswer { n, fired: 0 };
+        if let Some(l) = &g.fault_log {
+            l.add(format!("mock {} cut_mid_answer({n}) armed", g.tag));
+        }
+    }
+
+    /// Times the `delay` mode answered slowly — T2's proof the slow stage was a fact at the mock
+    /// and not a mode string nobody armed.
+    pub fn delay_firings(&self) -> u64 {
+        self.state.lock().unwrap().delays
+    }
+
+    /// Times `delay` answered after the client's timeout had passed: real answers the engine never
+    /// received, counted separately because they must not be mistaken for deliveries.
+    pub fn late_answers(&self) -> u64 {
+        self.state.lock().unwrap().late
+    }
+
+    /// Times `cut_mid_answer` fired, counted where the reset is performed.
+    pub fn cut_firings(&self) -> u64 {
+        self.state.lock().unwrap().cuts
     }
 
     /// Clear the fault mode. Held requests get an RST, never a late answer.
