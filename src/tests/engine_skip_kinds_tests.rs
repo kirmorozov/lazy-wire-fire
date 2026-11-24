@@ -85,6 +85,7 @@ fn state(rule: &Arc<Rule>) -> RuleState {
         last_error: None,
         backoff: Backoff::default(),
         pending_clear: false,
+        reset_request_seen: false,
         counters: Counters::default(),
         strikes: HashMap::new(),
         written: None,

@@ -17,9 +17,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use indexmap::{IndexMap, IndexSet};
+use mysql_async::binlog::events::Event;
 use mysql_async::binlog::row::BinlogRow;
+use mysql_async::binlog::value::BinlogValue;
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
+use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Value as My};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -323,6 +325,11 @@ struct RuleState {
     backoff: Backoff,
     /// `reset_requested` must be cleared in the rule table.
     pending_clear: bool,
+    /// A write of this rule's own row that still asked for a reset arrived while
+    /// `pending_clear` stood: a request raised after the run that the clear serves finished,
+    /// which that clear must not erase (see [`Engine::housekeeping`]). In memory only — the row
+    /// and the status table hold no version to compare, and adding one is barred.
+    reset_request_seen: bool,
     counters: Counters,
     /// Refusals per key (see [`STRIKES`]).
     strikes: HashMap<String, u32>,
@@ -401,7 +408,12 @@ struct Done {
 #[derive(Clone)]
 enum Route {
     Ignore,
-    Config,
+    /// A table of the tool's own config; `rules` says it is `lazy_wire_fire_rule` itself,
+    /// whose row writes the engine reads as a possible new `reset_requested` (see
+    /// [`Engine::housekeeping`]'s clear).
+    Config {
+        rules: bool,
+    },
     Watched(Arc<Watched>),
 }
 
@@ -1207,14 +1219,10 @@ impl Engine {
             let Some(saved) = self.saved.get(&n) else {
                 continue;
             };
-            let unfinished = saved.reset_state.starts_with("pending")
-                || saved.reset_state.starts_with("running");
-            if unfinished && self.rules.get(&n).is_some_and(|s| s.reset.is_none()) {
-                let reason = saved
-                    .reset_state
-                    .split_once(": ")
-                    .map_or("interrupted", |(_, r)| r)
-                    .to_string();
+            let Some(reason) = unfinished_reset(&saved.reset_state) else {
+                continue;
+            };
+            if self.rules.get(&n).is_some_and(|s| s.reset.is_none()) {
                 self.start_reset(&n, format!("{reason} (resumed after restart)"), false);
             }
         }
@@ -1247,6 +1255,9 @@ impl Engine {
         let Some(st) = self.rules.get_mut(name) else {
             return;
         };
+        // A new run consumes any request the clear was holding back: from here the reload's
+        // own arms serve it, and a fresh one has to announce itself again.
+        st.reset_request_seen = false;
         if st.rule.def.reset_steps.is_empty() {
             if requested && st.reset.is_none() && st.rule.error.is_none() {
                 st.pending_clear = true;
@@ -1474,7 +1485,13 @@ impl Engine {
                 let pos = self.rule_pos(&st);
                 if disabled.contains(&name) {
                     info!(rule = %name, "rule disabled");
-                    self.saved.entry(name.clone()).or_default().pos = Some(pos);
+                    // What comes back must find the reset that was going: the state running
+                    // it is gone with the removal, and only a live rule writes the status
+                    // table a restart resumes from — so the live state is copied here.
+                    let rs = st.reset_state.clone();
+                    let sv = self.saved.entry(name.clone()).or_default();
+                    sv.pos = Some(pos);
+                    sv.reset_state = rs;
                 } else {
                     info!(rule = %name, "rule removed");
                     self.saved.remove(&name);
@@ -1610,6 +1627,7 @@ impl Engine {
             last_error: error.map(|e| (e, crate::time::unix_now_ms())),
             backoff: Backoff::default(),
             pending_clear: false,
+            reset_request_seen: false,
             counters: Counters::default(),
             strikes: HashMap::new(),
             written: None,
@@ -1626,6 +1644,22 @@ impl Engine {
                 None => self.lose_continuity(name, "new rule".into()),
                 Some(p) if p < self.settled => self.rewinds.push((name.to_string(), p)),
                 Some(_) => {}
+            }
+            // A reset the removal interrupted — the rule was disabled while a step was in
+            // flight — survives the re-add the way it survives a restart: `choose_start`
+            // resumes exactly this saved state when the process comes back, and nothing about
+            // an enable/disable says the operator asked for the reset to die. A row that also
+            // carries `reset_requested` upgrades this run to the requested one below.
+            if let Some(reason) = self
+                .saved
+                .get(name)
+                .and_then(|s| unfinished_reset(&s.reset_state))
+            {
+                self.start_reset(
+                    name,
+                    format!("{reason} (resumed after the rule was added again)"),
+                    false,
+                );
             }
         }
         if rule.def.reset_requested {
@@ -2016,8 +2050,24 @@ impl Engine {
             } => {
                 self.in_txn = true;
                 match self.table_ids.get(&table_id).cloned() {
-                    Some(Route::Config) => {
+                    Some(Route::Config { rules }) => {
                         self.config_dirty.get_or_insert_with(Instant::now);
+                        if rules {
+                            // A run that has just finished and waits to clear its flag consumed
+                            // the request that stood when it started. A write that names that
+                            // same rule and still asks for a reset is the operator asking again,
+                            // and the clear must not erase what no run served: mark it, and
+                            // `housekeeping` will not erase what it has not consumed. Only the
+                            // rule the row names is marked — an unrelated rule's edit starts
+                            // nothing here.
+                            for n in Self::requested_rules(reader, table_id, kind, &event) {
+                                if let Some(st) = self.rules.get_mut(&n) {
+                                    if st.pending_clear {
+                                        st.reset_request_seen = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                     Some(Route::Watched(w)) => {
                         let Engine {
@@ -2137,7 +2187,9 @@ impl Engine {
     ) -> Result<Route> {
         if schema == self.cfg.schema && model::is_own_table(table.as_str()) {
             return Ok(if model::is_config_table(&table) {
-                Route::Config
+                Route::Config {
+                    rules: table == model::RULE,
+                }
             } else {
                 Route::Ignore
             });
@@ -2442,6 +2494,57 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The rules a write of `lazy_wire_fire_rule` names when their after-image still asks for a
+    /// reset: the `name` of each inserted or updated row whose `reset_requested` is 1. A delete
+    /// has no after-image, and a write that changes nothing makes no row event at all, so a
+    /// leftover 1 nobody touched names nothing here — which is right: an ask the table itself
+    /// cannot show is not an ask. The two columns sit at their [`model::RULE_COLS`] positions
+    /// (the engine created this table), and only an image with exactly that many columns is read;
+    /// a table map that names its own columns must agree with those positions.
+    fn requested_rules(
+        reader: &BinlogReader,
+        table_id: u64,
+        kind: RowsKind,
+        event: &Event,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        if matches!(kind, RowsKind::Delete) {
+            return out;
+        }
+        let Some(name_i) = model::RULE_COLS.iter().position(|c| *c == "name") else {
+            return out;
+        };
+        let Some(flag_i) = model::RULE_COLS
+            .iter()
+            .position(|c| *c == "reset_requested")
+        else {
+            return out;
+        };
+        if let Some(names) = reader.table_map(table_id).and_then(table_map_names) {
+            if names.get(name_i).map(String::as_str) != Some("name")
+                || names.get(flag_i).map(String::as_str) != Some("reset_requested")
+            {
+                return out;
+            }
+        }
+        let Ok(rows) = reader.rows(table_id, event) else {
+            return out;
+        };
+        for (_, after) in rows {
+            let Some(row) = after else { continue };
+            if row.len() != model::RULE_COLS.len() {
+                return out;
+            }
+            if !matches!(row.as_ref(flag_i), Some(BinlogValue::Value(My::Int(1)))) {
+                continue;
+            }
+            if let Some(BinlogValue::Value(My::Bytes(b))) = row.as_ref(name_i) {
+                out.push(String::from_utf8_lossy(b).into_owned());
+            }
+        }
+        out
     }
 
     /// One row of a watched table: every trigger that is `on` for this kind marks the row's
@@ -3339,6 +3442,29 @@ impl Engine {
                 .collect()
         };
         for n in clears {
+            // The finished run must not have its clear erase a request raised after it: a write
+            // of this rule's row arrived while `pending_clear` stood (see `on_item`) and no run
+            // ever served it. That request is consumed by running the reset again — the flag
+            // stays 1 and the new run clears it when its own steps succeed.
+            //
+            // What this cannot see is a write whose row event has not arrived by the time this
+            // UPDATE goes out: the row reads 1, no marker stands, and the clear erases an ask a
+            // millisecond old. Telling that apart needs a per-row version the table does not
+            // carry (neither the rule row nor the status table holds one), so an operator who
+            // raises the flag while a reset is running raises it again once the row says `done`.
+            if self.rules.get(&n).is_some_and(|s| s.reset_request_seen) {
+                info!(rule = %n, "reset_requested was raised again while the finished reset waited to clear: running it again");
+                if let Some(st) = self.rules.get_mut(&n) {
+                    st.pending_clear = false;
+                }
+                self.start_reset(
+                    &n,
+                    "reset_requested raised again while the finished reset was being cleared"
+                        .to_string(),
+                    true,
+                );
+                continue;
+            }
             match self
                 .control
                 .exec_drop(
@@ -3537,6 +3663,23 @@ fn spawn_job(
             outcome,
         });
     });
+}
+
+/// The reason of a reset a run never finished, from a `reset_state` that still says `pending…` or
+/// `running …/…`: the one test the two arms that resume such a run share — `choose_start` after a
+/// restart and `add_rule` after an enable/disable — so they cannot drift apart. A state saying
+/// `done:`, `missing:` or nothing at all finished, and asks for nothing.
+fn unfinished_reset(state: &str) -> Option<String> {
+    if state.starts_with("pending") || state.starts_with("running") {
+        Some(
+            state
+                .split_once(": ")
+                .map_or("interrupted", |(_, r)| r)
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 fn merge_marks(into: &mut Marks, m: Marks) {

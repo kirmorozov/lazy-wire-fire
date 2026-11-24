@@ -12542,6 +12542,555 @@ async fn a_reset_requested_while_a_prep_step_is_in_flight_finishes() {
     inst.stop().await;
 }
 
+/// `reset_requested = 1` raised while the FINISHED run still waits for its clear: the run that
+/// consumed the operator's first request is over, `pending_clear` holds the `UPDATE … = 0` for
+/// the next housekeeping round, and a reload in that window must not answer the operator's NEW
+/// request with `request = reset_requested && !pending_clear` → false and then erase it. The
+/// window is widened to the clear's own retry: a trigger of the test's own schema refuses the
+/// engine's clear (the statement that drops the flag to 0 without touching any other column)
+/// while a gate row stands, so the finished run provably waits — the WARN names the refusal and
+/// the 5 s hold. In that window the flag goes down and up again (`vars` moving beside it, which
+/// is what tells the operator's writes apart from the engine's clear), and the raised-again
+/// request must run the steps once more before anything is cleared: the mock answers the step
+/// three times in the rule's life — first start, the requested run, and the request raised in
+/// the clear window — the row names the third run for what it is, and only it clears the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_requested_during_the_clear_window_runs_the_steps_again() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "swalwin").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let ans = answer_log(&mock);
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([{"once": true, "template": "DELETE /scache HTTP/1.1\n\n"}]).to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('swal', 'hook', 'POST /sw HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (steps,),
+    )
+    .await;
+    db.trigger("swal", "orders", Some("{{new.id}}"), None).await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the first-start reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("swal").await?;
+            (rs.starts_with("done:") && answered(&ans, "/scache") == 1).then_some(())
+        },
+    )
+    .await;
+    // The clear holds: while a row stands in `lwf_clear_gate`, an UPDATE that drops
+    // `reset_requested` to 0 without touching `vars` — the engine's clear and nothing else in
+    // this schema writes like that — is refused. The operator's writes below move `vars` beside
+    // the flag, so the gate lets the request through and holds back only the erase.
+    db.exec("CREATE TABLE lwf_clear_gate (n INT)").await;
+    db.exec(
+        "CREATE TRIGGER lwf_gate_clear BEFORE UPDATE ON lazy_wire_fire_rule FOR EACH ROW \
+         BEGIN IF NEW.reset_requested = 0 AND OLD.vars <=> NEW.vars \
+                   AND EXISTS (SELECT 1 FROM lwf_clear_gate) THEN \
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'lwf-test: the clear is held'; \
+            END IF; END",
+    )
+    .await;
+    // The requested run: raised on a live engine, and its only step then frozen unanswered —
+    // the gate above already stands armed, so the clear cannot slip through before it is tried.
+    mock.hold_after(0);
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'swal'")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "the requested reset to stand at its step",
+        || async {
+            let (_, _, rs, _) = db.status("swal").await?;
+            (rs.contains("running: step 1/1") && rs.contains(": reset_requested")).then_some(())
+        },
+    )
+    .await;
+    // THE premise, proven: the step is in flight, not answered — the run below finishes only
+    // when the mock lets that send through again.
+    assert_eq!(
+        answered(&ans, "/scache"),
+        1,
+        "the requested run's step had been answered: it was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+    db.exec("INSERT INTO lwf_clear_gate VALUES (1)").await;
+    let base = warn_lines(&["swal", "clearing reset_requested", "retrying in 5 s"]).len();
+    // The step goes out again and is answered: the run finishes, `pending_clear` stands, and
+    // the housekeeping clear hits the gate.
+    mock.heal();
+    wait_for(
+        Duration::from_secs(20),
+        "the finished run's clear to be refused (and held for its 5 s retry)",
+        || async {
+            (warn_lines(&["swal", "clearing reset_requested", "retrying in 5 s"]).len() > base)
+                .then_some(())
+        },
+    )
+    .await;
+    // THE other half of the premise: the run the clear serves is finished and the flag it was
+    // asked with still stands — the operator's new request now lands in that window. (The row
+    // says done on the next persist, which is what this waits for; the clear's 5 s hold gives
+    // the raise room to land inside the window.)
+    let (f0, p0, _, _) = db.status("swal").await.expect("the status row");
+    wait_for(
+        Duration::from_secs(10),
+        "the finished run to be reported done",
+        || async {
+            let (_, _, rs, _) = db.status("swal").await?;
+            (rs.starts_with("done:")).then_some(())
+        },
+    )
+    .await;
+    let held: Vec<u8> = db
+        .query("SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'swal'")
+        .await;
+    assert_eq!(
+        held,
+        vec![1],
+        "the flag was cleared even though the clear is refused"
+    );
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 0, vars = '{\"rearm\":1}' WHERE name = 'swal'")
+        .await;
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1, vars = '{\"rearm\":2}' WHERE name = 'swal'")
+        .await;
+    db.exec("DELETE FROM lwf_clear_gate").await;
+    // The raised-again request must run the steps once more: its run freezes on its step (it
+    // is held by the mock below), and the row must name it for what it is — a request raised
+    // while the finished run was still waiting to clear. Polled with the evidence in hand
+    // because THIS is the assertion the bug fails: the flag ends 0, the steps ran once in the
+    // rule's life, and no second reset ever came.
+    mock.hold_after(0);
+    let mut seen = String::new();
+    let mut second = false;
+    for _ in 0..60 {
+        let row = db.status("swal").await;
+        seen = row.map(|r| r.2).unwrap_or_default();
+        if (seen.starts_with("pending:") || seen.starts_with("running:"))
+            && seen.contains("raised again")
+        {
+            second = true;
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert!(
+        second,
+        "the `reset_requested = 1` raised while the finished run waited to clear was swallowed: \
+         the clear erased it and no second reset ran. reset_state {seen:?}, position \
+         {f0}:{p0}, answered so far {}",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        answered(&ans, "/scache"),
+        2,
+        "the step was answered beyond the first start and the requested run while the second \
+         reset still stands frozen ({})",
+        traffic(&mock, &ans)
+    );
+    // Let it through: the second reset finishes, and only now may the flag go.
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "the raised-again reset to finish and clear the flag",
+        || async {
+            let (_, _, rs, _) = db.status("swal").await?;
+            if !rs.starts_with("done:") || answered(&ans, "/scache") != 3 {
+                return None;
+            }
+            let mut c = db.conn().await;
+            let r: Option<i8> = c
+                .exec_first(
+                    "SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = 'swal'",
+                    (),
+                )
+                .await
+                .unwrap();
+            quit(c).await;
+            (r == Some(0)).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        answered(&ans, "/scache"),
+        3,
+        "the step ran once for the first start, once for the requested run and once for the \
+         request raised in the clear window ({})",
+        traffic(&mock, &ans)
+    );
+    // And the rule still works.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (4, 1, 'new', 4)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the rule firing after the second reset",
+        || async {
+            let (f, p, _, _) = db.status("swal").await?;
+            (fired(&mock.requests(), "/sw").contains(&"4".to_string()) && (f, p) >= after)
+                .then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// A rule disabled while one of its reset steps is in flight and enabled again: the removal
+/// drops the `RuleState` — the run with it — and `add_rule` starts nothing for a row that does
+/// not carry `reset_requested`, so the reset the engine was half-way through dies until a
+/// process restart (which resumes exactly this from the saved `reset_state`). The re-add must
+/// resume it the way the restart does: step 1 arrives and is ANSWERED a second time (the
+/// first-start run had left it behind and died on step 2, whose send the mock never answered),
+/// the row names the resumed run as such, and the reset ends done. That the reload really
+/// processed the disable — the premise that the re-add is a fresh `add_rule` and not a rule
+/// that was never taken away — the answered step of a sentinel rule on a second mock proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_enabled_rule_resumes_the_reset_it_died_on() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "disres").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let ans = answer_log(&mock);
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let steps = json!([
+        {"once": true, "template": "DELETE /d1cache HTTP/1.1\n\n"},
+        {"once": true, "template": "DELETE /d2cache HTTP/1.1\n\n"}
+    ])
+    .to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('disb', 'hook', 'POST /db HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (steps,),
+    )
+    .await;
+    db.trigger("disb", "orders", Some("{{new.id}}"), None).await;
+    // The first-start reset answers step 1 and stands on step 2, unanswered.
+    mock.hold_after(1);
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "the reset to stand at step 2",
+        || async {
+            let (_, _, rs, _) = db.status("disb").await?;
+            (rs.contains("running: step 2/2") && answered(&ans, "/d1cache") == 1).then_some(())
+        },
+    )
+    .await;
+    // THE premise, proven rather than assumed: the row says step 2 is running and this rule's
+    // step 2 was answered never in the rule's life — the disable below finds the run mid-step.
+    assert_eq!(
+        answered(&ans, "/d2cache"),
+        0,
+        "step 2 had been answered: the reset was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+    db.exec("UPDATE lazy_wire_fire_rule SET enabled = 0 WHERE name = 'disb'")
+        .await;
+    // That the engine processed the disable before the re-enable, proven: a sentinel rule
+    // answers its own first-start step on a mock of its own (this one still holds everything
+    // past the answer it owes, so the sentinel cannot come to it).
+    let mock2 = Mock::start().await;
+    let ans2 = answer_log(&mock2);
+    db.target("hook2", "http", &mock2.url(), None, "{}").await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('disbs', 'hook2', 'POST /s HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (json!([{"once": true, "template": "DELETE /s-only HTTP/1.1\n\n"}]).to_string(),),
+    )
+    .await;
+    db.trigger("disbs", "orders", Some("{{new.id}}"), None)
+        .await;
+    wait_for(
+        Duration::from_secs(30),
+        "the sentinel rule's reset (the reload that took the disable)",
+        || async { (answered(&ans2, "/s-only") >= 1).then_some(()) },
+    )
+    .await;
+    // The reset that was in flight dies with the removal — and its frozen send stays frozen:
+    // no answer is owed to a dead run, so nothing is healed yet, and the resumed run's own
+    // step 1 (which must arrive after the re-enable) is what the mock below holds.
+    mock.hold_after(0);
+    db.exec("UPDATE lazy_wire_fire_rule SET enabled = 1 WHERE name = 'disb'")
+        .await;
+    // The re-add must resume what a restart resumes: the row must name the resumed run while
+    // its step 1 stands frozen. Polled with the evidence in hand because THIS is the assertion
+    // the bug fails — nothing arrives until a process restart.
+    let mut mid = None;
+    for _ in 0..60 {
+        if let Some(r) = db.status("disb").await {
+            if (r.2.starts_with("pending:") || r.2.starts_with("running:"))
+                && r.2.contains("resumed after the rule was added again")
+            {
+                mid = Some(r);
+                break;
+            }
+        }
+        sleep_ms(500).await;
+    }
+    let mid = mid.unwrap_or_else(|| {
+        panic!(
+            "the reset that was in flight when the rule was disabled died with it: re-enabling \
+             the rule started no reset (only a process restart resumes the saved one). answers \
+             so far {}",
+            traffic(&mock, &ans)
+        )
+    });
+    assert_eq!(
+        answered(&ans, "/d1cache"),
+        1,
+        "the resumed run's step 1 had been answered before it was frozen: {mid:?} ({})",
+        traffic(&mock, &ans)
+    );
+    // It runs the whole reset: step 1 answered exactly twice in the rule's life, step 2 at
+    // least once.
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "the resumed reset to finish",
+        || async {
+            let (_, _, rs, _) = db.status("disb").await?;
+            (rs.starts_with("done:")
+                && answered(&ans, "/d1cache") == 2
+                && answered(&ans, "/d2cache") >= 1)
+                .then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        answered(&ans, "/d1cache"),
+        2,
+        "step 1 ran once at first start and once in the resumed reset ({})",
+        traffic(&mock, &ans)
+    );
+    // And the rule works after its reset came back.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (7, 1, 'new', 7)").await;
+    let after = binlog_end(&db).await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(20),
+        "the rule firing after the resumed reset",
+        || async {
+            let (f, p, _, _) = db.status("disb").await?;
+            (fired(&mock.requests(), "/db").contains(&"7".to_string()) && (f, p) >= after)
+                .then_some(())
+        },
+    )
+    .await;
+    inst.stop().await;
+}
+
+/// The same window with two rules in it. `ncswa` and `ncswb` both finish a requested reset and
+/// both wait on a held clear; the operator then asks AGAIN of one of them alone (`ncswb`, 0 → 1
+/// with `vars` moving beside it, which is what tells an operator's write apart from the engine's
+/// clear). What the clear must not erase is the request the RULE's OWN row still carries: `ncswb`
+/// runs its steps once more and clears its flag, while `ncswa` — whose row said nothing — is
+/// cleared untouched, its step answered exactly the twice it was before (first start and the
+/// requested run) and its row `done`, never "raised again". A mark that followed every write of
+/// the rule table would re-send `ncswa`'s whole snapshot for a request it was never asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clear_window_marks_only_the_rule_whose_row_asked() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "nocros").await;
+    shop(&db).await;
+    let mock = Mock::start().await;
+    let ans = answer_log(&mock);
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    let stepa = json!([{"once": true, "template": "DELETE /reset-a HTTP/1.1\n\n"}]).to_string();
+    let stepb = json!([{"once": true, "template": "DELETE /reset-b HTTP/1.1\n\n"}]).to_string();
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('ncswa', 'hook', 'POST /fire-a HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (stepa,),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, reset_steps, debounce_ms) \
+         VALUES ('ncswb', 'hook', 'POST /fire-b HTTP/1.1\n\n{{join keys \",\"}}', ?, 100)",
+        (stepb,),
+    )
+    .await;
+    db.trigger("ncswa", "orders", Some("{{new.id}}"), None)
+        .await;
+    db.trigger("ncswb", "orders", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    wait_for(
+        Duration::from_secs(20),
+        "both first-start resets to finish",
+        || async {
+            let (_, _, ra, _) = db.status("ncswa").await?;
+            let (_, _, rb, _) = db.status("ncswb").await?;
+            (ra.starts_with("done:")
+                && rb.starts_with("done:")
+                && answered(&ans, "/reset-a") == 1
+                && answered(&ans, "/reset-b") == 1)
+                .then_some(())
+        },
+    )
+    .await;
+    // The clear holds for both rules: dropping the flag to 0 without touching `vars` is what the
+    // engine's clear does and nothing else in this schema writes like that.
+    db.exec("CREATE TABLE lwf_clear_gate (n INT)").await;
+    db.exec(
+        "CREATE TRIGGER lwf_gate_clear BEFORE UPDATE ON lazy_wire_fire_rule FOR EACH ROW \
+         BEGIN IF NEW.reset_requested = 0 AND OLD.vars <=> NEW.vars \
+                   AND EXISTS (SELECT 1 FROM lwf_clear_gate) THEN \
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'lwf-test: the clear is held'; \
+            END IF; END",
+    )
+    .await;
+    // One requested run each, both frozen on their step; then the gate stands and both steps go
+    // out together, so both runs finish into a held clear.
+    mock.hold_after(0);
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name IN ('ncswa', 'ncswb')")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "both requested resets to stand at their step",
+        || async {
+            let (_, _, ra, _) = db.status("ncswa").await?;
+            let (_, _, rb, _) = db.status("ncswb").await?;
+            (ra.contains("running: step 1/1") && rb.contains("running: step 1/1")).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        answered(&ans, "/reset-a"),
+        1,
+        "ncswa's step had been answered: it was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        answered(&ans, "/reset-b"),
+        1,
+        "ncswb's step had been answered: it was not in flight ({})",
+        traffic(&mock, &ans)
+    );
+    db.exec("INSERT INTO lwf_clear_gate VALUES (1)").await;
+    let base_a = warn_lines(&["ncswa", "clearing reset_requested", "retrying in 5 s"]).len();
+    let base_b = warn_lines(&["ncswb", "clearing reset_requested", "retrying in 5 s"]).len();
+    mock.heal();
+    wait_for(
+        Duration::from_secs(20),
+        "both finished runs' clears to be refused (and held for their 5 s retry)",
+        || async {
+            (warn_lines(&["ncswa", "clearing reset_requested", "retrying in 5 s"]).len() > base_a
+                && warn_lines(&["ncswb", "clearing reset_requested", "retrying in 5 s"]).len()
+                    > base_b)
+                .then_some(())
+        },
+    )
+    .await;
+    // THE premise: both runs are finished and the flags they were asked with still stand, so the
+    // operator's new request lands in the window — and it names one of the two rules.
+    wait_for(
+        Duration::from_secs(10),
+        "both finished runs to be reported done",
+        || async {
+            let (_, _, ra, _) = db.status("ncswa").await?;
+            let (_, _, rb, _) = db.status("ncswb").await?;
+            (ra.starts_with("done:") && rb.starts_with("done:")).then_some(())
+        },
+    )
+    .await;
+    for n in ["ncswa", "ncswb"] {
+        let held: Vec<u8> = db
+            .query(&format!(
+                "SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = '{n}'"
+            ))
+            .await;
+        assert_eq!(
+            held,
+            vec![1],
+            "the flag of {n} was cleared though its clear is refused"
+        );
+    }
+    // The ask names `ncswb` alone; the gate goes, so both clears are tried again. `ncswb`'s
+    // second run is frozen on its step, which is what makes it provable a second run at all.
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 0, vars = '{\"rearm\":1}' WHERE name = 'ncswb'")
+        .await;
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1, vars = '{\"rearm\":2}' WHERE name = 'ncswb'")
+        .await;
+    mock.hold_after(0);
+    db.exec("DELETE FROM lwf_clear_gate").await;
+    let mut seen_b = String::new();
+    let mut again = false;
+    for _ in 0..60 {
+        seen_b = db.status("ncswb").await.map(|r| r.2).unwrap_or_default();
+        if (seen_b.starts_with("pending:") || seen_b.starts_with("running:"))
+            && seen_b.contains("raised again")
+        {
+            again = true;
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert!(
+        again,
+        "the `reset_requested = 1` raised of ncswb while its finished run waited to clear was \
+         swallowed: reset_state {seen_b:?}, answered so far {}",
+        traffic(&mock, &ans)
+    );
+    // THE claim the over-broad mark fails: the rule whose row said nothing runs nothing again.
+    // Its step holds the two answers it had (first start and the requested run), and its own row
+    // is a finished one, not a run that was started for another rule's ask.
+    assert_eq!(
+        answered(&ans, "/reset-a"),
+        2,
+        "ncswa re-sent its reset for a request its row never made ({})",
+        traffic(&mock, &ans)
+    );
+    let (_, _, state_a, _) = db.status("ncswa").await.expect("the status row");
+    assert!(
+        !state_a.contains("raised again"),
+        "ncswa was reset for another rule's request: {state_a:?}"
+    );
+    // Both finish and both flags go: `ncswb`'s second run clears its own, `ncswa` is cleared once.
+    mock.heal();
+    wait_for(
+        Duration::from_secs(30),
+        "both resets done and both flags cleared",
+        || async {
+            let (_, _, ra, _) = db.status("ncswa").await?;
+            let (_, _, rb, _) = db.status("ncswb").await?;
+            if !ra.starts_with("done:")
+                || !rb.starts_with("done:")
+                || answered(&ans, "/reset-b") != 3
+            {
+                return None;
+            }
+            let mut c = db.conn().await;
+            let left: Option<i64> = c
+                .exec_first(
+                    "SELECT COUNT(*) FROM lazy_wire_fire_rule WHERE reset_requested <> 0",
+                    (),
+                )
+                .await
+                .unwrap();
+            quit(c).await;
+            (left == Some(0)).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        answered(&ans, "/reset-a"),
+        2,
+        "ncswa's step ran at its first start and its one requested run, and no further ({})",
+        traffic(&mock, &ans)
+    );
+    assert_eq!(
+        answered(&ans, "/reset-b"),
+        3,
+        "ncswb's step ran at its first start, its requested run and the request raised in the \
+         clear window ({})",
+        traffic(&mock, &ans)
+    );
+    inst.stop().await;
+}
+
 /// A configuration the engine cannot read: `reload_config` fails, the WARN says so, and the
 /// retry is the 1 s one and not the 120 s poll — proven by what the engine does with a rule the
 /// server only lets it read again later. Revoking SELECT on the rule table alone (table-granular

@@ -155,3 +155,26 @@ fn triggers() {
     };
     assert!(TriggerDef::from_row(&bad, "app", false).is_err());
 }
+
+/// `RULE_COLS` is what the engine reads a rule row's binlog image by (`Engine::requested_rules`
+/// looks for `name` and `reset_requested` at these positions when the table map does not name
+/// them), so its names and their order are the rule table's own DDL, verbatim.
+#[test]
+fn the_rule_columns_are_the_rule_table_own_ddl() {
+    let ddl = DDL
+        .iter()
+        .find(|d| d.contains("`lazy_wire_fire_rule` ("))
+        .expect("the rule table's DDL");
+    let body = &ddl[..ddl.find("PRIMARY KEY").expect("a primary key")];
+    let ticks: Vec<usize> = body.match_indices('`').map(|(i, _)| i).collect();
+    let cols: Vec<&str> = ticks
+        .chunks(2)
+        .map(|p| &body[p[0] + 1..p[1]])
+        .skip(1) // the table's own name
+        .collect();
+    assert_eq!(
+        cols,
+        RULE_COLS.to_vec(),
+        "the rule table's columns, in order"
+    );
+}

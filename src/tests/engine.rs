@@ -630,3 +630,31 @@ fn virtual_first_of_finds_the_generated_column() {
         "the wording is matched whatever its case"
     );
 }
+
+/// The one test both arms that resume a saved run share (`choose_start` after a restart,
+/// `add_rule` after an enable/disable): what a `reset_state` still asks for, and what it does not.
+#[test]
+fn an_unfinished_reset_names_its_reason() {
+    assert_eq!(
+        unfinished_reset("pending: reset_requested"),
+        Some("reset_requested".to_string()),
+        "a run that died before its first step was sent"
+    );
+    assert_eq!(
+        unfinished_reset("running: step 2/2 flush: continuity lost at binlog 4"),
+        Some("step 2/2 flush: continuity lost at binlog 4".to_string()),
+        "a run that died between its steps, reason and all"
+    );
+    assert_eq!(
+        unfinished_reset("running"),
+        Some("interrupted".to_string()),
+        "a state with no reason after it still resumes"
+    );
+    for over in ["", "done: 2026-11-24T00:00:00Z", "missing: new rule"] {
+        assert_eq!(
+            unfinished_reset(over),
+            None,
+            "{over:?} is not a run in flight"
+        );
+    }
+}
