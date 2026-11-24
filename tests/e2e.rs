@@ -4029,19 +4029,23 @@ async fn pg_target_reports_the_class_it_reached() {
         "the session still busy with the abandoned statement is gone"
     );
 
-    // The listing path, which is what a stray step reads. The class still decides whether the
-    // pooled connection survives, but the text is the client's own words: `rows` formats the
-    // `tokio_postgres::Error`, whose `Display` for a server error is the flat "db error", so the
-    // SQLSTATE the statement path names is lost here — and nothing on this path is a refusal.
+    // The listing path, which is what a stray step reads: the same classification the statement
+    // path gives. A refusal names its SQLSTATE and the server's words and is a `Rejected` that
+    // keeps the pooled connection; a "not now" stays transient and costs the session. What the
+    // class costs the keys is the caller's rule (a listing refusal strikes nothing — the reset
+    // step retries), not the client's: the client only says what the answer was.
     let p = pg_pid(&client).await;
     let e = client
         .rows("SELECT * FROM covpg_missing", t)
         .await
         .expect_err("there is no such table");
-    assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/sink: db error");
+    assert_eq!(
+        format!("{e:#}"),
+        r#"postgres 127.0.0.1/sink: 42P01: relation "covpg_missing" does not exist"#
+    );
     assert!(
-        !lazy_wire_fire::target::is_rejected(&e),
-        "a listing's refusal never strikes: {e:#}"
+        lazy_wire_fire::target::is_rejected(&e),
+        "a missing table is the listing statement's fault: {e:#}"
     );
     assert_eq!(pg_pid(&client).await, p, "and it keeps the connection");
     let locker = other().await;
@@ -4057,7 +4061,14 @@ async fn pg_target_reports_the_class_it_reached() {
         )
         .await
         .expect_err("row 11 is locked");
-    assert_eq!(format!("{e:#}"), "postgres 127.0.0.1/sink: db error");
+    assert_eq!(
+        format!("{e:#}"),
+        r#"postgres 127.0.0.1/sink: 55P03: could not obtain lock on row in relation "covpg_lock""#
+    );
+    assert!(
+        !lazy_wire_fire::target::is_rejected(&e),
+        "a lock is not the listing's fault: {e:#}"
+    );
     wait_for(
         Duration::from_secs(10),
         "the backend a transient listing cost",
@@ -4347,6 +4358,168 @@ async fn pg_target_a_listing_that_renders_nothing_costs_a_retry() {
             .map(|_| ())
     })
     .await;
+    inst.stop().await;
+}
+
+/// A stray listing the server refuses *as a statement* is a failed listing that names itself:
+/// the `WARN` and the rule's `last_error` carry the refusal's SQLSTATE and the server's own
+/// words (`42P01: relation … does not exist`) — the same answer the SQL statement path gives
+/// and the same answer the MySQL listing path already gave, where `with_conn` classifies. A
+/// flat `db error` here leaves a bad `list_template` undiagnosable. And the class costs nothing
+/// the MySQL path would not cost: the step retries with backoff (several WARNs, no strike —
+/// only an answer about a *message* refuses a key, never a listing), and with the missing
+/// table created the same reset finishes and deletes exactly the strays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_target_a_refused_listing_names_its_sqlstate_in_last_error() {
+    const PG: &str = "host=127.0.0.1 port=34432 user=postgres password=pgpw dbname=sink";
+    let (admin, conn) = match tokio_postgres::connect(PG, tokio_postgres::NoTls).await {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("no PostgreSQL on 127.0.0.1:34432: skipping");
+            return;
+        }
+    };
+    tokio::spawn(conn);
+    // The listing reads a table that is not there: the server refuses the statement itself.
+    // The documents go to a table of the test's own that IS there, so the only 42P01 in the
+    // rule's life is the refused listing.
+    admin
+        .batch_execute(
+            "DROP TABLE IF EXISTS covpg_gone, covpg_gone_doc;
+             CREATE TABLE covpg_gone_doc (what text PRIMARY KEY, i8 text);",
+        )
+        .await
+        .unwrap();
+
+    let root = need_db!();
+    let db = Db::fresh(&root, "covpggone").await;
+    db.exec("CREATE TABLE covpg_items (id BIGINT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    db.exec("INSERT INTO covpg_items VALUES (3,'c')").await;
+    tables(&db).await;
+    std::env::set_var("LWF_TEST_PG_PW", "pgpw");
+    db.target(
+        "pggone",
+        "pgsql",
+        "127.0.0.1:34432/sink",
+        None,
+        r#"{"username": "postgres", "password": "env:LWF_TEST_PG_PW"}"#,
+    )
+    .await;
+    let steps = json!([
+        {"for_each": "snapshot"},
+        {"for_each": "stray",
+         "list_template": "SELECT what FROM covpg_gone",
+         "keys": "JSON_EXTRACT(body, '$[*].what')",
+         "template": "DELETE FROM covpg_gone WHERE what \
+           IN ({{#each docs}}{{#unless @first}}, {{/unless}}{{sql_quote key}}{{/each}})"}
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, snapshot_keys_sql, template, reset_steps, debounce_ms) \
+         VALUES ('pgg', 'pggone', 'key', \
+         'SELECT id AS _key, name, NULL AS _op FROM covpg_items WHERE id IN (:keys)', \
+         'SELECT id AS _key FROM covpg_items', \
+         '{{#each docs}}INSERT INTO covpg_gone_doc (what, i8) \
+          VALUES (concat(''k'', {{sql_quote key}}), {{sql_quote key}}) \
+          ON CONFLICT (what) DO NOTHING{{/each}}', ?, 100)",
+        (steps.to_string(),),
+    )
+    .await;
+    db.trigger("pgg", "covpg_items", Some("{{new.id}}"), None)
+        .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // The refusal arrives in the WARN with the class the server gave and the server's words —
+    // not the flat `db error` the listing path used to answer with.
+    wait_for(
+        Duration::from_secs(60),
+        "the refused listing reported itself",
+        || async {
+            warnings()
+                .into_iter()
+                .filter(|l| l.starts_with("WARN") && l.contains("pgg"))
+                .any(|l| {
+                    l.contains("listing the target's keys failed")
+                        && l.contains("42P01")
+                        && l.contains(r#"relation "covpg_gone" does not exist"#)
+                })
+                .then_some(())
+        },
+    )
+    .await;
+    let s = wait_for(
+        Duration::from_secs(30),
+        "the rule's `last_error` names the refusal",
+        || async {
+            let s = db.status("pgg").await?;
+            let e = s.3.clone()?;
+            (e.contains("listing page 0")
+                && e.contains("42P01")
+                && e.contains(r#"relation "covpg_gone" does not exist"#))
+            .then_some(s)
+        },
+    )
+    .await;
+    assert!(
+        !s.2.starts_with("done"),
+        "a failed listing is not a reset that finished: {s:?}"
+    );
+    // A refusal of a listing waits and asks again, as the MySQL path does: the step is retried
+    // (the engine logs the failure again on the next backoff round), and no key was refused for
+    // it — the rule kept its snapshot key and the listing struck nothing.
+    wait_for(
+        Duration::from_secs(30),
+        "the refused listing retried",
+        || async {
+            (warnings()
+                .into_iter()
+                .filter(|l| l.starts_with("WARN") && l.contains("pgg"))
+                .filter(|l| l.contains("listing the target's keys failed"))
+                .count()
+                >= 2)
+                .then_some(())
+        },
+    )
+    .await;
+
+    // The table the listing asks for now exists. The strays the failed listing could not name
+    // are all there to be found: the failure struck nothing off, and the same reset finishes.
+    admin
+        .batch_execute(
+            "CREATE TABLE covpg_gone (what text PRIMARY KEY);
+             INSERT INTO covpg_gone VALUES ('g1'), ('g2'), ('3');",
+        )
+        .await
+        .unwrap();
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'pgg'")
+        .await;
+    async fn rows(admin: &tokio_postgres::Client) -> Vec<String> {
+        admin
+            .query("SELECT what FROM covpg_gone ORDER BY what", &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    }
+    wait_for(Duration::from_secs(90), "the strays deleted", || async {
+        (rows(&admin).await == ["3"]).then_some(())
+    })
+    .await;
+    wait_for(Duration::from_secs(30), "the reset done", || async {
+        db.status("pgg")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .map(|_| ())
+    })
+    .await;
+    assert!(
+        db.status("pgg")
+            .await
+            .filter(|s| s.2.starts_with("done"))
+            .is_some(),
+        "the same rule finished once the server could run its listing"
+    );
     inst.stop().await;
 }
 
