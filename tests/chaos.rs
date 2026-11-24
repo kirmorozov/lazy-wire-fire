@@ -1,10 +1,15 @@
-//! Chaos seeds (PRs 1 and 2 of the chaos suite, design §2/§5): the engine runs as a real child
-//! process, in-process `FaultProxy`s separate it from the shared servers per role, and every
-//! fault transition is gated on an observed event (`/status` fields, proxy counters, mock
-//! deliveries), never on a wall-clock sleep. S1 `source_cut_mid_stream`, T1 `target_down`
-//! (with a healthy sibling rule that must keep advancing) and P1 `sigkill_mid_flush` exercise
-//! P1–P5 jointly; S2–S5 add the rest of the source class (stall, flapping, a cut inside a
-//! 50 000-row group, and an XA whose COMMIT lands across a cut and across a kill). `h1` and `h2`
+//! Chaos seeds (design §2/§5): the engine runs as a real child process, in-process
+//! `FaultProxy`s separate it from the shared servers per role, and every fault transition is
+//! gated on an observed event (`/status` fields, proxy counters, mock deliveries), never on a
+//! wall-clock sleep. S1 `source_cut_mid_stream`, T1 `target_down` (with a healthy sibling rule
+//! that must keep advancing) and P1 `sigkill_mid_flush` exercise P1–P5 jointly; S2–S5 add the
+//! rest of the source class (stall, flapping, a cut inside a 50 000-row group, and an XA whose
+//! COMMIT lands across a cut and across a kill); T2–T6 add the target class. P2
+//! `sigkill_during_reset` interrupts a snapshot reset mid-step and requires it to start over
+//! after the restart, P3 `graceful_sigterm` is the cheap shutdown control (exit 0 within the
+//! stop grace, running actions finished, position saved for the next child), and C1
+//! `target_down_while_source_flaps` is the combined outage that proves "outage ≠ data loss"
+//! end to end. `h1` and `h2`
 //! are harness self-tests, and they are the reason two of the sampler's invariants can be trusted:
 //! each forges a row that *should* be refused — a position below a declared XA floor, and a position
 //! at the checkpoint of a phase whose keys never arrived — and requires the refusal. An invariant
@@ -3291,4 +3296,814 @@ async fn h3_environment_kill_is_not_a_product_failure() {
          -> panic naming the signal ({} abort recorded for this seed)",
         aborts_for("h3_environment_kill")
     );
+}
+
+// --------------------------------------------------------------------------- P2 reset
+
+/// The engine's own reset-progress line, as it is persisted in the status row's
+/// `reset_state` column while a `for_each` step walks its batches (`src/engine.rs`):
+/// `running: step <i>/<n> <name>: <done>/<total> keys: <reason>`. Returns
+/// `(step, steps, name, done, total)`.
+fn reset_progress(state: &str) -> Option<(u32, u32, String, u64, u64)> {
+    let rest = state.strip_prefix("running: step ")?;
+    let (step, tail) = rest.split_once('/')?;
+    let (steps, tail) = tail.split_once(' ')?;
+    let (name, tail) = tail.split_once(": ")?;
+    let (done, rest) = tail.split_once('/')?;
+    let (total, _) = rest.split_once(" keys:")?;
+    Some((
+        step.parse().ok()?,
+        steps.parse().ok()?,
+        name.to_owned(),
+        done.parse().ok()?,
+        total.parse().ok()?,
+    ))
+}
+
+/// How many times the application was asked at `path` during the run so far. The
+/// design §3 gate for a mid-step kill is "the step is not just claimed but observed
+/// to be producing calls", and this is the counter taken where those calls land.
+fn mock_path_hits(mock: &Mock, path: &str) -> usize {
+    mock.requests().iter().filter(|r| r.path == path).count()
+}
+
+/// The rule row's `reset_requested` flag — the operator's lever, read back from the
+/// table rather than trusted from the write.
+async fn reset_flag(db: &Db, rule: &str) -> Option<i64> {
+    let mut c = db.conn().await;
+    let r: Option<i64> = c
+        .exec_first(
+            "SELECT reset_requested FROM lazy_wire_fire_rule WHERE name = ?",
+            (rule,),
+        )
+        .await
+        .unwrap();
+    quit(c).await;
+    r
+}
+
+/// P2 (design §2): an operator asks for a full re-send (`reset_requested = 1`) while the
+/// engine is running, and the kernel does not cooperate: a SIGKILL lands while the
+/// snapshot step is demonstrably mid-batch — the status row carries the reset in flight
+/// and the step's own `/snap` calls are still arriving and advancing at the application.
+/// (The engine marks the row dirty at `pending:` and updates the `running:` progress in
+/// memory only — `drive_reset`, `src/engine.rs` — so the step's call counter, not the
+/// column, is the mid-step observation; the row is what ties the calls to this flip.)
+/// A reset is not a transaction.
+///
+/// Properties, each with the assertion that says it:
+/// * the fault fires inside a live reset: the gate is the in-flight row plus the step's
+///   own call counter at the mock, the child answers strictly fewer than all batches
+///   before the kill, and the flag is read back as `1` immediately before it (nothing is
+///   asserted about a reset nobody started);
+/// * the restarted child starts the interrupted reset over — the step re-runs from the
+///   beginning (`/snap` calls for the whole table again, `reset steps start` in its log)
+///   and completes with `done:` in the status row;
+/// * the engine clears the operator's flag itself after finishing (`reset_requested = 0`);
+/// * the saved position survives the crash: the second child boots on
+///   `starting from the saved positions`;
+/// * the work written while the reset was in flight — 200 `orders` keys on a second,
+///   disjoint rule — reaches the application exactly once after the restart, and the
+///   re-sent snapshot adds no unexplained duplicate (P4 is the sampler's, and the kill
+///   and the restart are its fault events).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2_sigkill_during_reset() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_p2").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("p2-reset");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+
+    // The reset rule: an announcement step, then a snapshot of all 5 000 `items` keys in
+    // batches of 250. The step's own template posts to `/snap`, so the step's calls are
+    // countable apart from the rule's ordinary flushes (which go to `/hook`). At the
+    // mock's armed delay every batch costs a third of a second, which makes the step
+    // last seconds — a window the kill can be *seen* to land inside, not guessed at.
+    let total = 5_000;
+    let steps = serde_json::json!([
+        {
+            "name": "announce",
+            "once": true,
+            "template": "POST /reset-announce HTTP/1.1\n\n"
+        },
+        {
+            "name": "snapshot",
+            "for_each": "snapshot",
+            "template": "POST /snap HTTP/1.1\n\n{{join keys \",\"}}"
+        }
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, snapshot_keys_sql, \
+         batch_max_keys, reset_steps, debounce_ms) VALUES (?, ?, ?, ?, ?, ?, 100)",
+        (
+            "snap",
+            "hook",
+            "POST /hook HTTP/1.1\n\n{{join keys \",\"}}",
+            "SELECT id AS _key FROM items",
+            250u32,
+            steps.to_string(),
+        ),
+    )
+    .await;
+    db.trigger("snap", "items", Some("{{new.id}}"), None).await;
+    // The live rule owns the keys written during the reset window: its own table and
+    // key range keep the `items` accounting clean and give the window its own traffic.
+    join_rule(&db, "live", "hook", "orders").await;
+
+    bulk_items(&db, 1, total).await;
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "p2_sigkill_during_reset",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_log(&lazy.log_path);
+
+    // The precondition the design states: the engine must be genuinely live before the
+    // fault — every seeded row delivered once, and no reset already in progress (an
+    // old `running:` row would turn this seed into a resume test nobody asked for).
+    let cp0 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase("snap", "seeded rows", cp0.clone(), keyset(1, total), &mock);
+    drain(&sp, &lazy, &db, "snap", cp0.clone(), 180).await;
+    let before = db
+        .status("snap")
+        .await
+        .expect("snap row after the first drain");
+    assert!(
+        !before.2.starts_with("running") && !before.2.starts_with("pending"),
+        "a reset was already in progress before the fault: reset_state = {:?}",
+        before.2
+    );
+
+    // The operator's lever, pulled the normal way: an UPDATE of the rule row. The delay
+    // is armed first so the snapshot step is slow enough to observe and interrupt.
+    mock.delay(300, 3000);
+    log.add("operator requests a reset: reset_requested = 1");
+    db.exec("UPDATE lazy_wire_fire_rule SET reset_requested = 1 WHERE name = 'snap'")
+        .await;
+    let hits0 = mock_path_hits(&mock, "/snap");
+    let (state_at_gate, hits_at_gate) = wait_for(
+        Duration::from_secs(90),
+        "the reset to be observed in flight (the row says pending/running) with the \
+         snapshot step's own `/snap` calls at the mock advancing",
+        || async {
+            let r = db.status("snap").await.unwrap_or_default();
+            let hits = mock_path_hits(&mock, "/snap");
+            // Which line the row carries is the persist cadence's choice: `start_reset`
+            // marks the row dirty at `pending:` and `drive_reset` rewrites the column
+            // in memory without ever setting the dirty flag again (`src/engine.rs`), so
+            // a poll sees `pending:` or a `running:` frozen wherever the step had got
+            // to. The strongest mid-step observation is therefore the step's own calls
+            // landing at the application, which is what `hits > hits0` counts; the row
+            // standing on a live reset is what ties those calls to this flip.
+            let s = &r.2;
+            let inside = s.starts_with("pending:") || s.starts_with("running:");
+            (inside && hits > hits0).then(|| (s.clone(), hits))
+        },
+    )
+    .await;
+    let progress = reset_progress(&state_at_gate);
+    if let Some((_, _, _, _done, total_keys)) = &progress {
+        assert_eq!(
+            *total_keys, total as u64,
+            "the snapshot step must walk every row of the table, not a part of it"
+        );
+    }
+    assert_eq!(
+        reset_flag(&db, "snap").await,
+        Some(1),
+        "the kill must happen while the operator's flag is still set — the engine \
+         clears it only when the reset finishes"
+    );
+    let snap_hits_before = mock_path_hits(&mock, "/snap");
+    assert!(
+        snap_hits_before > hits0,
+        "the snapshot step had produced no new call at the mock when the kill was about \
+         to land ({hits0} calls before the flag, {snap_hits_before} after): the step was \
+         never observed running, and a kill outside it would test nothing"
+    );
+    assert!(
+        snap_hits_before < hits0 + total as usize / 250,
+        "the first child had already answered the whole snapshot ({snap_hits_before} calls, \
+         all {} batches) before the kill: the step was not in flight, and a kill after it \
+         would test nothing",
+        total as usize / 250
+    );
+
+    // Work written between the reset's start and the crash — the keys whose delivery
+    // after the restart is the point of the seed.
+    log.add(format!(
+        "killing child 1 mid-snapshot (row `{state_at_gate}`, {snap_hits_before} step calls \
+         answered at the mock), with orders 10001..=10100 written during the reset"
+    ));
+    bulk_orders(&db, 10_001, 10_100).await;
+    let cp_live1 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "live",
+        "keys written during the reset",
+        cp_live1.clone(),
+        keyset(10_001, 10_100),
+        &mock,
+    );
+    lazy.kill();
+
+    // The restart finds the same unfinished state in the rule row (the flag is still 1)
+    // and in the status row (`running: step 2/2 ...`), and must run the reset to its
+    // end — from the beginning — before anything is believed delivered.
+    let mut lazy2 = Lazy::start(
+        "p2_sigkill_during_reset",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy2, 60);
+    sp.add_log(&lazy2.log_path);
+    let starts: Vec<String> = lazy2.log_lines_matching("reset steps start");
+    assert!(
+        !starts.is_empty(),
+        "the restarted child started no reset at all: the rule row still said \
+         reset_requested = 1 and the status row still said `running:`, so it had to \
+         ({:?})",
+        db.status("snap").await.map(|r| r.2)
+    );
+    let saved = lazy2.log_lines_matching("starting from the saved positions");
+    assert!(
+        !saved.is_empty(),
+        "the restarted child did not boot on the saved positions: {:?}",
+        lazy2.log_path
+    );
+    // It does not resume the step where it stopped — the interrupted reset starts over,
+    // so the step posts the whole table again: the first child answered at most the
+    // chunks it got to (the gate saw `{done}`), and the second owes all 20 batches.
+    wait_for(
+        Duration::from_secs(120),
+        "the crashed reset to finish on the second child (reset_state `done:`)",
+        || async {
+            let r = db.status("snap").await.unwrap_or_default();
+            r.2.starts_with("done:").then_some(())
+        },
+    )
+    .await;
+    let snap_hits = mock_path_hits(&mock, "/snap");
+    assert!(
+        snap_hits >= snap_hits_before + total as usize / 250,
+        "the snapshot step produced only {} `/snap` calls across the crash ({snap_hits_before} \
+         before the kill): the restarted child must re-walk the whole table \
+         ({total} keys in batches of 250), not half of it",
+        snap_hits
+    );
+    let done_lines = lazy2.log_lines_matching("reset steps done");
+    assert!(
+        !done_lines.is_empty(),
+        "the status row says done but the child never logged it: {:?}",
+        lazy2.log_path
+    );
+    // The operator's request is answered, so the engine clears the flag itself.
+    wait_for(
+        Duration::from_secs(30),
+        "the engine to clear the operator's reset_requested flag after finishing",
+        || async { (reset_flag(&db, "snap").await == Some(0)).then_some(()) },
+    )
+    .await;
+
+    // And the window's work arrives: the keys written during the reset (still unconfirmed
+    // when the child died) and everything written after, each exactly once — the sampler
+    // has policed P4 across the kill (its fault events are in the log), and P1-style
+    // byte-exact resume is P1's own claim; here the boot line above is the guard that
+    // the second child really started from the saved positions and not from the tail.
+    bulk_orders(&db, 10_101, 10_200).await;
+    let cp_live2 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "live",
+        "keys written after the reset",
+        cp_live2.clone(),
+        keyset(10_101, 10_200),
+        &mock,
+    );
+    drain(&sp, &lazy2, &db, "live", cp_live2.clone(), 120).await;
+    sp.check();
+    assert_all_keys(&mock, 10_001, 10_200, "P2 live (mid-reset window)");
+    assert_all_keys(&mock, 1, total, "P2 snapshot rows");
+    let (delivered, repeated) = delivery_report(&mock);
+    let at = progress
+        .map(|(_, _, _, d, t)| format!("{d}/{t} keys"))
+        .unwrap_or_else(|| format!("{hits_at_gate} step calls answered (row `{state_at_gate}`)"));
+    eprintln!(
+        "P2: killed mid-snapshot at {at}; /snap calls={snap_hits} \
+         ({snap_hits_before} before the kill, the rest is the second child's re-walk), \
+         deliveries={delivered} with {repeated} keys repeated across the kill window, \
+         200 live keys delivered through the crash"
+    );
+    assert_no_undelivered(&lazy);
+    assert_no_undelivered(&lazy2);
+    lazy2.kill();
+    sp.stop();
+}
+
+// ------------------------------------------------------------------------ P3 SIGTERM
+
+/// P3 (design §2): the cheap shutdown control. The engine takes a SIGTERM while a batch
+/// is demonstrably in flight at the target (the mock is answering 1 500 ms late and has
+/// already taken the phase-3 request), and the stop-grace budget is `LAZYWF_STOP_GRACE_MS
+/// = 3000` (`fault::Lazy::start`). This is the only place the suite asserts the *exit
+/// code*: a chaos restart by SIGKILL never has one.
+///
+/// Properties, each with the assertion that says it:
+/// * `Stop::Exited(0)` — not a signal death, not nonzero (P3's exit-code half);
+/// * the stop took longer than the in-flight call's remaining wait (the engine really
+///   waited for the running action) and well inside the grace plus slack;
+/// * the child logged `shutdown requested` and `stopped` as JSON lines (the shutdown
+///   path ran, in order, on its own);
+/// * the in-flight batch was delivered exactly once and its keys survived into the next
+///   child — which is asserted behaviourally: the restarted child boots on
+///   `starting from the saved positions` at the saved row and replays nothing (every
+///   key of the run, 1..=301, counted exactly once at the mock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p3_graceful_sigterm() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_p3").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("p3-term");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    join_rule(&db, "o", "hook", "orders").await;
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "p3_graceful_sigterm",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_log(&lazy.log_path);
+
+    // Two phases drain normally first: the saved position the next child must find.
+    for phase in 0..2u32 {
+        let (from, to) = (1 + phase * 100, (phase + 1) * 100);
+        bulk_orders(&db, from, to).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        sp.add_phase(
+            "o",
+            &format!("phase {}", phase + 1),
+            cp.clone(),
+            keyset(from, to),
+            &mock,
+        );
+        drain(&sp, &lazy, &db, "o", cp.clone(), 60).await;
+    }
+
+    // The in-flight window: every request is answered 1 500 ms after it arrives, inside
+    // the target's own 3 000 ms timeout (a late-but-complete answer is still a delivery)
+    // and inside the stop grace. SIGTERM may only be sent once the mock has *taken* the
+    // phase-3 request and the rule is still unconfirmed — an event, never a sleep.
+    mock.delay(1_500, 3_000);
+    bulk_orders(&db, 201, 300).await;
+    let cp3 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "o",
+        "phase 3 (in flight at the signal)",
+        cp3.clone(),
+        keyset(201, 300),
+        &mock,
+    );
+    wait_for(
+        Duration::from_secs(60),
+        "the phase-3 flush to be in flight at the mock (taken, unanswered, firing)",
+        || async {
+            let in_flight = mock
+                .requests()
+                .iter()
+                .any(|r| r.path == "/hook" && r.body.split(',').any(|k| k.trim() == "201"));
+            let row = db.status("o").await.map(|(f, p, _, _)| (f, p));
+            let firing = lazy.status().await["rules"]["o"]["firing"].as_bool() == Some(true);
+            (in_flight && firing && row.is_some_and(|r| r < cp3.clone())).then_some(())
+        },
+    )
+    .await;
+    log.add("SIGTERM sent while the phase-3 batch is in flight at the mock");
+    let t_stop = Instant::now();
+    let stop = lazy.term().await;
+    let elapsed = t_stop.elapsed();
+    if stop.is_environment_kill() {
+        eprintln!("P3: SKIPPED BY ENVIRONMENT — the harness's child was taken; see tmp/out/chaos/env-aborts.log");
+        return;
+    }
+    // The exit code, which only a clean shutdown has.
+    assert!(
+        matches!(stop, Stop::Exited(0)),
+        "P3: SIGTERM with an in-flight batch ended {stop:?}, not a clean exit 0"
+    );
+    // The running action was waited for, not abandoned: the mock answers 1 500 ms after
+    // the request arrives and the signal went out just after it did, so a stop that
+    // finished in a flash had not waited for the lane. And the whole stop fits inside
+    // the 3 000 ms grace with slack.
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "P3: the child exited {elapsed:?} after SIGTERM although the in-flight call was \
+         armed to answer 1 500 ms after arriving: the shutdown did not wait for the \
+         running action before persisting"
+    );
+    assert!(
+        elapsed <= Duration::from_millis(3_000 + 1_500),
+        "P3: the stop took {elapsed:?}, beyond the 3 000 ms stop grace plus 1 500 ms of \
+         harness slack — the engine ignored its deadline as much as a too-fast exit does"
+    );
+    // The child's own account of the shutdown, as JSON lines (`LAZYWF_LOG_FORMAT=json`).
+    let requested = lazy.log_lines_matching("shutdown requested");
+    assert_eq!(
+        requested.len(),
+        1,
+        "P3: {} `shutdown requested` lines (the watcher logs exactly one): {:?}",
+        requested.len(),
+        lazy.log_path
+    );
+    let v: serde_json::Value = serde_json::from_str(&requested[0]).expect("json log line");
+    assert_eq!(
+        v["fields"]["message"].as_str(),
+        Some("shutdown requested"),
+        "the line matching `shutdown requested` is not the watcher's message: {v}"
+    );
+    let stopped = lazy.log_lines_matching("\"stopped\"");
+    assert!(
+        stopped.iter().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .filter(|v| v["fields"]["message"].as_str() == Some("stopped"))
+                .is_some()
+        }),
+        "P3: no `stopped` message after the lane drained: {:?}",
+        lazy.log_path
+    );
+    // The in-flight batch landed exactly once despite the signal — no lost and no
+    // double-sent answer on the shutdown path.
+    sp.check();
+    assert_all_keys(&mock, 1, 300, "P3 (in-flight batch delivered)");
+
+    // The position the next child resumes from: read after the clean exit, and the pair
+    // `choose_start` takes its minimum over (P1's reading).
+    db.tick().await;
+    wait_row_past(&db, "o", &cp3.clone(), 30).await;
+    let (pf, pp, _, _) = db.status("o").await.expect("rule row after the clean stop");
+    let (sf, spos) = instance_row(&db)
+        .await
+        .expect("instance row after the clean stop");
+    let (ef, ep) = if (sf.as_str(), spos) <= (pf.as_str(), pp) {
+        (sf.clone(), spos)
+    } else {
+        (pf.clone(), pp)
+    };
+
+    // The second child: boots on the saved positions and re-delivers nothing — the
+    // behavioural form of "the batch that confirmed before the exit was saved". One
+    // more key proves the child is really streaming (an absence asserted against a
+    // child that never woke would prove nothing), and then the exact-once count over
+    // the whole run is the replay check.
+    let mut lazy2 = Lazy::start(
+        "p3_graceful_sigterm",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy2, 60);
+    sp.add_log(&lazy2.log_path);
+    let starts = lazy2.log_lines_matching("starting from the saved positions");
+    assert!(
+        !starts.is_empty(),
+        "the restarted child did not boot on the saved positions: {:?}",
+        lazy2.log_path
+    );
+    let line = starts.last().unwrap().clone();
+    let v: serde_json::Value = serde_json::from_str(&line).expect("json log line");
+    assert_eq!(
+        v["fields"]["position"].as_str(),
+        Some(format!("{ef}:{ep}").as_str()),
+        "the restarted child did not resume at the minimum of the two saved rows \
+         (instance {sf}:{spos}, rule {pf}:{pp})"
+    );
+    bulk_orders(&db, 301, 301).await;
+    let cp4 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "o",
+        "phase 4 (second child)",
+        cp4.clone(),
+        keyset(301, 301),
+        &mock,
+    );
+    drain(&sp, &lazy2, &db, "o", cp4.clone(), 60).await;
+    sp.check();
+    assert_all_keys(&mock, 1, 301, "P3 (second child)");
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, keys) in mock.deliveries() {
+        for k in keys {
+            *seen.entry(k).or_insert(0) += 1;
+        }
+    }
+    let replayed: Vec<String> = (1..=301)
+        .map(|i| i.to_string())
+        .filter(|k| seen.get(k).copied().unwrap_or(0) != 1)
+        .collect();
+    assert!(
+        replayed.is_empty(),
+        "P3: {} keys were not delivered exactly once across the graceful stop and restart \
+         (e.g. {:?}): a key whose flush confirmed before the SIGTERM must not be re-sent \
+         by the next child, and one that was lost has no excuse either",
+        replayed.len(),
+        replayed.iter().take(5).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "P3: exit 0 in {elapsed:?} (stop grace 3 s, in-flight call 1.5 s), {} deliveries for \
+         301 keys, each exactly once; the next child resumed at {ef}:{ep}",
+        mock.delivery_count()
+    );
+    assert_no_undelivered(&lazy);
+    assert_no_undelivered(&lazy2);
+    lazy2.kill();
+    sp.stop();
+}
+
+// -------------------------------------------------------------------------- C1 combined
+
+/// The drain bound after the combined outage heals — measured, not guessed (design §3).
+/// Three runs on MySQL 8.4 (`tmp/out/lwf-worker-chaos-pr4/evidence/run-c1_target_down_while_source_flaps.rep{1,2,3}.log`)
+/// drained in 1.068 s, 1.082 s and 1.099 s; the bound is the measured figure with the
+/// headroom a loaded box needs, and the seed prints the elapsed drain so a regression in
+/// it stays visible. A heal that never lets the rules catch up is a hang this catches.
+const C1_DRAIN_BOUND_SECS: u64 = 60;
+
+/// C1 (design §2): the combined outage — the target is dead (`refuse`) for the whole
+/// window while the binlog dump port flaps (6 resets, the S3 storm), under a load that
+/// keeps both the key space and the versions moving: 6 × 250 write-once `orders`, 200
+/// `customers` rows inserted and then re-updated twice (the `id:version` key template,
+/// so every bump is a new key), and a sibling rule on healthy `items` traffic that must
+/// keep advancing while everything else burns. "Outage ≠ data loss" end to end.
+///
+/// Properties:
+/// * both faults are facts where they are performed — `flap_cuts`/`flap_resets` at the
+///   dump proxy (and its mode back to `live`), `refusals()` at the target proxy, and the
+///   stuck rules' `last_error` naming the refused port;
+/// * the stuck rules' rows stay pinned below their first unconfirmed checkpoint all
+///   window (the sampler's P2, checked here once per phase and at the end), while the
+///   sibling rule's row walks past the last checkpoint *through* the window — the
+///   combined claim that a dead target never waits for the stream and vice versa;
+/// * after the heal everything drains within the bound: every orders key, every
+///   `id:version` key, every sibling key, positions at or above their checkpoints, no
+///   key given up on (P5), and any redelivery inside the window sits between the
+///   storm's own fault events (P4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c1_target_down_while_source_flaps() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_c1").await;
+    chaos_shop(&db).await;
+    // The customers table gains the version column the `id:version` key template rides on.
+    db.exec("ALTER TABLE customers ADD COLUMN v INT NOT NULL DEFAULT 1")
+        .await;
+    let log = FaultLog::new();
+    let down = Mock::start().await;
+    down.set_fault_log(log.clone());
+    down.tag("c1-down");
+    let up = Mock::start().await;
+    up.set_fault_log(log.clone());
+    up.tag("c1-up");
+    let tprog = FaultProxy::start(&down.addr.to_string(), "c1-target", Some(log.clone())).await;
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target(
+        "down",
+        "http",
+        &format!("http://{}/hook", tprog.addr()),
+        None,
+        "{}",
+    )
+    .await;
+    db.target("free", "http", &up.url(), None, "{}").await;
+    join_rule(&db, "o", "down", "orders").await;
+    // The version-bump rule: one rule that takes both writes and key updates.
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, debounce_ms) VALUES (?, ?, ?, 100)",
+        ("v", "down", "POST /hook HTTP/1.1\n\n{{join keys \",\"}}"),
+    )
+    .await;
+    db.trigger("v", "customers", Some("{{new.id}}:{{new.v}}"), None)
+        .await;
+    join_rule(&db, "sib", "free", "items").await;
+    tprog.refuse(true);
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "c1_target_down_while_source_flaps",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_proxy(&tprog);
+    sp.add_log(&lazy.log_path);
+    wait_for(
+        Duration::from_secs(30),
+        "the engine to be streaming before the storm starts",
+        || async {
+            lazy.status().await["streaming"]
+                .as_bool()
+                .unwrap_or(false)
+                .then_some(())
+        },
+    )
+    .await;
+
+    // The storm first, so its cuts fall in the first half of the window and the writes
+    // are interleaved with it (S3's pacing: every phase is gated on the proxy's own
+    // count of reset connections, never on the clock).
+    binp.flap(6);
+    log.add("combined outage: dump port flapping (6 cuts) while the target port is dead");
+    let mut cps: Vec<(String, u64)> = Vec::new();
+    let mut cust_sets: Vec<BTreeSet<String>> = Vec::new();
+    for phase in 0..6u32 {
+        let (from, to) = (1 + phase * 250, (phase + 1) * 250);
+        bulk_orders(&db, from, to).await;
+        // Customers: inserted in phase 1, bumped twice after — each bump mints 200
+        // fresh `id:version` keys on the stuck rule.
+        match phase {
+            0 => {
+                let rows: Vec<String> = (1..=200).map(|i| format!("({i}, 'c{i}', 1)")).collect();
+                db.exec(&format!(
+                    "INSERT INTO customers (id, name, v) VALUES {}",
+                    rows.join(",")
+                ))
+                .await;
+                cust_sets.push(version_keys(1, 200, 1));
+            }
+            1 | 2 => {
+                db.exec("UPDATE customers SET v = v + 1 WHERE id BETWEEN 1 AND 200")
+                    .await;
+                cust_sets.push(version_keys(1, 200, phase + 1));
+            }
+            _ => {}
+        }
+        // The sibling's healthy traffic, 100 fresh items keys per phase.
+        let (ifrom, ito) = (6_001 + phase * 100, 6_100 + phase * 100);
+        bulk_items(&db, ifrom, ito).await;
+        let cp = binlog_end(&db).await;
+        db.tick().await;
+        sp.add_phase(
+            "o",
+            &format!("orders phase {}", phase + 1),
+            cp.clone(),
+            keyset(from, to),
+            &down,
+        );
+        if let Some(keys) = cust_sets.get(phase as usize) {
+            sp.add_phase(
+                "v",
+                &format!("customers v={}", phase + 1),
+                cp.clone(),
+                keys.clone(),
+                &down,
+            );
+        }
+        sp.add_phase(
+            "sib",
+            &format!("sibling phase {}", phase + 1),
+            cp.clone(),
+            keyset(ifrom, ito),
+            &up,
+        );
+        cps.push(cp);
+        // Pacing on the proxy's own counter (S3's pattern), capped at the six cuts the
+        // storm makes: the later phases write after the storm, while the target is
+        // still dead — the outage keeps its second half without the storm.
+        let seen = ((phase as u64 + 1) * 2).min(6);
+        binp.wait(
+            move |s| s.flap_cuts >= seen,
+            &format!("{seen} dump connections reset by the storm"),
+        )
+        .await;
+    }
+    binp.wait(
+        |s| s.flap_cuts == 6 && s.mode == "live",
+        "the storm to be over: 6 reset connections and the port live again",
+    )
+    .await;
+
+    // Both faults observed, each counted where it is performed. The target count is
+    // gated on the engine's own attempt first: `last_error` naming the refused port is
+    // the event that says a connect happened, and only then is "the port refused it"
+    // this proxy's claim to make.
+    let st = binp.stat();
+    assert_eq!(
+        st.flap_cuts, 6,
+        "the storm claimed {} cuts, not the design's 6",
+        st.flap_cuts
+    );
+    assert_eq!(
+        st.flap_resets, 6,
+        "the storm counted {} cuts but reset only {} sockets: a number, not a fault",
+        st.flap_cuts, st.flap_resets
+    );
+    wait_pending(&lazy, "o", 30).await;
+    wait_pending(&lazy, "v", 30).await;
+    let err = wait_rule_error(&db, "o", &tprog.addr().to_string(), 60).await;
+    assert!(
+        tprog.refusals() >= 1,
+        "the target port was refused {} connections while the rule's own last_error says \
+         the engine dialled it ({err}): a dead endpoint nobody refused is not an outage",
+        tprog.refusals()
+    );
+    // The stuck rules stay pinned below their first unconfirmed checkpoint while the
+    // storm is over and the target is still dead; the sibling walked through it.
+    let (fo, po, _, _) = db.status("o").await.expect("stuck o row");
+    assert!(
+        (fo.clone(), po) < cps[0].clone(),
+        "the stuck rule reached {fo}:{po} while its first checkpoint {}:{} is unconfirmed",
+        cps[0].0,
+        cps[0].1
+    );
+    let (fv, pv, _, _) = db.status("v").await.expect("stuck v row");
+    assert!(
+        (fv.clone(), pv) < cps[0].clone(),
+        "the version rule reached {fv}:{pv} while its first checkpoint {}:{} is unconfirmed",
+        cps[0].0,
+        cps[0].1
+    );
+    sp.check();
+    wait_row_past(&db, "sib", &cps[5], 90).await;
+    sp.check();
+    log.add(format!(
+        "combined outage observed: {} refusals at the target, 6 dump cuts, o pinned at \
+         {fo}:{po}, sibling past the last checkpoint — healing the target",
+        tprog.refusals()
+    ));
+    let t_drain = Instant::now();
+    tprog.heal();
+    // The bound: the retry backoff is capped at 800 ms (LAZYWF_MAX_BACKOFF_MS), the
+    // storm is over, so what remains is one backoff plus the queued flushes.
+    drain(&sp, &lazy, &db, "o", cps[5].clone(), C1_DRAIN_BOUND_SECS).await;
+    let drained_in = t_drain.elapsed();
+    sp.check();
+    wait_row_past(&db, "v", &cps[2], 90).await;
+    assert_all_keys(&down, 1, 1_500, "C1 orders");
+    assert_keys(&down, &union_keys(&cust_sets), "C1 customers");
+    assert_all_keys(&up, 6_001, 6_600, "C1 sibling");
+    let (delivered, repeated) = delivery_report(&down);
+    let (sib_delivered, sib_repeated) = delivery_report(&up);
+    eprintln!(
+        "C1: {} orders + {} customer-version + 600 sibling write-once keys through a dead \
+         target and a 6-cut dump storm; target deliveries={delivered} (repeated keys=\
+         {repeated}, inside the outage's fault events), sibling deliveries={sib_delivered} \
+         (repeated={sib_repeated}), refusals={}, dump cuts={}, drained in {:?} \
+         (bound {C1_DRAIN_BOUND_SECS} s), last_error={err}",
+        1_500,
+        cust_sets.iter().map(|s| s.len()).sum::<usize>(),
+        tprog.refusals(),
+        st.flap_cuts,
+        drained_in
+    );
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
 }
