@@ -121,6 +121,7 @@ async fn engine_with_flush_ready(
         last_error: None,
         backoff: Backoff::default(),
         pending_clear: false,
+        reset_request_seen: false,
         counters: Counters::default(),
         strikes: HashMap::new(),
         written: None,

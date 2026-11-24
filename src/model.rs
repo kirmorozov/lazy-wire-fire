@@ -83,6 +83,28 @@ pub const DDL: [&str; 4] = [
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 ];
 
+/// `lazy_wire_fire_rule`'s columns in the order [`DDL`] creates them. The table is the engine's
+/// own, so a row image of it is exactly these columns and in this order: that is how the engine
+/// finds a `reset_requested` write in one on a server without `binlog_row_metadata=FULL`, where
+/// the table map names nothing (see the clear in [`crate::engine`]'s `housekeeping`). A row image
+/// whose column count is not this one is not read at all.
+pub const RULE_COLS: [&str; 14] = [
+    "name",
+    "enabled",
+    "target",
+    "selects",
+    "snapshot_keys_sql",
+    "template",
+    "fire_per",
+    "batch_max_keys",
+    "batch_max_bytes",
+    "debounce_ms",
+    "max_delay_ms",
+    "reset_steps",
+    "reset_requested",
+    "vars",
+];
+
 /// Creates the tables that are missing. Without the CREATE privilege, tables created by
 /// someone else are fine.
 pub async fn ensure(conn: &mut Conn) -> Result<()> {
