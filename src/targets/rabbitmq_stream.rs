@@ -43,8 +43,8 @@
 //! (murmur3 of it, modulo the partitions the broker lists); on a plain stream it is carried but
 //! unused. A super stream record without one is refused alone (nothing to route by). The
 //! document key `keys[i]`
-//! travels as the application property `lazywf_key` (the counterpart of amqp's message id);
-//! with no keys (a `once` step) the records carry none.
+//! travels as the application property `lazywf_key` (the counterpart of amqp's message id); a
+//! `once` step (no keys at all) cannot list records, so it never publishes (see [`send`]).
 //!
 //! # Outcomes
 //!
@@ -910,28 +910,18 @@ impl Action {
     }
 }
 
-/// Sends one rendered `once` action (no keys) and checks `expect` on every record.
-pub async fn send(client: &Client, rendered: &str, expect: &Expect, pool: &Pool) -> Result<Sent> {
-    let Some(items) = items_of(client, rendered, &[]).await? else {
-        return Ok(Sent::Skipped);
-    };
-    for (i, o) in items.iter().enumerate() {
-        match o {
-            Outcome::Ok(stream, id) => expect
-                .row(pool, |u| Row::rabbitmq_stream(u, stream, *id))
-                .await
-                .with_context(|| format!("record {i} of {}", client.url))?
-                .map_err(|e| rejected(format!("{} record {i}: {e}", client.url)))?,
-            Outcome::Refused(why) => {
-                return Err(rejected(format!(
-                    "{} record {i}: the broker refused it: {why}",
-                    client.url
-                )))
-            }
-            Outcome::Transient(why) => bail!("{} record {i}: {why}", client.url),
-        }
-    }
-    Ok(Sent::Ok)
+/// Sends one rendered `once` action — an action with no keys, which is all a `once` reset step
+/// can render. [`Action::parse`] takes a record list only with one key per record, so such a
+/// render either lists nothing (nothing to publish) or is refused as a render: there is never a
+/// record whose confirm to wait for, and `expect` has nothing to book. It is kept as its own
+/// entry point because the render checks it makes (the request line, the body) are the whole of
+/// it. Every batch of this kind goes through [`send_items`]: the engine sends a batch to the
+/// per-item path for a kind of `Kind::reports_items`, so this is reached from `fire_once` alone.
+pub async fn send(client: &Client, rendered: &str, _expect: &Expect, _pool: &Pool) -> Result<Sent> {
+    // `Some` needs a parsed, non-empty record list, which needs a key per record: with no keys
+    // `items_of` answers `None` or refuses the render, so nothing is ever booked here.
+    items_of(client, rendered, &[]).await?;
+    Ok(Sent::Skipped)
 }
 
 /// Sends one rendered action (record i takes key i) and checks `expect` on every sent record.

@@ -30,8 +30,8 @@
 //! the murmur2 of the key, made positive with `& 0x7fffffff`, mod the partition count), its
 //! rendered `value` (one JSON value, serialized compactly) and optional
 //! `headers` (string to string). A record carries only `value` and `headers` — the key comes
-//! from the row. With no keys (a `once` reset step) the records have no key and land on
-//! partition 0.
+//! from the row. A record with no key of its own takes the first partition; a `once` step (no
+//! keys at all) cannot list records, so it never produces (see [`send`]).
 //!
 //! The batch is compressed per target (`vars.compression`: `none`, `gzip`, `lz4` or `zstd` —
 //! zstd by default), and the largest one the target takes is the broker's `message.max.bytes`,
@@ -705,8 +705,8 @@ impl Client {
             Partitions::Got(p) => p,
             Partitions::Missing => return Err(missing_refusal(&self.url, &self.addr.topic)),
         };
-        // Group record i by the partition of key i. A record without a key (a `once` step) has
-        // no hash to go by and takes the first partition.
+        // Group record i by the partition of key i. A record with an empty key has no hash to go
+        // by and takes the first partition.
         let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
         for i in 0..action.records.len() {
             let p = match keys.get(i) {
@@ -859,28 +859,18 @@ enum StepErr {
     Timeout,
 }
 
-/// Sends one rendered `once` action (no keys) and checks `expect` on every record.
-pub async fn send(client: &Client, rendered: &str, expect: &Expect, pool: &Pool) -> Result<Sent> {
-    let Some(items) = items_of(client, rendered, &[]).await? else {
-        return Ok(Sent::Skipped);
-    };
-    for (i, (pid, o)) in items.iter().enumerate() {
-        match o {
-            Outcome::Ok(offset) => expect
-                .row(pool, |u| Row::kafka(u, &client.addr.topic, *pid, *offset))
-                .await
-                .with_context(|| format!("record {i} of {}", client.url))?
-                .map_err(|e| rejected(format!("{} record {i}: {e}", client.url)))?,
-            Outcome::Refused(why) => {
-                return Err(rejected(format!(
-                    "{} record {i}: the broker refused it: {why}",
-                    client.url
-                )))
-            }
-            Outcome::Transient(why) => bail!("{} record {i}: {why}", client.url),
-        }
-    }
-    Ok(Sent::Ok)
+/// Sends one rendered `once` action — an action with no keys, which is all a `once` reset step
+/// can render. [`Action::parse`] takes a record list only with one key per record, so such a
+/// render either lists nothing (nothing to send) or is refused as a render: there is never a
+/// record whose answer to check, and `expect` has nothing to book. It is kept as its own entry
+/// point because the render checks it makes (the request line, the body) are the whole of it.
+/// Every batch of this kind goes through [`send_items`]: the engine sends a batch to the per-item
+/// path for a kind of `Kind::reports_items`, so this is reached from `fire_once` alone.
+pub async fn send(client: &Client, rendered: &str, _expect: &Expect, _pool: &Pool) -> Result<Sent> {
+    // `Some` needs a parsed, non-empty record list, which needs a key per record: with no keys
+    // `items_of` answers `None` or refuses the render, so nothing is ever booked here.
+    items_of(client, rendered, &[]).await?;
+    Ok(Sent::Skipped)
 }
 
 /// Sends one rendered action (record i takes key i) and checks `expect` on every sent record.
