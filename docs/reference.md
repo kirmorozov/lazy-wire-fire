@@ -1522,9 +1522,23 @@ only when its own message says the requested position cannot be served: a purged
 binlog file, a position outside the file, or GTIDs the position needs are gone. Any other 1236
 keeps the position: the dump is retried with the capped backoff, the server's message is logged
 as a WARN and shown as `stream_error` on `/status` until the stream delivers events again
-([Status](#status)). An interrupted reset starts over after a restart, and a reset interrupted by
-disabling the rule comes back when the rule is enabled again: it is taken up the way one
-interrupted by a process death is, and its steps run from the first one.
+([Status](#status)). An interrupted reset starts over from step 1 after a restart, and a reset
+interrupted by disabling the rule is not dropped: it is taken up when the rule is enabled
+again, and its steps run from the first one — only a fresh process takes a run up at a later one.
+
+The requested reset is the one exception to starting over. When the process dies in the steps of a
+`reset_requested` run and the flag still stands at boot, the new process takes that walk up at the
+step the rule's `reset_state` line shows: the steps before it finished — every batch of each came
+back answered, so the target confirmed their keys — are not sent again, and the step it died in
+runs again from its own beginning, at-least-once like every step (the keys still to send lived in
+memory and died with the process). What vouches for the two runs being the same reset is the
+`fp<8 hex>` token a `running:` line carries beside the step counter: a short digest of the rule's
+fingerprint, the string its whole definition folds into (its steps and their listing SQL, the
+templates, the selects, the batch sizes, the target). So editing the rule while the process was
+down — any part of what that string holds — starts the walk over from step 1, and so do a line an
+older version wrote without the token, a run that started on its own, one that never reached a step
+(`pending:`), and a restart that finds the rule's binlog position gone: such a rule re-syncs from
+step 1, as it does for any lost position. The new process logs `reset steps resume at step N`.
 
 A `reset_requested` raised under a reset that is already running is not folded into it: a run
 that started on its own (continuity lost, a new rule) starts over from step 1 as the requested
@@ -1588,7 +1602,7 @@ operator who raised the flag during a run raises it again once the rule's `reset
 |---|---|
 | `binlog_file`, `binlog_pos` | every action for changes before this point met `expect`. `*`: where the stream resumes. The position is a transaction boundary: the end of the last event that closed a transaction (`Xid`, `XA PREPARE`, `COMMIT` / `ROLLBACK`, a statement on its own), never the position of a statement inside one — the events that open a group differ per server, the ones that close it do not, so the boundary is the same rule whether GTIDs are on or off |
 | `lag_ms` | age of the oldest change not yet confirmed (or how far the stream is behind) |
-| `reset_state` | `none`, `pending: <reason>`, `running: step i/n …`, `done: <time>`, `missing: <reason>` (continuity lost, the rule has no reset steps) |
+| `reset_state` | `none`, `pending: <reason>`, `running: step i/n fp<digest> <step>: …`, `done: <time>`, `missing: <reason>` (continuity lost, the rule has no reset steps). The `fp…` token beside the step counter digests the rule's definition: only a line whose token matches the rule as it is loaded now lets a restart take a requested reset up at that step — [Reset steps](#reset-steps) |
 | `last_error`, `last_error_at` | the last failure |
 | `server_identity` | `*` only: the server the positions belong to |
 | `updated_at` | written when the position moves, and at least every 30 s |
