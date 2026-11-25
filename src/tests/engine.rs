@@ -776,3 +776,189 @@ fn a_saved_requested_run_resumes_only_from_what_the_line_vouches_for() {
         );
     }
 }
+
+/// The recognizer `choose_start`'s carry-over arm reads through for a run that started on
+/// its own: the same `running:` line and the same def proofs as the requested arm (#209),
+/// but the reason test inverted — the two requested reasons are the request's own and keep
+/// starting over (a leftover one under a cleared flag is `add_rule`'s to judge, and #209
+/// refuses it there), while every continuity reason, restart and re-add wording resumes at
+/// the step it died in. Whether the rule kept its position is the boot's to know
+/// (`choose_start`'s lost set), not the line's; a rule that lost it gets a fresh step-0 run
+/// and never reaches this test.
+#[test]
+fn an_unrequested_run_resumes_from_its_line_except_the_request_s_own() {
+    let steps = || {
+        vec![
+            model::ResetStep {
+                name: "announce".into(),
+                kind: StepKind::Once,
+                template: None,
+            },
+            model::ResetStep {
+                name: "snapA".into(),
+                kind: StepKind::Snapshot,
+                template: None,
+            },
+            model::ResetStep {
+                name: "snapB".into(),
+                kind: StepKind::Snapshot,
+                template: None,
+            },
+        ]
+    };
+    const FP: &str = "target|steps|template";
+    let tok = format!("fp{}", fingerprint_digest(FP));
+    // The reasons a run that started on its own writes, in the two shapes `drive_reset`
+    // puts on the line: each continues at the step it was interrupted in.
+    for (state, want) in [
+        (
+            format!("running: step 2/3 {tok} snapA: new rule"),
+            1,
+        ),
+        (
+            format!("running: step 3/3 {tok} snapB: 250/1000 keys: binlog position mysql-bin.000003:4 is no longer available"),
+            2,
+        ),
+        (
+            format!("running: step 1/3 {tok} announce: the server changed (position saved on old, this is new)"),
+            0,
+        ),
+        (
+            format!("running: step 2/3 {tok} snapA: its triggers work again after an error"),
+            1,
+        ),
+        // The carry-over wordings are runs that started on their own too: a crash inside
+        // one takes it up at its step again, exactly as a crash inside the first attempt.
+        (
+            format!("running: step 2/3 {tok} snapA: new rule (resumed after restart)"),
+            1,
+        ),
+        (
+            format!("running: step 2/3 {tok} snapA: new rule (resumed after the rule was added again)"),
+            1,
+        ),
+        (
+            format!("running: step 2/3 {tok} snapA: 100/1000 keys: new rule (resumed after restart)"),
+            1,
+        ),
+        // A run the live rule change restarted under these very steps is the loaded def's
+        // own again (its line carries this fingerprint), so it continues where it stood.
+        (
+            format!("running: step 2/3 {tok} snapA: new rule; restarted after the rule changed"),
+            1,
+        ),
+        // A requested line whose flag was cleared under the dead process became, when the
+        // boot took it up, an unrequested run like any other — the carry-over arms started
+        // it with `requested` false, so its own interruption resumes at its step.
+        (
+            format!("running: step 2/3 {tok} snapA: reset_requested (resumed after restart)"),
+            1,
+        ),
+    ] {
+        assert_eq!(
+            resume_unrequested_reset(&state, &steps(), FP),
+            Some(want),
+            "{state:?} is a saved unrequested run a restart continues at its step"
+        );
+    }
+    // The two texts a run serving the request writes are the request's own and never this
+    // arm's (with them, #209's `add_rule` arm is the judge: while the flag stands it
+    // resumes its own, and a leftover under a cleared flag starts over). Everything the
+    // line cannot vouch for — no step reached, no token, another def's token, a moved step
+    // name, a wrong count, a finished state — starts over too.
+    for state in [
+        "pending: new rule",
+        "done: 2026-11-24T00:00:00Z",
+        "missing: new rule",
+        "none",
+        "",
+        "running: step 2/3 snapA: new rule",
+        "running: step 2/3",
+        "running",
+        "running: step 2/3 fpdeadbeef snapA: new rule",
+        &format!("running: step 2/3 {tok} snapZ: new rule"),
+        &format!("running: step 2/4 {tok} snapA: new rule"),
+        &format!("running: step 0/3 {tok} snapA: new rule"),
+        &format!("running: step 4/3 {tok} snapB: new rule"),
+        &format!("running: step 2/3 {tok} snapA: reset_requested"),
+        &format!("running: step 2/3 {tok} snapA: 100/1000 keys: reset_requested"),
+        &format!("running: step 2/3 {tok} snapA: reset_requested raised again while the finished reset was being cleared"),
+        &format!("running: step 2/3 {tok} snapA: 1/3 keys: reset_requested raised again while the finished reset was being cleared"),
+    ] {
+        assert_eq!(
+            resume_unrequested_reset(state, &steps(), FP),
+            None,
+            "{state:?} is no saved unrequested run a restart may skip finished steps for"
+        );
+    }
+    // The line from a rule whose def moved while the process was down vouches for nothing,
+    // whatever its reason.
+    assert_eq!(
+        resume_unrequested_reset(
+            &format!("running: step 3/3 {tok} snapB: new rule"),
+            &steps(),
+            "target|steps|a DIFFERENT template"
+        ),
+        None,
+        "same step names, edited def: the finished steps are not this def's"
+    );
+}
+
+/// The other half of the carry-over arm's decision, the part the line cannot carry: whether
+/// THIS BOOT still holds the rule's position. A rule that lost continuity gets a fresh
+/// step-0 run from `lose_continuity` and this boot replays from the tail, not from at or
+/// below the rule's confirmed point — so nothing a finished step read is covered, and even a
+/// line this arm would otherwise resume continues nothing. `choose_start` passes `false` for
+/// every rule in its `lost` set; this pins that the run then starts over, not continues.
+#[test]
+fn a_rule_that_lost_continuity_on_this_boot_restarts_its_carry_over_run() {
+    let steps = || {
+        vec![
+            model::ResetStep {
+                name: "announce".into(),
+                kind: StepKind::Once,
+                template: None,
+            },
+            model::ResetStep {
+                name: "snapA".into(),
+                kind: StepKind::Snapshot,
+                template: None,
+            },
+            model::ResetStep {
+                name: "snapB".into(),
+                kind: StepKind::Snapshot,
+                template: None,
+            },
+        ]
+    };
+    const FP: &str = "target|steps|template";
+    let tok = format!("fp{}", fingerprint_digest(FP));
+    // The very line that resumes at step 3 for a rule that kept its position.
+    let line = format!("running: step 3/3 {tok} snapB: binlog position 4 is no longer available");
+    assert_eq!(
+        carried_reset_resume(true, &line, &steps(), FP),
+        Some(2),
+        "the line resumes for a rule that kept its position"
+    );
+    // The same line, the same rule, a boot that just lost its continuity: nothing resumes,
+    // so the arm's `start_reset` leaves the run at step 0 and the walk goes from the first.
+    assert_eq!(
+        carried_reset_resume(false, &line, &steps(), FP),
+        None,
+        "a boot that lost the rule's position may not skip its finished steps over"
+    );
+    // Same for the plain reasons: the position, not the reason text, is what the boot checks.
+    for reason in ["first start", "new rule", "the server changed (a, b)"] {
+        let line = format!("running: step 2/3 {tok} snapA: {reason}");
+        assert_eq!(
+            carried_reset_resume(true, &line, &steps(), FP),
+            Some(1),
+            "{reason:?} resumes with the position kept"
+        );
+        assert_eq!(
+            carried_reset_resume(false, &line, &steps(), FP),
+            None,
+            "{reason:?} starts over once this boot lost the position"
+        );
+    }
+}
