@@ -8,7 +8,10 @@
 //! `sigkill_during_reset` interrupts a snapshot reset mid-step and requires it to start over
 //! after the restart, P2b `sigkill_during_requested_reset_resumes_the_saved_step` kills a
 //! requested reset at a later step and requires the restarted child to resume there — the
-//! finished steps answered no more, the interrupted one re-walked whole — P3
+//! finished steps answered no more, the interrupted one re-walked whole — P2c
+//! `sigkill_during_unrequested_reset_resumes_the_saved_step` holds the same proof for a reset
+//! that started on its own (the first start's walk, killed with the rule's position
+//! persisted), P3
 //! `graceful_sigterm` is the cheap shutdown control (exit 0 within the
 //! stop grace, running actions finished, position saved for the next child), and C1
 //! `target_down_while_source_flaps` is the combined outage that proves "outage ≠ data loss"
@@ -3939,6 +3942,264 @@ async fn p2b_sigkill_during_requested_reset_resumes_the_saved_step() {
          (finished steps added 0 calls: /reset-announce {ann_frozen}->{ann_after}, /snapA \
          {snapa_frozen}->{snapa_after}; interrupted + trailing steps answered {} /snapB and \
          {} /snapC calls across the kill)",
+        snapb_after - snapb_at_gate,
+        snapc_after - snapc_gate
+    );
+    assert_no_undelivered(&lazy);
+    assert_no_undelivered(&lazy2);
+    lazy2.kill();
+}
+
+// ------------------------------------------------------------------------ P2c unrequested reset resume
+
+/// P2c (the resume half of the runs that started on their own): P2b's four steps, the same
+/// paths and chunk counts — but no operator request anywhere. The reset is the first start's
+/// own walk: the rule row stands in the table before the child ever starts, and the reason
+/// `choose_start` writes is "first start". The kill lands mid the third step once the rule
+/// and the instance rows are persisted — the restart must boot on their positions, which is
+/// the one thing the resume leans on (the rows are the rule's confirmed point, and the
+/// crashed child wrote them itself: nothing unconfirmed sits below them, `rule_pos` floors
+/// the persisted position at the core's oldest unflushed mark). The restarted child must
+/// continue the run there — no further `/reset-announce` and no further `/snapA` call from
+/// it (the two counters a walk-from-step-1 recovery moves: these read red on main), the
+/// interrupted `snapB` re-walked whole because its key set died with the process
+/// (at-least-once), `snapC` run, the row finishing `done:` — the proof P2b holds for the
+/// requested run, held now for one that started on its own. A boot that loses the rule's
+/// continuity again refuses this resume (no candidate, no `skip_until`, fresh step-0 run);
+/// that direction is P2's claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2c_sigkill_during_unrequested_reset_resumes_the_saved_step() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_p2c").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("p2c-reset");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+
+    // P2b's four steps, three of them chunked: the two chunk counts the resumed child must
+    // not repeat are the finished step's own (10 `/snapA` calls per walk), and the count it
+    // must owe in full is the interrupted step's (10 more `/snapB` calls). The row carries
+    // no request: this walk is the boot's own.
+    let total = 1_000;
+    let batch = 100u32;
+    let chunks = (total / batch) as usize;
+    let steps = serde_json::json!([
+        {
+            "name": "announce",
+            "once": true,
+            "template": "POST /reset-announce HTTP/1.1\n\n"
+        },
+        {
+            "name": "snapA",
+            "for_each": "snapshot",
+            "template": "POST /snapA HTTP/1.1\n\n{{join keys \",\"}}"
+        },
+        {
+            "name": "snapB",
+            "for_each": "snapshot",
+            "template": "POST /snapB HTTP/1.1\n\n{{join keys \",\"}}"
+        },
+        {
+            "name": "snapC",
+            "for_each": "snapshot",
+            "template": "POST /snapC HTTP/1.1\n\n{{join keys \",\"}}"
+        }
+    ]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, template, snapshot_keys_sql, \
+         batch_max_keys, reset_steps, debounce_ms) VALUES (?, ?, ?, ?, ?, ?, 100)",
+        (
+            "snapu",
+            "hook",
+            "POST /hook HTTP/1.1\n\n{{join keys \",\"}}",
+            "SELECT id AS _key FROM items",
+            batch,
+            steps.to_string(),
+        ),
+    )
+    .await;
+    db.trigger("snapu", "items", Some("{{new.id}}"), None).await;
+
+    // The rows are seeded before the child ever starts: they are older than any position
+    // the stream could replay from, and the snapshot steps' own reads are their only
+    // coverage — the exact shape that would lose keys if a restart skipped finished steps
+    // it could not vouch for.
+    bulk_items(&db, 1, total).await;
+    // The mock is slow before the first walk begins: every answered chunk costs 600 ms, so
+    // a ten-chunk step runs some six seconds — wider than the five-second persist cycle —
+    // and the kill can be *seen* to land inside the step.
+    mock.delay(600, 3000);
+
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "p2c_sigkill_during_unrequested_reset",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+
+    // The gate, read as P2b reads it: the persisted row standing on step 3/4 with the
+    // third step's own calls advancing — plus the two positions the resume needs, both
+    // status rows written. A "first start" boot claimed no position to begin with: only
+    // what the crashed child persisted itself can keep the restart's replay at or below
+    // every unconfirmed change, and these rows are that persisted word.
+    let (state_at_gate, snapb_at_gate) = wait_for(
+        Duration::from_secs(180),
+        "the first start's reset to stand on `running: step 3/4 fp… snapB` in the persisted \
+         row with the step's calls advancing and both status rows written",
+        || async {
+            let r = db.status("snapu").await.unwrap_or_default();
+            let star = db.status("*").await.unwrap_or_default();
+            let hits = mock_path_hits(&mock, "/snapB");
+            let inside = r.2.starts_with("running: step 3/4 ") && r.2.contains(" snapB: ");
+            let saved = !r.0.is_empty() && r.1 > 0 && !star.0.is_empty() && star.1 > 0;
+            (inside && saved && hits > 0).then(|| (r.2.clone(), hits))
+        },
+    )
+    .await;
+    // The batches form is what the persist cadence usually catches; the loop-top form is
+    // equally a step-3 line, and the counter only checks when keys are there to check.
+    assert!(
+        state_at_gate.starts_with("running: step 3/4 ")
+            && state_at_gate.contains(" snapB: ")
+            && reset_progress(&state_at_gate).is_none_or(|(step, n, name, _done, tot)| step == 3
+                && n == 4
+                && name == "snapB"
+                && tot == total as u64),
+        "the gate row must be the step-3 progress line of a full walk: {state_at_gate:?}"
+    );
+    assert_eq!(
+        reset_flag(&db, "snapu").await,
+        Some(0),
+        "this seed never asks for a reset — the walk under the kill must be the boot's own, \
+         not the operator's"
+    );
+    // What the gate has proven about the steps before it, read as counters: the walk
+    // answered the announcement and all 10 `snapA` batches (a step advances only on
+    // answered chunks, so its passing step 3 is the proof).
+    let ann_frozen = mock_path_hits(&mock, "/reset-announce");
+    let snapa_frozen = mock_path_hits(&mock, "/snapA");
+    let snapc_gate = mock_path_hits(&mock, "/snapC");
+    assert_eq!(
+        snapa_frozen, chunks,
+        "the first start's walk had not answered the finished step's 10 batches at the gate \
+         ({snapa_frozen} `/snapA` calls): the gate row did not stand on step 3 of a walk that \
+         had passed snapA"
+    );
+    assert_eq!(
+        ann_frozen, 1,
+        "the first start's walk had not answered the announcement at the gate: {ann_frozen}"
+    );
+
+    log.add(format!(
+        "killing child 1 mid-snapB of the first start's own reset (row `{state_at_gate}`, \
+         step calls at the gate: /snapA={snapa_frozen} /snapB={snapb_at_gate} \
+         /snapC={snapc_gate})"
+    ));
+    lazy.kill();
+
+    // The restart finds the row still on the interrupted step and no request in the rule
+    // row: the boot takes the run up as its own carry-over and continues it at its step.
+    let mut lazy2 = Lazy::start(
+        "p2c_sigkill_during_unrequested_reset",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy2, 60);
+    assert!(
+        !lazy2.log_lines_matching("reset steps start").is_empty(),
+        "the restarted child started no reset at all: the status row still said `running:`, \
+         so it had to ({:?})",
+        db.status("snapu").await.map(|r| r.2)
+    );
+    assert!(
+        !lazy2
+            .log_lines_matching("first start (resumed after restart)")
+            .is_empty(),
+        "the restarted child did not take the crashed run up as the boot's carry-over: {:?}",
+        lazy2.log_path
+    );
+    assert!(
+        !lazy2
+            .log_lines_matching("starting from the saved positions")
+            .is_empty(),
+        "the restarted child did not boot on the saved positions — the resume reads a rule \
+         that kept its position, and a boot that lost it again would have replayed from the \
+         tail: {:?}",
+        lazy2.log_path
+    );
+    wait_for(
+        Duration::from_secs(180),
+        "the resumed reset to finish (status row `done:`)",
+        || async {
+            let r = db.status("snapu").await.unwrap_or_default();
+            r.2.starts_with("done:").then_some(())
+        },
+    )
+    .await;
+    assert!(
+        !lazy2.log_lines_matching("reset steps done").is_empty(),
+        "the status row says done but the child never logged it: {:?}",
+        lazy2.log_path
+    );
+
+    // THE proof, both read on counters the gate froze: the finished steps were not
+    // re-walked (a walk-from-step-1 recovery moves both of these), and the interrupted
+    // step re-ran whole. The chunk counts across the kill drop to the remaining steps, not
+    // the full one.
+    let snapa_after = mock_path_hits(&mock, "/snapA");
+    assert_eq!(
+        snapa_after, snapa_frozen,
+        "the restarted child re-sent the finished snapA step: {snapa_frozen} `/snapA` calls \
+         stood answered at the kill, {snapa_after} after the reset finished — the rule kept \
+         its position and the row carried this very def, so the steps before the interrupted \
+         one had been target-confirmed and owe no second send"
+    );
+    let ann_after = mock_path_hits(&mock, "/reset-announce");
+    assert_eq!(
+        ann_after, ann_frozen,
+        "the restarted child re-sent the finished announcement step: {ann_frozen} calls at \
+         the kill, {ann_after} after"
+    );
+    let snapb_after = mock_path_hits(&mock, "/snapB");
+    assert!(
+        snapb_after >= snapb_at_gate + chunks,
+        "the interrupted step must be re-sent whole from its beginning ({chunks} batches): \
+         {snapb_at_gate} `/snapB` calls at the gate, {snapb_after} at done"
+    );
+    let snapc_after = mock_path_hits(&mock, "/snapC");
+    assert!(
+        snapc_after >= snapc_gate + chunks,
+        "the step after the interrupted one never ran: {snapc_gate} `/snapC` calls at the \
+         gate, {snapc_after} at done"
+    );
+    // The line the resume itself prints (`choose_start`, engine.rs), read last so the
+    // chunk counts above are what fails a walk-from-step-1 recovery.
+    assert!(
+        !lazy2
+            .log_lines_matching("reset steps resume at step")
+            .is_empty(),
+        "the restarted child logged no resume of the saved run: {:?}",
+        lazy2.log_path
+    );
+    assert_all_keys(&mock, 1, total, "P2c snapshot rows");
+    eprintln!(
+        "P2c: killed mid-snapB of the first start's own reset at `{state_at_gate}`; the \
+         restarted child resumed at step 3 (finished steps added 0 calls: /reset-announce \
+         {ann_frozen}->{ann_after}, /snapA {snapa_frozen}->{snapa_after}; interrupted and \
+         trailing steps answered {} /snapB and {} /snapC calls across the kill)",
         snapb_after - snapb_at_gate,
         snapc_after - snapc_gate
     );

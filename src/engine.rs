@@ -1211,6 +1211,7 @@ impl Engine {
                 }
             }
         }
+        let lost_now: HashSet<String> = lost.iter().map(|(n, _)| n.clone()).collect();
         for (n, reason) in lost {
             self.lose_continuity(&n, reason);
         }
@@ -1223,7 +1224,33 @@ impl Engine {
                 continue;
             };
             if self.rules.get(&n).is_some_and(|s| s.reset.is_none()) {
+                // A rule that lost continuity above already got its fresh step-0 run from
+                // `lose_continuity`: its saved position is out of the game, so no boot may
+                // skip its finished steps over. A rule that kept it may — the steps before
+                // the interrupted one are target-confirmed, and everything the target has
+                // not seen sits above the position this boot replays from at or below
+                // (`rule_pos` is floored at the core's oldest unflushed mark), so the stream
+                // here re-marks it. The requested run's own arms are `add_rule`'s (#200,
+                // #203, #209); this is the boot's carry-over arm.
+                let resume = self.rules.get(&n).and_then(|s| {
+                    carried_reset_resume(
+                        !lost_now.contains(&n),
+                        &saved.reset_state,
+                        &s.rule.def.reset_steps,
+                        &s.rule.fingerprint,
+                    )
+                });
                 self.start_reset(&n, format!("{reason} (resumed after restart)"), false);
+                if let Some(step) = resume {
+                    if let Some(run) = self.rules.get_mut(&n).and_then(|s| s.reset.as_mut()) {
+                        run.step = step;
+                        info!(
+                            rule = %n,
+                            "reset steps resume at step {}: the saved run was this def's and the rule kept its position",
+                            step + 1
+                        );
+                    }
+                }
             }
         }
         info!(position = %start, "starting from {}", if lost_all.is_some() { "the current binlog position" } else { "the saved positions" });
@@ -3745,16 +3772,16 @@ fn fingerprint_digest(fingerprint: &str) -> String {
     format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 }
 
-/// The step a restart continues a requested reset from, from the rule's own saved
-/// `reset_state`: `Some(i - 1)` when it still says `running: step {i}/{n} fp{digest} {name}:
+/// The step a saved `running:` line records, and the reason written after its step name:
+/// `Some((i - 1, tail))` when `state` still says `running: step {i}/{n} fp{digest} {name}:
 /// …`, the token digests the current fingerprint ([`fingerprint_digest`] — a def that moved
 /// while the process was down restarts its own walk, the way [`Engine::update_rule`] restarts
-/// a changed live run), the reason is one [`REQUESTED_RESET_REASONS`] carries, and the
-/// recorded step count and step name still match `steps`. Everything else is `None`:
-/// `pending:` (no step was reached yet), a line without the token or with another rule's, a
-/// reason that is not a requested run's, def drift, or a shape this parser does not
-/// recognise — and the reset starts over from step 1, exactly as a fresh request asks
-/// (#200, #203).
+/// a changed live run), and the recorded step count and step name still match `steps`.
+/// Everything else is `None`: `pending:` (no step was reached yet), a line without the token
+/// or with another def's, or a shape this parser does not recognise. The two resume arms read
+/// the same line through this and apply their own reason test: [`resume_requested_reset`]
+/// for the run serving the operator's request, [`resume_unrequested_reset`] for one that
+/// started on its own.
 ///
 /// Skipping the finished steps is safe to do at-least-once: a step advances only after every
 /// chunk of it came back answered (`drive_reset` and `on_done`'s reset arms), so their keys
@@ -3762,11 +3789,11 @@ fn fingerprint_digest(fingerprint: &str) -> String {
 /// beginning: its key set lived in memory and died with the process, and the saved `done`
 /// count lags reality by the persist cadence — a count into a re-listed set is a progress
 /// note for `/status`, not a cursor a restart may skip keys by.
-fn resume_requested_reset(
-    state: &str,
+fn saved_reset_run<'a>(
+    state: &'a str,
     steps: &[model::ResetStep],
     fingerprint: &str,
-) -> Option<usize> {
+) -> Option<(usize, &'a str)> {
     let rest = state.strip_prefix("running: step ")?;
     let (idx, rest) = rest.split_once(' ')?;
     let (i, n) = idx.split_once('/')?;
@@ -3783,16 +3810,77 @@ fn resume_requested_reset(
     }
     // `drive_reset` writes the step name after the token, then either the bare reason or
     // `{done}/{total} keys: {reason}`. A name that does not split this way simply never
-    // matches and the run starts over. Both accepted reasons end the line.
+    // matches and the run starts over.
     let (name, tail) = rest.split_once(": ")?;
     let want = steps.get(i - 1)?;
     if want.name != name {
         return None;
     }
+    Some((i - 1, tail))
+}
+
+/// The step a restart continues a requested reset from: the line of the run that was serving
+/// the operator's request ([`saved_reset_run`] for the shape and the def proofs), and only a
+/// reason [`REQUESTED_RESET_REASONS`] carries — with the reasons' exact texts, so a carry-over
+/// wording that appended itself to one is not the request's own; a run that restarted under
+/// one starts over from step 1, exactly as a fresh request asks (#200, #203).
+fn resume_requested_reset(
+    state: &str,
+    steps: &[model::ResetStep],
+    fingerprint: &str,
+) -> Option<usize> {
+    let (step, tail) = saved_reset_run(state, steps, fingerprint)?;
+    // Both accepted reasons end the line.
     REQUESTED_RESET_REASONS
         .into_iter()
         .find(|r| tail == *r || tail.ends_with(&format!(": {r}")))
-        .map(|_| i - 1)
+        .map(|_| step)
+}
+
+/// The step a restart continues a run that started on its own from — the unrequested one
+/// (`choose_start`'s and `add_rule`'s carry-over arms keep its reason's shape): the same line
+/// read through [`saved_reset_run`], with the reason test inverted. The two
+/// [`REQUESTED_RESET_REASONS`] are the request's own and belong to `add_rule`'s arm — a
+/// leftover one under a flag that was cleared meanwhile keeps starting over, as #209 left it.
+/// Everything else the engine writes for such a run resumes, the carry-over wordings of a run
+/// that already took up a restart once included: each of its finished steps was target-
+/// confirmed, and the interrupted one re-runs whole.
+///
+/// The one proof the line cannot carry is that this boot replays from at or below the rule's
+/// confirmed point — `choose_start` holds that and enforces it: it resumes only a rule that
+/// did NOT lose continuity on this boot. A rule that did takes no candidate from its saved
+/// position and gets no `skip_until`, so the rows a skipped snapshot read would have covered
+/// sit in nobody's replay window, and its walk starts over from step 1. With the position
+/// kept, nothing is skipped over: the rule's persisted watermark never runs ahead of the
+/// core's oldest unflushed mark (`rule_pos` takes it as a floor), so every change the target
+/// has not yet seen sits above it and this boot's own replay re-marks it; a finished stray
+/// step's keys were delete-confirmed, and the steps from the interrupted one list afresh when
+/// their turn comes.
+fn resume_unrequested_reset(
+    state: &str,
+    steps: &[model::ResetStep],
+    fingerprint: &str,
+) -> Option<usize> {
+    let (step, tail) = saved_reset_run(state, steps, fingerprint)?;
+    let requested = REQUESTED_RESET_REASONS
+        .iter()
+        .any(|r| tail == *r || tail.ends_with(&format!(": {r}")));
+    (!requested).then_some(step)
+}
+
+/// The step `choose_start`'s carry-over arm continues a saved unrequested run from, given
+/// what this boot knows about the rule beyond the line: `kept_position` says the rule is
+/// not among this boot's `lost` — its saved position stood, so this boot replays from at
+/// or below it and the skipped finished steps are covered. A rule that lost continuity on
+/// this boot resumes NOTHING: `lose_continuity` has just given it a fresh step-0 run, and
+/// with no usable position no boot bounds what a skipped step's read saw.
+fn carried_reset_resume(
+    kept_position: bool,
+    state: &str,
+    steps: &[model::ResetStep],
+    fingerprint: &str,
+) -> Option<usize> {
+    kept_position.then(|| resume_unrequested_reset(state, steps, fingerprint))?
 }
 
 fn merge_marks(into: &mut Marks, m: Marks) {
