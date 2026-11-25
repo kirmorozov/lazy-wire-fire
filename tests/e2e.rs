@@ -8019,6 +8019,822 @@ async fn kafka_restart() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The kafka kind's PER-RECORD answers, against the in-process fake broker of
+// `tests/common/kafka_broker.rs`. The tests above ask a real broker what it does; these tell a
+// broker what to do, which is the only way to see the arms that a broker decides: a produce refused
+// over one record of its batch, an answer whose offset `expect` will not have, a produce that is
+// never answered at all, and an answer that cannot be matched to the request it answers. None of
+// them touches the container, so they run wherever MySQL does — the default e2e set and CI with it.
+
+/// The schema of the fake-broker tests: `orders`, a target of the `kafka` kind on the fake's
+/// `orders` topic, and a rule that renders one record per key with its document and its `op` header.
+/// `fire_per` is `batch` (the keys of a flush travel in one produce) or `key` (one produce each);
+/// `timeout_ms` is the target's own limit on a partition step, and `expect` the check every taken
+/// record is booked through.
+async fn kafka_fake_setup(
+    db: &Db,
+    rule: &str,
+    endpoint: &str,
+    fire_per: &str,
+    timeout_ms: u32,
+    expect: Option<&str>,
+) {
+    db.exec("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(20), qty INT)")
+        .await;
+    tables(db).await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_target (name, kind, endpoints, expect, vars, timeout_ms) \
+         VALUES ('events', 'kafka', ?, ?, '{}', ?)",
+        (endpoint, expect, timeout_ms),
+    )
+    .await;
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, fire_per, selects, template, debounce_ms) \
+         VALUES (?, 'events', ?, ?, ?, 100)",
+        (
+            rule,
+            fire_per,
+            "SELECT id AS _key, sku, qty, NULL AS _op FROM orders WHERE id IN (:keys)",
+            KAFKA_PUT,
+        ),
+    )
+    .await;
+    db.trigger(rule, "orders", Some("{{new.id}}"), None).await;
+}
+
+/// The three keys every one of these tests fires in one flush.
+const KAFKA_FAKE_ROWS: &str = "INSERT INTO orders VALUES (1,'A-1',3),(2,'B-2',1),(3,'C-3',5)";
+
+/// The answer log as `(batch size, answer)` per produce — the shape a split, a wait or a cut
+/// connection leaves, without the records each produce carried.
+fn fake_shape(broker: &kafka_broker::KafkaBroker) -> Vec<(usize, kafka_broker::Answer)> {
+    broker
+        .produced()
+        .iter()
+        .map(|p| (p.records.len(), p.answer))
+        .collect()
+}
+
+/// How many times each key arrived, as a plain map the assertions can name.
+fn fake_arrivals(broker: &kafka_broker::KafkaBroker, counts: &[(&str, usize)]) -> bool {
+    let mut want = std::collections::BTreeMap::new();
+    for (k, n) in counts {
+        want.insert(k.to_string(), *n);
+    }
+    broker.key_arrivals("orders") == want
+}
+
+/// The fake broker is under test too: every verdict below is an answer this peer chose, so one
+/// test talks to it with rskafka's own client, with no database and no engine in the way. It pins
+/// the four things the other tests rest on — the metadata lists what was declared (and sorts the
+/// partitions it was given), a produce is answered with the offset the fake named, a produce is
+/// refused with the code the fake named, and what the fake says it took is what the client sent,
+/// headers and all, out of a compressed batch. If this test fails, the peer is not really answering
+/// and the assertions of every test below mean nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_the_fake_broker_answers_rskafka_itself() {
+    use rskafka::chrono::Utc;
+    use rskafka::client::partition::{Compression, UnknownTopicHandling};
+    use rskafka::client::ClientBuilder;
+    use rskafka::record::Record;
+
+    let b = kafka_broker::KafkaBroker::start().await;
+    // Deliberately unsorted: the target picks a partition by position in the list the broker
+    // gives, so the fake must sort them.
+    b.partitioned("orders", &[1, 0]);
+    b.on_produce(|p| {
+        if p.has_key("big") {
+            kafka_broker::Answer::Code(10) // MessageTooLarge
+        } else {
+            kafka_broker::Answer::AcceptAt { base: 7 }
+        }
+    });
+    let endpoint = b.endpoint();
+    let rec = |key: &str, body: &str| Record {
+        key: Some(key.as_bytes().to_vec()),
+        value: Some(body.as_bytes().to_vec()),
+        headers: std::collections::BTreeMap::from([(
+            "op".to_string(),
+            "upsert".as_bytes().to_vec(),
+        )]),
+        timestamp: Utc::now(),
+    };
+
+    // Every step is bounded: a peer that does not answer its own client must fail the test rather
+    // than sit on the suite.
+    let (names, partitions, offsets, refused) =
+        tokio::time::timeout(Duration::from_secs(60), async move {
+            let client = ClientBuilder::new(vec![endpoint])
+                .client_id("lwf-fake-check")
+                .build()
+                .await
+                .expect("the fake answers ApiVersions");
+            let topics = client
+                .list_topics()
+                .await
+                .expect("the fake answers Metadata");
+            let pc = client
+                .partition_client("orders", 1, UnknownTopicHandling::Retry)
+                .await
+                .expect("the fake names a leader");
+            let offsets = pc
+                .produce(vec![rec("one", r#"{"sku":"A-1"}"#)], Compression::Zstd)
+                .await
+                .expect("the fake takes the batch");
+            let refused = format!(
+                "{:?}",
+                pc.produce(vec![rec("big", "{}")], Compression::NoCompression)
+                    .await
+                    .unwrap_err()
+            );
+            let t = &topics[0];
+            (
+                t.name.clone(),
+                t.partitions.iter().copied().collect::<Vec<i32>>(),
+                offsets,
+                refused,
+            )
+        })
+        .await
+        .expect("the fake answered its own client within a minute");
+
+    assert_eq!(names, "orders");
+    assert_eq!(partitions, [0, 1], "the declared partitions, sorted");
+    assert_eq!(offsets, [7], "the client reports the offset the fake named");
+    assert!(
+        refused.contains("MessageTooLarge"),
+        "the refused produce did not carry the code the fake named: {refused}"
+    );
+
+    // What the peer booked: the taken record, read out of a zstd batch, and nothing for the refused
+    // one.
+    let stored = b.stored("orders");
+    assert_eq!(
+        stored.len(),
+        1,
+        "the refused batch took nothing: {stored:?}"
+    );
+    assert_eq!(stored[0].partition, 1);
+    assert_eq!(stored[0].offset, 7);
+    assert_eq!(stored[0].key.as_deref(), Some("one"));
+    assert_eq!(stored[0].value_str(), r#"{"sku":"A-1"}"#);
+    assert_eq!(stored[0].header("op"), Some("upsert"));
+    let produced = b.produced();
+    assert_eq!(produced.len(), 2, "{produced:?}");
+    assert!(produced[0].compressed, "the first batch went out zstd");
+    assert!(!produced[1].compressed, "the second went out uncompressed");
+}
+
+/// A produce the broker refuses over ONE record of its batch (`MessageTooLarge`: a record set it
+/// cannot take) says nothing about the batch's other records — it took none and named none. So the
+/// target splits the group until the record stands by itself: the neighbours land on the first
+/// attempt and only that key is struck. Driven here from the answer rather than from the record's
+/// size: the fake refuses every batch that carries key 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_an_error_code_answer_refuses_only_the_record_it_names() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    b.on_produce(|p| {
+        if p.has_key("2") {
+            kafka_broker::Answer::Code(10) // MessageTooLarge
+        } else {
+            kafka_broker::Answer::Accept
+        }
+    });
+    let db = Db::fresh(&root, "kf_code").await;
+    kafka_fake_setup(
+        &db,
+        "kf_code",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "batch",
+        3000,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "key 2 refused by its own code and dropped",
+        || async {
+            let (f, p, _, last) = db.status("kf_code").await?;
+            let last = last?;
+            (last.contains("key `2` refused 5 times, dropped") && (f, p) >= start).then_some(last)
+        },
+    )
+    .await;
+    // The answer's own code, on the record it died in: by the fifth attempt only that record is
+    // left in the batch, so it is position 0.
+    assert!(err.contains("MessageTooLarge"), "{err}");
+    assert!(err.contains("record 0"), "{err}");
+
+    // The first attempt, produce by produce: the whole batch refused, its first half (key 1) taken,
+    // its second half refused again, then the two records of that half apart — five produces, of
+    // which only the two that named no refused key took anything.
+    let shape = fake_shape(&b);
+    assert_eq!(
+        shape[..5],
+        [
+            (3, kafka_broker::Answer::Code(10)),
+            (1, kafka_broker::Answer::Accept),
+            (2, kafka_broker::Answer::Code(10)),
+            (1, kafka_broker::Answer::Code(10)),
+            (1, kafka_broker::Answer::Accept),
+        ],
+        "the batch was split until the refused record stood alone: {shape:?}"
+    );
+    assert!(
+        b.produced()[0].compressed,
+        "the batch went on the wire compressed, and the peer read the records out of it"
+    );
+    // Every later attempt carries the refused key alone (its neighbours are booked by now): one
+    // produce per attempt, four of them, and then the key is given up for.
+    assert_eq!(
+        shape.len(),
+        9,
+        "the first attempt's 5 produces, then 4 of key 2 alone: {shape:?}"
+    );
+    assert!(
+        shape[5..]
+            .iter()
+            .all(|s| *s == (1, kafka_broker::Answer::Code(10))),
+        "a retry carried something but key 2: {shape:?}"
+    );
+    assert!(
+        b.produced()[5..].iter().all(|p| p.has_key("2")),
+        "a retry carried something but key 2"
+    );
+
+    // What the partition holds: the two neighbours, once each, in the order the split reached them,
+    // at the offsets of a log that only ever moved forward. The refused record is not in it.
+    let stored = b.stored("orders");
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    assert_eq!(stored[0].key.as_deref(), Some("1"));
+    assert_eq!(stored[0].json(), json!({"sku": "A-1", "qty": 3}));
+    assert_eq!(stored[0].header("op"), Some("upsert"));
+    assert_eq!(stored[0].offset, 0);
+    assert_eq!(stored[1].key.as_deref(), Some("3"));
+    assert_eq!(stored[1].json(), json!({"sku": "C-3", "qty": 5}));
+    assert_eq!(
+        stored[1].offset, 1,
+        "the taken batches fill the partition in order"
+    );
+    assert!(
+        fake_arrivals(&b, &[("1", 1), ("3", 1)]),
+        "no key arrived twice, and key 2 never: {:?}",
+        b.key_arrivals("orders")
+    );
+
+    // The reason the answer gave for THAT record is what the key was given up for, in the line that
+    // says so (that line carries no schema, so the rule name attributes it).
+    let dropped = warn_lines(&["undelivered", "rule=kf_code", "key=2", "MessageTooLarge"]);
+    assert_eq!(dropped.len(), 1, "the code is not in the log: {dropped:?}");
+    assert!(dropped[0].contains("strikes=5"), "{:?}", dropped[0]);
+    inst.stop().await;
+}
+
+/// A refusal that is a property of the topic or the account rather than of one record
+/// (`TopicAuthorizationFailed`) is shared by every record of the batch, and two things follow. The
+/// target does not split it: a batch refused whole costs ONE produce per attempt, where the same
+/// batch refused over one record costs five (the test above). And the engine does not strike the
+/// keys: with nothing booked, a refusal that covers the whole flush says the template or the target
+/// is at fault and not a key, so the keys wait instead of being given up at the fifth strike —
+/// `judge_strikes` (`src/engine.rs:243`) and the README's "Undelivered keys" ("when a whole flush
+/// is refused, the template or the target is at fault, and nothing is dropped").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_a_whole_batch_refusal_waits_and_costs_one_produce() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    b.answer(kafka_broker::Answer::Code(29)); // TopicAuthorizationFailed
+    let db = Db::fresh(&root, "kf_batch").await;
+    kafka_fake_setup(
+        &db,
+        "kf_batch",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "batch",
+        3000,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    // Six attempts, which is one past the five that would have dropped the keys had they been
+    // struck: the wait_for below cannot end until the sixth ask has been made.
+    let err = wait_for(
+        Duration::from_secs(90),
+        "six attempts at the batch the broker refuses whole",
+        || async {
+            let (f, p, _, last) = db.status("kf_batch").await?;
+            let last = last?;
+            (b.produce_count() >= 6 && last.contains("TopicAuthorizationFailed") && (f, p) >= start)
+                .then_some(last)
+        },
+    )
+    .await;
+    assert!(err.contains("TopicAuthorizationFailed"), "{err}");
+    // One produce per attempt and every one of them the whole batch: the bound on splitting keeps a
+    // refusal about the topic or the account from costing a produce per record.
+    let shape = fake_shape(&b);
+    assert!(shape.len() >= 6, "{shape:?}");
+    assert!(
+        shape
+            .iter()
+            .all(|s| *s == (3, kafka_broker::Answer::Code(29))),
+        "a batch the broker refuses whole was split, or something else was asked: {shape:?}"
+    );
+    assert_eq!(b.stored_count("orders"), 0, "a refused batch takes nothing");
+    // Nothing was given up for a key the broker refused along with its neighbours.
+    let dropped = warn_lines(&["undelivered", "rule=kf_batch"]);
+    assert!(
+        dropped.is_empty(),
+        "a whole-batch refusal struck a key: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+/// A code that is not a verdict on the records — `RequestTimedOut`: the broker did not say it took
+/// them and did not say it refused them — leaves every record of the batch unbooked: no key is
+/// struck, nothing is dropped, and the same keys go out again as one batch and land once each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_a_transient_code_answer_waits_and_is_sent_again() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let first = first.clone();
+        b.on_produce(move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                kafka_broker::Answer::Code(7) // RequestTimedOut
+            } else {
+                kafka_broker::Answer::Accept
+            }
+        });
+    }
+    let db = Db::fresh(&root, "kf_wait").await;
+    kafka_fake_setup(
+        &db,
+        "kf_wait",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "batch",
+        3000,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    wait_for(
+        Duration::from_secs(90),
+        "the three keys, after the wait",
+        || async { (b.stored_count("orders") == 3).then_some(()) },
+    )
+    .await;
+    sleep_ms(1500).await;
+    assert_eq!(
+        fake_shape(&b),
+        [
+            (3, kafka_broker::Answer::Code(7)),
+            (3, kafka_broker::Answer::Accept)
+        ],
+        "the batch waited and then went as a batch"
+    );
+    let (f, p, _, last) = db.status("kf_wait").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= start,
+        "the position did not move on: {f}:{p}"
+    );
+    assert!(
+        last.as_deref().unwrap_or("").contains("RequestTimedOut"),
+        "the transient verdict is not in `last_error`: {last:?}"
+    );
+    assert!(
+        fake_arrivals(&b, &[("1", 1), ("2", 1), ("3", 1)]),
+        "a waited-for key arrived twice, or not at all: {:?}",
+        b.key_arrivals("orders")
+    );
+    let dropped = warn_lines(&["undelivered", "rule=kf_wait"]);
+    assert!(
+        dropped.is_empty(),
+        "a transient answer dropped a key: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+/// `expect` holds the ANSWER to a per-record check, and the answer a produce gives is the offset
+/// the broker named for that record. The fake puts every batch that carries key 2 at offset 5 and
+/// the rule's `expect` will not have that offset: only that key is refused — by the target's own
+/// check, not by the broker, which took the record every single time — while its neighbours land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_expect_refuses_the_record_at_the_offset_the_answer_named() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    b.on_produce(|p| {
+        if p.has_key("2") {
+            kafka_broker::Answer::AcceptAt { base: 5 }
+        } else {
+            kafka_broker::Answer::Accept
+        }
+    });
+    let db = Db::fresh(&root, "kf_expect").await;
+    // One key per fire: each record stands alone in its batch, so the base the fake names IS the
+    // offset `expect` sees for it, and no other record can be handed that offset.
+    kafka_fake_setup(
+        &db,
+        "kf_expect",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "key",
+        3000,
+        Some("JSON_EXTRACT(body, '$.offset') <> 5"),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "key 2 refused by `expect` and dropped",
+        || async {
+            let (f, p, _, last) = db.status("kf_expect").await?;
+            let last = last?;
+            (last.contains("key `2` refused 5 times, dropped") && (f, p) >= start).then_some(last)
+        },
+    )
+    .await;
+    assert!(err.contains("`expect` not met"), "{err}");
+    assert!(err.contains("$.offset"), "{err}");
+    // Seven produces: five attempts at key 2, each answered at the poisoned offset, and one record
+    // each for the neighbours, answered at the partition's own log end.
+    let shape = fake_shape(&b);
+    assert_eq!(
+        shape
+            .iter()
+            .filter(|s| **s == (1, kafka_broker::Answer::AcceptAt { base: 5 }))
+            .count(),
+        5,
+        "key 2 was answered at the poisoned offset once per attempt: {shape:?}"
+    );
+    assert_eq!(
+        shape
+            .iter()
+            .filter(|s| **s == (1, kafka_broker::Answer::Accept))
+            .count(),
+        2,
+        "the two neighbours were each answered once: {shape:?}"
+    );
+    assert_eq!(shape.len(), 7, "{shape:?}");
+    // The broker took key 2 five times: a refusal by `expect` is the target's verdict on the answer,
+    // and the records the answer named are in the partition regardless. The neighbours, once each.
+    assert!(
+        fake_arrivals(&b, &[("1", 1), ("2", 5), ("3", 1)]),
+        "the broker took what `expect` refused: {:?}",
+        b.key_arrivals("orders")
+    );
+    let at_five: Vec<i64> = b
+        .stored("orders")
+        .iter()
+        .filter(|s| s.key.as_deref() == Some("2"))
+        .map(|s| s.offset)
+        .collect();
+    assert_eq!(
+        at_five,
+        vec![5; 5],
+        "every refused record at the named offset"
+    );
+    let dropped = warn_lines(&["undelivered", "rule=kf_expect", "key=2", "`expect` not met"]);
+    assert_eq!(
+        dropped.len(),
+        1,
+        "the refusal is not in the log: {dropped:?}"
+    );
+    assert!(dropped[0].contains("strikes=5"), "{:?}", dropped[0]);
+    inst.stop().await;
+}
+
+/// A produce the broker leaves unanswered is decided by the target's own time limit, not by the
+/// suite's: every record of the batch is left "not known to be in", the keys wait and go out again,
+/// and the second answer lands them once. Nothing is struck and nothing is dropped, and the
+/// unanswered request stays unanswered — the fake was told to say nothing and said nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_a_produce_that_is_not_answered_waits_and_is_sent_again() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let first = first.clone();
+        b.on_produce(move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                kafka_broker::Answer::Silence
+            } else {
+                kafka_broker::Answer::Accept
+            }
+        });
+    }
+    let db = Db::fresh(&root, "kf_silent").await;
+    // The target's own limit, not the suite's: 700 ms of no answer is what ends the first attempt.
+    kafka_fake_setup(
+        &db,
+        "kf_silent",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "batch",
+        700,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    wait_for(
+        Duration::from_secs(90),
+        "the three keys, after the unanswered produce",
+        || async { (b.stored_count("orders") == 3).then_some(()) },
+    )
+    .await;
+    sleep_ms(1500).await;
+    assert_eq!(
+        fake_shape(&b),
+        [
+            (3, kafka_broker::Answer::Silence),
+            (3, kafka_broker::Answer::Accept)
+        ],
+        "the batch was sent once into silence and once again"
+    );
+    let (f, p, _, last) = db.status("kf_silent").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= start,
+        "the position did not move on: {f}:{p}"
+    );
+    assert!(
+        last.as_deref()
+            .unwrap_or("")
+            .contains("no produce answer within"),
+        "the target's own verdict is not in `last_error`: {last:?}"
+    );
+    assert!(
+        fake_arrivals(&b, &[("1", 1), ("2", 1), ("3", 1)]),
+        "a key was lost or sent twice: {:?}",
+        b.key_arrivals("orders")
+    );
+    let dropped = warn_lines(&["undelivered", "rule=kf_silent"]);
+    assert!(
+        dropped.is_empty(),
+        "an unanswered produce dropped a key: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+/// A produce whose connection is cut under the client is neither a refusal nor a verdict: rskafka
+/// notices the broken stream, drops that connection and sends the same batch again on a new one. The
+/// engine sees one call that succeeded and no key is struck; the only evidence the wire broke at all
+/// is the broker's own log of the two produces — and the topic holds each record exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_a_broken_connection_is_sent_again_on_a_new_one() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let first = first.clone();
+        b.on_produce(move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                kafka_broker::Answer::HangUp
+            } else {
+                kafka_broker::Answer::Accept
+            }
+        });
+    }
+    let db = Db::fresh(&root, "kf_cut").await;
+    kafka_fake_setup(
+        &db,
+        "kf_cut",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "batch",
+        3000,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    wait_for(
+        Duration::from_secs(90),
+        "the three keys, after the cut connection",
+        || async { (b.stored_count("orders") == 3).then_some(()) },
+    )
+    .await;
+    sleep_ms(1500).await;
+    assert_eq!(
+        fake_shape(&b),
+        [
+            (3, kafka_broker::Answer::HangUp),
+            (3, kafka_broker::Answer::Accept)
+        ],
+        "the batch was sent once into a cut connection and once again"
+    );
+    let produced = b.produced();
+    assert_eq!(produced.len(), 2, "one action, two produces: {produced:?}");
+    assert!(
+        fake_arrivals(&b, &[("1", 1), ("2", 1), ("3", 1)]),
+        "a cut connection lost or duplicated a record: {:?}",
+        b.key_arrivals("orders")
+    );
+    // The engine never heard about the break: rskafka dropped the broken connection and sent the
+    // same batch again inside the one call, so there is no failed produce for the engine to report
+    // on and no key was struck. The two produces for one action are the only evidence it happened.
+    let (f, p, _, last) = db.status("kf_cut").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= start,
+        "the position did not move on: {f}:{p}"
+    );
+    let last = last.as_deref().unwrap_or("");
+    for failed in ["refused", "no produce answer", "not known to be complete"] {
+        assert!(
+            !last.contains(failed),
+            "the engine was told about a produce its client healed: {last:?}"
+        );
+    }
+    let dropped = warn_lines(&["undelivered", "rule=kf_cut"]);
+    assert!(
+        dropped.is_empty(),
+        "a cut connection dropped a key: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+/// Three answers that took the batch but cannot be matched to the request they answer: another
+/// topic's name, another partition's, and no partition at all. No offset can be read out of any of
+/// them, so the records are "not known to be in" — which is exactly what the engine is built for:
+/// they go out again and land, and the partition ends up holding each of them TWICE, once from the
+/// answer nobody could read. That is at-least-once, shown rather than claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_an_answer_the_client_cannot_match_is_not_a_loss() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    b.topic("orders", 1);
+    // Each key is answered wrongly once, by its own shape of wrong, and normally from then on.
+    let wronged: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    {
+        let wronged = wronged.clone();
+        b.on_produce(move |p| {
+            let key = p
+                .records
+                .first()
+                .and_then(|r| r.key.clone())
+                .unwrap_or_default();
+            let wrong = match key.as_str() {
+                "1" => kafka_broker::Answer::WrongTopic,
+                "2" => kafka_broker::Answer::WrongPartition,
+                "3" => kafka_broker::Answer::NoPartition,
+                _ => return kafka_broker::Answer::Accept,
+            };
+            if wronged.lock().unwrap().insert(key) {
+                wrong
+            } else {
+                kafka_broker::Answer::Accept
+            }
+        });
+    }
+    let db = Db::fresh(&root, "kf_unmatch").await;
+    // One key per fire, so each of the three shapes of wrong answer belongs to one record.
+    kafka_fake_setup(
+        &db,
+        "kf_unmatch",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "key",
+        3000,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    wait_for(
+        Duration::from_secs(90),
+        "each key twice: the unmatchable answer and the one that landed",
+        || async { (b.key_arrivals("orders").values().copied().sum::<usize>() == 6).then_some(()) },
+    )
+    .await;
+    sleep_ms(1500).await;
+    let produced = b.produced();
+    assert_eq!(
+        produced.len(),
+        6,
+        "one unmatchable answer and one good one per key: {produced:?}"
+    );
+    for (key, answer) in [
+        ("1", kafka_broker::Answer::WrongTopic),
+        ("2", kafka_broker::Answer::WrongPartition),
+        ("3", kafka_broker::Answer::NoPartition),
+    ] {
+        let wrong: Vec<&kafka_broker::Produced> = produced
+            .iter()
+            .filter(|p| p.answer == answer && p.has_key(key))
+            .collect();
+        assert_eq!(
+            wrong.len(),
+            1,
+            "{key} was not answered by {answer:?} exactly once"
+        );
+        assert_eq!(
+            produced
+                .iter()
+                .filter(|p| p.answer == kafka_broker::Answer::Accept && p.has_key(key))
+                .count(),
+            1,
+            "{key} did not land exactly once after the unmatchable answer"
+        );
+    }
+    assert!(
+        fake_arrivals(&b, &[("1", 2), ("2", 2), ("3", 2)]),
+        "the partition does not hold each key twice: {:?}",
+        b.key_arrivals("orders")
+    );
+    let (f, p, _, last) = db.status("kf_unmatch").await.expect("a status row");
+    assert!(
+        (f.clone(), p) >= start,
+        "the position did not move on: {f}:{p}"
+    );
+    assert!(
+        last.as_deref()
+            .unwrap_or("")
+            .contains("not known to be complete"),
+        "the verdict on an unreadable answer is not in `last_error`: {last:?}"
+    );
+    let dropped = warn_lines(&["undelivered", "rule=kf_unmatch"]);
+    assert!(
+        dropped.is_empty(),
+        "an unreadable answer dropped a key: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+/// A topic the broker does not list is refused BEFORE any produce: the metadata read is the whole
+/// check (the target never creates a topic), and the answer says which topic the target asked for.
+/// The refusal covers every key of the flush at once, so nothing is booked and no key is struck —
+/// the keys wait, with `last_error` naming the target's own mistake, instead of being given up at
+/// the fifth strike (`judge_strikes`, `src/engine.rs:243`; README, "Undelivered keys"). No record
+/// reaches the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_a_topic_the_broker_does_not_list_refuses_before_any_produce() {
+    let root = need_db!();
+    let b = kafka_broker::KafkaBroker::start().await;
+    // The broker is up and serves a topic; it simply has no `orders`.
+    b.topic("other", 1);
+    let db = Db::fresh(&root, "kf_ntopic").await;
+    kafka_fake_setup(
+        &db,
+        "kf_ntopic",
+        &format!("kafka://{}/orders", b.endpoint()),
+        "batch",
+        3000,
+        Some(KAFKA_EXPECT),
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+    let start = binlog_end(&db).await;
+    db.exec(KAFKA_FAKE_ROWS).await;
+    let err = wait_for(
+        Duration::from_secs(90),
+        "the missing topic named in `last_error`",
+        || async {
+            let (f, p, _, last) = db.status("kf_ntopic").await?;
+            let last = last?;
+            (last.contains("the topic `orders` is unknown to the broker") && (f, p) >= start)
+                .then_some(last)
+        },
+    )
+    .await;
+    // The name in the message is the one the target was pointed at, and the sentence says the
+    // target does not create topics: this is a configuration the operator can fix.
+    assert!(err.contains("orders"), "{err}");
+    assert!(err.contains("does not create"), "{err}");
+    // The whole check was the metadata read: the target asked the broker what topics it has, and
+    // produced nothing.
+    let (api_versions, metadata, produces) = b.requests();
+    assert!(
+        api_versions >= 1 && metadata >= 1,
+        "the topic check never reached the broker: {api_versions} ApiVersions, {metadata} Metadata"
+    );
+    assert_eq!(
+        produces, 0,
+        "a topic the broker does not list is never produced to"
+    );
+    assert_eq!(b.stored_count("orders"), 0);
+    let dropped = warn_lines(&["undelivered", "rule=kf_ntopic"]);
+    assert!(
+        dropped.is_empty(),
+        "an unknown topic gave a key up: {dropped:?}"
+    );
+    inst.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // The servicebus kind against RabbitMQ 4 speaking AMQP 1.0 (`LAZYWF_TEST_SERVICEBUS=
 // 127.0.0.1:34610`, the compose `amqp` profile's RabbitMQ: its 5672 answers both 0-9-1 and 1.0
 // and picks by itself, and 34610 is that port published for this kind). RabbitMQ has no `$cbs`

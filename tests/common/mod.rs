@@ -1,9 +1,10 @@
-//! Test harness: a schema per test, the engine running in-process, a scriptable HTTP target, and
-//! the in-process gRPC server of [`grpc_server`].
+//! Test harness: a schema per test, the engine running in-process, a scriptable HTTP target, the
+//! in-process gRPC server of [`grpc_server`], and the in-process Kafka peer of [`kafka_broker`].
 #![allow(dead_code)]
 
 pub mod fault;
 pub mod grpc_server;
+pub mod kafka_broker;
 
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
