@@ -516,9 +516,12 @@ fn is_per_record_refusal(e: &ClientError) -> bool {
 }
 
 /// The broker does not list the topic at all (checked at the metadata read, before any
-/// produce): the target never creates one, so a produce to it would be refused again — the
-/// engine strikes the keys. This is where an unknown topic refuses; a produce answer's
-/// `UnknownTopicOrPartition` is only stale routing and retries (`code_outcome`).
+/// produce): the target never creates one, so a produce to it would be refused again. This is
+/// where an unknown topic refuses; a produce answer's `UnknownTopicOrPartition` is only stale
+/// routing and retries (`code_outcome`). The keys are refused, and struck only when other keys of
+/// the same flush went through (`judge_strikes`, `src/engine.rs:247`): a flush refused whole —
+/// every key of it refused, nothing booked — waits, with the cause in `last_error` (README,
+/// "Undelivered keys").
 fn missing_refusal(url: &str, topic: &str) -> anyhow::Error {
     rejected(format!(
         "{url}: the topic `{topic}` is unknown to the broker (it must exist: the target does not create it)"
@@ -555,7 +558,8 @@ enum Partitions {
     /// The topic's partitions, sorted (0..n).
     Got(Vec<i32>),
     /// The broker does not list this topic (the target never creates one, so a produce to it
-    /// would be refused again: the engine strikes the keys).
+    /// would be refused again): refused, and struck only when other keys of the same flush went
+    /// through (`judge_strikes`).
     Missing,
 }
 
