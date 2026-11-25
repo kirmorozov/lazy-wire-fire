@@ -1522,23 +1522,30 @@ only when its own message says the requested position cannot be served: a purged
 binlog file, a position outside the file, or GTIDs the position needs are gone. Any other 1236
 keeps the position: the dump is retried with the capped backoff, the server's message is logged
 as a WARN and shown as `stream_error` on `/status` until the stream delivers events again
-([Status](#status)). An interrupted reset starts over from step 1 after a restart, and a reset
-interrupted by disabling the rule is not dropped: it is taken up when the rule is enabled
-again, and its steps run from the first one — only a fresh process takes a run up at a later one.
+([Status](#status)). An interrupted reset continues at its saved step after a restart when the
+rule kept its binlog position (see below), and a reset interrupted by disabling the rule is not
+dropped: it is taken up when the rule is enabled again, and its steps run from the first one —
+only a fresh process takes a run up at a later one.
 
-The requested reset is the one exception to starting over. When the process dies in the steps of a
-`reset_requested` run and the flag still stands at boot, the new process takes that walk up at the
-step the rule's `reset_state` line shows: the steps before it finished — every batch of each came
-back answered, so the target confirmed their keys — are not sent again, and the step it died in
-runs again from its own beginning, at-least-once like every step (the keys still to send lived in
-memory and died with the process). What vouches for the two runs being the same reset is the
+The requested reset is not the only run a restart continues. When the process dies in the steps of
+a `reset_requested` run and the flag still stands at boot, the new process takes that walk up at
+the step the rule's `reset_state` line shows: the steps before it finished — every batch of each
+came back answered, so the target confirmed their keys — are not sent again, and the step it died
+in runs again from its own beginning, at-least-once like every step (the keys still to send lived
+in memory and died with the process). What vouches for the two runs being the same reset is the
 `fp<8 hex>` token a `running:` line carries beside the step counter: a short digest of the rule's
 fingerprint, the string its whole definition folds into (its steps and their listing SQL, the
 templates, the selects, the batch sizes, the target). So editing the rule while the process was
-down — any part of what that string holds — starts the walk over from step 1, and so do a line an
-older version wrote without the token, a run that started on its own, one that never reached a step
-(`pending:`), and a restart that finds the rule's binlog position gone: such a rule re-syncs from
-step 1, as it does for any lost position. The new process logs `reset steps resume at step N`.
+down — any part of what that string holds — starts the walk over from step 1, and so do a line
+an older version wrote without the token, a line whose token digests a different definition, and
+a run that never reached a step (`pending:`). A run that started on its own — continuity lost, a
+new rule, triggers working again after an error, any reason but the request's own — is continued
+at its saved step too, on a boot where the rule kept its binlog position: the steps before the
+interrupted one had every batch answered, so the target confirmed their keys, and the rule's saved
+position never runs ahead of what the target has not yet seen, so the boot's own replay covers
+everything after it. A rule that starts the boot without a usable position re-syncs from step 1, as
+it does for any lost position, and a rule enabled again still runs its steps from the first one.
+The new process logs `reset steps resume at step N` for both resumes.
 
 A `reset_requested` raised under a reset that is already running is not folded into it: a run
 that started on its own (continuity lost, a new rule) starts over from step 1 as the requested
