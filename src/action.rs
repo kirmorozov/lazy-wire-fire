@@ -898,10 +898,15 @@ async fn fire_docs(
 
 /// Reads the documents for `keys` and fires them, group by group. A transient failure stops
 /// it; the keys not confirmed are in `failed_keys`, the refused ones in `rejected`.
+///
+/// The keys are borrowed: one group is a slice of the caller's list, so a flush that goes
+/// out well copies no key on its way through here (the audit's finding 11, the keys half).
+/// What fails does copy — a key that comes back in `failed_keys` becomes the caller's own,
+/// which is the same hand-over every other failure path in this file makes.
 pub async fn fire_keys(
     env: &Env,
     rule: &Rule,
-    keys: Vec<String>,
+    keys: &[String],
     template: &str,
     reset: Value,
     docs_override: Option<Vec<Doc>>,
@@ -909,25 +914,27 @@ pub async fn fire_keys(
     let mut f = Fired::default();
     let Some(target) = rule.target.clone() else {
         f.error = Some(rule.error.clone().unwrap_or_else(|| "no target".into()));
-        f.failed_keys = keys;
+        f.failed_keys = keys.to_vec();
         return f;
     };
     if let Some(e) = &rule.error {
         f.error = Some(e.clone());
-        f.failed_keys = keys;
+        f.failed_keys = keys.to_vec();
         return f;
     }
     let group = rule.group_size().max(1);
-    let mut chunks: Vec<Vec<String>> = keys.chunks(group).map(<[String]>::to_vec).collect();
     let mut overrides = docs_override.map(|d| {
         d.into_iter()
             .map(|d| (d.key.clone(), d))
             .collect::<HashMap<_, _>>()
     });
-    let mut i = 0;
-    while i < chunks.len() {
-        let unit = std::mem::take(&mut chunks[i]);
-        i += 1;
+    // Groups are taken from the front of the list, so `waiting` is the keys a stop leaves
+    // behind. The old `Vec<Vec<String>>` existed only so a failed group could be moved into
+    // `failed_keys`; the two arms below clone instead, on a path that already clones
+    // everything else it reports.
+    let mut rest = keys;
+    while !rest.is_empty() {
+        let (unit, waiting) = rest.split_at(group.min(rest.len()));
         let t0 = Instant::now();
         let docs = match &mut overrides {
             Some(o) => Ok(unit
@@ -940,28 +947,30 @@ pub async fn fire_keys(
                     })
                 })
                 .collect()),
-            None => load_docs(env, rule, &unit).await,
+            None => load_docs(env, rule, unit).await,
         };
         f.select_time += t0.elapsed();
         let docs: Vec<Doc> = match docs {
             Ok(d) => d,
             Err(e) => {
+                // This group never went out and no later one will: all of them wait.
                 f.error = Some(format!("{e:#}"));
-                f.failed_keys.extend(unit);
-                break;
+                f.failed_keys.extend(rest.iter().cloned());
+                return f;
             }
         };
         if fire_docs(
-            env, rule, &target, &unit, &docs, template, &reset, None, &mut f,
+            env, rule, &target, unit, &docs, template, &reset, None, &mut f,
         )
         .await
         .is_err()
         {
+            // `fire_docs` accounted for this group's keys; the groups behind it wait
+            // unattempted, which is what the not-yet-taken chunks used to be.
+            f.failed_keys.extend(waiting.iter().cloned());
             break;
         }
-    }
-    for c in chunks {
-        f.failed_keys.extend(c);
+        rest = waiting;
     }
     f
 }
@@ -1087,19 +1096,13 @@ pub async fn list_strays(env: &Env, rule: &Rule, step: usize) -> Result<Vec<IdSe
 }
 
 /// Fires deletes for stray `keys` on endpoint `ep` only.
-pub async fn fire_strays(
-    env: &Env,
-    rule: &Rule,
-    step: usize,
-    ep: usize,
-    keys: Vec<String>,
-) -> Fired {
+pub async fn fire_strays(env: &Env, rule: &Rule, step: usize, ep: usize, keys: &[String]) -> Fired {
     let mut f = Fired::default();
     let target = match (&rule.target, &rule.error) {
         (Some(t), None) => t.clone(),
         (_, e) => {
             f.error = Some(e.clone().unwrap_or_else(|| "no target".into()));
-            f.failed_keys = keys;
+            f.failed_keys = keys.to_vec();
             return f;
         }
     };
@@ -1108,15 +1111,19 @@ pub async fn fire_strays(
             "endpoint {ep} of target `{}` is gone",
             target.def.name
         ));
-        f.failed_keys = keys;
+        f.failed_keys = keys.to_vec();
         return f;
     }
     let name = rule.step(step).map(|s| s.name.clone()).unwrap_or_default();
     let template = rule.step_action(step);
     let group = rule.group_size().max(1);
-    let chunks: Vec<Vec<String>> = keys.chunks(group).map(<[String]>::to_vec).collect();
-    for (n, chunk) in chunks.iter().enumerate() {
-        let docs: Vec<Doc> = chunk
+    // Groups as slices (see `fire_keys`): a step that sends every group copies no key, and
+    // the one that stops copies the groups behind it, which is what the owned chunks were
+    // kept for.
+    let mut rest = keys;
+    while !rest.is_empty() {
+        let (unit, waiting) = rest.split_at(group.min(rest.len()));
+        let docs: Vec<Doc> = unit
             .iter()
             .map(|k| Doc {
                 key: k.clone(),
@@ -1124,12 +1131,12 @@ pub async fn fire_strays(
                 delete: true,
             })
             .collect();
-        let reset = json!({"step": name, "keys": chunk});
+        let reset = json!({"step": name, "keys": unit});
         if fire_docs(
             env,
             rule,
             &target,
-            chunk,
+            unit,
             &docs,
             &template,
             &reset,
@@ -1139,11 +1146,10 @@ pub async fn fire_strays(
         .await
         .is_err()
         {
-            for c in &chunks[n + 1..] {
-                f.failed_keys.extend(c.iter().cloned());
-            }
+            f.failed_keys.extend(waiting.iter().cloned());
             break;
         }
+        rest = waiting;
     }
     f
 }
@@ -1249,3 +1255,7 @@ mod keyquery_tests;
 #[cfg(test)]
 #[path = "tests/loaddocs_chunk_tests.rs"]
 mod loaddocs_tests;
+
+#[cfg(test)]
+#[path = "tests/flush_keys_alloc_tests.rs"]
+mod flush_keys_alloc_tests;

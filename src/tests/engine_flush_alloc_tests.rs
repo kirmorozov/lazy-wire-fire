@@ -219,14 +219,19 @@ async fn starting_a_flush_reports_its_allocation_cost() {
     };
     let ((), n) = alloc_measure::count(|| e.spawn_flush(RULE));
     eprintln!("spawn_flush of 200 keys and 20 keys_sql queries: {n} allocations");
-    // The bound, not the print: the same flush on the commit this branch starts from
-    // (91ef9e7) costs 1,005 allocations and on this branch 825, the 180 between them being
-    // the deep copy of the 20 `KeyQuery` parameter sets. A reintroduced `queries.clone()`
-    // in `spawn_flush` walks the count back over this line.
+    // The bound, not the print. The same flush costs 1,005 allocations on the commit PR-F
+    // started from (91ef9e7: the query payloads and the keys were both copied up front) and
+    // 417 on main after PR-F — measured three times, and accounted for part by part: 201 for
+    // `buf.keys.render` (one String per key, necessary), 201 for the armed fallback's
+    // `keys.clone()`, the rest the lane and the `Arc`s. Here it costs 216: the fallback is a
+    // closure `spawn_job` calls only if the task died, so a flush that goes out well renders
+    // its keys once. A reintroduced up-front copy — `queries.clone()` or `keys.clone()` —
+    // walks the count back over this line.
     assert!(
-        n <= 900,
-        "the flush is copying its query payloads again: {n} allocations against base 1,005 \
-         and 825 as measured here; the up-front queries clone is back"
+        n <= 300,
+        "the flush is copying its own data again: {n} allocations against main's 417 and the \
+         216 measured here (201 to render the keys, the rest the lane and the Arcs); an \
+         up-front keys or queries clone is back"
     );
     // it really flushed: the lane holds the generation and the buffer gave it up
     assert!(matches!(e.rules[RULE].lane, Some(Lane::Flush { .. })));
@@ -245,10 +250,16 @@ async fn a_panicked_job_still_reports_its_keys() {
     };
     let keys = flush_keys(3);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let failed = Outcome::Flush {
-        fired: Fired::failed(keys.clone()),
-        keep_queries: true,
-        resolved: Vec::new(),
+    // The shape a real flush arms: the key list lives in one `Arc` the task holds too, and
+    // the fallback is a closure `spawn_job` calls only because the task died.
+    let armed = Arc::new(keys.clone());
+    let failed = {
+        let armed = Arc::clone(&armed);
+        move || Outcome::Flush {
+            fired: Fired::failed((*armed).clone()),
+            keep_queries: true,
+            resolved: Vec::new(),
+        }
     };
     // the shared payloads a real flush would have handed to both sides
     let shared = Arc::new(flush_queries(3));
