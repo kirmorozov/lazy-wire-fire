@@ -901,6 +901,11 @@ async fn redis_an_expect_the_reply_will_not_vouch_for_is_refused_alone() {
     .unwrap();
     let t = Duration::from_secs(3);
     let cmd = |a: &[&str]| a.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+    // This test owns DB 7, so it starts from empty: a CI job that runs the suite against two
+    // servers on one redis container (the "+ targets" job) would otherwise read the PREVIOUS leg's
+    // `rwd:seen` counter and documents here, and "sent five times" would be true before the key
+    // had been sent once.
+    redis.command(&cmd(&["FLUSHDB"]), t).await.unwrap();
 
     // `SET` answers `OK`, so those keys pass. Key 2 pushes onto a list, which answers a COUNT: the
     // answer is about that command, the check will not have it, and the list counts the attempts.
@@ -1003,6 +1008,9 @@ async fn redis_a_reply_the_expect_cannot_be_answered_for_waits_and_lands() {
     .unwrap();
     let t = Duration::from_secs(3);
     let cmd = |a: &[&str]| a.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+    // This test owns DB 8: empty at the start, so a job that runs the suite against two servers on
+    // one redis container cannot read the previous leg's counter or documents here.
+    redis.command(&cmd(&["FLUSHDB"]), t).await.unwrap();
     // The script answers the bulk `(` (and notes that it ran): a `(` is no regular expression, so
     // the check below cannot be answered for that reply.
     redis.command(&cmd(&["DEL", "rwe:seen"]), t).await.unwrap();
@@ -5539,11 +5547,20 @@ fn kin_stored(data: &str) -> Value {
 /// number, checked per record with that record as `body`.
 const KIN_EXPECT: &str = "JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL";
 
-/// `expect` of the unjudgeable test: the check matches one field of the answer against another,
-/// so an answer that carries a pattern the database itself refuses makes the check unanswerable
-/// for THAT record — and for no other, since it is the record that is `body` here.
-const KIN_BAD_EXPECT: &str =
-    "JSON_UNQUOTE(JSON_EXTRACT(body, '$.seq')) REGEXP JSON_UNQUOTE(JSON_EXTRACT(body, '$.pat'))";
+/// `expect` of the unjudgeable test. It stores a record whose answer carries a sequence number
+/// AND whose own `breaks` field does not ask the database for something it cannot answer: for key
+/// 2 the answer carries `breaks: "yes"`, and the check then asks for a column that is not one
+/// value, which the SERVER refuses — MySQL and MariaDB both answer `Subquery returns more than 1
+/// row`. So the check is unanswerable for THAT record and for no other (the record is `body`
+/// here), and the reason is the database's own words, not an answer of "no". A malformed `REGEXP`
+/// pattern would look like a cleaner way to ask for this and is NOT portable: MySQL refuses `(`
+/// outright, MariaDB refuses it too when the pattern arrives as text but answers "no match" when
+/// the driver binds the row's JSON as bytes, which is how the engine sends it. An invalid JSON
+/// path is worse: MariaDB answers it as NULL. `IFNULL(…, 1)` keeps the load-time check of the
+/// sample row (no `breaks` field) answerable — falsy, which is fine, but not an error.
+const KIN_BAD_EXPECT: &str = "JSON_EXTRACT(body, '$.SequenceNumber') IS NOT NULL \
+     AND IFNULL((SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) d \
+                 WHERE JSON_UNQUOTE(JSON_EXTRACT(body, '$.breaks')) = 'yes'), 1) = 1";
 
 /// A record the answer stored but will not vouch for (no `SequenceNumber`): `expect` speaks
 /// about that record and refuses it alone, while its neighbours of the same batch are confirmed
@@ -5810,19 +5827,18 @@ async fn kinesis_a_record_the_answer_omits_is_sent_again_and_lands() {
 async fn kinesis_a_record_whose_expect_cannot_be_judged_waits_for_the_whole_batch() {
     let root = need_db!();
     let mock = Mock::start().await;
-    // `pat` is the pattern the check matches `seq` with: for key 2 the answer carries a pattern
-    // MySQL itself refuses, so the check cannot be answered for that record.
-    fn pat(k: &str) -> &'static str {
-        if k == "2" {
-            "("
-        } else {
-            "^s"
-        }
-    }
+    // `breaks` is the field that makes the check unanswerable: key 2's record carries `yes`, which
+    // turns the check into a question the database itself refuses (see `KIN_BAD_EXPECT`).
     mock.respond(|r| {
         let out: Vec<Value> = kin_records(r)
             .iter()
-            .map(|(k, d)| json!({"SequenceNumber": "1", "Data": d, "seq": "s1", "pat": pat(k)}))
+            .map(|(k, d)| {
+                let mut rec = json!({"SequenceNumber": "1", "Data": d});
+                if k == "2" {
+                    rec["breaks"] = json!("yes");
+                }
+                rec
+            })
             .collect();
         (200, json!({"Records": out}).to_string())
     });
@@ -5839,24 +5855,32 @@ async fn kinesis_a_record_whose_expect_cannot_be_judged_waits_for_the_whole_batc
     let inst = Instance::ready(config(&db, &[])).await;
     db.exec("INSERT INTO customers (id, name) VALUES (1,'Ann'),(2,'Bob'),(3,'Cy')")
         .await;
-    // The batch fails as a wait, and names the record the check died on and why.
+    // The batch fails as a wait, and the message names the record the check died on. A refusal
+    // reads differently ("record 1: status 200, `expect` not met (…)"), so the predicate asks for
+    // the wording of a check that DIED — otherwise a wrong premise would let the key be refused
+    // and dropped here, and only the assertions below would notice.
     let err = wait_for(
         Duration::from_secs(90),
         "the unjudgeable record fails the batch",
         || async {
             let last = db.status("kin_bad_expect").await?.3?;
-            (last.contains("record ") && last.contains("REGEXP")).then_some(last)
+            (last.contains("record 1 of") && last.contains("evaluating `expect`")).then_some(last)
         },
     )
     .await;
-    // The message names the item the check died on: which record of the batch, at which endpoint.
+    // Which record of the batch, at which endpoint, and the check that died — the SQL as `short()`
+    // keeps it (120 characters of it). The REASON is the database's own words (`Subquery returns
+    // more than 1 row` on both servers), so it is not asserted here; it is printed with a failure.
     assert!(err.contains("record 1 of"), "{err}");
     assert!(err.contains(&mock.url()), "{err}");
     assert!(err.contains("evaluating `expect`"), "{err}");
-    assert!(err.contains(KIN_BAD_EXPECT), "{err}");
     assert!(
-        err.contains("regular expression"),
-        "the database's own reason is missing: {err}"
+        err.contains("IFNULL((SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2)"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("`expect` not met"),
+        "an unjudgeable check was read as that record's refusal: {err}"
     );
     // Nothing was refused: no key struck, no key dropped, and a key the answer had confirmed
     // goes out again — an unknown answer cannot confirm anything.
