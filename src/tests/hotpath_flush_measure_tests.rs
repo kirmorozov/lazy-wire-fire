@@ -137,8 +137,9 @@ fn rendering_a_chunk_costs_this() {
         let warm = context(&rule, target, &ks, &ds, ep, &Value::Null);
         assert!(!rule.templates.render(ACTION, &warm).unwrap().is_empty());
 
-        let (_, docs_json) =
-            alloc_measure::count(|| black_box(ds.iter().map(Doc::to_json).collect::<Vec<_>>()).len());
+        let (_, docs_json) = alloc_measure::count(|| {
+            black_box(ds.iter().map(Doc::to_json).collect::<Vec<_>>()).len()
+        });
         let (_, ctx_only) =
             alloc_measure::count(|| black_box(context(&rule, target, &ks, &ds, ep, &Value::Null)));
         let (_, render_shared) =
@@ -192,6 +193,33 @@ fn the_context_clones_what_it_was_given() {
     );
 }
 
+/// What the necessary half of `spawn_flush`'s count is: `buf.keys.render` builds one
+/// `String` per key out of the buffer's ids, so the 417 the flush test prints splits
+/// into the render (~n Strings), the armed fallback's clone (n + 1, measured by
+/// `the_flush_copies_its_own_keys_twice`) and a handful of lane/Arc bookkeeping.
+#[test]
+fn rendering_the_flush_s_own_key_list_costs_this() {
+    use crate::keyspace::{IdSets, KeySpaces};
+    let n = 200;
+    let mut ks = KeySpaces::new();
+    let mut sets = IdSets::default();
+    for i in 0..n {
+        // The same shape the flush test's keys have: a text key (the tail is not a
+        // number), so it lives in the text space as a tuple and renders as its text.
+        let k = format!("order-{i:05}-customer-acme");
+        let (s, key) = ks.locate(&k);
+        sets.insert(s, key);
+    }
+    let warm = ks.render(sets.as_map());
+    assert_eq!(warm.len(), n);
+    let (_, render_cost) = alloc_measure::count(|| black_box(ks.render(sets.as_map())).len());
+    eprintln!("buf.keys.render of {n} keys: {render_cost} allocs");
+    assert!(
+        render_cost >= n,
+        "a rendered key is a String of its own: {render_cost} for {n}"
+    );
+}
+
 /// The flush's two copies of its keys (finding 11's keys half, PR-F's disclosed
 /// deviation): the armed fallback's `keys.clone()` and `fire_keys`' chunking.
 /// Both expressions are verbatim from the code they cost.
@@ -210,14 +238,17 @@ fn the_flush_copies_its_own_keys_twice() {
         // 1,000-key flush is one group.
         let group = 10_000;
         let groups = ks.chunks(group).count();
-        let (_, chunk_cost) =
-            alloc_measure::count(|| black_box(ks.chunks(group).map(<[String]>::to_vec).collect::<Vec<_>>()));
+        let (_, chunk_cost) = alloc_measure::count(|| {
+            black_box(ks.chunks(group).map(<[String]>::to_vec).collect::<Vec<_>>())
+        });
         assert_eq!(
             chunk_cost,
             n + groups + 1,
             "the chunking copies every key and builds one Vec per group: {chunk_cost} for {n}"
         );
-        eprintln!("flush of {n} keys: keys.clone() {clone_cost} allocs, chunking {chunk_cost} allocs");
+        eprintln!(
+            "flush of {n} keys: keys.clone() {clone_cost} allocs, chunking {chunk_cost} allocs"
+        );
     }
 }
 
@@ -285,9 +316,18 @@ fn sending_a_rendered_group_costs_this() {
     let rt = runtime();
 
     // The action as the flush renders it, then one send alone, warm.
-    let ctx = context(&rule, &target, &ks, &ds, &target.endpoints[0].ctx, &Value::Null);
+    let ctx = context(
+        &rule,
+        &target,
+        &ks,
+        &ds,
+        &target.endpoints[0].ctx,
+        &Value::Null,
+    );
     let rendered = rule.templates.render(ACTION, &ctx).expect("renders");
-    let warm = rt.block_on(target.send(0, &rendered)).expect("the mock answers 200");
+    let warm = rt
+        .block_on(target.send(0, &rendered))
+        .expect("the mock answers 200");
     assert!(matches!(warm, crate::target::Sent::Ok));
     let (_, send_cost) =
         alloc_measure::count(|| black_box(rt.block_on(target.send(0, &rendered)).unwrap()));
@@ -320,9 +360,12 @@ fn sending_a_rendered_group_costs_this() {
     // The counted run's own keys and docs are built before the count starts.
     let count_docs = chunk_docs(1000);
     let count_keys = chunk_keys(1000);
-    let (fired, whole) =
-        alloc_measure::count(|| black_box(fire(count_docs, count_keys)));
-    assert_eq!(fired.ok, 1, "the counted flush went out too: {:#?}", fired.error);
+    let (fired, whole) = alloc_measure::count(|| black_box(fire(count_docs, count_keys)));
+    assert_eq!(
+        fired.ok, 1,
+        "the counted flush went out too: {:#?}",
+        fired.error
+    );
     eprintln!(
         "1,000-key flush chunk without load_docs: send alone {send_cost} allocs, \
          fire_keys(docs_override) {whole} allocs, keys_done {}",
