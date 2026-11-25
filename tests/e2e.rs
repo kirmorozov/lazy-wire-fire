@@ -14147,6 +14147,12 @@ async fn a_failed_reset_requested_clear_waits_five_seconds() {
     // front of it (`Table 'lwf_clr5s.lazy_wire_fire_rule' doesn't exist`): the schema is a needle
     // the line really carries, so a matching line can only be this test's.
     let w0 = warn_lines_in(&db, &["crul", "clearing reset_requested"]).len();
+    // Before this instant the clear cannot be attempted at all: the held step is answered only
+    // from here, the reset finishes on that answer, and the clear of the flag follows it. The
+    // engine arms its 5 s retry when the attempt is refused (`src/engine.rs:3483`) and honours it
+    // from there, so no attempt precedes this instant by 5 s — which makes it the one point the
+    // floor at the end of the test can be measured from.
+    let armed = std::time::Instant::now();
     mock.heal();
 
     // The reset finishes and the clear of the flag fails FOR the missing table.
@@ -14200,7 +14206,7 @@ async fn a_failed_reset_requested_clear_waits_five_seconds() {
     // The table is back: the attempt that the 5 s timer holds does the clear the server refused.
     db.exec("RENAME TABLE lazy_wire_fire_rule_off TO lazy_wire_fire_rule")
         .await;
-    let t0 = std::time::Instant::now();
+    let restored = std::time::Instant::now();
     wait_for(
         Duration::from_secs(30),
         "the flag cleared by the retry",
@@ -14218,10 +14224,20 @@ async fn a_failed_reset_requested_clear_waits_five_seconds() {
         },
     )
     .await;
+    // The floor runs from `armed`, where the wait begins for the engine, and not from the rename
+    // above. That rename is DDL behind the retries the engine is making of the same schema, and a
+    // floor read from it measures the test's way back as much as the timer: it asks the queries and
+    // the lock to fit inside whatever of the 5 s they leave. On a loaded full-suite run they left
+    // 214 ms and the test failed a retry that had run exactly on its timer. Measured here, the gap
+    // from the refused attempt to the clear is 5.0-5.15 s and from `armed` 5.56-5.83 s (12 runs,
+    // an idle box), so this floor, 1.5 s under the shortest of them, still refuses a clear that
+    // came on the 1 s reload cadence instead of the 5 s one the WARN names.
+    let waited = armed.elapsed();
     assert!(
-        t0.elapsed() >= Duration::from_secs(1),
-        "the clear did not wait for its timer: {:?}",
-        t0.elapsed()
+        waited >= Duration::from_secs(4),
+        "the clear did not wait for its timer: the flag was 0 {waited:?} after the reset could \
+         first have asked for it, and {:?} after the table came back, when the retry is 5 s",
+        restored.elapsed()
     );
     assert!(inst.health.is_ready(), "the engine died on the clear");
     // The rule itself still works after all of that.
