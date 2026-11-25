@@ -1663,7 +1663,38 @@ impl Engine {
             }
         }
         if rule.def.reset_requested {
+            // A boot into a request that still stands: when the saved row is a reset that was
+            // itself running on this request and its recorded step still belongs to these
+            // steps, the new process continues that run at the step it died in — the steps
+            // before it finished and their keys were confirmed by the target, and the
+            // interrupted step re-runs from its own beginning (at-least-once). Every other
+            // shape starts over from step 1, as a fresh request asks: the row carries no
+            // version, so only what the saved line itself can vouch for serves as "this run
+            // is the one that request started" (see [`resume_requested_reset`]). `initial`
+            // only: a re-add or a reload has its own arms, and they keep restarting (#200,
+            // #203).
+            let resume = initial
+                .then(|| {
+                    self.saved.get(name).and_then(|s| {
+                        resume_requested_reset(
+                            &s.reset_state,
+                            &rule.def.reset_steps,
+                            &rule.fingerprint,
+                        )
+                    })
+                })
+                .flatten();
             self.start_reset(name, "reset_requested".into(), true);
+            if let Some(step) = resume {
+                if let Some(run) = self.rules.get_mut(name).and_then(|st| st.reset.as_mut()) {
+                    run.step = step;
+                    info!(
+                        rule = %name,
+                        "reset steps resume at step {}: the saved run was serving this request",
+                        step + 1
+                    );
+                }
+            }
         }
     }
 
@@ -3010,6 +3041,10 @@ impl Engine {
         let (incarnation, rid) = (st.incarnation, run.id);
         let rname = name.to_string();
         let steps = rule.def.reset_steps.len();
+        // The line a running step writes carries a digest of the rule it was walked under,
+        // so only that same def lets a restart skip the finished steps (see
+        // [`resume_requested_reset`]).
+        let fp = format!("fp{}", fingerprint_digest(&rule.fingerprint));
         loop {
             if run.step >= steps {
                 info!(rule = %name, "reset steps done ({})", run.reason);
@@ -3024,9 +3059,10 @@ impl Engine {
             let i = run.step;
             let step = &rule.def.reset_steps[i];
             st.reset_state = format!(
-                "running: step {}/{} {}: {}",
+                "running: step {}/{} {} {}: {}",
                 i + 1,
                 steps,
+                fp,
                 step.name,
                 run.reason
             );
@@ -3112,9 +3148,10 @@ impl Engine {
                     }
                     let chunk = pending.clone().expect("set above");
                     st.reset_state = format!(
-                        "running: step {}/{} {}: {}/{} keys: {}",
+                        "running: step {}/{} {} {}: {}/{} keys: {}",
                         i + 1,
                         steps,
+                        fp,
                         step.name,
                         done,
                         total,
@@ -3680,6 +3717,82 @@ fn unfinished_reset(state: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The reasons a run that serves the operator's request writes — the two texts the requested
+/// arms put into `reset_state`. An unrequested run writes other texts ("new rule", a lost
+/// position, …), and both resume arms append "(resumed after restart)" / "(resumed after the
+/// rule was added again)" to whatever they carry, so an exact match here never mistakes a run
+/// that started on its own for one serving the request in the row.
+const REQUESTED_RESET_REASONS: [&str; 2] = [
+    "reset_requested",
+    "reset_requested raised again while the finished reset was being cleared",
+];
+
+/// The token a `running:` line carries beside the step counter: a short digest of the rule
+/// fingerprint — `Rule::fingerprint`, everything the actions are built from (the step bodies
+/// and their listing SQL, the templates, and the target definition included), the same string
+/// [`Engine::update_rule`] compares when a live rule change restarts a running reset. Only a
+/// line whose token matches the loaded rule lets a restart skip its finished steps: a def
+/// edited while the process was down ran those steps under a different contract, and the
+/// target the new def names may never have seen them. `std`'s SipHash with fixed keys: stable
+/// for the life of a build; an upgrade that moved the hash costs one re-walk — the safe
+/// direction. A line written without the token (an older version) matches nothing and starts
+/// over, as today.
+fn fingerprint_digest(fingerprint: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    fingerprint.hash(&mut h);
+    format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
+}
+
+/// The step a restart continues a requested reset from, from the rule's own saved
+/// `reset_state`: `Some(i - 1)` when it still says `running: step {i}/{n} fp{digest} {name}:
+/// …`, the token digests the current fingerprint ([`fingerprint_digest`] — a def that moved
+/// while the process was down restarts its own walk, the way [`Engine::update_rule`] restarts
+/// a changed live run), the reason is one [`REQUESTED_RESET_REASONS`] carries, and the
+/// recorded step count and step name still match `steps`. Everything else is `None`:
+/// `pending:` (no step was reached yet), a line without the token or with another rule's, a
+/// reason that is not a requested run's, def drift, or a shape this parser does not
+/// recognise — and the reset starts over from step 1, exactly as a fresh request asks
+/// (#200, #203).
+///
+/// Skipping the finished steps is safe to do at-least-once: a step advances only after every
+/// chunk of it came back answered (`drive_reset` and `on_done`'s reset arms), so their keys
+/// each had a send that the target confirmed. The interrupted step is re-run from its own
+/// beginning: its key set lived in memory and died with the process, and the saved `done`
+/// count lags reality by the persist cadence — a count into a re-listed set is a progress
+/// note for `/status`, not a cursor a restart may skip keys by.
+fn resume_requested_reset(
+    state: &str,
+    steps: &[model::ResetStep],
+    fingerprint: &str,
+) -> Option<usize> {
+    let rest = state.strip_prefix("running: step ")?;
+    let (idx, rest) = rest.split_once(' ')?;
+    let (i, n) = idx.split_once('/')?;
+    let i: usize = i.parse().ok()?;
+    let n: usize = n.parse().ok()?;
+    if i == 0 || i > n || n != steps.len() {
+        return None;
+    }
+    // The digest token sits between the counter and the step name; a line that predates it
+    // has the name there, never matches, and the run starts over.
+    let (token, rest) = rest.split_once(' ')?;
+    if token != format!("fp{}", fingerprint_digest(fingerprint)) {
+        return None;
+    }
+    // `drive_reset` writes the step name after the token, then either the bare reason or
+    // `{done}/{total} keys: {reason}`. A name that does not split this way simply never
+    // matches and the run starts over. Both accepted reasons end the line.
+    let (name, tail) = rest.split_once(": ")?;
+    let want = steps.get(i - 1)?;
+    if want.name != name {
+        return None;
+    }
+    REQUESTED_RESET_REASONS
+        .into_iter()
+        .find(|r| tail == *r || tail.ends_with(&format!(": {r}")))
+        .map(|_| i - 1)
 }
 
 fn merge_marks(into: &mut Marks, m: Marks) {
