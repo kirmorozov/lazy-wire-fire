@@ -549,6 +549,51 @@ async fn a_once_step_has_no_keys_so_it_cannot_list_records() {
     assert!(chain(&e).contains("1 records for 2 keys"), "{}", chain(&e));
 }
 
+/// What a `once` step ends as, for every shape its render can take: skipped when there is nothing
+/// to publish, refused when the render itself is wrong. Never `Sent::Ok`, which would say "a
+/// record of this action went through" — with no keys there is no record to have published, which
+/// is what the per-item arms of `send` used to assume and no longer does. The broker is never
+/// asked: the endpoint below answers nothing, and a publish that reached it would fail as a wait,
+/// not skip.
+#[tokio::test]
+async fn a_once_step_books_no_record_whatever_it_renders() {
+    let c = client("rabbitmq-stream://127.0.0.1:1/orders");
+    for rendered in [
+        "",                                     // nothing rendered
+        "  \n ",                                // blank
+        "POST / HTTP/1.1\n\n{\"records\": []}", // a publish with no records
+    ] {
+        assert_eq!(
+            send(&c, rendered, &no_expect(), &pool()).await.unwrap(),
+            Sent::Skipped,
+            "`{rendered}` is not a publish"
+        );
+    }
+    // A render that is wrong is refused, and the wrongness is named: the action will not change
+    // by itself, so the keys are struck rather than left to wait.
+    for (rendered, why) in [
+        (
+            format!("POST / HTTP/1.1\n\n{}", body(1)),
+            "1 records for 0 keys",
+        ),
+        (
+            format!("POST / HTTP/1.1\n\n{}", body(2)),
+            "2 records for 0 keys",
+        ),
+        (
+            "POST / HTTP/1.1\n\nnot json".to_string(),
+            "the publish body",
+        ),
+        ("GET / HTTP/1.1\n\n{}".to_string(), "GET / is not POST /"),
+    ] {
+        let e = send(&c, &rendered, &no_expect(), &pool())
+            .await
+            .unwrap_err();
+        assert!(crate::target::is_rejected(&e), "{}", chain(&e));
+        assert!(chain(&e).contains(why), "{} names {why}", chain(&e));
+    }
+}
+
 /// A broker that cannot be reached says nothing about the records: the call fails as a wait
 /// (never a refusal, which would strike every key of the batch), naming the endpoint.
 #[tokio::test]
