@@ -2709,7 +2709,19 @@ impl Engine {
                             .as_mut()
                             .expect("a Full-key trigger means the table has objects");
                         let obj = objs[ii].get_or_insert_with(|| w.layout.object(img)).clone();
-                        let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op_text(op), "table": w.table});
+                        // The row's context, built rather than serialised: `json!` of a
+                        // `Value` deep-copies it, so this one object — owned once by the
+                        // cache above, and read again by the pass that follows — was copied
+                        // three more times to fill three roots that all hold it. Built by
+                        // hand it is copied twice and moved into the third (the hot-path
+                        // audit's finding 8, the row's own object).
+                        let mut ctx = Map::new();
+                        ctx.insert("old".into(), obj.clone());
+                        ctx.insert("new".into(), obj.clone());
+                        ctx.insert("row".into(), obj);
+                        ctx.insert("op".into(), Value::String(op_text(op).into()));
+                        ctx.insert("table".into(), Value::String(w.table.clone()));
+                        let ctx = Value::Object(ctx);
                         for tpl in lines {
                             match rule.templates.render(tpl, &ctx) {
                                 Ok(s) => {
