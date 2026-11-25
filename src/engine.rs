@@ -3947,6 +3947,10 @@ mod stream_verdict_tests;
 mod hotpath_alloc_tests;
 
 #[cfg(test)]
+#[path = "tests/hotpath_row_measure_tests.rs"]
+mod hotpath_row_measure_tests;
+
+#[cfg(test)]
 #[path = "tests/engine_flush_alloc_tests.rs"]
 mod flush_alloc_tests;
 

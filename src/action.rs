@@ -1249,3 +1249,7 @@ mod keyquery_tests;
 #[cfg(test)]
 #[path = "tests/loaddocs_chunk_tests.rs"]
 mod loaddocs_tests;
+
+#[cfg(test)]
+#[path = "tests/hotpath_flush_measure_tests.rs"]
+mod hotpath_flush_measure_tests;
