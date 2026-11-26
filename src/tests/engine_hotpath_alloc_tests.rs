@@ -40,6 +40,20 @@ fn rule(key: KeyTemplate, changed: &[&str], full: bool) -> Arc<Rule> {
         templates
             .add("k0", "{{row.sku}}", &["row", "old", "new"])
             .expect("compiles");
+        // every root a Full key can read, in one key: the context's shape, visible in what
+        // the trigger marks (`a_full_key_row_renders_the_context_it_always_rendered`)
+        templates
+            .add(
+                "k1",
+                "{{op}}|{{table}}|{{row.sku}}|{{old.qty}}|{{new.qty}}",
+                &["row", "old", "new", "op", "table"],
+            )
+            .expect("compiles");
+        // the whole context as JSON: the order of its roots is part of what a template can
+        // see (`a_full_key_row_costs_three_copies_of_its_object` pins it)
+        templates
+            .add("k2", "{{json this}}", &["row", "old", "new", "op", "table"])
+            .expect("compiles");
     }
     let trigger = Trigger {
         def: TriggerDef {
@@ -117,6 +131,12 @@ struct Hot {
 impl Hot {
     /// A table with one trigger whose key is `key` (`any_full`: whether it is a Full one).
     fn new(key: KeyTemplate, changed: &[&str], any_full: bool) -> Hot {
+        Self::at(layout(), key, changed, any_full)
+    }
+
+    /// The same over a given layout: the Full-key tests use a wide table, where the row's
+    /// object is big enough for its copies to show up above the render.
+    fn at(layout: Arc<Layout>, key: KeyTemplate, changed: &[&str], any_full: bool) -> Hot {
         let rule = rule(key, changed, any_full);
         let mut rules = BTreeMap::new();
         rules.insert(RULE.to_string(), state(&rule));
@@ -124,7 +144,7 @@ impl Hot {
         let any_on = Engine::watched_kinds(&triggers);
         Hot {
             w: Watched {
-                layout: layout(),
+                layout,
                 table: "shop.orders".into(),
                 triggers,
                 any_full,
@@ -302,6 +322,126 @@ fn a_full_key_row_still_gets_its_object() {
     assert_eq!(hot.keys(), "sku-1,sku-2");
     assert_eq!(hot.render_warnings, 0);
     assert_eq!(hot.rows(), Some(1));
+}
+
+/// The same table, wide: twelve watched columns, so one copy of the row's object is a dozen
+/// keys and a dozen values and the copies a Full key pays for it show up above the render.
+fn wide_layout() -> Arc<Layout> {
+    Arc::new(Layout::new(
+        (0..12)
+            .map(|i| format!("c{i}"))
+            .chain(["sku".into(), "qty".into()])
+            .collect(),
+        vec![ColKind::Plain; 14],
+    ))
+}
+
+/// A row of `wide_layout`: text columns with text in them, so a copy costs what it costs.
+fn wide_row(sku: &str, qty: i64) -> Option<BinlogRow> {
+    let v = |x: My| Some(BinlogValue::Value(x));
+    Some(BinlogRow::new(
+        (0..12)
+            .map(|i| {
+                v(My::Bytes(
+                    format!("column-{i}-value-of-a-decent-length").into_bytes(),
+                ))
+            })
+            .chain([v(My::Bytes(sku.as_bytes().to_vec())), v(My::Int(qty))])
+            .collect(),
+        Arc::new([]),
+    ))
+}
+
+/// The five roots a Full key reads come out of one row object: `old`, `new` and `row` are
+/// the same value. Building the context by hand instead of letting `json!` serialise that
+/// object three times must change nothing a user can see — the same template, the same key,
+/// including a value that needs escaping and a non-ASCII one. Main renders the same string:
+/// this assertion is the equality, not the cost (`the row's object is copied three times`).
+#[test]
+fn a_full_key_row_renders_the_context_it_always_rendered() {
+    let mut hot = Hot::new(KeyTemplate::Full(vec!["k0".into(), "k1".into()]), &[], true);
+    let (before, after) = (row(7, "sku-\"1\"", 3), row(7, "北京-2", 5));
+    hot.feed(RowsKind::Update, &before, &after);
+    assert_eq!(hot.render_warnings, 0);
+    assert_eq!(hot.rows(), Some(1));
+    // The buffer hands the marked keys out in its own order; what is compared is the set.
+    let marked = hot.keys();
+    let got: std::collections::BTreeSet<&str> = marked.split(',').collect();
+    let want: std::collections::BTreeSet<&str> = [
+        "sku-\"1\"",
+        "北京-2",
+        "update|shop.orders|sku-\"1\"|3|3",
+        "update|shop.orders|北京-2|5|5",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        got, want,
+        "a Full key renders the same context it always rendered"
+    );
+}
+
+/// The order of the row context's roots is part of what a template can see, and `Value ==`
+/// would not catch it: `serde_json` is built with `preserve_order`, so an ordered map
+/// compares without regard to order. It is pinned where it is real — a Full key whose
+/// template is `{{json this}}` marks the rendered context as its key. The order is the one
+/// `json!` wrote, the values are the row's.
+#[test]
+fn a_full_key_rows_context_keeps_the_order_of_its_roots() {
+    let mut hot = Hot::new(KeyTemplate::Full(vec!["k2".into()]), &[], true);
+    // one image: an insert, so the context renders once and the rule marks one key
+    let after = row(7, "sku-1", 3);
+    hot.feed(RowsKind::Insert, &None, &after);
+    assert_eq!(hot.render_warnings, 0);
+    let rendered = hot.keys();
+    let ctx: Value = serde_json::from_str(&rendered).expect("the marked key is the context");
+    let roots: Vec<&str> = ctx
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        roots,
+        vec!["old", "new", "row", "op", "table"],
+        "the row context's roots are not in the order `json!` wrote them ({rendered})"
+    );
+    assert_eq!(ctx["op"], json!("insert"), "the op the row carries");
+    assert_eq!(ctx["table"], json!("shop.orders"), "the table it came from");
+    assert_eq!(ctx["row"]["sku"], json!("sku-1"), "the row itself");
+    assert_eq!(ctx["old"], ctx["row"], "and the three roots that hold it");
+    assert_eq!(ctx["new"], ctx["row"]);
+}
+
+/// The cost half of the same finding: the row's object is built once per image and read by
+/// three roots. `json!` deep-copied it into a new value for each of them — four copies
+/// counting the build; built by hand, two roots clone it and the third takes it, three.
+/// The bound is the four-copy shape's number less the copy this removes: run against main's
+/// `json!` line it fails, which is what makes it a bound and not a print.
+#[test]
+fn a_full_key_row_costs_three_copies_of_its_object() {
+    let mut hot = Hot::at(
+        wide_layout(),
+        KeyTemplate::Full(vec!["k0".into()]),
+        &[],
+        true,
+    );
+    let (before, after) = (wide_row("sku-1", 3), wide_row("sku-2", 5));
+    hot.feed(RowsKind::Update, &before, &after);
+    assert_eq!(hot.render_warnings, 0);
+    assert_eq!(hot.keys(), "sku-1,sku-2");
+    let ((), n) = alloc_measure::count(|| {
+        for _ in 0..10 {
+            hot.feed(RowsKind::Update, &before, &after);
+        }
+    });
+    let per_row = n / 10;
+    eprintln!("a Full-key row of fourteen columns, both images: {per_row} allocations");
+    assert!(
+        per_row <= 500,
+        "the row's object is being copied again: {per_row} allocations per Full-key row \
+         against the number measured here, with main's four copies per image"
+    );
 }
 
 /// What one text column costs as a value, the way the row path takes it: the borrowed conversion

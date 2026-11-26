@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Params, Pool, Row, Value as My};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
@@ -467,6 +467,15 @@ pub async fn load_docs(env: &Env, rule: &Rule, keys: &[String]) -> Result<Vec<Do
 }
 
 /// Context for one action.
+/// Context for one action: the roots a template may read — `keys`, `docs`, `rule`,
+/// `target`, `vars`, `endpoint`, `reset`.
+///
+/// The entries are put into the map, not run through `json!`. `json!` of an expression that
+/// is already a `Value` serialises it into a new one, so every entry below — and `docs`
+/// above all, one owned `Value` per key — was deep-copied on its way in as well as on the
+/// way out (the hot-path audit's finding 10). A context is a copy of the group's data
+/// either way: the same group may render for several endpoints, and the flush still owes
+/// its docs to the buffer. The saving is that it is copied once, not twice.
 pub fn context(
     rule: &Rule,
     target: &Target,
@@ -475,16 +484,26 @@ pub fn context(
     endpoint: &Value,
     reset: &Value,
 ) -> Value {
-    json!({
-        "keys": keys,
-        // The contract: `docs` is empty when the rule has no selects (the keys are the data).
-        "docs": if rule.selects.is_empty() { Vec::new() } else { docs.iter().map(Doc::to_json).collect::<Vec<_>>() },
-        "rule": rule.name(),
-        "target": target.ctx,
-        "vars": Value::Object(rule.def.vars.clone()),
-        "endpoint": endpoint,
-        "reset": reset,
-    })
+    let mut ctx = Map::new();
+    ctx.insert(
+        "keys".into(),
+        Value::Array(keys.iter().map(|k| Value::String(k.clone())).collect()),
+    );
+    // The contract: `docs` is empty when the rule has no selects (the keys are the data).
+    ctx.insert(
+        "docs".into(),
+        Value::Array(if rule.selects.is_empty() {
+            Vec::new()
+        } else {
+            docs.iter().map(Doc::to_json).collect::<Vec<_>>()
+        }),
+    );
+    ctx.insert("rule".into(), Value::String(rule.name().into()));
+    ctx.insert("target".into(), target.ctx.clone());
+    ctx.insert("vars".into(), Value::Object(rule.def.vars.clone()));
+    ctx.insert("endpoint".into(), endpoint.clone());
+    ctx.insert("reset".into(), reset.clone());
+    Value::Object(ctx)
 }
 
 #[derive(Debug, Default)]
@@ -1259,3 +1278,7 @@ mod loaddocs_tests;
 #[cfg(test)]
 #[path = "tests/flush_keys_alloc_tests.rs"]
 mod flush_keys_alloc_tests;
+
+#[cfg(test)]
+#[path = "tests/context_build_alloc_tests.rs"]
+mod context_build_alloc_tests;
