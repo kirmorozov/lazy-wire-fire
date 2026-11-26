@@ -205,6 +205,7 @@ async fn engine_with_flush_ready(
         filter_checked: HashSet::new(),
         binlog_filtered: BTreeSet::new(),
         stream_error: None,
+        undecodable: UndecodableWatch::default(),
     };
     Some((e, rx))
 }

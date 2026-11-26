@@ -62,6 +62,13 @@ const STMT_DML_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Status rows are rewritten at least this often (`updated_at`).
 const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 const RETRY_FIRST: Duration = Duration::from_millis(500);
+/// The stream loop's reconnect ladder: the pause after a round that did not recover, doubled per
+/// round up to the cap. A round that ends on a position the server cannot serve (a 1236 that keeps
+/// it) or on bytes this build cannot decode walks it until the position moves, while a round that
+/// delivered reconnects after [`STREAM_FAST_PATH`].
+const STREAM_BACKOFF_FIRST: Duration = Duration::from_millis(500);
+const STREAM_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const STREAM_FAST_PATH: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
 struct Backoff {
@@ -662,6 +669,9 @@ pub struct Engine {
     /// A binlog dump error whose message says nothing about the position (see `binlog_unusable`):
     /// the position is kept and the dump retried; shown on `/status` until the stream recovers.
     stream_error: Option<String>,
+    /// What the stream loop remembers of the events this build cannot decode (see
+    /// [`UndecodableWatch`]): the position its one line named, and how many such events there were.
+    undecodable: UndecodableWatch,
 }
 
 fn server_code(e: &anyhow::Error) -> Option<u16> {
@@ -1049,6 +1059,7 @@ pub async fn run(
         filter_checked: HashSet::new(),
         binlog_filtered: BTreeSet::new(),
         stream_error: None,
+        undecodable: UndecodableWatch::default(),
         cfg,
     };
     e.reload_config(true).await?;
@@ -1345,6 +1356,52 @@ impl Engine {
     fn on_kept_binlog_error(&mut self, e: &anyhow::Error, at: &Position, retry_in: Duration) {
         self.stream_error = Some(format!("{e:#} at {at}"));
         warn!("binlog dump at {at} failed ({e:#}); the position is kept, retrying in {retry_in:?}");
+    }
+
+    /// An event this build cannot decode, seen where the reader maps the stream (review A-02, the
+    /// `undecodable` arm): the bytes arrived and the decoder refused them, so every connect that
+    /// starts at this position fails on them again until a build that reads them ships. The loop
+    /// treats it as it treats a 1236 the server cannot serve — the position is kept, the event is
+    /// never skipped, and the round does not count as recovered, so the backoff keeps growing
+    /// instead of the 200 ms a stream that is moving earns — and `/status` carries the decoder's
+    /// words (`stream_error`) until the stream delivers again. The position gets one WARN line, not
+    /// one per round: see [`UndecodableWatch::note`].
+    fn on_undecodable_stream_error(
+        &mut self,
+        e: &anyhow::Error,
+        at: &Position,
+        retry_in: Duration,
+    ) {
+        self.stream_error = Some(format!("{e:#} at {at}"));
+        if self.undecodable.note(at) {
+            warn_undecodable_stream_error(e, at, retry_in);
+        }
+        if let Some(m) = &self.metrics {
+            m.undecodable_event();
+        }
+    }
+
+    /// The rows of a watched table, refused by the decoder: the one ERROR line the owner's ruling
+    /// of 2026-11-16 (carried by `source::Undecodable`) requires, `/status` told, the counter moved
+    /// — and the caller exits at once, because the ruling keeps a decode failure fatal. The ten
+    /// generic re-reads this error used to burn were re-reads of the same boundary, each failing on
+    /// the same bytes: they reached the same exit two seconds later, with ten log lines.
+    fn on_undecodable_rows(&mut self, e: &anyhow::Error) {
+        self.stream_error = Some(format!("{e:#}"));
+        self.undecodable.count();
+        if let Some(m) = &self.metrics {
+            m.undecodable_event();
+        }
+        error_undecodable_rows(e);
+    }
+
+    /// The stream delivered events again after a kept position (a 1236 the server cannot serve, or
+    /// bytes this build cannot decode): the dump error is no longer current — `/status` stops
+    /// showing it, which is the contract of [`Engine::on_kept_binlog_error`] — and the position the
+    /// reader was stuck at is forgotten, so standing still there again is news.
+    fn on_stream_recovered(&mut self) {
+        self.stream_error = None;
+        self.undecodable.recovered();
     }
 
     async fn on_missing_binlog(&mut self, e: &anyhow::Error) -> Result<()> {
@@ -1825,7 +1882,7 @@ impl Engine {
         mut rx: mpsc::UnboundedReceiver<Done>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<()> {
-        let mut backoff = Duration::from_millis(500);
+        let mut backoff = STREAM_BACKOFF_FIRST;
         let mut pos = start;
         let mut item_failures = 0u32;
         let mut failed_at: Option<Position> = None;
@@ -1874,13 +1931,19 @@ impl Engine {
                     if server_code(&e) == Some(1236) && !source::is_duplicate_server_id(&e) {
                         self.on_kept_binlog_error(&e, &pos, backoff);
                         kept_position = true;
+                    } else if source::is_undecodable(&e) {
+                        // Bytes this build cannot decode: every connect gets the same refusal, so
+                        // the position is kept and the ladder keeps growing, as it does for a 1236
+                        // the server cannot serve (see [`Engine::on_undecodable_stream_error`]).
+                        self.on_undecodable_stream_error(&e, &pos, backoff);
+                        kept_position = true;
                     } else {
                         warn!("binlog connect failed: {e:#}; retrying in {backoff:?}");
                     }
                     if self.idle(backoff, &mut rx, shutdown).await? {
                         break 'reconnect;
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    backoff = (backoff * 2).min(STREAM_BACKOFF_MAX);
                     continue 'reconnect;
                 }
             };
@@ -1889,6 +1952,7 @@ impl Engine {
             let mut last_event = Instant::now();
             let mut delivered = false;
             let mut hit_1236 = false;
+            let mut hit_undecodable = false;
             loop {
                 self.health.beat();
                 let wake = self.next_wakeup();
@@ -1904,7 +1968,7 @@ impl Engine {
                                 if !delivered {
                                     delivered = true;
                                     if !kept_position {
-                                        backoff = Duration::from_millis(500);
+                                        backoff = STREAM_BACKOFF_FIRST;
                                     }
                                 }
                                 // The time a rows event was logged (statement start); 0 is unknown.
@@ -1916,14 +1980,26 @@ impl Engine {
                                 }
                                 self.caught_up = matches!(item, Item::Heartbeat);
                                 if let Err(e) = self.on_item(&reader, item).await {
-                                    item_failures += 1;
-                                    failed_at = Some(self.boundary.clone());
-                                    if item_failures >= 10 {
-                                        return Err(e.context("processing binlog events keeps failing"));
+                                    match on_item_failure(&e) {
+                                        ItemFailure::GiveUp => {
+                                            // The rows of a watched table, refused by the decoder:
+                                            // the ruling the copy carries keeps this fatal, and the
+                                            // ten re-reads that used to precede the same exit each
+                                            // failed on the same bytes.
+                                            self.on_undecodable_rows(&e);
+                                            return Err(e);
+                                        }
+                                        ItemFailure::Retry => {
+                                            item_failures += 1;
+                                            failed_at = Some(self.boundary.clone());
+                                            if item_failures >= 10 {
+                                                return Err(e.context("processing binlog events keeps failing"));
+                                            }
+                                            warn!("processing a binlog event: {e:#}; re-reading from {}", self.boundary);
+                                            self.heal_control().await?;
+                                            break;
+                                        }
                                     }
-                                    warn!("processing a binlog event: {e:#}; re-reading from {}", self.boundary);
-                                    self.heal_control().await?;
-                                    break;
                                 }
                             }
                             Ok(None) => {
@@ -1935,6 +2011,11 @@ impl Engine {
                                     self.on_missing_binlog(&e).await?;
                                 } else if source::is_duplicate_server_id(&e) {
                                     self.reroll_server_id();
+                                } else if source::is_undecodable(&e) {
+                                    let at = self.boundary.clone();
+                                    self.on_undecodable_stream_error(&e, &at, backoff);
+                                    hit_undecodable = true;
+                                    kept_position = true;
                                 } else if server_code(&e) == Some(1236) {
                                     let at = self.boundary.clone();
                                     self.on_kept_binlog_error(&e, &at, backoff);
@@ -1976,25 +2057,17 @@ impl Engine {
             self.txn_marks.clear();
             self.xa_current = None;
             pos = self.boundary.clone();
-            // A connection that delivered events without a kept 1236: the stream recovered, so
-            // the error is no longer current and the backoff starts over. While a 1236 that keeps
-            // the position repeats, the capped backoff grows even though each attempt delivers
-            // the events before the offending one.
-            let recovered = delivered && !hit_1236;
-            if recovered {
+            // A connection that delivered events without a kept 1236 or a refused event: the
+            // stream recovered, so the error is no longer current and the backoff starts over.
+            // While a position the server cannot serve, or bytes this build cannot decode, repeats,
+            // the capped backoff grows even though each attempt delivers the events before it.
+            let sched = round_schedule(delivered, hit_1236, hit_undecodable, backoff);
+            if sched.recovered {
                 kept_position = false;
-                self.stream_error = None;
-                backoff = Duration::from_millis(500);
+                self.on_stream_recovered();
             }
-            let pause = if recovered {
-                Duration::from_millis(200)
-            } else {
-                backoff
-            };
-            if !recovered {
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            }
-            if self.idle(pause, &mut rx, shutdown).await? {
+            backoff = sched.backoff;
+            if self.idle(sched.pause, &mut rx, shutdown).await? {
                 break 'reconnect;
             }
         }
@@ -3700,15 +3773,16 @@ impl Engine {
         if let Some(reg) = &self.metrics {
             reg.set_binlog_lag(self.stream_lag_ms() as f64 / 1000.0);
         }
-        self.health.set_status(json!({
-            "instance": self.cfg.instance,
-            "position": resume.to_string(),
-            "stream_lag_ms": self.stream_lag_ms(),
-            "stream_error": self.stream_error,
-            "statement_events_ignored": self.stmt_dml_ignored,
-            "rules": summary,
-            "binlog_filtered_schemas": self.binlog_filtered.iter().collect::<Vec<_>>(),
-        }));
+        self.health.set_status(status_json(
+            &self.cfg.instance,
+            &resume,
+            self.stream_lag_ms(),
+            self.stream_error.as_deref(),
+            self.stmt_dml_ignored,
+            self.undecodable.seen,
+            summary,
+            self.binlog_filtered.iter().cloned().collect(),
+        ));
         if rows.is_empty() {
             return Ok(());
         }
@@ -3933,6 +4007,184 @@ fn first_words(q: &str) -> String {
     w.join(" ")
 }
 
+/// What the stream loop remembers of the events this build cannot decode (review A-02, the
+/// `undecodable` arm): the position its one line named, and how many such events there were since
+/// the start. Memory only, like [`Engine::stream_error`]: a boot of a stream that works starts
+/// clean, and the tool's tables hold no counters.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UndecodableWatch {
+    /// The position the last line named. `None` until the first stuck round, and cleared when the
+    /// stream delivers again, so any other position — a second stuck one, or the same one after the
+    /// stream moved on — gets a line of its own instead of being silent.
+    named: Option<Position>,
+    /// Events this build could not decode: the `undecodable` field of `/status` and
+    /// `lazywf_binlog_undecodable_total` on `/metrics`.
+    seen: u64,
+}
+
+impl UndecodableWatch {
+    /// Registers one refused event at `at` and answers whether a line is due: `true` the first time
+    /// a position is named, `false` for the rounds that come back to it (the reader will return to
+    /// the same bytes every round of the back-off ladder, and one sentence repeated every five
+    /// seconds says nothing new), and `true` again for a position not named yet — a second standstill
+    /// must not read as a stream that recovered. The key resets in [`UndecodableWatch::recovered`]
+    /// rather than the watch remembering every position it has seen: the idiom of
+    /// [`Engine::stmt_dml_last`]. Every event is counted, line or no line: an alert reads the number.
+    ///
+    /// Split out of [`Engine::on_undecodable_stream_error`] so the unit test can drive it without a
+    /// live engine (the `stmt_dml_gate` idiom).
+    fn note(&mut self, at: &Position) -> bool {
+        self.seen += 1;
+        if self.named.as_ref() == Some(at) {
+            return false;
+        }
+        self.named = Some(at.clone());
+        true
+    }
+
+    /// Registers one refused event whose line the caller logs as it pleases: the fatal rows decode,
+    /// which says its one ERROR line and then exits, so there is nothing to rate limit.
+    fn count(&mut self) {
+        self.seen += 1;
+    }
+
+    /// The stream delivered events again: the position it had named is no longer where the reader
+    /// stands, so standing still there later is news, and gets its line.
+    fn recovered(&mut self) {
+        self.named = None;
+    }
+}
+
+/// What one finished round of the stream loop decided about the reconnect schedule (see
+/// [`round_schedule`]).
+#[derive(Debug)]
+struct RoundSchedule {
+    /// The connection delivered events and nothing kept the position: the dump error is no longer
+    /// current, and the ladder starts over.
+    recovered: bool,
+    /// How long to wait before the next connect.
+    pause: Duration,
+    /// The ladder's next step, for the round after this one.
+    backoff: Duration,
+}
+
+/// The schedule of the next connect, after a round that ended with the reader disconnected.
+///
+/// A round is recovered when it delivered and nothing kept the position. Both kinds of kept position
+/// mean the next connect fails the same way — a 1236 the server cannot serve, or bytes this build
+/// cannot decode (`source::is_undecodable`) — so such a round must not earn the [`STREAM_FAST_PATH`]
+/// a stream that is moving earns, nor reset the ladder: that is the difference between waiting for
+/// the source or for a deploy at a growing interval, and opening a new connection and dump request
+/// on the server five times a second forever with `/livez` green. The schedule says only *when* to
+/// connect again, never *from where*: the loop re-reads from the stream's boundary either way, so a
+/// refused event is read again by every round until a build that decodes it ships.
+///
+/// Split out of [`Engine::stream`] so the unit test can drive the ladder without a live engine (the
+/// `stmt_dml_gate` idiom).
+fn round_schedule(
+    delivered: bool,
+    hit_1236: bool,
+    hit_undecodable: bool,
+    backoff: Duration,
+) -> RoundSchedule {
+    let recovered = delivered && !hit_1236 && !hit_undecodable;
+    if recovered {
+        return RoundSchedule {
+            recovered,
+            pause: STREAM_FAST_PATH,
+            backoff: STREAM_BACKOFF_FIRST,
+        };
+    }
+    RoundSchedule {
+        recovered,
+        pause: backoff,
+        backoff: (backoff * 2).min(STREAM_BACKOFF_MAX),
+    }
+}
+
+/// What the stream loop does with an `on_item` failure (see [`on_item_failure`]).
+enum ItemFailure {
+    /// The rows this build cannot decode: the ruling `source::Undecodable` carries keeps a decode
+    /// failure fatal, so the process exits now.
+    GiveUp,
+    /// Anything else — a source that went away, a control connection that flapped: re-read from the
+    /// boundary, on the generic budget of attempts the loop already keeps.
+    Retry,
+}
+
+/// The class of a failed `on_item`. The classification is the copy's own (`is_undecodable` answers
+/// "cannot decode", never "the source went away": a cut read stays `is_transient` and on the generic
+/// path), and the consequence is the engine's: once the class is known, re-reading the same boundary
+/// ten times reaches the same exit two seconds later, so the attempts are dropped rather than kept.
+/// Split out so the unit test can drive the decision without a live engine.
+fn on_item_failure(e: &anyhow::Error) -> ItemFailure {
+    if source::is_undecodable(e) {
+        ItemFailure::GiveUp
+    } else {
+        ItemFailure::Retry
+    }
+}
+
+/// The ONE WARN line of a round that ended on bytes this build cannot decode: the position the
+/// reader keeps coming back to, how long before it comes back, and that the event is neither
+/// skipped nor lost. `{e:#}` is the copy's own line — kind, position, the table when the bytes name
+/// one, and what the decoder said — so no words of ours repeat those (`source::Undecodable`'s
+/// `Display` is written to be the record an operator gets).
+fn warn_undecodable_stream_error(e: &anyhow::Error, at: &Position, retry_in: Duration) {
+    warn!(
+        at = %at,
+        retry_in = ?retry_in,
+        "binlog event this build cannot decode: {e:#}; the position is kept, the event is not \
+         skipped, reading again in {retry_in:?}"
+    );
+}
+
+/// The ONE ERROR line of the refused rows of a watched table: the process exits after it, so this
+/// line is the whole record. It names kind, table and position as fields an alert can filter on,
+/// and quotes the decoder verbatim — which is what `source::Undecodable`'s `Display` is for.
+fn error_undecodable_rows(e: &anyhow::Error) {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<source::Undecodable>())
+    {
+        Some(u) => tracing::error!(
+            kind = %u.kind,
+            table = %u.table.as_deref().unwrap_or("unknown"),
+            at = %u.position,
+            "{u}"
+        ),
+        // `is_undecodable` also accepts an invalid-data packet the mapper never tagged.
+        None => tracing::error!("binlog rows this build cannot decode: {e:#}"),
+    }
+}
+
+/// The `/livez` status JSON: the instance's stream state and the per-rule summary. The three stream
+/// keys are what an operator reads when the reader stands at one position and nothing moves — the
+/// dump error it is kept through, the DML the stream could not carry, and the events this build
+/// cannot decode. Split out of [`Engine::persist`] so the keys are testable without a connected
+/// engine (the `stmt_dml_gate` idiom).
+fn status_json(
+    instance: &str,
+    resume: &Position,
+    stream_lag_ms: u64,
+    stream_error: Option<&str>,
+    statement_events_ignored: u64,
+    undecodable: u64,
+    rules: Map<String, Value>,
+    binlog_filtered: Vec<String>,
+) -> Value {
+    json!({
+        "instance": instance,
+        "position": resume.to_string(),
+        "stream_lag_ms": stream_lag_ms,
+        "stream_error": stream_error,
+        "statement_events_ignored": statement_events_ignored,
+        "undecodable": undecodable,
+        "rules": rules,
+        "binlog_filtered_schemas": binlog_filtered,
+    })
+}
+
 /// The rate-limit entry of `(schema, table)`: its slot, or `None` when the table is new and the
 /// map already holds [`MAX_STMT_DML_TABLES`] of them — the key is a name the source states, so
 /// the map cannot grow with it (lazyview's is bounded by the tables whose sessions twist
@@ -4070,6 +4322,10 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "tests/engine_stream_verdict_tests.rs"]
 mod stream_verdict_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_undecodable_tests.rs"]
+mod undecodable_tests;
 
 #[cfg(test)]
 #[path = "tests/engine_hotpath_alloc_tests.rs"]
