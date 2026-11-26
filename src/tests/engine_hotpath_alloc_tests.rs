@@ -106,6 +106,7 @@ fn state(rule: &Arc<Rule>) -> RuleState {
         pending_clear: false,
         reset_request_seen: false,
         counters: Counters::default(),
+        applied_ts: 0,
         strikes: HashMap::new(),
         written: None,
         dirty: false,

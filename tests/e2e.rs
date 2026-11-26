@@ -16714,3 +16714,146 @@ async fn the_binlog_stream_recovers_from_wire_faults() {
 // it on their own schedule, so nothing here can put a stored coordinate behind the end of the log.
 // That is a statement about what a test on a shared server may do, not about the code — nothing here
 // says those arms are unreachable in production, and they are listed as a gap rather than tested.
+
+/// Per-rule `source_lag_seconds`: the honest distance on the **source's** clock, where the
+/// local-clock `lag_ms` and `stream_lag_ms` keep their old meanings untouched (the ported
+/// `SourceClock`). Three states, in order: a caught-up rule reads 0 and stays 0 while an
+/// unwatched table keeps producing rows events (they are not the rule's business and must not
+/// move its head); a rule whose sink refuses the flush ages by the real seconds the source has
+/// been ahead, on `/status` and on `lazywf_source_lag_seconds` alike, while the stream itself
+/// keeps proving its head (heartbeats arrive — the backlog is the rule's, not the reader's); and
+/// when the sink recovers the reading returns to 0. Condition-based throughout: no sleeps that
+/// stand in for observations, and nothing asserts a number that only a wall clock can hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_lag_ages_a_stuck_rule_and_reads_zero_when_caught_up() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "src_lag").await;
+    shop(&db).await;
+    // A table no rule reads: its rows events must leave every rule's head where it stands.
+    db.exec("CREATE TABLE items (id INT PRIMARY KEY, note VARCHAR(50))")
+        .await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    order_rule(&db, &mock).await;
+    let metrics = Arc::new(lazy_wire_fire::metrics::Metrics::default());
+    let inst = Instance::ready_with_metrics(config(&db, &[]), metrics.clone()).await;
+
+    let rule_lag = || -> u64 {
+        inst.health.status()["rules"]["orders"]["source_lag_seconds"]
+            .as_u64()
+            .expect("source_lag_seconds on the rule's /status summary")
+    };
+    let gauge = || -> u64 {
+        metrics
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix("lazywf_source_lag_seconds{rule=\"orders\"} "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("the source-lag gauge is on the exposition")
+    };
+
+    // (1) Caught up: a real row delivered, the rule quiet — and then a little over two
+    // heartbeat periods of rows on the unwatched table. The clock does not chase them:
+    // only the rows of tables the rule reads feed its head.
+    db.exec("INSERT INTO customers VALUES (1, 'Ann')").await;
+    db.exec("INSERT INTO orders VALUES (10, 1, 'new', 12.50)")
+        .await;
+    wait_for(
+        Duration::from_secs(20),
+        "orders 10 delivered from its row events",
+        || async {
+            last_docs(&mock.requests())
+                .get("10")
+                .cloned()
+                .flatten()
+                .filter(|d| d["status"] == "new")
+        },
+    )
+    .await;
+    inst.quiet().await;
+    // Zero arrives with the first heartbeat after the last watched row (the head is proven,
+    // not assumed): wait for the reading, never sleep toward it.
+    wait_for(
+        Duration::from_secs(10),
+        "the caught-up rule reads zero on /status",
+        || async { (rule_lag() == 0).then_some(()) },
+    )
+    .await;
+    let start = std::time::Instant::now();
+    let mut n = 0;
+    while start.elapsed() < Duration::from_millis(2600) {
+        n += 1;
+        db.exec(&format!("INSERT INTO items VALUES ({n}, 'unwatched')"))
+            .await;
+    }
+    assert_eq!(
+        rule_lag(),
+        0,
+        "{n} rows events of an unwatched table moved the rule's head"
+    );
+
+    // (2) Stuck: the sink refuses, and one watched row arrives. The source is now ahead of
+    // the rule for as long as the refusal lasts, and the reading shows exactly that — the
+    // age of the head the rule has not been allowed to apply, growing with the stall.
+    mock.respond(|_| (500, r#"{"errors":true}"#.into()));
+    db.exec("INSERT INTO orders VALUES (11, 1, 'stuck', 5.00)")
+        .await;
+    wait_for(
+        Duration::from_secs(30),
+        "the stuck rule ages on the source's clock with its keys held back",
+        || async {
+            let s = inst.health.status();
+            let r = &s["rules"]["orders"];
+            (r["source_lag_seconds"].as_u64() >= Some(2)
+                && gauge() >= 2
+                && (r["pending_keys"].as_u64() > Some(0) || r["firing"] == true))
+                .then_some(())
+        },
+    )
+    .await;
+    let s = inst.health.status();
+    assert!(
+        s["stream_lag_ms"].as_u64().unwrap_or(u64::MAX) < 2_000,
+        "the stream itself lost its head (the reader's own distance must stay a \
+         heartbeat's width while only the rule is stuck): {s}"
+    );
+    assert!(
+        s["rules"]["orders"]["source_lag_seconds"].as_u64() >= Some(2),
+        "the stuck rule did not age on /status: {s}"
+    );
+
+    // (3) Recovered: the keys go through, and both readings return to zero — the same
+    // `0` the caught-up rule read before the stall, for the same reason.
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    wait_for(
+        Duration::from_secs(30),
+        "the stuck row delivered after the sink recovered",
+        || async {
+            last_docs(&mock.requests())
+                .get("11")
+                .cloned()
+                .flatten()
+                .filter(|d| d["status"] == "stuck")
+        },
+    )
+    .await;
+    inst.quiet().await;
+    wait_for(
+        Duration::from_secs(10),
+        "the recovered rule reads zero again",
+        || async { (rule_lag() == 0).then_some(()) },
+    )
+    .await;
+    wait_for(
+        Duration::from_secs(10),
+        "the gauge settles at zero with the status line",
+        || async { (gauge() == 0).then_some(()) },
+    )
+    .await;
+    assert_eq!(
+        inst.health.status()["rules"]["orders"]["pending_keys"].as_u64(),
+        Some(0),
+        "keys still pending while the readings say caught up"
+    );
+    inst.stop().await;
+}
