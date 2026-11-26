@@ -57,6 +57,7 @@ src/docs.rs	row[i] = parse_json(std::mem::take(&mut row[i]));
 src/docs.rs	row[ms[0].0].clone()
 src/docs.rs	self.groups[*g].clone(),
 src/engine.rs	"pending_keys": st.buffer.pending_keys() as u64,
+src/engine.rs	(crate::time::unix_now() as i64 + self.offset).max(0) as u64
 src/engine.rs	*done += batch.take().map_or(0, |b| b.len() as u64);
 src/engine.rs	.expect("a Full-key trigger means the table has objects");
 src/engine.rs	.expect("begin moved the pending ids into the generation");
@@ -86,6 +87,7 @@ src/engine.rs	m.set_pending(st.buffer.pending_keys() as u64);
 src/engine.rs	matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
 src/engine.rs	reg.set_binlog_lag(self.stream_lag_ms() as f64 / 1000.0);
 src/engine.rs	rules.get_mut(name).expect("present").buffer.locate(k);	2
+src/engine.rs	self.clock.offset = src_now.saturating_sub(crate::time::unix_now() as i64);
 src/engine.rs	st.counters.select_ms = fired.select_time.as_millis() as u64;
 src/health.rs	buf.extend_from_slice(&chunk[..n]);
 src/http.rs	Some((i, _)) => format!("{}…", &s[..i]),

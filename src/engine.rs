@@ -95,6 +95,188 @@ impl Backoff {
     }
 }
 
+/// What the reader knows about the **source's** clock, ported from lazyview's `SourceClock`
+/// (review O-01, ruling 1: "N seconds behind the source" has to hold during a backlog, not only
+/// while the source is idle). Both timestamps are the source's own clock — a common-header
+/// timestamp and the source's `UNIX_TIMESTAMP()` — so no host clock and no skew enters the
+/// number, and an idle source gives exactly 0. A source that never goes idle gives it too, via the
+/// second head proof ([`read_proves_head`]): what matters is that the reader is keeping up, not
+/// that the server fell quiet.
+///
+/// Cost (owner rule): integer stores only, and only on the rows events of watched tables in
+/// [`Engine::on_item`] (the header ts is a field the reader has already parsed) and on
+/// heartbeats; no allocation; `offset` costs one statement per (re)connect and per
+/// [`CLOCK_REFRESH`] tick, never per event; the head proofs read fields the engine already keeps.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SourceClock {
+    /// Header ts of the newest change to a watched table this connection has seen
+    /// (`BinlogReader::event_ts` at the routed [`Item::Rows`] in [`Engine::on_item`]); 0: nothing
+    /// read yet. A rule that has applied this much is caught up with the source. The engine's
+    /// own pen (the config and status tables) and the shape-only events are not a rule's
+    /// business and do not move it.
+    fed_ts: u64,
+    /// Header ts of the *first* change to a watched table this connection has read: the oldest
+    /// change the rules may still be missing. A rule that has applied nothing since the process
+    /// started (`RuleState::applied_ts` 0) is measured against it, so an engine restarted over a
+    /// gap reports the length of the gap rather than the age of the epoch. 0: nothing read.
+    gap_ts: u64,
+    /// The stream is at its head by the reference's proof: the last stamp was a heartbeat whose
+    /// payload position was the position the engine has applied to ([`heartbeat_proves_head`]). A
+    /// backlog can still sit in the read buffer while the server heartbeats, so the position, not
+    /// the event type, is what proves the stream caught up with the source's binlog. The other
+    /// proof, for a source that keeps writing, is [`read_proves_head`]; [`SourceClock::lag_with`]
+    /// takes either.
+    at_head: bool,
+    /// When the server last said its dump was empty (a heartbeat arrived), on the source's clock —
+    /// whether or not that heartbeat proved the head. A rule that has read nothing this
+    /// connection ages from here, not from the epoch.
+    head_ts: u64,
+    /// The reader is connected and able to deliver: false while reconnecting or between rounds —
+    /// a source that keeps writing while nothing is read is a growing lag, not a growing head.
+    reading: bool,
+    /// Rows the rules have not been handed yet: lazywf has no drain queue (rules are marked at
+    /// COMMIT), so this is the engine's `in_txn` at publish time — a half-read transaction in
+    /// hand is read, so the source is ahead of the rules, and not yet counted as fed.
+    pending_read: bool,
+    /// `source UNIX_TIMESTAMP() − local unix now`, asked at connect and at the housekeeping tick:
+    /// [`SourceClock::now`] is the source's clock between two of those questions.
+    offset: i64,
+}
+
+impl SourceClock {
+    /// The source's clock, right now: the local clock shifted by the measured offset (so a source
+    /// whose clock differs from the host's by minutes is still measured against itself).
+    fn now(&self) -> u64 {
+        (crate::time::unix_now() as i64 + self.offset).max(0) as u64
+    }
+
+    /// The newest change the rule has applied, on the source's clock: its own stamp; else the
+    /// oldest change this connection has read (see [`SourceClock::gap_ts`]); else the last
+    /// heartbeat — a rule that has read nothing this connection ages from when the server last
+    /// said its dump was empty, never from the epoch.
+    fn applied(&self, applied_ts: u64) -> u64 {
+        if applied_ts != 0 {
+            applied_ts
+        } else if self.gap_ts != 0 {
+            self.gap_ts
+        } else {
+            self.head_ts
+        }
+    }
+
+    /// Seconds `applied_ts` is behind the source, saturating, with the head proven by the caller:
+    ///
+    /// * `0` while the rule is [`rule_settled`], the stream is at its head, the reader is reading,
+    ///   nothing stands unread, and the rule has applied every change read — an idle source,
+    ///   however long idle, is 0 seconds behind;
+    /// * otherwise the age of the newest applied change on the source's clock, so a backlog after
+    ///   an outage, a reconnecting stream and a rule whose sink keeps failing all show a number
+    ///   that grows with the time the source has been ahead.
+    ///
+    /// Two deviations from the reference's `lag(applied_ts)`, both ours deliberately:
+    ///
+    /// * `settled` — a rule with keys still pending and no applied stamp (`applied_ts` 0) falls
+    ///   back to `gap_ts`, which for a single-transaction backlog equals `fed_ts`; without the
+    ///   flag such a rule would read "caught up" while its keys still wait to fire;
+    /// * `head` is passed in rather than read from [`Self::at_head`] alone, because the heartbeat
+    ///   is not the only proof available: a server sends a heartbeat only once its dump has been
+    ///   empty for a whole period, so on a source that never goes quiet for one, `at_head` would
+    ///   never be set and a rule that has read and applied everything would age forever — the
+    ///   false alarm this field exists to rule out. The engine passes the heartbeat proof OR
+    ///   [`read_proves_head`].
+    fn lag_with(&self, applied_ts: u64, settled: bool, head: bool) -> u64 {
+        let applied = self.applied(applied_ts);
+        if settled && head && self.reading && !self.pending_read && applied >= self.fed_ts {
+            0
+        } else {
+            self.now().saturating_sub(applied)
+        }
+    }
+
+    /// A rows event of a watched table was read with header ts `ts` (0: unknown, ignored): the
+    /// gap freezes at the first row of a run, the head follows the last one, and any head proof
+    /// is stale (a row we hold came from below the position a heartbeat proved).
+    fn note_fed(&mut self, ts: u64) {
+        if ts != 0 {
+            if self.gap_ts == 0 {
+                self.gap_ts = ts;
+            }
+            self.fed_ts = ts;
+            self.at_head = false;
+        }
+    }
+}
+
+/// The head proof of a heartbeat (the `Item::Heartbeat` arm of [`Engine::on_item`], split out so
+/// the unit test can drive the decision without a live engine — the [`on_item_failure`] idiom).
+///
+/// `head` is the position the payload carried (the reference's semantics; see
+/// [`BinlogReader::heartbeat_head`] — on servers whose payload is not a plain position, like the
+/// MySQL 8.4 and MariaDB dumps whose first eight bytes are the file NAME, it is unusable, which
+/// is what the second clause is for); `applied` is the position everything read is committed to,
+/// `reader_pos` where the reader stands. Outside a transaction: the payload equality proves the
+/// head when the payload is a plain position naming exactly where we applied, in the file the
+/// reader stands in; the position equality does the same when the payload cannot be matched (the
+/// reader standing at the applied position says everything this connection has read is committed
+/// and nothing stands unread, so no rows sit between the applied position and the head the
+/// heartbeat just proved). Follows the reference verbatim: a still-unread transit between the
+/// two equal positions can prove the head a moment early, and it is bounded and self-correcting
+/// — the arriving rows' feed ([`SourceClock::note_fed`]) de-proves it at once.
+fn heartbeat_proves_head(
+    in_txn: bool,
+    applied: &Position,
+    reader_pos: &Position,
+    head: u64,
+) -> bool {
+    !in_txn
+        && ((head != 0 && applied.pos == head && applied.file == reader_pos.file)
+            || applied == reader_pos)
+}
+
+/// The second head proof, for a source that keeps writing: the newest change the reader handed us
+/// — of ANY table, watched or not, [`Engine::last_event_ts`] — was logged no more than `within`
+/// ago on the source's own clock. Such a source never lets its dump go quiet, so it never
+/// heartbeats ([`heartbeat_proves_head`] cannot fire), and yet the reader is demonstrably keeping
+/// up with it: the source is writing and every change it wrote has reached us. `within` is the
+/// heartbeat period the dump itself is configured with (`cfg.heartbeat`, the value handed to
+/// [`BinlogReader::connect`]): the interval within which an idle dump would have heartbeated
+/// instead of sending this row.
+///
+/// What it cannot fake: a reader stalled behind a backlog hands old stamps, so the age is large
+/// and the proof denies; a source that has stopped writing hands nothing at all (`last_read_ts` 0)
+/// and the heartbeat path decides; a transaction logged at its statement start (a long `BEGIN` …
+/// `COMMIT`) reads old and denies too. Every way this proof can be wrong denies the head rather
+/// than inventing it, and the one over-proof it shares with the heartbeat — a change written just
+/// after the newest one read, still in transit — is bounded by `within` and de-proved the moment
+/// the change arrives ([`SourceClock::note_fed`]).
+///
+/// The third deviation from the reference, after `lag`'s `settled` flag and `pending_read`.
+fn read_proves_head(last_read_ts: u64, src_now: u64, within: Duration) -> bool {
+    last_read_ts != 0 && src_now.saturating_sub(last_read_ts) <= within.as_secs()
+}
+
+/// Whether a rule has settled: it holds nothing that could still be applied later — no buffered
+/// keys, no lane (a flush or reset run of its own), no prep job, no pending reset run, no sink
+/// or trigger error (the retry timer holds its keys), no freeze, its own backoff is open, and
+/// its target is not on a backoff of its own. The same pieces [`Engine::schedule`] reads before
+/// it fires a flush; split out so the unit test can drive the decision without a live engine.
+fn rule_settled(st: &RuleState, target_blocked: bool, now: Instant) -> bool {
+    st.buffer.is_empty()
+        && st.lane.is_none()
+        && !st.prep
+        && st.reset.is_none()
+        && st.rule.error.is_none()
+        && st.rule.trigger_error.is_none()
+        && st.frozen_at.is_none()
+        && st.backoff.blocked(now).is_none()
+        && !target_blocked
+}
+
+/// How often [`Engine::refresh_source_clock`] asks the source its time (lazyview's housekeeping
+/// cadence). The throttle timestamp moves on every attempt, failures included, so a source that
+/// will not answer costs one statement per tick and not one per loop turn.
+const CLOCK_REFRESH: Duration = Duration::from_secs(30);
+
 /// Keys one transaction marked for one rule.
 #[derive(Debug, Default)]
 struct Marks {
@@ -338,6 +520,10 @@ struct RuleState {
     /// and the status table hold no version to compare, and adding one is barred.
     reset_request_seen: bool,
     counters: Counters,
+    /// Everything this rule has applied, on the **source's** clock (a header ts), stamped while
+    /// the rule is [`rule_settled`] (see [`SourceClock::lag`]); 0: nothing since this process
+    /// started — the clock then measures against the connection's `gap_ts`.
+    applied_ts: u64,
     /// Refusals per key (see [`STRIKES`]).
     strikes: HashMap<String, u32>,
     written: Option<(Position, Instant)>,
@@ -672,6 +858,14 @@ pub struct Engine {
     /// What the stream loop remembers of the events this build cannot decode (see
     /// [`UndecodableWatch`]): the position its one line named, and how many such events there were.
     undecodable: UndecodableWatch,
+    /// What the reader knows of the **source's** clock (see [`SourceClock`]): fed by the routed
+    /// rows events and the heartbeats in [`Engine::on_item`], reset on every connect, and asked
+    /// the source's time per [`CLOCK_REFRESH`] tick. The per-rule `source_lag_seconds` on
+    /// `/status` and `lazywf_source_lag_seconds` are read from here at publish.
+    clock: SourceClock,
+    /// When the source's time was last asked ([`Engine::refresh_source_clock`]); moves on every
+    /// attempt, failure included, so a flapping source cannot make this a per-turn statement.
+    last_clock: Instant,
 }
 
 fn server_code(e: &anyhow::Error) -> Option<u16> {
@@ -1060,6 +1254,14 @@ pub async fn run(
         binlog_filtered: BTreeSet::new(),
         stream_error: None,
         undecodable: UndecodableWatch::default(),
+        // `head_ts` at the local now: `housekeeping` can reach `persist` through `idle` before
+        // the first connect, and a rule measured against an unset head must not read an epoch
+        // age (the connect arms the clock for real, see the stream loop).
+        clock: SourceClock {
+            head_ts: crate::time::unix_now(),
+            ..SourceClock::default()
+        },
+        last_clock: Instant::now(),
         cfg,
     };
     e.reload_config(true).await?;
@@ -1315,6 +1517,10 @@ impl Engine {
             backoff: Backoff::default(),
         });
         st.reset_state = format!("pending: {reason}");
+        // The run re-reads the table from a snapshot: what the rule applied before is no
+        // longer its honest head, so the stamp starts over (the clock's own gap measures it
+        // meanwhile, see [`SourceClock::applied`]).
+        st.applied_ts = 0;
         st.dirty = true;
     }
 
@@ -1713,6 +1919,7 @@ impl Engine {
             pending_clear: false,
             reset_request_seen: false,
             counters: Counters::default(),
+            applied_ts: 0,
             strikes: HashMap::new(),
             written: None,
             dirty: true,
@@ -1949,6 +2156,21 @@ impl Engine {
             };
             info!(position = %pos, "streaming the binlog");
             self.health.set_streaming(true);
+            // Freshness (lazyview's review O-01, ruling 1): a connection knows nothing of the
+            // source's clock until it asks, and has read nothing; the stamps are per connection,
+            // so a reconnect that re-reads from the boundary starts afresh instead of keeping a
+            // head this connection never saw. It starts believed at the head (the first heartbeat
+            // proves it either way within a heartbeat period) and ages from the connect instant,
+            // never from the epoch.
+            let head_ts = self.clock.now();
+            self.clock = SourceClock {
+                offset: self.clock.offset,
+                reading: true,
+                at_head: true,
+                head_ts,
+                ..SourceClock::default()
+            };
+            self.refresh_source_clock().await;
             let mut last_event = Instant::now();
             let mut delivered = false;
             let mut hit_1236 = false;
@@ -2050,6 +2272,10 @@ impl Engine {
                 }
             }
             self.health.set_streaming(false);
+            // The reader stands between rounds: not reading, and no head proof survives a
+            // reconnect — a source that keeps writing while nothing is read is a growing lag.
+            self.clock.reading = false;
+            self.clock.at_head = false;
             let _ = reader.close().await;
             // A partly read transaction is read again from its start.
             self.in_txn = false;
@@ -2201,6 +2427,11 @@ impl Engine {
                         }
                     }
                     Some(Route::Watched(w)) => {
+                        // Freshness (the ported clock, owner rule: integer stores only, on this
+                        // arm alone): the rows about to be routed move the head the rules chase.
+                        // Unwatched and own-pen tables never reach this arm, so they cannot put
+                        // the head where the rules are not.
+                        self.clock.note_fed(u64::from(reader.event_ts()));
                         let Engine {
                             txn_marks,
                             rules,
@@ -2298,7 +2529,24 @@ impl Engine {
             Item::Incident { pos } => {
                 warn!(at = %pos, "INCIDENT event in the binlog: the source reports possibly lost changes");
             }
-            Item::Heartbeat | Item::Other => {}
+            Item::Heartbeat => {
+                // The head proof (the ported clock): the payload's position is where the
+                // server's dump stood; the stream is at its head only if the engine has applied
+                // to exactly there, outside a transaction (the server drains its socket at once,
+                // so a backlog may still sit in the read buffer while it heartbeats). Either way
+                // the heartbeat is the last moment the server was known empty: a rule with
+                // nothing read yet ages from here, not from the epoch.
+                self.clock.head_ts = self.clock.now();
+                if heartbeat_proves_head(
+                    self.in_txn,
+                    &self.boundary,
+                    reader.position(),
+                    reader.heartbeat_head(),
+                ) {
+                    self.clock.at_head = true;
+                }
+            }
+            Item::Other => {}
         }
         Ok(())
     }
@@ -3357,7 +3605,17 @@ impl Engine {
     fn on_done(&mut self, d: Done) {
         let max = self.cfg.max_backoff;
         let now_ms = crate::time::unix_now_ms();
-        let Some(st) = self.rules.get_mut(&d.rule) else {
+        let settle_now = Instant::now();
+        // Borrowed as pieces before the rule's own state (the [`schedule`] idiom): the settle
+        // stamp below reads the target's hold and the fed head while holding the rule.
+        let Engine {
+            rules,
+            target_backoff,
+            clock,
+            settled,
+            ..
+        } = self;
+        let Some(st) = rules.get_mut(&d.rule) else {
             return;
         };
         if st.incarnation != d.incarnation {
@@ -3417,6 +3675,20 @@ impl Engine {
                             // Nothing goes back: this completes the flush's only chunk.
                             st.buffer.core.done(Vec::new(), Vec::new());
                         }
+                        // Freshness: this flush went through clean. If the rule now holds nothing
+                        // back (no buffer, lane, reset, error hold, freeze, target hold), its
+                        // applied stamp moves to the head this connection was fed to. `persist`
+                        // restamps every tick (that is what ages a rule that marks nothing); this
+                        // stamp is what carries a rule that flushes the last keys of a backlog.
+                        let target_blocked = target_backoff
+                            .get(&st.rule.def.target)
+                            .and_then(|b| b.blocked(settle_now))
+                            .is_some();
+                        if rule_settled(st, target_blocked, settle_now)
+                            && clock.fed_ts > st.applied_ts
+                        {
+                            st.applied_ts = clock.fed_ts;
+                        }
                     }
                     err => {
                         let err = err.unwrap_or_else(|| "some actions failed".into());
@@ -3435,7 +3707,7 @@ impl Engine {
                         } else {
                             // A rebase drained the generation meanwhile: the refused keys
                             // go back at the position everything rebased to.
-                            let origin = self.settled.clone();
+                            let origin = settled.clone();
                             for (s, set) in again.into_pairs() {
                                 for v in set.ints.to_sorted_vec() {
                                     st.buffer.core.mark_int(s, v, &origin);
@@ -3579,7 +3851,7 @@ impl Engine {
             }
         }
         if target_ok {
-            if let Some(b) = self.target_backoff.get_mut(&target) {
+            if let Some(b) = target_backoff.get_mut(&target) {
                 b.ok();
             }
         }
@@ -3666,6 +3938,12 @@ impl Engine {
             }
             self.schedule();
         }
+        // Freshness: re-measure the source's clock on this cadence (next to the persist tick,
+        // never per event). The throttle moves on every attempt, failure included.
+        if self.last_clock.elapsed() >= CLOCK_REFRESH {
+            self.last_clock = Instant::now();
+            self.refresh_source_clock().await;
+        }
         if now >= self.last_persist + self.cfg.status_every {
             if let Err(e) = self.persist(false).await {
                 if e.to_string().contains("instance lock") {
@@ -3699,6 +3977,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Asks the source its own time (`SELECT UNIX_TIMESTAMP()`), once, and keeps the difference
+    /// to the local clock: a rule's `source_lag_seconds` is then source clock minus source clock,
+    /// so an engine whose host clock is off by minutes still reports 0 for a rule that is caught
+    /// up, and a rule that is behind shows the real distance. One statement per (re)connect and
+    /// per [`CLOCK_REFRESH`] tick — never per event, and no new write anywhere. A failed question
+    /// keeps the last offset: the figures ride the previous measurement until the next tick.
+    async fn refresh_source_clock(&mut self) {
+        match self
+            .control
+            .query_first::<i64, _>("SELECT UNIX_TIMESTAMP()")
+            .await
+        {
+            Ok(Some(src_now)) if src_now > 0 => {
+                // Saturating, not raw: the offset is a measured difference, and a server that
+                // answers with a nonsense clock must not be able to reach an arithmetic panic.
+                self.clock.offset = src_now.saturating_sub(crate::time::unix_now() as i64);
+            }
+            Ok(_) => debug!("asking the source its time: no answer; keeping the last offset"),
+            Err(e) => debug!("asking the source its time: {e:#}; keeping the last offset"),
+        }
+    }
+
     /// Writes the positions that moved (and every row now and then).
     async fn persist(&mut self, force: bool) -> Result<()> {
         self.last_persist = Instant::now();
@@ -3706,13 +4006,65 @@ impl Engine {
         let mut rows = Vec::new();
         let mut summary = Map::new();
         let now = Instant::now();
+        // Freshness (the settle stamp, mirroring the reference's re-publish on the housekeeping
+        // tick): a rule with nothing left held back has applied everything it was handed, so its
+        // stamp moves to the head this connection was fed to. Stamping here on every status tick,
+        // not only when a flush completes, is what keeps a rule that marks nothing (a
+        // `changed_columns` filter, a quiet watched table) honest instead of ageing an old stamp.
+        // Not while a transaction is half read: its rows are read but no rule has been handed
+        // them yet (rules are marked at COMMIT), and stamping then would claim them applied.
+        {
+            let Engine {
+                rules,
+                target_backoff,
+                clock,
+                in_txn,
+                ..
+            } = self;
+            // Rows read but not handed to a rule (lazywf has no drain queue): the reading may not
+            // claim caught up while a transaction is in hand. See [`SourceClock::pending_read`].
+            clock.pending_read = *in_txn;
+            for st in rules.values_mut() {
+                let target_blocked = target_backoff
+                    .get(&st.rule.def.target)
+                    .and_then(|b| b.blocked(now))
+                    .is_some();
+                if rule_settled(st, target_blocked, now) && !*in_txn && clock.fed_ts > st.applied_ts
+                {
+                    st.applied_ts = clock.fed_ts;
+                }
+            }
+        }
+        // The head proof for this publish ([`SourceClock::lag_with`]): the reference's heartbeat,
+        // or the reader keeping up with a source that keeps writing. `cfg.heartbeat` is the period
+        // the dump is configured with (the value handed to `BinlogReader::connect`), the interval
+        // within which an idle dump would have heartbeated; the floor keeps a degenerate 0 from
+        // turning the proof into an equality against the second.
+        let head = self.clock.at_head
+            || read_proves_head(
+                u64::from(self.last_event_ts),
+                self.clock.now(),
+                self.cfg.heartbeat.max(Duration::from_secs(1)),
+            );
         for (name, st) in &self.rules {
             let pos = self.rule_pos(st);
             let lag = self.rule_lag_ms(st);
+            // The honest per-rule lag on the source's clock (see [`SourceClock`]): the reader's
+            // distance from the source's own timestamps, per rule. It is not `lag_ms`, which
+            // stays the local-clock age of the rule's own pending marks.
+            let target_blocked = self
+                .target_backoff
+                .get(&st.rule.def.target)
+                .and_then(|b| b.blocked(now))
+                .is_some();
+            let source_lag_seconds =
+                self.clock
+                    .lag_with(st.applied_ts, rule_settled(st, target_blocked, now), head);
             // The pending gauge reads the same source the status table shows (`pending_keys`,
             // which reads the dedup buffer's `pending_len`); the value is pushed to the atomic.
             if let Some(m) = &st.mrule {
                 m.set_pending(st.buffer.pending_keys() as u64);
+                m.set_source_lag(source_lag_seconds);
             }
             let reset_state = if st.reset_state.is_empty() {
                 "none".to_string()
@@ -3724,6 +4076,7 @@ impl Engine {
                 json!({
                     "position": pos.to_string(),
                     "lag_ms": lag,
+                    "source_lag_seconds": source_lag_seconds,
                     "pending_keys": st.buffer.pending_keys() as u64,
                     "firing": st.lane.is_some(),
                     "events": st.counters.events,
@@ -4342,3 +4695,7 @@ mod skip_kinds_tests;
 #[cfg(test)]
 #[path = "tests/engine_route_cache_tests.rs"]
 mod route_cache_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_source_clock_tests.rs"]
+mod source_clock_tests;
