@@ -2223,16 +2223,68 @@ async fn online_schema_change_keeps_continuity() {
     db.exec("ALTER TABLE _orders_gho ADD COLUMN note VARCHAR(20) NULL")
         .await;
     db.exec("INSERT INTO _orders_gho (id, customer_id, status, total) SELECT id, customer_id, status, total FROM orders").await;
+    // What the server was STARTED with, never a `SET GLOBAL`: the two metadata settings make two
+    // different promises of this cut-over, and the matrix runs both — `docker-compose.test.yml`
+    // gives `--binlog-row-metadata=FULL` to `mysql80` and `mysql80-noorder` and leaves it at the
+    // default everywhere else. A server without the variable answers like MINIMAL.
+    let mut control = db.conn().await;
+    let meta: Option<String> = control
+        .query_first("SELECT @@GLOBAL.binlog_row_metadata")
+        .await
+        .ok()
+        .flatten();
+    control.disconnect().await.ok();
+    let full = meta.as_deref() == Some("FULL");
+    let how = if full {
+        "at once"
+    } else {
+        "once the copy phase has been read"
+    };
+    eprintln!(
+        "osc: binlog_row_metadata={} → cutting over {how}",
+        meta.as_deref().unwrap_or("?")
+    );
     db.exec("UPDATE orders SET total = 5 WHERE id = 1").await;
     db.exec("UPDATE _orders_gho SET total = 5 WHERE id = 1")
         .await;
+    // The gate, and why it belongs to MINIMAL alone. The Notes of `docs/reference.md`: under the
+    // default metadata "names come from `information_schema` and a column-count mismatch resets
+    // the rules of that table", and `binlog_row_metadata=FULL` is the recommendation — with FULL a
+    // row image names its own columns (`rows::layout_from_names`), so *when* the engine reads an
+    // event cannot change what it says, and this cut-over has to keep continuity with the `RENAME`
+    // landing wherever it lands. Under MINIMAL the names come from the `information_schema` read
+    // taken when the event is PROCESSED (`rows::Catalog::layout`), and the layout of `orders` is
+    // still cold at this update — the instance started after rows 1 and 2 were inserted and its
+    // first-start reset is a plain SQL scan — so a `RENAME` that lands first puts the 4-column
+    // event of the old table against the 5-column copy that is `orders` by then, and the engine's
+    // answer to a layout that disagrees with the event is the honest one: drop the rows,
+    // `LayoutMismatch`, lose the rule's continuity, run its reset steps. That is a reset and a lost
+    // key — the opposite of what this test is about — paid for by the test running ahead of the
+    // stream. Nor does waiting indulge the engine: gh-ost keeps a copy current for as long as the
+    // live table is in service and swaps only what its tracker has applied, so a real run leaves it
+    // no such choice; this test, writing eight statements in a row, can leave it one. The key of
+    // the copy phase is the harness's own condition for "the engine has read it": a fire can only
+    // follow a decoded row.
+    if !full {
+        wait_for(
+            Duration::from_secs(10),
+            "the change during the copy (the update of order 1 on the old table), before the swap",
+            || async {
+                fired(&mock.requests(), "/o")
+                    .contains(&"1".to_string())
+                    .then_some(())
+            },
+        )
+        .await;
+    }
     db.exec("RENAME TABLE orders TO _orders_del, _orders_gho TO orders")
         .await;
     db.exec("INSERT INTO orders (id, customer_id, status, total, note) VALUES (3, 1, 'n', 1, 'x')")
         .await;
-    // The two changes are waited for one after the other, each with its own allowance: they
-    // shared one deadline, so a slow first one left the second almost nothing, and the message
-    // said only that the pair did not arrive.
+    // The two keys are waited for on either line, each with its own allowance rather than a
+    // deadline shared with the other: a slow first one used to leave the second almost nothing,
+    // and the message said only that the pair did not arrive. On a MINIMAL server the first of
+    // these has already been satisfied by the wait above.
     wait_for(
         Duration::from_secs(10),
         "the change during the copy (the update of order 1 on the old table)",
