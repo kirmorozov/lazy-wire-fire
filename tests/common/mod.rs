@@ -1105,34 +1105,36 @@ impl Mock {
 /// path: the write goes over such a connection, the engine reads the binlog those commits land
 /// in, and a server that answers slowly slows all of it down. That says more than the run-queue
 /// depth of the box does. `None` when there is no server to ask.
+///
+/// Every call measures anew: it is the load probe of the moment, and callers that poll it
+/// throttle themselves (`wait_scale` does, at its 5 s probe period). Measuring once and keeping
+/// the answer for a whole suite is exactly what let a box that got busy mid-suite keep
+/// idle-box deadlines (the `sql_targets` flake of 2026-11-26, F-4).
 pub fn db_rtt() -> Option<Duration> {
-    static RTT: OnceLock<Option<Duration>> = OnceLock::new();
-    *RTT.get_or_init(|| {
-        let dsn = root_dsn()?;
-        // A thread with a runtime of its own: this is called from inside the test's runtime.
-        std::thread::spawn(move || {
-            let probe = async move {
-                let mut worst = Duration::ZERO;
-                for _ in 0..3 {
-                    let t = Instant::now();
-                    let url = format!("{dsn}/?prefer_socket=false");
-                    let mut c = mysql_async::Conn::new(Opts::from_url(&url)?).await?;
-                    let _: Vec<i8> = c.query("SELECT 1").await?;
-                    quit(c).await;
-                    worst = worst.max(t.elapsed());
-                }
-                Ok::<_, mysql_async::Error>(worst)
-            };
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?
-                .block_on(probe)
-                .ok()
-        })
-        .join()
-        .unwrap_or_default()
+    let dsn = root_dsn()?;
+    // A thread with a runtime of its own: this is called from inside the test's runtime.
+    std::thread::spawn(move || {
+        let probe = async move {
+            let mut worst = Duration::ZERO;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let url = format!("{dsn}/?prefer_socket=false");
+                let mut c = mysql_async::Conn::new(Opts::from_url(&url)?).await?;
+                let _: Vec<i8> = c.query("SELECT 1").await?;
+                quit(c).await;
+                worst = worst.max(t.elapsed());
+            }
+            Ok::<_, mysql_async::Error>(worst)
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(probe)
+            .ok()
     })
+    .join()
+    .unwrap_or_default()
 }
 
 /// How much longer every deadline of this harness allows than an idle box needs.
@@ -1147,14 +1149,51 @@ pub fn db_rtt() -> Option<Duration> {
 /// a quiet machine and on CI these are exactly the old deadlines, and it never goes above 8, so a
 /// condition that really never comes still fails — minutes later at the worst, with the allowance
 /// it used in the message.
+///
+/// The measurement is taken *while the suite runs*, not once at its start: a suite is one process
+/// of several minutes, and the work of other projects can arrive long after the first wait (that
+/// is how F-4 flaked: the scale was frozen at 1.0 while a loaded box doubled the wall time of a
+/// later wait). A probe runs at most every 5 s, and the scale is the highest sample of the last
+/// 45 s — a load spike covers the waits that follow it, a box quiet throughout still measures
+/// exactly 1. The probe blocks its caller for its own duration (a few ms on an idle server, a
+/// failed one short of that), so it must stay throttled.
 pub fn wait_scale() -> f64 {
-    static SCALE: OnceLock<f64> = OnceLock::new();
-    *SCALE.get_or_init(|| {
-        let told = std::env::var("LAZYWF_TEST_WAIT_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok());
+    /// How often the load probe may run at most.
+    const PROBE_TTL: Duration = Duration::from_secs(5);
+    /// How long a sample keeps counting.
+    const SAMPLE_WINDOW: Duration = Duration::from_secs(45);
+
+    struct Scale {
+        /// The samples of the window, oldest first.
+        samples: VecDeque<(Instant, f64)>,
+        /// The earliest a new probe may run; `None` until the first has.
+        next_probe: Option<Instant>,
+        /// The last scale written out, so the line appears when the number moves.
+        printed: f64,
+    }
+
+    static SCALE: Mutex<Scale> = Mutex::new(Scale {
+        samples: VecDeque::new(),
+        next_probe: None,
+        printed: -1.0,
+    });
+
+    // The operator's word beats any measurement, as it always has.
+    if let Some(told) = std::env::var("LAZYWF_TEST_WAIT_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        return told.clamp(1.0, 8.0);
+    }
+
+    let mut g = SCALE.lock().expect("the wait scale samples");
+    let now = Instant::now();
+    let mut probe = None;
+    if g.next_probe.is_none_or(|t| now >= t) {
+        g.next_probe = Some(now + PROBE_TTL);
         // A connect, a query and a disconnect of one of these servers: 1-3 ms when it is idle.
-        let from_server = db_rtt().map_or(1.0, |r| r.as_secs_f64() / 0.005);
+        let rtt = db_rtt();
+        let from_server = rtt.map_or(1.0, |r| r.as_secs_f64() / 0.005);
         let from_host = std::fs::read_to_string("/proc/loadavg")
             .ok()
             .and_then(|s| {
@@ -1165,15 +1204,32 @@ pub fn wait_scale() -> f64 {
             .zip(std::thread::available_parallelism().ok())
             .map(|(load, cores)| load / cores.get() as f64)
             .unwrap_or(1.0);
-        let s = told
-            .unwrap_or_else(|| from_server.max(from_host))
-            .clamp(1.0, 8.0);
-        eprintln!(
-            "wait scale: {s} (server round trip {:?}, host load per core {from_host:.2})",
-            db_rtt()
-        );
-        s
-    })
+        g.samples.push_back((now, from_server.max(from_host)));
+        while g
+            .samples
+            .front()
+            .is_some_and(|(t, _)| now - *t > SAMPLE_WINDOW)
+        {
+            g.samples.pop_front();
+        }
+        probe = Some(format!(
+            "server round trip {rtt:?}, host load per core {from_host:.2}"
+        ));
+    }
+    let s = g
+        .samples
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(1.0_f64, f64::max)
+        .clamp(1.0, 8.0);
+    if (s - g.printed).abs() >= 0.5 {
+        g.printed = s;
+        match probe {
+            Some(p) => eprintln!("wait scale: {s} ({p})"),
+            None => eprintln!("wait scale: {s}"),
+        }
+    }
+    s
 }
 
 /// The time to allow for a condition that is expected within `base` on an idle box.

@@ -549,23 +549,66 @@ fn fake_vars(extra: &str) -> String {
 }
 
 fn fake_def(json: &str) -> TargetDef {
+    // Short enough that a test which waits for nothing is a fast failure, long enough
+    // that a loopback frame round-trip never loses the race — on a plain build.
+    fake_def_budget(json, Duration::from_millis(400))
+}
+
+/// A target def with the per-action limit the test chooses. The 400 ms of [`fake_def`] suits a
+/// plain build; a send whose *success* the test asserts on a machine that may be running the
+/// instrumented (coverage) build derives its budget from a measured round trip instead —
+/// see [`measured_batch_budget`].
+fn fake_def_budget(json: &str, timeout: Duration) -> TargetDef {
     TargetDef {
         name: "sb".into(),
         kind: crate::model::Kind::ServiceBus,
         endpoints: vec![],
         tls: TlsSpec::parse(Some("disabled")).unwrap(),
-        // Short enough that a test which waits for nothing is a fast failure, long enough
-        // that a loopback frame round-trip never loses the race.
-        timeout: Duration::from_millis(400),
+        timeout,
         expect: None,
         vars: vars(json),
     }
 }
 
 fn fake_client(port: u16, json: &str) -> Client {
-    let def = fake_def(json);
+    fake_client_budget(port, json, Duration::from_millis(400))
+}
+
+fn fake_client_budget(port: u16, json: &str, timeout: Duration) -> Client {
+    let def = fake_def_budget(json, timeout);
     let (_ctx, client) = Client::new(&def, &format!("sb://127.0.0.1:{port}/orders")).unwrap();
     client
+}
+
+/// The per-action budget for a send whose success the test asserts, measured rather than
+/// guessed. `send_batch` gives the whole batch **one** deadline (a product decision, kept),
+/// so the later messages race what the earlier ones already took: on the instrumented
+/// (coverage) build the fake peer's answer path alone outgrew the fixed 400 ms and message
+/// 2 came back `Transient` once (flake F-5, coverage job of `48bbcbd`). So the budget is
+/// derived from the box: run the very same two-message batch once against a throwaway peer
+/// under a bound generous enough to be no race at all, and give the real send eight times
+/// what that took — floored at the plain build's 400 ms (a quiet machine keeps the old
+/// number exactly), capped so a send that truly never completes still fails. A probe that
+/// itself cannot finish falls back to the plain budget: a real defect then shows up in the
+/// real send, under the old bound, unchanged.
+async fn measured_batch_budget() -> Duration {
+    const PLAIN: Duration = Duration::from_millis(400);
+    const PROBE_BOUND: Duration = Duration::from_secs(10);
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client_budget(p.port(), &fake_vars(r#", "dedup": true"#), PROBE_BOUND);
+    let t = std::time::Instant::now();
+    let r = outcomes(&c, &msgs(&[msg("A"), msg("B")]), 2).await;
+    let took = t.elapsed();
+    let budget = match r {
+        Ok(out) if out.iter().all(|o| matches!(o, Outcome::Ok)) => {
+            (took * 8).clamp(PLAIN, PROBE_BOUND)
+        }
+        _ => PLAIN,
+    };
+    if budget != PLAIN {
+        eprintln!("measured batch budget: {budget:?} (two-message round trip {took:?})");
+    }
+    budget
 }
 
 /// One message of a distinguishable document.
@@ -772,8 +815,14 @@ async fn the_peer_answers_a_raw_sasl_handshake() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_fake_peer_takes_the_token_and_the_messages() {
+    // The two messages ride the target's single per-batch deadline, so on a build that
+    // runs slow (the instrumented coverage one) the second disposition races the peer's
+    // own answer path: this lost once under coverage. The budget is therefore measured
+    // from this very path on this box, not raced against a fixed 400 ms — see
+    // [`measured_batch_budget`].
+    let budget = measured_batch_budget().await;
     let p = Peer::start(Script::happy()).await;
-    let c = fake_client(p.port(), &fake_vars(r#", "dedup": true"#));
+    let c = fake_client_budget(p.port(), &fake_vars(r#", "dedup": true"#), budget);
     let out = went_in(&p, outcomes(&c, &msgs(&[msg("A"), msg("B")]), 2).await);
     assert_eq!(out, vec![Outcome::Ok, Outcome::Ok]);
 
