@@ -693,6 +693,18 @@ impl Answers {
     }
 }
 
+/// Which step of the open the peer never answers: the client's own budget has to be what
+/// ends the wait, and name the step that was waiting (`open_rest`'s per-step deadlines).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mute {
+    /// Never answer a session Begin — the client's CBS session begin hangs.
+    Begin,
+    /// Answer the CBS session's begin and leave the entity session's begin unanswered.
+    EntityBegin,
+    /// Answer everything but the entity's sender attach.
+    EntityAttach,
+}
+
 /// The script of one connection.
 #[derive(Clone)]
 pub struct Script {
@@ -701,6 +713,8 @@ pub struct Script {
     /// (`None`: it answers that one as it answers the first). A node that takes a token at the
     /// open and refuses it later is what the refresh path has to survive.
     pub cbs_refresh: Option<Cbs>,
+    /// A step of the open the peer drops instead of answering (`None`: it answers them all).
+    pub mute: Option<Mute>,
     /// The answers of the entity link (the link that is not the CBS node).
     pub answers: Answers,
     /// After this many transfers of the entity link the peer detaches it.
@@ -725,6 +739,7 @@ impl Default for Script {
         Self {
             cbs: Cbs::Ok,
             cbs_refresh: None,
+            mute: None,
             answers: Answers::default(),
             detach_after: None,
             detach_condition: None,
@@ -746,6 +761,12 @@ impl Script {
     /// A CBS node with a script of its own.
     pub fn cbs(mut self, c: Cbs) -> Self {
         self.cbs = c;
+        self
+    }
+
+    /// A peer that never answers one step of the open.
+    pub fn mute(mut self, m: Mute) -> Self {
+        self.mute = Some(m);
         self
     }
 
@@ -990,6 +1011,9 @@ async fn serve(mut sock: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> R
     }
 
     let mut links: Vec<Link> = Vec::new();
+    // Session Begins seen on this connection, so a `Mute::EntityBegin` can answer the CBS
+    // session's (the first) and drop the entity's (the second).
+    let mut begins = 0usize;
     // The `put-token`s of THIS connection: the node answers the first one by `script.cbs` and
     // every later one — the token a refresh brings — by `script.cbs_refresh`, when it has one.
     let put_tokens = AtomicUsize::new(0);
@@ -1023,6 +1047,16 @@ async fn serve(mut sock: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> R
                 // The responder names the initiator's channel as its remote channel; the one
                 // the client names for us (none, as the initiator) is not what we answer with.
                 let _ = remote_channel;
+                begins += 1;
+                let muted = match script.mute {
+                    Some(Mute::Begin) => true,
+                    Some(Mute::EntityBegin) => begins > 1,
+                    _ => false,
+                };
+                if muted {
+                    // The begin stands unanswered: the client's own budget is what ends it.
+                    continue;
+                }
                 let begin = composite(
                     0x11,
                     &[
@@ -1052,6 +1086,11 @@ async fn serve(mut sock: TcpStream, script: Script, seen: Arc<Mutex<Seen>>) -> R
                 // it as its own.
                 let mine = handle;
                 let is_cbs = source.as_deref() == Some(CBS) || target.as_deref() == Some(CBS);
+                // The entity's sender attach may be the one step left unanswered: the client
+                // waits for an attach that never comes and its own budget ends the open.
+                if script.mute == Some(Mute::EntityAttach) && !is_cbs && !role {
+                    continue;
+                }
                 // A broker that will not create the entity answers the attach with no terminus
                 // at all and then drops the link naming why — the AMQP way to refuse a node.
                 // It is also the only way the shipped client's attach failure can carry a

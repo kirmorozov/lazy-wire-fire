@@ -254,7 +254,6 @@ src/targets/servicebus.rs	_ => out[i] = Some(Outcome::Transient(format!("the sen
 src/targets/servicebus.rs	if out[i].is_some() {
 src/targets/servicebus.rs	let inner = slot.as_mut().expect("opened above");
 src/targets/servicebus.rs	let m = &self.msgs[i];
-src/targets/servicebus.rs	out[i] = Some(Outcome::Refused("the message could not be encoded".into()));
 src/targets/servicebus.rs	out[i] = Some(Outcome::Refused(why.clone()));
 src/targets/smtp.rs	Ok(n as usize)
 src/targets/smtp.rs	Some(i) => (&s[..i], &s[i + 1..]),

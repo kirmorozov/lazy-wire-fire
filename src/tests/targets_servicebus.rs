@@ -534,7 +534,7 @@ fn scheme_refusals() {
 mod peer;
 
 use peer::{composite, decode, frame, read_frame, sasl_frame, In, V};
-use peer::{Answer, Answers, Cbs, Peer, Script};
+use peer::{Answer, Answers, Cbs, Mute, Peer, Script};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -728,7 +728,11 @@ fn condition_text_is_the_symbol_the_peer_wrote() {
             .iter()
             .map(|(c, _)| *c)
             .collect::<Vec<_>>(),
-        vec!["amqp:not-found", "amqp:unauthorized-access"]
+        vec![
+            "amqp:not-found",
+            "amqp:unauthorized-access",
+            "com.microsoft:entity-disabled"
+        ]
     );
     // The 0.14 types crate has no `Display` for an `ErrorCondition` at all, and its `Debug`
     // is the Rust variant name — which is why the wire text is taken through `Symbol::from`.
@@ -935,15 +939,13 @@ async fn a_cbs_node_that_settles_the_request_as_released_is_a_retry() {
 }
 
 #[tokio::test]
-async fn a_cbs_node_that_never_answers_times_the_open_out() {
-    // No disposition for the request at all: the budget of the open ends it, so a stuck
-    // broker cannot park a worker.
-    //
-    // Pin (SB-1): the text is the OPEN's, not CBS's. `put_cbs_token` has a "no CBS reply within
-    // the target's time limit" of its own, but both of its call sites wrap it in a `timeout` of
-    // the same duration, so the outer arm always fires first and that text cannot be reached
-    // from a send. When CBS gets its own budget (or a shorter one), this expected text is what
-    // flips.
+async fn a_cbs_node_that_never_answers_times_the_put_token_out() {
+    // The node attaches its links and then swallows the put-token — neither settles it nor
+    // answers it. The exchange owns its one timer: the request send and the reply read are
+    // waited on together against the open's deadline, and the step that timed out says so
+    // itself. It used to be the open's own text that spoke here: both call sites wrapped the
+    // exchange in a `timeout` of the same duration that started earlier, so the open's
+    // "begin or attach" words answered for a CBS node nobody heard from.
     let p = Peer::start(Script::happy().cbs(Cbs::Silent)).await;
     let c = fake_client(p.port(), &fake_vars(""));
     let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
@@ -951,8 +953,7 @@ async fn a_cbs_node_that_never_answers_times_the_open_out() {
     assert_eq!(
         e.to_string(),
         format!(
-            "opening the session and sender link of sb://127.0.0.1:{}/orders timed out after \
-             400ms (the broker did not answer begin or attach)",
+            "sb://127.0.0.1:{}/orders: no CBS reply within the target's time limit",
             p.port()
         )
     );
@@ -1053,12 +1054,11 @@ async fn a_cbs_node_that_says_nothing_about_the_refreshed_token_is_a_retry() {
 #[tokio::test]
 async fn a_cbs_node_that_stops_answering_times_the_refresh_out() {
     // The node took the first token and answers nothing after it — the refresh is what a stuck
-    // CBS node costs: the target's budget, and the connection goes with it.
-    //
-    // Pin (SB-1): the text is the REFRESH's own timeout, which is the outer of the two waits on
-    // `put_cbs_token` — the inner "no CBS reply within the target's time limit" of the same
-    // duration can never be the one that speaks (see
-    // `a_cbs_node_that_never_answers_times_the_open_out`).
+    // CBS node costs: the target's budget, and the connection goes with it. The wait is the
+    // exchange's own (one timer over the request send and the reply read), so the text is the
+    // CBS node's own too — it used to be a same-duration outer `timeout` that spoke here, from
+    // the caller, naming no step (see
+    // `a_cbs_node_that_never_answers_times_the_put_token_out`).
     let p = Peer::start(Script::happy().cbs_refresh(Cbs::Silent)).await;
     let c = fake_client(p.port(), &fake_vars(""));
     outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
@@ -1068,7 +1068,7 @@ async fn a_cbs_node_that_stops_answering_times_the_refresh_out() {
     assert_eq!(
         e.to_string(),
         format!(
-            "sb://127.0.0.1:{}/orders: the CBS token refresh timed out",
+            "sb://127.0.0.1:{}/orders: no CBS reply within the target's time limit",
             p.port()
         )
     );
@@ -1174,14 +1174,21 @@ async fn a_condition_about_anything_else_waits() {
 async fn an_answer_that_only_says_the_delivery_is_seen_waits() {
     // `received` settles nothing: the delivery is known, its fate is not.
     //
-    // Pin (SB-1): this row is the whole reach of `send_batch`'s per-delivery
-    // `_ => Outcome::Transient("the send failed: {e}")` arm — the client builds only
-    // `NonTerminalDeliveryState`, `IllegalDeliveryState` and `LinkStateError`, and the last of
-    // those is matched above it. The arm beside it, `MessageEncodeError` → Refused "the message
-    // could not be encoded", has no way to happen over a live link: the value is encoded while
-    // the message is BUILT (see `a_pre_refused_message_never_reaches_the_link`), so by the time
-    // `send_batchable` serializes it there is nothing left to fail. Keep that pairing in mind
-    // before either arm is rewritten.
+    // Note what this row is. It is the whole reach of `send_batch`'s per-delivery
+    // `_ => Outcome::Transient("the send failed: {e}")` arm — of the errors the client can
+    // build here, only `NonTerminalDeliveryState` and `IllegalDeliveryState` come from a live
+    // link and reach it (a `LinkStateError` is matched above it as the lost link it is).
+    // There used to be an arm here for `SendError::MessageEncodeError`, refusing the message
+    // as "could not be encoded": the library builds that error in exactly one place — the
+    // serialization `send_with_state` performs on the finished message (fe2o3-amqp 0.14.1
+    // `link/error.rs` `From<serde_amqp::Error>`) — and an `AmqpValue` message the target has
+    // already built and size-checked cannot fail it: the encoder's own failures are values
+    // longer than u32::MAX (a string, symbol, binary, array or map past 4 GiB — the entity's
+    // `max_message_size`, capped at 100 MiB by `max_message_bytes`, rules that out before the
+    // link is touched, see `a_pre_refused_message_never_reaches_the_link`) and writer errors
+    // of a serializer that writes into memory. An arm for it was a promise nothing could
+    // call, so it is gone; a serialization failure that ever appears is a link failure now,
+    // transient like any other unknown.
     let p = Peer::start(Script::happy().answers(Answers::one(Answer::Received))).await;
     let c = fake_client(p.port(), &fake_vars(""));
     let out = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
@@ -1232,28 +1239,25 @@ async fn a_message_the_peer_never_answers_waits() {
 }
 
 #[tokio::test]
-async fn a_link_closed_naming_the_entity_leaves_the_message_unknown() {
+async fn a_link_closed_naming_the_entity_refuses_the_target() {
     // The peer closes the sender link naming the missing entity, but only after the link stood
-    // (a broker that reclaims an idle link). Nothing is known about the message then: transient,
-    // and the connection goes.
-    //
-    // Note what this proves about `send_batch`' lost-link rule. Pin (SB-1): the client reports a
-    // link the peer closed as `SendError::LinkStateError`, never as `SendError::Detached` (which
-    // it never builds), so `detach_condition` — which reads only the latter — always finds no
-    // condition: `Lost::Link.condition` is always None and the whole-target refusal it guards
-    // (an entity condition on a lost link) cannot fire at all. The peer's condition survives only
-    // inside the client's own text (`lost_link_reports`). A missing entity refused AT ATTACH,
-    // which is where that rule does fire, is `an_entity_refused_at_attach_refuses_the_target`.
-    // If the product learns to read the condition off a lost link, THIS expected text becomes a
-    // refusal and flips.
+    // (a broker that reclaims an idle link). The condition says what the attach's refusal says:
+    // the entity is not there to send to. It is therefore the same whole-target refusal
+    // `an_entity_refused_at_attach_refuses_the_target` is — found once, not a per-message
+    // strike — and not an unknown to retry: `send_batch` reads the condition the peer wrote
+    // off the lost link (fe2o3 carries it on `SendError::LinkStateError`, which is what the
+    // client builds for a peer close; its `SendError::Detached` variant is never built).
     let p = Peer::start(Script::happy().detach_on_attach(Some("amqp:not-found"), true)).await;
     let c = fake_client(p.port(), &fake_vars(""));
-    let out = went_in(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    let (e, rejected) = refused_whole(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert!(rejected, "{e:#}");
     assert_eq!(
-        out,
-        vec![Outcome::Transient(lost_link_reports(link_closed(Some(
-            ErrorCondition::AmqpError(AmqpError::NotFound),
-        ))))]
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: the queue or topic does not exist (the target does not \
+             create it)",
+            p.port()
+        )
     );
     assert!(
         p.trace().contains("amqp:not-found"),
@@ -1264,16 +1268,41 @@ async fn a_link_closed_naming_the_entity_leaves_the_message_unknown() {
 }
 
 #[tokio::test]
+async fn a_link_closed_naming_a_disabled_entity_refuses_the_target() {
+    // The entity is there but switched off: `com.microsoft:entity-disabled` says so (the
+    // Microsoft page on messaging exceptions names it for a runtime operation on a disabled
+    // entity, and the Azure SDKs refuse it without a retry). Like the missing entity, it is
+    // positively about the entity and not about this send, so the whole target is refused —
+    // a retry against a disabled entity is a worker parked until someone enables it.
+    let p =
+        Peer::start(Script::happy().detach_on_attach(Some("com.microsoft:entity-disabled"), true))
+            .await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let (e, rejected) = refused_whole(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert!(rejected, "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: the queue or topic is disabled (enable the entity or \
+             point the target at a live one)",
+            p.port()
+        )
+    );
+    assert!(c.inner.lock().await.is_none(), "the connection is dropped");
+}
+
+#[tokio::test]
 async fn answered_messages_keep_their_answer_when_the_link_is_lost() {
     // The peer takes the first message and then drops the link. The message it answered is
     // known to be in and keeps that verdict; the rest of the batch has no answer, and an
     // unknown message is never a refusal.
     //
-    // Pin (SB-1): the two unanswered messages end on the BUDGET, not on the link. The peer's
-    // detach does not wake a `send_batchable` future that is already pending, so the loop never
-    // learns the link went away and `Lost::Link` is not what closes this batch. Watching the
-    // link while the dispositions are awaited would turn these two rows into
-    // `the link was lost: ...` — which is what the engine would rather be told.
+    // The batch ends on the LINK, not on the budget: `send_batch` watches the link while the
+    // dispositions are awaited (`Sender::on_detach`), so the detach is what closes the wait,
+    // at once and with the peer's condition. That condition names the token's missing right —
+    // a whole-target rule — but this batch has a message known to be in, and the engine may
+    // only strike what is not known to be in: so the unanswered messages are transient, with
+    // the entity verdict in their text.
     let p =
         Peer::start(Script::happy().detach_after(1, Some("amqp:unauthorized-access"), true)).await;
     let c = fake_client(p.port(), &fake_vars(""));
@@ -1283,10 +1312,11 @@ async fn answered_messages_keep_their_answer_when_the_link_is_lost() {
     );
     assert_eq!(out[0], Outcome::Ok, "the peer answered this one");
     let unknown = || {
-        Outcome::Transient(format!(
-            "no disposition within the target's {:?}",
-            Duration::from_millis(400)
-        ))
+        Outcome::Transient(
+            "the link was lost (the token cannot send to the entity (check vars.key_name, \
+             vars.key and the rule's Send right))"
+                .into(),
+        )
     };
     assert_eq!(out[1], unknown(), "{:?}", out[1]);
     assert_eq!(out[2], unknown(), "{:?}", out[2]);
@@ -1347,6 +1377,83 @@ async fn a_peer_that_never_talks_back_times_the_open_out() {
             p.port()
         )
     );
+}
+
+#[tokio::test]
+async fn a_broker_that_never_answers_the_cbs_session_begin_times_the_open_out() {
+    // The socket stood and the handshake stands, but the first session begin is never
+    // answered. The open's budget — the target's time limit, once — ends it, and the text
+    // says the peer owed the begin. (The CBS steps share this budget: no step of one open
+    // restarts the clock, which is what the two equal-duration outer `timeout`s used to
+    // allow.)
+    let p = Peer::start(Script::happy().mute(Mute::Begin)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "opening the session and sender link of sb://127.0.0.1:{}/orders timed out after \
+             400ms (the broker did not answer begin or attach)",
+            p.port()
+        )
+    );
+    // The begin was asked for and the put-token never got a session to travel on.
+    assert!(
+        p.trace().contains("Begin"),
+        "the peer saw the begin: {}",
+        p.trace()
+    );
+    assert_eq!(p.seen().put_tokens.len(), 0);
+}
+
+#[tokio::test]
+async fn a_broker_that_never_answers_the_entity_session_begin_times_the_open_out() {
+    // The CBS side stands — token included — and then the entity session's begin goes
+    // unanswered: the same one budget, the same text, and the token stands proven good:
+    // this is the peer owing a begin, not a credential complaint.
+    let p = Peer::start(Script::happy().mute(Mute::EntityBegin)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "opening the session and sender link of sb://127.0.0.1:{}/orders timed out after \
+             400ms (the broker did not answer begin or attach)",
+            p.port()
+        )
+    );
+    assert_eq!(
+        p.seen().put_tokens.len(),
+        1,
+        "the token went in before the entity session"
+    );
+}
+
+#[tokio::test]
+async fn a_broker_that_never_answers_the_sender_attach_times_the_open_out() {
+    // Everything before the entity's sender link answered; the attach exchange itself goes
+    // silent. Same budget, same text — the peer's half of the attach is exactly what the
+    // text names.
+    let p = Peer::start(Script::happy().mute(Mute::EntityAttach)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "opening the session and sender link of sb://127.0.0.1:{}/orders timed out after \
+             400ms (the broker did not answer begin or attach)",
+            p.port()
+        )
+    );
+    assert_eq!(
+        p.seen().put_tokens.len(),
+        1,
+        "and no message went: the link never stood"
+    );
+    assert_eq!(p.seen().bodies.len(), 0);
 }
 
 #[tokio::test]
@@ -1416,15 +1523,12 @@ async fn a_session_entity_refuses_the_message_without_its_group() {
 fn an_address_that_is_not_a_queue_or_topic_is_refused() {
     let cases = [
         (
-            // Pin (SB-1): the namespace's own subscription bail (`send to the topic, not to a
-            // subscription`, `servicebus.rs:264-265`) cannot be reached — a path holding
-            // `/subscriptions/` holds a `/`, and the character set just above refuses it first.
-            // This is the text an operator actually reads; the local form below, where `/` is
-            // allowed, is the one that does name a subscription.
+            // The subscription refusal names itself: the path holds a `/`, but the
+            // character-set check no longer speaks for it (it used to sit above this bail and
+            // answer a subscription with a complaint about characters).
             "sb://contoso.servicebus.windows.net/orders/subscriptions/s1",
-            "endpoint `sb://contoso.servicebus.windows.net/orders/subscriptions/s1`: an entity \
-             path holds letters, digits, `-`, `.` and `_` (a subscription is not sent to: send \
-             to the topic)",
+            "endpoint `sb://contoso.servicebus.windows.net/orders/subscriptions/s1`: send to \
+             the topic, not to a subscription",
         ),
         (
             "sb://127.0.0.1:34610/",
@@ -1436,12 +1540,10 @@ fn an_address_that_is_not_a_queue_or_topic_is_refused() {
              digits, `-`, `.`, `_`, `/` and `%`",
         ),
         (
-            // Pin (SB-1): as above — `$` is not in the address's character set either, so the
-            // "does not start with `$`" bail below it (`servicebus.rs:286-287`) cannot be the
-            // one that fires; the charset refuses the system node first.
+            // As above: `$` is not in the address's character set either, but the system-node
+            // refusal stands before the set and names the node, not the character.
             "sb://127.0.0.1:34610/$cbs",
-            "endpoint `sb://127.0.0.1:34610/$cbs`: a local broker's address holds letters, \
-             digits, `-`, `.`, `_`, `/` and `%`",
+            "endpoint `sb://127.0.0.1:34610/$cbs`: an address does not start with `$`",
         ),
         (
             "sb://127.0.0.1:34610/orders/subscriptions/s1",
