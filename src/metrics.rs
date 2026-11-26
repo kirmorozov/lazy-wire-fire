@@ -205,6 +205,13 @@ pub struct Metrics {
     /// per event; the WARN line is rate limited by the engine's `note_statement_dml` to one per
     /// table per interval. No labels: the table belongs to the log line, not to the surface.
     statement_events_ignored: AtomicU64,
+    /// `lazywf_binlog_undecodable_total`: events the reader could not decode with this build
+    /// (review A-02) — the stream is stuck at the position one of them sits at until a build that
+    /// decodes it ships. Counted at both stream sites: the mapping failure the engine backs off
+    /// from, and the refused rows of a watched table, which exits the process (so the number a
+    /// restart starts back at 0 is itself the crash-loop's signal, next to the ERROR line).
+    /// No labels: the position and the decoder's words belong to the log line.
+    undecodable: AtomicU64,
 }
 
 impl Metrics {
@@ -273,6 +280,13 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts one event the reader could not decode with this build
+    /// (`lazywf_binlog_undecodable_total`). One `fetch_add`, no lookup and no lock, on an event the
+    /// stream either backs off from or dies on — never the hot path.
+    pub fn undecodable_event(&self) {
+        self.undecodable.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Renders the exposition (`text/plain; version=0.0.4`). Allocates freely: only a scrape
     /// calls this. The order is deterministic (rules and pairs sorted, outcomes and buckets in
     /// fixed order) so a scrape snapshot is hand-checkable.
@@ -288,6 +302,7 @@ impl Metrics {
             &mut out,
             self.statement_events_ignored.load(Ordering::Relaxed),
         );
+        undecodable(&mut out, self.undecodable.load(Ordering::Relaxed));
         pending_keys(&mut out, &r.rules);
         flush_total(&mut out, &r.pairs);
         dropped_keys(&mut out, &r.pairs);
@@ -354,6 +369,17 @@ fn statement_events_ignored(out: &mut String, n: u64) {
     out.push_str("# HELP lazywf_statement_events_ignored_total DML that arrived as a statement-format QUERY event (a session switched its own binlog_format away from ROW): its rows are not in the binlog, so the rules on its table missed those changes until they are rebuilt.\n");
     out.push_str("# TYPE lazywf_statement_events_ignored_total counter\n");
     out.push_str("lazywf_statement_events_ignored_total ");
+    out.push_str(&n.to_string());
+    out.push('\n');
+}
+
+/// The instance-wide count of the events this build could not decode. No label for the position or
+/// the table: those are on the log line the reader writes once per stuck position, and the label
+/// sets are frozen.
+fn undecodable(out: &mut String, n: u64) {
+    out.push_str("# HELP lazywf_binlog_undecodable_total Binlog events this build could not decode: the reader keeps coming back to the position one of them sits at until a build that decodes it ships.\n");
+    out.push_str("# TYPE lazywf_binlog_undecodable_total counter\n");
+    out.push_str("lazywf_binlog_undecodable_total ");
     out.push_str(&n.to_string());
     out.push('\n');
 }
@@ -621,6 +647,9 @@ mod tests {
             "# HELP lazywf_statement_events_ignored_total DML that arrived as a statement-format QUERY event (a session switched its own binlog_format away from ROW): its rows are not in the binlog, so the rules on its table missed those changes until they are rebuilt.",
             "# TYPE lazywf_statement_events_ignored_total counter",
             "lazywf_statement_events_ignored_total 0",
+            "# HELP lazywf_binlog_undecodable_total Binlog events this build could not decode: the reader keeps coming back to the position one of them sits at until a build that decodes it ships.",
+            "# TYPE lazywf_binlog_undecodable_total counter",
+            "lazywf_binlog_undecodable_total 0",
             "# HELP lazywf_pending_keys Keys pending in a rule's dedup buffer, not yet delivered.",
             "# TYPE lazywf_pending_keys gauge",
             "lazywf_pending_keys{rule=\"orders\"} 5",
@@ -693,6 +722,24 @@ mod tests {
         assert!(m
             .render()
             .contains("lazywf_statement_events_ignored_total 5"));
+        assert_eq!(m.entry_count(), (0, 0), "no labels, so no registry entry");
+    }
+
+    /// An event the reader could not decode is counted per event, at both stream sites: the mapping
+    /// failure the engine backs off from, and the refused rows event that exits the process. The
+    /// line is rate limited (one per stuck position) and the process may not survive the second
+    /// case, so the counter is what an alert reads — and a scrape of a stuck instance must show it.
+    #[test]
+    fn undecodable_counts_every_event_the_reader_refused() {
+        let m = Metrics::default();
+        assert!(
+            m.render().contains("lazywf_binlog_undecodable_total 0"),
+            "a counter a scrape has never seen still shows"
+        );
+        for _ in 0..4 {
+            m.undecodable_event();
+        }
+        assert!(m.render().contains("lazywf_binlog_undecodable_total 4"));
         assert_eq!(m.entry_count(), (0, 0), "no labels, so no registry entry");
     }
 
