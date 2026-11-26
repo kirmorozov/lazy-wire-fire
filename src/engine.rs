@@ -2709,7 +2709,19 @@ impl Engine {
                             .as_mut()
                             .expect("a Full-key trigger means the table has objects");
                         let obj = objs[ii].get_or_insert_with(|| w.layout.object(img)).clone();
-                        let ctx = json!({"old": obj, "new": obj, "row": obj, "op": op_text(op), "table": w.table});
+                        // The row's context, built rather than serialised: `json!` of a
+                        // `Value` deep-copies it, so this one object — owned once by the
+                        // cache above, and read again by the pass that follows — was copied
+                        // three more times to fill three roots that all hold it. Built by
+                        // hand it is copied twice and moved into the third (the hot-path
+                        // audit's finding 8, the row's own object).
+                        let mut ctx = Map::new();
+                        ctx.insert("old".into(), obj.clone());
+                        ctx.insert("new".into(), obj.clone());
+                        ctx.insert("row".into(), obj);
+                        ctx.insert("op".into(), Value::String(op_text(op).into()));
+                        ctx.insert("table".into(), Value::String(w.table.clone()));
+                        let ctx = Value::Object(ctx);
                         for tpl in lines {
                             match rule.templates.render(tpl, &ctx) {
                                 Ok(s) => {
@@ -3005,7 +3017,9 @@ impl Engine {
             .take(usize::MAX, usize::MAX)
             .expect("begin moved the pending ids into the generation");
         let maps: BTreeMap<key::SpaceId, buffer::IdSet> = taken.ids.into_iter().collect();
-        let keys: Vec<String> = buf.keys.render(&maps);
+        // The flush's own key list, in one copy: the job reads it, and the armed fallback
+        // below reads it too (the audit's finding 11, the keys half — see `fire_keys`).
+        let keys = Arc::new(buf.keys.render(&maps));
         // Shared with the job (which reads the payloads to resolve `keys_sql`) and with the
         // lane (which puts them back if the flush fails): one copy of every parameter set for
         // the whole flush instead of a deep clone of it here.
@@ -3029,8 +3043,12 @@ impl Engine {
         buf.first = None;
         buf.last = None;
         let (rule, incarnation, name) = (st.rule.clone(), st.incarnation, name.to_string());
-        let failed = Outcome::Flush {
-            fired: Fired::failed(keys.clone()),
+        // The panic fallback, built only if the task dies: an armed `Outcome` here would
+        // copy every key on every flush, including the ones that go out well. The job owns
+        // the list, so the fallback holds another handle to the same one.
+        let armed = Arc::clone(&keys);
+        let failed = move || Outcome::Flush {
+            fired: Fired::failed((*armed).clone()),
             keep_queries: true,
             resolved: Vec::new(),
         };
@@ -3111,6 +3129,7 @@ impl Engine {
                             run: rid,
                             fired: Fired::failed(Vec::new()),
                         };
+                        let failed = move || failed;
                         spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                             let reset = json!({"step": rule.def.reset_steps[i].name, "keys": []});
                             let fired =
@@ -3128,6 +3147,7 @@ impl Engine {
                             run: rid,
                             keys: Err("internal error".into()),
                         };
+                        let failed = move || failed;
                         spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                             let keys = action::snapshot_keys(&env, &rule)
                                 .await
@@ -3146,6 +3166,7 @@ impl Engine {
                             run: rid,
                             per_ep: Err("internal error".into()),
                         };
+                        let failed = move || failed;
                         spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                             let per_ep = action::list_strays(&env, &rule, i)
                                 .await
@@ -3191,12 +3212,13 @@ impl Engine {
                         run: rid,
                         fired: Fired::failed(Vec::new()),
                     };
+                    let failed = move || failed;
                     spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
                         let reset = json!({"step": rule.def.reset_steps[i].name, "keys": chunk});
                         let fired = action::fire_keys(
                             &env,
                             &rule,
-                            chunk,
+                            &chunk,
                             &rule.step_action(i),
                             reset,
                             None,
@@ -3248,8 +3270,9 @@ impl Engine {
                         run: rid,
                         fired: Fired::failed(Vec::new()),
                     };
+                    let failed = move || failed;
                     spawn_job(tx.clone(), rname.clone(), incarnation, failed, async move {
-                        let fired = action::fire_strays(&env, &rule, i, e, chunk).await;
+                        let fired = action::fire_strays(&env, &rule, i, e, &chunk).await;
                         Outcome::Reset { run: rid, fired }
                     });
                     return;
@@ -3706,11 +3729,15 @@ impl Engine {
 
 /// Runs a job on its own task; if it panics, a failure is still reported, so the rule's lane
 /// is never left taken.
+/// Runs one job of one rule and reports its outcome to the engine. `failed` is the outcome
+/// to report when the task itself dies (it panicked, or was cancelled): a closure, so a
+/// fallback that has to copy the job's data pays for it only on that path — the flush's
+/// fallback holds a handle to the flush's own key list and clones it here, if at all.
 fn spawn_job(
     tx: mpsc::UnboundedSender<Done>,
     rule: String,
     incarnation: u64,
-    failed: Outcome,
+    failed: impl FnOnce() -> Outcome + Send + 'static,
     job: impl std::future::Future<Output = Outcome> + Send + 'static,
 ) {
     tokio::spawn(async move {
@@ -3718,7 +3745,7 @@ fn spawn_job(
             Ok(o) => o,
             Err(e) => {
                 tracing::error!(rule = %rule, "job failed unexpectedly: {e}");
-                failed
+                failed()
             }
         };
         let _ = tx.send(Done {
@@ -3969,48 +3996,62 @@ fn warn_statement_dml(d: &crate::sql::StmtDml, at: &Position, count: u64) {
     );
 }
 
+/// One flush: the fence, the `keys_sql` keys, then every key in groups. `keys` is the
+/// flush's own list as `spawn_flush` built it, in an `Arc` it shares with its panic
+/// fallback: the list is copied only when `keys_sql` resolves keys to add to it, because
+/// that is the one thing that must extend it.
 async fn flush_job(
     env: &Env,
     rule: &Rule,
     spec: FenceSpec,
-    mut keys: Vec<String>,
+    keys: Arc<Vec<String>>,
     queries: &[(String, KeyQuery)],
 ) -> Outcome {
-    let fail = |e: anyhow::Error, keys: Vec<String>| Outcome::Flush {
+    let fail = |e: anyhow::Error, keys: &[String]| Outcome::Flush {
         fired: Fired {
             error: Some(format!("{e:#}")),
-            failed_keys: keys,
+            failed_keys: keys.to_vec(),
             ..Default::default()
         },
         keep_queries: true,
         resolved: Vec::new(),
     };
     if let Err(e) = action::fence(env, &spec).await {
-        return fail(e, keys);
+        return fail(e, &keys);
     }
     let mut resolved = Vec::new();
+    // What `keys_sql` found beyond the keys the rows already marked: kept apart from the
+    // shared list so that list stays shared, and appended only below, where the two become
+    // the list this flush fires.
+    let mut found_keys = Vec::new();
     if !queries.is_empty() {
         match action::resolve_keys(env, queries.iter().map(|(_, q)| q)).await {
             Ok(found) => {
                 let mut seen = text_set(keys.iter().map(String::as_str));
                 for k in found {
                     if seen.insert(key::Key::from_text(&k)) {
-                        keys.push(k.clone());
+                        found_keys.push(k.clone());
                         resolved.push(k);
                     }
                 }
             }
-            Err(e) => return fail(e, keys),
+            Err(e) => return fail(e, &keys),
         }
     }
-    if keys.is_empty() {
+    if keys.is_empty() && found_keys.is_empty() {
         return Outcome::Flush {
             fired: Fired::default(),
             keep_queries: false,
             resolved,
         };
     }
-    let fired = action::fire_keys(env, rule, keys, rule::ACTION, Value::Null, None).await;
+    let fired = if found_keys.is_empty() {
+        action::fire_keys(env, rule, &keys, rule::ACTION, Value::Null, None).await
+    } else {
+        let mut all = (*keys).clone();
+        all.extend(found_keys);
+        action::fire_keys(env, rule, &all, rule::ACTION, Value::Null, None).await
+    };
     Outcome::Flush {
         fired,
         keep_queries: false,

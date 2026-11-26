@@ -136,6 +136,12 @@ yaml_serde = "0.10"
 # Tests only: compiles a .proto with no protoc (pure Rust), so the tests build the descriptor
 # sets they need and check the one shipped for lazywf's own contract against its .proto.
 protox = "0.10"
+# Tests only: the fake broker of `tests/common/kafka_broker.rs` needs `rskafka::protocol` (the wire
+# codec) to read a produce and write an answer; `unstable-fuzzing` is rskafka's own switch for
+# publishing that module. Dev-only, and the same version and `default-features` as the product
+# dependency above: nothing enters the tree, `Cargo.lock` is unchanged, and a non-test build never
+# sees this feature (edition 2021, resolver 2), so the release binary is untouched.
+rskafka = { version = "0.6", default-features = false, features = ["unstable-fuzzing"] }
 
 [profile.release]
 lto = true

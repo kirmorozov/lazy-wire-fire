@@ -21,9 +21,7 @@ src/action.rs	f.failed_keys.extend(keys[a..b].iter().cloned());	4
 src/action.rs	f.keys_done += (b - a) as u64;
 src/action.rs	f.rejected.push((keys[a].clone(), format!("{e:#}")));	2
 src/action.rs	for (a, b) in &parts[n + 1..] {
-src/action.rs	for c in &chunks[n + 1..] {
 src/action.rs	if book_items(&keys[a..b], items, f) {
-src/action.rs	let unit = std::mem::take(&mut chunks[i]);
 src/action.rs	r.unwrap()
 src/aws.rs	Value::Number(n) => n.as_u64().map(|n| n as usize),
 src/aws.rs	if b[i] == b'%' && i + 2 < b.len() {
@@ -64,6 +62,7 @@ src/engine.rs	.expect("a Full-key trigger means the table has objects");
 src/engine.rs	.expect("begin moved the pending ids into the generation");
 src/engine.rs	.expect("inserted just above if it was missing");
 src/engine.rs	.with_constraints(PoolConstraints::new(0, cfg.pool_size).expect("0 <= max"))
+src/engine.rs	format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 src/engine.rs	info!(rule = %d.rule, "reset step {}: {} stray keys", run.step + 1, per_ep.iter().map(|s| s.len() as u64).sum::<u64>());
 src/engine.rs	let (Some(b), Some(a)) = (images[0], images[1]) else {
 src/engine.rs	let Some(img) = images[ii] else {
@@ -88,7 +87,6 @@ src/engine.rs	matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
 src/engine.rs	reg.set_binlog_lag(self.stream_lag_ms() as f64 / 1000.0);
 src/engine.rs	rules.get_mut(name).expect("present").buffer.locate(k);	2
 src/engine.rs	st.counters.select_ms = fired.select_time.as_millis() as u64;
-src/engine.rs	format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
 src/health.rs	buf.extend_from_slice(&chunk[..n]);
 src/http.rs	Some((i, _)) => format!("{}…", &s[..i]),
 src/http.rs	Some(i) => (&rest[..i], &rest[i + 1..]),
