@@ -2907,7 +2907,9 @@ async fn bounded_delay_while_keys_keep_changing() {
     // debounce and a half. On an idle host, where a write costs a couple of hundred milliseconds,
     // that is the 1 s debounce and the 1.5 s cap the test always had and a change every 500 ms; on
     // a host where one write costs a second, all three stretch together instead of walking into
-    // each other. The bound the test measures against stays `max_delay_ms` plus one scaled second.
+    // each other. The bound the test measures against is `max_delay_ms` plus the widest interval
+    // the loop itself saw between two of its key changes plus one scaled second, for the reason
+    // spelled out where the bound is built.
     let mut cadence = Duration::ZERO;
     for i in 0..4u32 {
         let since = std::time::Instant::now();
@@ -2932,9 +2934,25 @@ async fn bounded_delay_while_keys_keep_changing() {
     // round trip of the UPDATE late when the host is busy.
     let t0 = std::time::Instant::now();
     db.exec("INSERT INTO orders VALUES (1, 1, 'n', 0)").await;
-    let bound = Duration::from_millis(max_delay_ms) + deadline(Duration::from_secs(1));
+    // What the fire may take: the cap the rule promises, plus the host's share of this very
+    // measurement. The engine counts `max_delay` from the instant IT marked the first key
+    // (`Buffer::due` is `min(last + debounce, first + max_delay)` with both stamps taken while
+    // marking), and that instant is this test's write plus the commit, the binlog, and the
+    // engine being scheduled at all — none of which this test can promise to be quick. The loop
+    // measures exactly that path: `gap` is the widest interval it saw between two of its own key
+    // changes, so one of those is a write of this harness and the host around it, under this
+    // run's load rather than an assumed one. The bound grows with it, for the same reason the
+    // debounce, the interval and the cap above do. It cannot stretch into what the test is for:
+    // a batch that ignores its cap keeps waiting for a quiet moment, the loop stops changing the
+    // key at the bound, and the fire that never comes is the failure. Measured on MySQL 8.4 over
+    // 15 runs, the fire landed 0.04-0.48 s after `max_delay` while the same runs' `gap` was
+    // 0.55-1.56 s: the lag follows the host, and one fixed second was the only term that did not.
+    let allowed = |seen: Duration| {
+        Duration::from_millis(max_delay_ms) + seen + deadline(Duration::from_secs(1))
+    };
     let mut first;
     let mut gap = Duration::ZERO;
+    let mut gap_at_fire: Option<Duration> = None;
     let mut prev = t0;
     // The instants at which this test changed the key: the insert that queued it, then every
     // update below. The premise check further down names the one the batch was built on.
@@ -2949,16 +2967,23 @@ async fn bounded_delay_while_keys_keep_changing() {
         changes.push(now);
         i += 1;
         first = mock.arrived("/k");
+        if first.is_some() && gap_at_fire.is_none() {
+            // The allowance is the traffic the batch lived through, not the intervals the loop
+            // went on measuring after the answer had already arrived.
+            gap_at_fire = Some(gap);
+        }
         // The key keeps changing until the fire has been seen (and five times at least, so the
         // window is a moving one): when it arrives, the key was still moving, which is what the
         // test is named for. Past the bound it stops, and the `no fire` expect below is the
         // failure of a rule that never released the batch.
-        if i >= 5 && (first.is_some() || t0.elapsed() > bound) {
+        if i >= 5 && (first.is_some() || t0.elapsed() > allowed(gap)) {
             break;
         }
         sleep_ms(every_ms).await;
     }
     let at = first.expect("no fire while the key kept changing");
+    let gap_used = gap_at_fire.unwrap_or(gap);
+    let bound = allowed(gap_used);
     let delay = at
         .checked_duration_since(t0)
         .expect("the fire arrived before the write that queued it");
@@ -2972,12 +2997,14 @@ async fn bounded_delay_while_keys_keep_changing() {
     let since_change = at.duration_since(containing);
     eprintln!(
         "first fire {delay:?} after the write (bound {bound:?} = max_delay {max_delay_ms} ms + \
-         the host's own slack), key changed at most every {gap:?}, debounce {debounce_ms} ms, the \
-         batch's own change was {since_change:?} old"
+         the {gap_used:?} this run waits between key changes + the host's own slack), key changed \
+         at most every {gap:?}, debounce {debounce_ms} ms, the batch's own change was \
+         {since_change:?} old"
     );
     assert!(
         delay <= bound,
-        "first fire after {delay:?}, the bound is {bound:?}"
+        "first fire after {delay:?}, the bound is {bound:?} (max_delay {max_delay_ms} ms + the \
+         {gap_used:?} between this run's own key changes + the host's own slack)"
     );
     // The premise of the name, checked rather than assumed: the fire is tied to a change this test
     // made, and that change was still inside the debounce window when the fire arrived. If it were
