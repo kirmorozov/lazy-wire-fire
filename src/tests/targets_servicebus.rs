@@ -522,6 +522,948 @@ fn scheme_refusals() {
     assert!(refuse_scheme(false, &["kafka://a/b".into()]).is_ok());
 }
 
+// ==================================================================== the fake peer (CBS, faults)
+//
+// The CBS negotiation and the answer to a transfer are driven against an in-process fake
+// endpoint (`targets_servicebus_peer.rs`): the Microsoft emulator is not available, so the
+// peer is written from the protocol and scripted per test. Every case asserts the verdict of
+// EACH message and the exact text of its cause — a message is refused only when the peer's
+// answer is positively about that message.
+
+#[path = "targets_servicebus_peer.rs"]
+mod peer;
+
+use peer::{composite, decode, frame, read_frame, sasl_frame, In, V};
+use peer::{Answer, Answers, Cbs, Peer, Script};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// The name the fake peer's target reads its SAS key from.
+const FAKE_KEY: &str = "LWF_SB_FAKE_KEY";
+
+/// `vars` of a local broker: the SAS key by reference, plus anything the test adds.
+fn fake_vars(extra: &str) -> String {
+    std::env::set_var(FAKE_KEY, "c2VjcmV0LWtleQ==");
+    assert!(extra.is_empty() || extra.starts_with(','), "{extra}");
+    format!(r#"{{"key_name":"send","key":"env:{FAKE_KEY}"{extra}}}"#)
+}
+
+fn fake_def(json: &str) -> TargetDef {
+    TargetDef {
+        name: "sb".into(),
+        kind: crate::model::Kind::ServiceBus,
+        endpoints: vec![],
+        tls: TlsSpec::parse(Some("disabled")).unwrap(),
+        // Short enough that a test which waits for nothing is a fast failure, long enough
+        // that a loopback frame round-trip never loses the race.
+        timeout: Duration::from_millis(400),
+        expect: None,
+        vars: vars(json),
+    }
+}
+
+fn fake_client(port: u16, json: &str) -> Client {
+    let def = fake_def(json);
+    let (_ctx, client) = Client::new(&def, &format!("sb://127.0.0.1:{port}/orders")).unwrap();
+    client
+}
+
+/// One message of a distinguishable document.
+fn msg(sku: &str) -> String {
+    format!(r#"{{"value": {{"sku": "{sku}"}}}}"#)
+}
+
+fn msgs(v: &[String]) -> String {
+    format!(r#"{{"messages": [{}]}}"#, v.join(","))
+}
+
+/// The outcomes of one action: message i takes key `k{i}`.
+async fn outcomes(client: &Client, body: &str, n: usize) -> Result<Vec<Outcome>> {
+    let keys: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+    let mut action = parse(body, n).unwrap().unwrap();
+    client.send_batch(&keys, &mut action).await
+}
+
+/// The same for an entity with sessions enabled (every message needs its group id).
+async fn outcomes_in_session(client: &Client, body: &str, n: usize) -> Result<Vec<Outcome>> {
+    let keys: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+    let mut action = Action::parse(body.as_bytes(), n, true, MAX_MESSAGE_BYTES)
+        .unwrap()
+        .unwrap();
+    client.send_batch(&keys, &mut action).await
+}
+
+/// A send that is meant to work, with the peer's frame log at hand when it does not.
+#[track_caller]
+fn went_in(p: &Peer, r: Result<Vec<Outcome>>) -> Vec<Outcome> {
+    r.unwrap_or_else(|e| panic!("the send failed: {e:#}\nthe peer saw:\n{}", p.trace()))
+}
+
+/// A send that is meant to fail, with the peer's frame log at hand when it does not.
+#[track_caller]
+fn refused_whole(p: &Peer, r: Result<Vec<Outcome>>) -> (anyhow::Error, bool) {
+    match r {
+        Ok(o) => panic!(
+            "expected the whole send to fail, got {o:?}\nthe peer saw:\n{}",
+            p.trace()
+        ),
+        Err(e) => {
+            let rejected = crate::target::is_rejected(&e);
+            (e, rejected)
+        }
+    }
+}
+
+/// The text a lost link leaves on an unanswered message. `send_batch` keeps `e.to_string()` of
+/// the client's own error, so the expected text is built from a real error value of that type:
+/// the wording is the library's, it cannot drift into something the code never says.
+fn lost_link_reports(err: SendError) -> String {
+    format!("the link was lost: {err}")
+}
+
+/// The client's error for a sender link the peer closed, with or without a condition.
+fn link_closed(condition: Option<ErrorCondition>) -> SendError {
+    use fe2o3_amqp::link::LinkStateError;
+    SendError::LinkStateError(match condition {
+        Some(c) => LinkStateError::RemoteClosedWithError(PeerError::new(c, None, None)),
+        None => LinkStateError::RemoteClosed,
+    })
+}
+
+/// The text a refused attach leaves on the whole send (`open_rest` says the client's own
+/// error), built from a real value of that type for the same reason as `lost_link_reports`.
+fn attach_refused(url: &str, condition: ErrorCondition) -> String {
+    let err = SenderAttachError::RemoteClosedWithError(PeerError::new(condition, None, None));
+    format!("attaching the sender of {url} failed: {err}")
+}
+
+#[test]
+fn condition_text_is_the_symbol_the_peer_wrote() {
+    use fe2o3_amqp::types::definitions::{AmqpError, ConnectionError, LinkError, SessionError};
+    let text = |c: ErrorCondition| condition_text(&c);
+    assert_eq!(
+        text(ErrorCondition::AmqpError(AmqpError::NotFound)),
+        "amqp:not-found"
+    );
+    assert_eq!(
+        text(ErrorCondition::AmqpError(AmqpError::UnauthorizedAccess)),
+        "amqp:unauthorized-access"
+    );
+    assert_eq!(
+        text(ErrorCondition::ConnectionError(
+            ConnectionError::ConnectionForced
+        )),
+        "amqp:connection:forced"
+    );
+    assert_eq!(
+        text(ErrorCondition::SessionError(SessionError::WindowViolation)),
+        "amqp:session:window-violation"
+    );
+    assert_eq!(
+        text(ErrorCondition::LinkError(LinkError::MessageSizeExceeded)),
+        "amqp:link:message-size-exceeded"
+    );
+    // A vendor condition is the symbol as it arrived.
+    assert_eq!(
+        text(ErrorCondition::Custom(Symbol::from(
+            "com.microsoft:server-busy"
+        ))),
+        "com.microsoft:server-busy"
+    );
+    // The conditions of the two rules the peer's answer is judged by are the ones the code
+    // reads (a typo in either table would silently turn refusals into retries or the other way).
+    assert_eq!(
+        MESSAGE_CONDITIONS.to_vec(),
+        vec![
+            "amqp:link:message-size-exceeded",
+            "amqp:decode-error",
+            "amqp:invalid-field"
+        ]
+    );
+    assert_eq!(
+        ENTITY_CONDITIONS
+            .iter()
+            .map(|(c, _)| *c)
+            .collect::<Vec<_>>(),
+        vec!["amqp:not-found", "amqp:unauthorized-access"]
+    );
+    // The 0.14 types crate has no `Display` for an `ErrorCondition` at all, and its `Debug`
+    // is the Rust variant name — which is why the wire text is taken through `Symbol::from`.
+    // Pinning that here keeps the workaround honest.
+    assert_ne!(
+        format!("{:?}", ErrorCondition::AmqpError(AmqpError::NotFound)),
+        "amqp:not-found"
+    );
+    assert_eq!(
+        Symbol::from(&AmqpError::NotFound).as_str(),
+        "amqp:not-found"
+    );
+}
+
+#[test]
+fn fill_unknown_answers_only_the_messages_with_no_verdict() {
+    let mut out: Vec<Option<Outcome>> = vec![None, Some(Outcome::Ok), None];
+    fill_unknown(&mut out, "the link was lost".into());
+    assert_eq!(
+        out,
+        vec![
+            Some(Outcome::Transient("the link was lost".into())),
+            // A message the peer already answered keeps its answer: the engine only strikes
+            // what is not known to be in.
+            Some(Outcome::Ok),
+            Some(Outcome::Transient("the link was lost".into())),
+        ]
+    );
+    // Nothing to fill is not an error.
+    let mut answered = vec![Some(Outcome::Ok)];
+    fill_unknown(&mut answered, "x".into());
+    assert_eq!(answered, vec![Some(Outcome::Ok)]);
+}
+
+#[tokio::test]
+async fn the_peer_answers_a_raw_sasl_handshake() {
+    // The peer speaks bytes, so one test speaks bytes back: the SASL handshake, the header
+    // exchange and an open — the bytes of the two frames the peer itself writes are pinned.
+    let p = Peer::start(Script::happy()).await;
+    let mut sock = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+    sock.write_all(b"AMQP\x03\x01\x00\x00").await.unwrap();
+    let mut got = [0u8; 8];
+    sock.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"AMQP\x03\x01\x00\x00", "the SASL header");
+    // The mechanisms we are offered: ANONYMOUS, as an array of symbols.
+    let (ch, body) = read_frame(&mut sock).await.unwrap().unwrap();
+    assert_eq!(ch, 0);
+    assert_eq!(
+        body,
+        vec![
+            0x00, 0x53, 0x40, 0xc0, 0x0f, 0x01, 0xe0, 0x0c, 0x01, 0xa3, 0x09, b'A', b'N', b'O',
+            b'N', b'Y', b'M', b'O', b'U', b'S',
+        ][..],
+        "the sasl-mechanisms frame"
+    );
+    // The client's init, then our outcome: accepted.
+    let init = composite(0x41, &[Some(V::Sym("ANONYMOUS".into())), None, None]);
+    sock.write_all(&sasl_frame(&init)).await.unwrap();
+    let (_ch, body) = read_frame(&mut sock).await.unwrap().unwrap();
+    assert_eq!(
+        body,
+        vec![0x00, 0x53, 0x44, 0xc0, 0x03, 0x01, 0x50, 0x00][..],
+        "the sasl-outcome frame: code ok"
+    );
+    // The AMQP header, and the answer to an open.
+    sock.write_all(b"AMQP\x00\x01\x00\x00").await.unwrap();
+    let mut got = [0u8; 8];
+    sock.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"AMQP\x00\x01\x00\x00");
+    let open = composite(0x10, &[Some(V::Str("probe".into())), None]);
+    sock.write_all(&frame(0, &open)).await.unwrap();
+    let (ch, body) = read_frame(&mut sock).await.unwrap().unwrap();
+    assert_eq!((ch, body[0]), (0, 0x00));
+    let d = decode(&body).unwrap();
+    assert!(matches!(d, In::Open), "{d:?}");
+    let trace = p.trace();
+    assert!(trace.contains("sasl-init"), "{trace}");
+    assert!(trace.contains("Open"), "{trace}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fake_peer_takes_the_token_and_the_messages() {
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(r#", "dedup": true"#));
+    let out = went_in(&p, outcomes(&c, &msgs(&[msg("A"), msg("B")]), 2).await);
+    assert_eq!(out, vec![Outcome::Ok, Outcome::Ok]);
+
+    let seen = p.seen();
+    assert_eq!(seen.put_tokens.len(), 1, "one token per connection");
+    // The token is a SAS token for this entity, signed with the key the reference holds.
+    let token = &seen.put_tokens[0];
+    assert!(
+        token.starts_with("SharedAccessSignature sr=sb%3A%2F%2F127.0.0.1%2Forders&sig="),
+        "{token}"
+    );
+    assert!(token.ends_with("&skn=send"), "{token}");
+    assert_eq!(
+        seen.cbs_props[0].get("operation").map(String::as_str),
+        Some("put-token")
+    );
+    assert_eq!(
+        seen.cbs_props[0].get("type").map(String::as_str),
+        Some(SAS_TOKEN_TYPE)
+    );
+    assert_eq!(
+        seen.cbs_props[0].get("name").map(String::as_str),
+        Some("sb://127.0.0.1/orders")
+    );
+    // Two messages, two deliveries, two documents — and the dedup id of each is its own.
+    assert_eq!(seen.bodies.len(), 2, "{:?}", seen.bodies);
+    assert!(
+        seen.bodies[0].contains(r#"data={"sku":"A"}"#),
+        "{}",
+        seen.bodies[0]
+    );
+    assert!(
+        seen.bodies[1].contains(r#"data={"sku":"B"}"#),
+        "{}",
+        seen.bodies[1]
+    );
+    let id_of = |b: &str| {
+        b.split("mid=")
+            .nth(1)
+            .and_then(|r| r.split(';').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (a, b) = (id_of(&seen.bodies[0]), id_of(&seen.bodies[1]));
+    assert!(a.len() == 64 && b.len() == 64 && a != b, "{a} / {b}");
+}
+
+#[tokio::test]
+async fn a_target_without_keys_sends_without_cbs() {
+    // The local-broker override: anonymous, so no CBS node is touched at all.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), "{}");
+    let out = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    assert_eq!(out, vec![Outcome::Ok]);
+    let seen = p.seen();
+    assert!(seen.put_tokens.is_empty(), "{:?}", seen.put_tokens);
+    assert_eq!(seen.bodies.len(), 1);
+}
+
+#[tokio::test]
+async fn a_token_the_cbs_node_refuses_refuses_the_send() {
+    // 403 is a verdict on the token itself: refused, and a retry cannot help.
+    let p = Peer::start(Script::happy().cbs(Cbs::Status(403, Some("unauthorized".into())))).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: CBS refused the token (status 403): unauthorized",
+            p.port()
+        )
+    );
+    // The message never went: the peer saw one token and no entity message.
+    assert_eq!(p.seen().put_tokens.len(), 1);
+    assert!(p.seen().bodies.is_empty());
+}
+
+#[tokio::test]
+async fn a_cbs_status_that_says_nothing_is_a_retry_not_a_refusal() {
+    // A 500 from CBS says nothing about the token, so the send is not refused; the client
+    // keeps the connection down and the engine retries.
+    let p = Peer::start(Script::happy().cbs(Cbs::Status(500, Some("internal".into())))).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: CBS did not accept the token (status 500): internal",
+            p.port()
+        )
+    );
+    assert_eq!(p.seen().put_tokens.len(), 1);
+}
+
+#[tokio::test]
+async fn a_cbs_node_that_settles_the_request_as_released_is_a_retry() {
+    // The node saw the request and did not take the token — without a status, which is not a
+    // verdict on the token.
+    let p = Peer::start(Script::happy().cbs(Cbs::Released)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    let why = e.to_string();
+    assert!(
+        why.contains("the CBS node did not accept the token request"),
+        "{why}"
+    );
+    assert!(
+        why.starts_with(&format!("sb://127.0.0.1:{}/orders: ", p.port())),
+        "{why}"
+    );
+}
+
+#[tokio::test]
+async fn a_cbs_node_that_never_answers_times_the_open_out() {
+    // No disposition for the request at all: the budget of the open ends it, so a stuck
+    // broker cannot park a worker.
+    //
+    // Pin (SB-1): the text is the OPEN's, not CBS's. `put_cbs_token` has a "no CBS reply within
+    // the target's time limit" of its own, but both of its call sites wrap it in a `timeout` of
+    // the same duration, so the outer arm always fires first and that text cannot be reached
+    // from a send. When CBS gets its own budget (or a shorter one), this expected text is what
+    // flips.
+    let p = Peer::start(Script::happy().cbs(Cbs::Silent)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "opening the session and sender link of sb://127.0.0.1:{}/orders timed out after \
+             400ms (the broker did not answer begin or attach)",
+            p.port()
+        )
+    );
+    assert_eq!(p.seen().put_tokens.len(), 1);
+}
+
+#[tokio::test]
+async fn the_token_is_put_again_before_it_ages_out() {
+    // The CBS spec drops the links of an expired token, so the client re-puts it well before
+    // its expiry: the second action of a connection whose token is due puts a new one.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    assert_eq!(p.seen().put_tokens.len(), 1);
+
+    age_out_the_token(&c).await;
+    // The token is the same string within one second (it is signed by the second), so a new
+    // expiry needs the clock to move.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    outcomes(&c, &msgs(&[msg("B")]), 1).await.unwrap();
+    let seen = p.seen();
+    assert_eq!(seen.put_tokens.len(), 2, "the token was renewed");
+    let expiry = |t: &str| {
+        t.split('&')
+            .find_map(|p| p.strip_prefix("se="))
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or_default()
+    };
+    assert!(
+        expiry(&seen.put_tokens[1]) > expiry(&seen.put_tokens[0]),
+        "a token with a new expiry: {:?}",
+        seen.put_tokens
+    );
+    assert_eq!(seen.bodies.len(), 2, "over the same connection");
+}
+
+/// Ages the connection's token past the refresh margin, as time would: the next action of this
+/// connection puts a new one. (Only a test that compares two tokens needs the clock to move,
+/// because a token is signed by the second; one that only needs a refresh does not.)
+async fn age_out_the_token(client: &Client) {
+    let mut slot = client.inner.lock().await;
+    let inner = slot.as_mut().expect("the connection is open");
+    inner.token_exp = crate::time::unix_now_ms() / 1000;
+}
+
+#[tokio::test]
+async fn a_cbs_node_that_refuses_the_refreshed_token_refuses_the_send() {
+    // The token the open took was fine; the one the refresh brings is refused. The verdict of a
+    // refresh is a verdict on the whole send — nothing of this action may be called in.
+    let p = Peer::start(Script::happy().cbs_refresh(Cbs::Status(403, Some("unauthorized".into()))))
+        .await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    age_out_the_token(&c).await;
+    let (e, rejected) = refused_whole(&p, outcomes(&c, &msgs(&[msg("B")]), 1).await);
+    assert!(rejected, "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: CBS refused the token (status 403): unauthorized",
+            p.port()
+        )
+    );
+    let seen = p.seen();
+    assert_eq!(seen.put_tokens.len(), 2, "the second put is the refresh");
+    assert_eq!(
+        seen.bodies.len(),
+        1,
+        "the second action's message never went"
+    );
+    assert!(c.inner.lock().await.is_none(), "the connection is dropped");
+}
+
+#[tokio::test]
+async fn a_cbs_node_that_says_nothing_about_the_refreshed_token_is_a_retry() {
+    // A 500 at refresh time is no verdict on the key: the send fails, the engine retries, and
+    // the connection is dropped so the next one starts from the beginning.
+    let p =
+        Peer::start(Script::happy().cbs_refresh(Cbs::Status(500, Some("internal".into())))).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    age_out_the_token(&c).await;
+    let (e, rejected) = refused_whole(&p, outcomes(&c, &msgs(&[msg("B")]), 1).await);
+    assert!(!rejected, "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: CBS did not accept the token (status 500): internal",
+            p.port()
+        )
+    );
+    let seen = p.seen();
+    assert_eq!(seen.put_tokens.len(), 2);
+    assert_eq!(seen.bodies.len(), 1, "the refused refresh sent no message");
+    assert!(c.inner.lock().await.is_none(), "the connection is dropped");
+}
+
+#[tokio::test]
+async fn a_cbs_node_that_stops_answering_times_the_refresh_out() {
+    // The node took the first token and answers nothing after it — the refresh is what a stuck
+    // CBS node costs: the target's budget, and the connection goes with it.
+    //
+    // Pin (SB-1): the text is the REFRESH's own timeout, which is the outer of the two waits on
+    // `put_cbs_token` — the inner "no CBS reply within the target's time limit" of the same
+    // duration can never be the one that speaks (see
+    // `a_cbs_node_that_never_answers_times_the_open_out`).
+    let p = Peer::start(Script::happy().cbs_refresh(Cbs::Silent)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    age_out_the_token(&c).await;
+    let (e, rejected) = refused_whole(&p, outcomes(&c, &msgs(&[msg("B")]), 1).await);
+    assert!(!rejected, "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: the CBS token refresh timed out",
+            p.port()
+        )
+    );
+    let seen = p.seen();
+    assert_eq!(seen.put_tokens.len(), 2, "the refresh was asked for");
+    assert_eq!(seen.bodies.len(), 1, "and no message went over it");
+    assert!(c.inner.lock().await.is_none(), "the connection is dropped");
+}
+
+#[tokio::test]
+async fn an_entity_refused_at_attach_refuses_the_target() {
+    // A missing entity: refused once, for the whole target — the strikes rule, not a retry.
+    let p = Peer::start(Script::happy().refuse_attach("amqp:not-found")).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let (e, _) = refused_whole(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert!(crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "sb://127.0.0.1:{}/orders: the queue or topic does not exist (the target does not \
+             create it)",
+            p.port()
+        )
+    );
+    // The token was taken: the refusal is about the entity, not the credential.
+    assert_eq!(p.seen().put_tokens.len(), 1);
+}
+
+#[tokio::test]
+async fn a_link_refused_for_an_unknown_reason_is_a_retry() {
+    // A busy broker at attach time says nothing about the entity or the key.
+    let p = Peer::start(Script::happy().refuse_attach("com.microsoft:server-busy")).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let (e, rejected) = refused_whole(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert!(!rejected, "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        attach_refused(
+            &format!("sb://127.0.0.1:{}/orders", p.port()),
+            ErrorCondition::Custom(Symbol::from("com.microsoft:server-busy")),
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_this_message_condition_refuses_that_message_alone() {
+    // The outcome rule, message by message: the first is in, the second and third are
+    // refused by their own conditions, each with the peer's condition and description.
+    let p = Peer::start(Script::happy().answers(Answers::seq(vec![
+        Answer::Accept,
+        Answer::Reject(
+            "amqp:link:message-size-exceeded".into(),
+            Some("too big for the entity".into()),
+        ),
+        Answer::reject("amqp:decode-error"),
+    ])))
+    .await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = outcomes(&c, &msgs(&[msg("A"), msg("B"), msg("C")]), 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            Outcome::Ok,
+            Outcome::Refused(
+                "the entity refused the message (amqp:link:message-size-exceeded): \
+                 too big for the entity"
+                    .into()
+            ),
+            // A rejected without a description says so rather than inventing one.
+            Outcome::Refused(
+                "the entity refused the message (amqp:decode-error): no description".into()
+            ),
+        ]
+    );
+    // All three messages really went to the peer: the verdict is per message, not per action.
+    let seen = p.seen();
+    assert_eq!(seen.bodies.len(), 3, "{:?}", seen.bodies);
+}
+
+#[tokio::test]
+async fn a_condition_about_anything_else_waits() {
+    // Server-busy is not about this message: transient, with the condition kept in the text.
+    let p = Peer::start(Script::happy().answers(Answers::one(Answer::Reject(
+        "com.microsoft:server-busy".into(),
+        Some("try later".into()),
+    ))))
+    .await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    assert_eq!(
+        out,
+        vec![Outcome::Transient(
+            "the entity did not take the message (rejected, com.microsoft:server-busy): \
+             try later"
+                .into()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_only_says_the_delivery_is_seen_waits() {
+    // `received` settles nothing: the delivery is known, its fate is not.
+    //
+    // Pin (SB-1): this row is the whole reach of `send_batch`'s per-delivery
+    // `_ => Outcome::Transient("the send failed: {e}")` arm — the client builds only
+    // `NonTerminalDeliveryState`, `IllegalDeliveryState` and `LinkStateError`, and the last of
+    // those is matched above it. The arm beside it, `MessageEncodeError` → Refused "the message
+    // could not be encoded", has no way to happen over a live link: the value is encoded while
+    // the message is BUILT (see `a_pre_refused_message_never_reaches_the_link`), so by the time
+    // `send_batchable` serializes it there is nothing left to fail. Keep that pairing in mind
+    // before either arm is rewritten.
+    let p = Peer::start(Script::happy().answers(Answers::one(Answer::Received))).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    assert_eq!(
+        out,
+        vec![Outcome::Transient(
+            "the send failed: A non-terminal delivery state is received when an outcome is \
+             expected"
+                .into()
+        )]
+    );
+    assert_eq!(p.seen().bodies.len(), 1);
+}
+
+#[tokio::test]
+async fn an_answer_for_another_message_is_no_answer_for_this_one() {
+    // The peer settles a delivery number this link never carried: nobody else's answer may
+    // settle this message, so it is still unknown when the budget runs out.
+    let p = Peer::start(Script::happy().answers(Answers::one(Answer::AcceptOther))).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap();
+    assert_eq!(
+        out,
+        vec![Outcome::Transient(
+            "no disposition within the target's 400ms".into()
+        )]
+    );
+    assert_eq!(p.seen().bodies.len(), 1, "the message did go, unanswered");
+}
+
+#[tokio::test]
+async fn a_message_the_peer_never_answers_waits() {
+    // Silence is not a refusal either: everything about the message is unknown.
+    let p = Peer::start(Script::happy().answers(Answers::one(Answer::Silence))).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = outcomes(&c, &msgs(&[msg("A"), msg("B")]), 2).await.unwrap();
+    assert_eq!(
+        out,
+        vec![
+            Outcome::Transient("no disposition within the target's 400ms".into()),
+            // The link is dropped with the first unknown message, so the second never even
+            // asked: it is unknown in the same way.
+            Outcome::Transient("no disposition within the target's 400ms".into()),
+        ]
+    );
+    // The connection is gone: the next action reconnects.
+    assert!(c.inner.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn a_link_closed_naming_the_entity_leaves_the_message_unknown() {
+    // The peer closes the sender link naming the missing entity, but only after the link stood
+    // (a broker that reclaims an idle link). Nothing is known about the message then: transient,
+    // and the connection goes.
+    //
+    // Note what this proves about `send_batch`' lost-link rule. Pin (SB-1): the client reports a
+    // link the peer closed as `SendError::LinkStateError`, never as `SendError::Detached` (which
+    // it never builds), so `detach_condition` — which reads only the latter — always finds no
+    // condition: `Lost::Link.condition` is always None and the whole-target refusal it guards
+    // (an entity condition on a lost link) cannot fire at all. The peer's condition survives only
+    // inside the client's own text (`lost_link_reports`). A missing entity refused AT ATTACH,
+    // which is where that rule does fire, is `an_entity_refused_at_attach_refuses_the_target`.
+    // If the product learns to read the condition off a lost link, THIS expected text becomes a
+    // refusal and flips.
+    let p = Peer::start(Script::happy().detach_on_attach(Some("amqp:not-found"), true)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = went_in(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert_eq!(
+        out,
+        vec![Outcome::Transient(lost_link_reports(link_closed(Some(
+            ErrorCondition::AmqpError(AmqpError::NotFound),
+        ))))]
+    );
+    assert!(
+        p.trace().contains("amqp:not-found"),
+        "the peer named the condition: {}",
+        p.trace()
+    );
+    assert!(c.inner.lock().await.is_none(), "the connection is dropped");
+}
+
+#[tokio::test]
+async fn answered_messages_keep_their_answer_when_the_link_is_lost() {
+    // The peer takes the first message and then drops the link. The message it answered is
+    // known to be in and keeps that verdict; the rest of the batch has no answer, and an
+    // unknown message is never a refusal.
+    //
+    // Pin (SB-1): the two unanswered messages end on the BUDGET, not on the link. The peer's
+    // detach does not wake a `send_batchable` future that is already pending, so the loop never
+    // learns the link went away and `Lost::Link` is not what closes this batch. Watching the
+    // link while the dispositions are awaited would turn these two rows into
+    // `the link was lost: ...` — which is what the engine would rather be told.
+    let p =
+        Peer::start(Script::happy().detach_after(1, Some("amqp:unauthorized-access"), true)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = went_in(
+        &p,
+        outcomes(&c, &msgs(&[msg("A"), msg("B"), msg("C")]), 3).await,
+    );
+    assert_eq!(out[0], Outcome::Ok, "the peer answered this one");
+    let unknown = || {
+        Outcome::Transient(format!(
+            "no disposition within the target's {:?}",
+            Duration::from_millis(400)
+        ))
+    };
+    assert_eq!(out[1], unknown(), "{:?}", out[1]);
+    assert_eq!(out[2], unknown(), "{:?}", out[2]);
+    assert_eq!(
+        p.seen().bodies.len(),
+        3,
+        "all three were handed to the link"
+    );
+    assert!(c.inner.lock().await.is_none(), "the connection is dropped");
+}
+
+#[tokio::test]
+async fn a_link_lost_for_another_reason_waits() {
+    // The link is gone and the reason is not about the entity: everything unanswered is
+    // transient, with the peer's condition in the text.
+    let p =
+        Peer::start(Script::happy().detach_on_attach(Some("amqp:resource-limit-exceeded"), true))
+            .await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = went_in(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert_eq!(
+        out,
+        vec![Outcome::Transient(lost_link_reports(link_closed(Some(
+            ErrorCondition::AmqpError(AmqpError::ResourceLimitExceeded),
+        ))))]
+    );
+    assert!(
+        p.trace().contains("amqp:resource-limit-exceeded"),
+        "the peer named the condition: {}",
+        p.trace()
+    );
+}
+
+#[tokio::test]
+async fn a_link_detached_without_a_reason_waits() {
+    // A detach that names nothing says even less.
+    let p = Peer::start(Script::happy().detach_on_attach(None, true)).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = went_in(&p, outcomes(&c, &msgs(&[msg("A")]), 1).await);
+    assert_eq!(
+        out,
+        vec![Outcome::Transient(lost_link_reports(link_closed(None)))]
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_never_talks_back_times_the_open_out() {
+    // No answer to the header at all: the budget of the connect ends it, and a broker that
+    // is stuck is not a reason to refuse anything.
+    let p = Peer::start(Script::silent()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "connecting to sb://127.0.0.1:{}/orders timed out after 400ms",
+            p.port()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_sasl_refusal_refuses_the_target() {
+    // A handshake the namespace will not take is a credential problem the retry cannot fix.
+    let p = Peer::start(Script::refuse_sasl()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{e:#}");
+    let why = e.to_string();
+    assert!(
+        why.starts_with(&format!("sb://127.0.0.1:{}/orders: ", p.port())),
+        "{why}"
+    );
+    assert!(why.to_ascii_lowercase().contains("sasl"), "{why}");
+}
+
+#[tokio::test]
+async fn a_pre_refused_message_never_reaches_the_link() {
+    // An over-size document is refused on its own, without a transfer — and does not disturb
+    // the message that is fine.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let big = format!("\"{}\"", "x".repeat(MAX_MESSAGE_BYTES + 1));
+    let body = format!(r#"{{"messages": [{{"value": {big}}}, {}]}}"#, msg("B"));
+    let out = outcomes(&c, &body, 2).await.unwrap();
+    let Outcome::Refused(why) = &out[0] else {
+        panic!("the over-size message: {out:?}");
+    };
+    assert!(why.contains("maximum"), "{why}");
+    assert_eq!(out[1], Outcome::Ok);
+    let seen = p.seen();
+    assert_eq!(seen.bodies.len(), 1, "only the second message was sent");
+    assert!(
+        seen.bodies[0].contains(r#"data={"sku":"B"}"#),
+        "{}",
+        seen.bodies[0]
+    );
+}
+
+#[tokio::test]
+async fn a_session_entity_refuses_the_message_without_its_group() {
+    // The session-less message is refused alone, the one with its group id goes: the rule's
+    // `session` contract is enforced per message.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(r#", "session": true"#));
+    let body =
+        r#"{"messages": [{"value": {"sku": "A"}, "session": "g1"}, {"value": {"sku": "B"}}]}"#;
+    let out = outcomes_in_session(&c, body, 2).await.unwrap();
+    assert_eq!(out[0], Outcome::Ok, "the message with its group id went");
+    let Outcome::Refused(why) = &out[1] else {
+        panic!("the message without a session: {out:?}");
+    };
+    assert!(why.contains("session"), "{why}");
+    let seen = p.seen();
+    assert_eq!(seen.bodies.len(), 1);
+    assert!(seen.bodies[0].contains("sid=g1"), "{}", seen.bodies[0]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The load-time refusals of the same kind, by their exact words: an address that is not a queue
+// or topic, credentials in a form the kind cannot take, a var of the wrong type. They are
+// decided before any connection, so a peer is not needed — and the text is the whole point, it
+// is what an operator with a broken rule reads.
+
+#[test]
+fn an_address_that_is_not_a_queue_or_topic_is_refused() {
+    let cases = [
+        (
+            // Pin (SB-1): the namespace's own subscription bail (`send to the topic, not to a
+            // subscription`, `servicebus.rs:264-265`) cannot be reached — a path holding
+            // `/subscriptions/` holds a `/`, and the character set just above refuses it first.
+            // This is the text an operator actually reads; the local form below, where `/` is
+            // allowed, is the one that does name a subscription.
+            "sb://contoso.servicebus.windows.net/orders/subscriptions/s1",
+            "endpoint `sb://contoso.servicebus.windows.net/orders/subscriptions/s1`: an entity \
+             path holds letters, digits, `-`, `.` and `_` (a subscription is not sent to: send \
+             to the topic)",
+        ),
+        (
+            "sb://127.0.0.1:34610/",
+            "endpoint `sb://127.0.0.1:34610/`: no queue or topic in the path",
+        ),
+        (
+            "sb://127.0.0.1:34610/orders~eu",
+            "endpoint `sb://127.0.0.1:34610/orders~eu`: a local broker's address holds letters, \
+             digits, `-`, `.`, `_`, `/` and `%`",
+        ),
+        (
+            // Pin (SB-1): as above — `$` is not in the address's character set either, so the
+            // "does not start with `$`" bail below it (`servicebus.rs:286-287`) cannot be the
+            // one that fires; the charset refuses the system node first.
+            "sb://127.0.0.1:34610/$cbs",
+            "endpoint `sb://127.0.0.1:34610/$cbs`: a local broker's address holds letters, \
+             digits, `-`, `.`, `_`, `/` and `%`",
+        ),
+        (
+            "sb://127.0.0.1:34610/orders/subscriptions/s1",
+            "endpoint `sb://127.0.0.1:34610/orders/subscriptions/s1`: send to the topic, not to a \
+             subscription",
+        ),
+    ];
+    for (endpoint, why) in cases {
+        let e = Addr::parse(endpoint).unwrap_err();
+        assert_eq!(e.to_string(), why);
+    }
+    // The 260-character limit of a local address, counted in bytes as the namespace's is.
+    // The limit counts the address as the broker is given it, the leading `/` included: 260
+    // characters stand, 261 do not.
+    let ok = "x".repeat(259);
+    assert_eq!(
+        Addr::parse(&format!("sb://127.0.0.1:34610/{ok}"))
+            .unwrap()
+            .entity,
+        format!("/{ok}")
+    );
+    let long = "x".repeat(260);
+    let e = Addr::parse(&format!("sb://127.0.0.1:34610/{long}")).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!("endpoint `sb://127.0.0.1:34610/{long}`: the address is 1 to 260 characters")
+    );
+}
+
+#[test]
+fn credentials_in_a_form_the_kind_cannot_take_are_refused_with_the_rule() {
+    let cases = [
+        (
+            r#"{"key": "env:SB_KEY"}"#,
+            "`vars.key` needs `vars.key_name` (the authorization rule name)",
+        ),
+        (
+            r#"{"key_name": "send"}"#,
+            "`vars.key_name` needs `vars.key` (the key)",
+        ),
+        (
+            r#"{"username": "u", "password": "pw"}"#,
+            "`vars.password` must be a reference (`env:NAME` or `file:/path`), never a literal",
+        ),
+    ];
+    for (json, why) in cases {
+        let e = auth_of(&vars(json), true).unwrap_err();
+        assert_eq!(e.to_string(), why);
+    }
+}
+
+#[test]
+fn a_var_of_the_wrong_type_is_refused_at_load() {
+    // `session` and `dedup` are booleans or absent; anything else is a typo that must not
+    // silently mean `false`.
+    for (extra, why) in [
+        (
+            r#""session": "yes""#,
+            r#"`vars.session` is "yes" (a boolean)"#,
+        ),
+        (r#""dedup": 1"#, "`vars.dedup` is 1 (a boolean)"),
+    ] {
+        let json = format!(r#"{{"key_name":"send","key":"env:K",{extra}}}"#);
+        let def = fake_def(&json);
+        let e = Client::new(&def, "sb://127.0.0.1:34610/orders")
+            .err()
+            .unwrap_or_else(|| panic!("`{extra}` is not a boolean: the load accepted it"));
+        assert_eq!(e.to_string(), why);
+    }
+}
+
 #[test]
 fn rule_batches_are_bounded_by_the_entity() {
     let def = |fire_per: FirePer, bytes: Option<usize>| {
@@ -542,4 +1484,173 @@ fn rule_batches_are_bounded_by_the_entity() {
     assert!(rule_errors(&d, MAX_MESSAGE_BYTES).is_empty());
     let d = def(FirePer::Key, Some(MAX_MESSAGE_BYTES + 1));
     assert!(rule_errors(&d, MAX_MESSAGE_BYTES).is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The target-facing door: `items_of` is what the engine calls with the rendered request, so this
+// is where a request that is not a send, a body the parser refuses, and an empty action are
+// decided — before a byte reaches the wire. (`send` and `send_items` above it need the database
+// to write the expectation row: those are the e2e's `servicebus_*` tests, not a unit's.)
+
+/// The rendered request of a servicebus send, as a template's `action` renders it.
+fn rendered(body: &str) -> String {
+    format!("POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{body}")
+}
+
+#[tokio::test]
+async fn a_request_that_is_not_a_send_is_refused() {
+    // The kind sends and nothing else: a method or a path other than `POST /` is refused whole,
+    // and the peer never hears from us.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let keys = vec!["k0".to_string()];
+    for (request, why) in [
+        (
+            "GET / HTTP/1.1\r\n\r\n",
+            "servicebus targets only send: GET / is not POST /",
+        ),
+        (
+            "DELETE /orders HTTP/1.1\r\n\r\n",
+            "servicebus targets only send: DELETE /orders is not POST /",
+        ),
+    ] {
+        let e = c.items_of(request, &keys).await.unwrap_err();
+        assert!(crate::target::is_rejected(&e), "{e:#}");
+        assert_eq!(e.to_string(), why);
+    }
+    assert!(p.seen().bodies.is_empty());
+    assert!(p.seen().put_tokens.is_empty(), "not even the token");
+}
+
+#[tokio::test]
+async fn a_request_that_cannot_be_parsed_is_refused_with_the_parser_wording() {
+    // A request line the HTTP parser itself rejects keeps its wording, prefixed.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let e = c.items_of("nonsense", &[]).await.unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        e.to_string(),
+        "the rendered request: request line `nonsense` has no path"
+    );
+    assert!(p.seen().bodies.is_empty());
+}
+
+#[tokio::test]
+async fn a_body_the_message_parser_refuses_is_refused_as_the_send_body() {
+    // The body is the contract: an unknown field of a message is refused whole, with the
+    // parser's own words, and nothing goes to the entity.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let cases = [
+        (
+            r#"{"messages": [{"nope": 1}]}"#,
+            "the send body: message 0 has no `value`",
+        ),
+        (
+            r#"{"messages": [{"value": {"sku": "A"}, "nope": 1}]}"#,
+            "the send body: message 0 has the unknown field `nope` (a message carries `value`, \
+             `session` and `properties`)",
+        ),
+        (
+            r#"{"messages": "not a list"}"#,
+            "the send body: the send body is `{\"messages\": […]}`",
+        ),
+    ];
+    for (body, why) in cases {
+        let e = c
+            .items_of(&rendered(body), &["k0".into()])
+            .await
+            .unwrap_err();
+        assert!(crate::target::is_rejected(&e), "{e:#}");
+        assert_eq!(e.to_string(), why);
+    }
+    // Body bytes that are not JSON at all keep serde's words after the kind's; only the kind's
+    // half is pinned here, the parser's phrasing belongs to its own crate.
+    let e = c
+        .items_of(&rendered("not JSON at all"), &["k0".into()])
+        .await
+        .unwrap_err();
+    assert!(crate::target::is_rejected(&e), "{e:#}");
+    assert!(
+        e.to_string()
+            .starts_with("the send body: the send body is not JSON"),
+        "{e:#}"
+    );
+    assert!(p.seen().bodies.is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_action_sends_nothing_and_says_so() {
+    // `Ok(None)` is "nothing rendered": the engine skips the step, it is not a failure and not
+    // a send — no connection, no token, no message.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    assert!(c.items_of("", &["k0".into()]).await.unwrap().is_none());
+    assert!(c
+        .items_of(&rendered(r#"{"messages": []}"#), &[])
+        .await
+        .unwrap()
+        .is_none());
+    let seen = p.seen();
+    assert!(seen.bodies.is_empty() && seen.put_tokens.is_empty());
+}
+
+#[tokio::test]
+async fn a_rendered_send_answers_for_every_key() {
+    // The door the engine actually walks through: the rendered request, one outcome per key, in
+    // the order of the keys.
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(p.port(), &fake_vars(""));
+    let out = c
+        .items_of(
+            &rendered(&msgs(&[msg("A"), msg("B")])),
+            &["k0".into(), "k1".into()],
+        )
+        .await
+        .unwrap()
+        .expect("a rendered action");
+    assert_eq!(out, vec![Outcome::Ok, Outcome::Ok]);
+    assert_eq!(p.seen().bodies.len(), 2);
+}
+
+#[tokio::test]
+async fn a_port_with_no_broker_behind_it_fails_the_connect() {
+    // A namespace that is simply not there: not a refusal (the address may come back), and the
+    // client's own connect error travels in the text.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+    let port = listener.local_addr().expect("a local address").port();
+    drop(listener); // nothing is listening here now
+    let c = fake_client(port, &fake_vars(""));
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert!(
+        e.to_string().starts_with(&format!(
+            "connecting to sb://127.0.0.1:{port}/orders failed: "
+        )),
+        "{e:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_key_that_cannot_be_resolved_fails_before_the_wire() {
+    // The key is read at the open, not at load, and the name of the target whose credential is
+    // missing is in the text; a secret that is absent is nobody's fault but is not a refusal.
+    std::env::remove_var("LWF_SB_ABSENT_KEY");
+    let p = Peer::start(Script::happy()).await;
+    let c = fake_client(
+        p.port(),
+        r#"{"key_name":"send","key":"env:LWF_SB_ABSENT_KEY"}"#,
+    );
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    assert!(!crate::target::is_rejected(&e), "{e:#}");
+    assert_eq!(
+        format!("{e:#}"),
+        format!(
+            "vars.key for sb://127.0.0.1:{}/orders: environment variable `LWF_SB_ABSENT_KEY` is \
+             not set",
+            p.port()
+        )
+    );
+    assert!(p.seen().bodies.is_empty(), "no connection was opened");
 }
