@@ -123,6 +123,7 @@ async fn engine_with_flush_ready(
         pending_clear: false,
         reset_request_seen: false,
         counters: Counters::default(),
+        applied_ts: 0,
         strikes: HashMap::new(),
         written: None,
         dirty: false,
@@ -206,6 +207,13 @@ async fn engine_with_flush_ready(
         binlog_filtered: BTreeSet::new(),
         stream_error: None,
         undecodable: UndecodableWatch::default(),
+        // Same seed as `Engine::run`: a rule measured before the first connect ages from the
+        // seed, not from the epoch (see the clock tests).
+        clock: SourceClock {
+            head_ts: crate::time::unix_now(),
+            ..SourceClock::default()
+        },
+        last_clock: Instant::now(),
     };
     Some((e, rx))
 }

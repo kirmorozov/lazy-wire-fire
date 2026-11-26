@@ -110,6 +110,10 @@ impl FlushOutcome {
 pub struct RuleHandle {
     /// `lazywf_pending_keys{rule}`: the dedup buffer's pending count, pushed at status time.
     pending_keys: AtomicU64,
+    /// `lazywf_source_lag_seconds{rule}`: the rule's distance from the source on the **source's**
+    /// clock, pushed at status time next to `pending_keys` (0 when a heartbeat has proven the
+    /// stream at its head and the rule has applied everything). See `SourceClock` in the engine.
+    source_lag: AtomicU64,
     /// `lazywf_flush_duration_seconds{rule}`: per-bucket counts (the bucket whose `le` first
     /// covers the observation), summed cumulatively only at render.
     buckets: Vec<AtomicU64>,
@@ -121,6 +125,7 @@ impl RuleHandle {
     fn new() -> Self {
         RuleHandle {
             pending_keys: AtomicU64::new(0),
+            source_lag: AtomicU64::new(0),
             buckets: (0..BUCKETS.len()).map(|_| AtomicU64::new(0)).collect(),
             sum_bits: AtomicU64::new(0),
             count: AtomicU64::new(0),
@@ -130,6 +135,12 @@ impl RuleHandle {
     /// Publishes the rule's pending key count (read from the dedup buffer at status time).
     pub fn set_pending(&self, n: u64) {
         self.pending_keys.store(n, Ordering::Relaxed);
+    }
+
+    /// Publishes the rule's source lag in seconds (the engine's `SourceClock` reading, pushed at
+    /// status time next to the pending count).
+    pub fn set_source_lag(&self, secs: u64) {
+        self.source_lag.store(secs, Ordering::Relaxed);
     }
 
     /// Records one flush's wall time. Atomic only: one bucket bump, a sum CAS and a count bump.
@@ -304,6 +315,7 @@ impl Metrics {
         );
         undecodable(&mut out, self.undecodable.load(Ordering::Relaxed));
         pending_keys(&mut out, &r.rules);
+        source_lag(&mut out, &r.rules);
         flush_total(&mut out, &r.pairs);
         dropped_keys(&mut out, &r.pairs);
         flush_duration(&mut out, &r.rules);
@@ -394,6 +406,20 @@ fn pending_keys(out: &mut String, rules: &BTreeMap<String, Arc<RuleHandle>>) {
         label_str(out, "rule", name);
         out.push_str("} ");
         out.push_str(&h.pending_keys.load(Ordering::Relaxed).to_string());
+        out.push('\n');
+    }
+}
+
+fn source_lag(out: &mut String, rules: &BTreeMap<String, Arc<RuleHandle>>) {
+    out.push_str(
+        "# HELP lazywf_source_lag_seconds How far behind the source a rule is, on the source's own clock: 0 only when a heartbeat proved the stream at its head and the rule applied everything read. Not lazywf_binlog_lag_seconds, which is the reader's own distance.\n",
+    );
+    out.push_str("# TYPE lazywf_source_lag_seconds gauge\n");
+    for (name, h) in rules {
+        out.push_str("lazywf_source_lag_seconds{");
+        label_str(out, "rule", name);
+        out.push_str("} ");
+        out.push_str(&h.source_lag.load(Ordering::Relaxed).to_string());
         out.push('\n');
     }
 }
@@ -622,8 +648,10 @@ mod tests {
             p.flush(FlushOutcome::Refused);
         }
         p.dropped(1);
-        // 5 pending keys; three flushes timed at 0.5 s, 1 s and 2 s (exact in f64).
+        // 5 pending keys; the rule reads 7 s behind the source (a fixed reading of the clock);
+        // three flushes timed at 0.5 s, 1 s and 2 s (exact in f64).
         r.set_pending(5);
+        r.set_source_lag(7);
         r.observe_flush(Duration::from_millis(500)); // <= 0.5 s bucket
         r.observe_flush(Duration::from_secs(1)); // <= 1 s bucket
         r.observe_flush(Duration::from_secs(2)); // <= 5 s bucket
@@ -653,6 +681,9 @@ mod tests {
             "# HELP lazywf_pending_keys Keys pending in a rule's dedup buffer, not yet delivered.",
             "# TYPE lazywf_pending_keys gauge",
             "lazywf_pending_keys{rule=\"orders\"} 5",
+            "# HELP lazywf_source_lag_seconds How far behind the source a rule is, on the source's own clock: 0 only when a heartbeat proved the stream at its head and the rule applied everything read. Not lazywf_binlog_lag_seconds, which is the reader's own distance.",
+            "# TYPE lazywf_source_lag_seconds gauge",
+            "lazywf_source_lag_seconds{rule=\"orders\"} 7",
             "# HELP lazywf_flush_total Flushes by outcome: success (expect met), retry (transient, kept pending), refused (permanent refusal).",
             "# TYPE lazywf_flush_total counter",
             "lazywf_flush_total{rule=\"orders\",target=\"search\",outcome=\"success\"} 12",
