@@ -1522,10 +1522,19 @@ only when its own message says the requested position cannot be served: a purged
 binlog file, a position outside the file, or GTIDs the position needs are gone. Any other 1236
 keeps the position: the dump is retried with the capped backoff, the server's message is logged
 as a WARN and shown as `stream_error` on `/status` until the stream delivers events again
-([Status](#status)). An interrupted reset continues at its saved step after a restart when the
-rule kept its binlog position (see below), and a reset interrupted by disabling the rule is not
-dropped: it is taken up when the rule is enabled again, and its steps run from the first one —
-only a fresh process takes a run up at a later one.
+([Status](#status)). An event this build cannot decode is kept the same way — the position stays,
+nothing is skipped, and every round reads it again on the same capped ladder (500 ms doubling to
+5 s) rather than the 200 ms a stream that is moving earns, since every connect ends on the same
+refusal. It is not a source fault and it starts no reset: the reader waits for a build, not for the
+server. One WARN line names the stuck position, said again when the reader moves to a new stuck
+position or after the stream has delivered events again. What the reader cannot decode in the rows
+of a watched table is fatal: the process exits at once on one ERROR line naming the kind, the
+position and the decoder's own words (the table too, when the bytes name one), and every restart
+comes back to the same bytes — the instance stays down until a build that decodes them ships. An
+interrupted reset continues at its saved step after a restart when the rule kept its binlog
+position (see below), and a reset interrupted by disabling the rule is not dropped: it is taken up
+when the rule is enabled again, and its steps run from the first one — only a fresh process takes
+a run up at a later one.
 
 The requested reset is not the only run a restart continues. When the process dies in the steps of
 a `reset_requested` run and the flag still stands at boot, the new process takes that walk up at
@@ -1535,16 +1544,21 @@ in runs again from its own beginning, at-least-once like every step (the keys st
 in memory and died with the process). What vouches for the two runs being the same reset is the
 `fp<8 hex>` token a `running:` line carries beside the step counter: a short digest of the rule's
 fingerprint, the string its whole definition folds into (its steps and their listing SQL, the
-templates, the selects, the batch sizes, the target). So editing the rule while the process was
-down — any part of what that string holds — starts the walk over from step 1, and so do a line
-an older version wrote without the token, a line whose token digests a different definition, and
-a run that never reached a step (`pending:`). A run that started on its own — continuity lost, a
-new rule, triggers working again after an error, any reason but the request's own — is continued
-at its saved step too, on a boot where the rule kept its binlog position: the steps before the
-interrupted one had every batch answered, so the target confirmed their keys, and the rule's saved
-position never runs ahead of what the target has not yet seen, so the boot's own replay covers
-everything after it. A rule that starts the boot without a usable position re-syncs from step 1, as
-it does for any lost position, and a rule enabled again still runs its steps from the first one.
+templates, the selects, the batch sizes, the target: its name, kind, endpoints without their
+userinfo, TLS, timeout and `expect`, and its `vars` by name, not by value). So editing the rule
+while the process was down — any part of what that string holds — starts the walk over from step
+1, and so do a line an older version wrote without the token, a line whose token digests a
+different definition, and a run that never reached a step (`pending:`). A target var's value is
+not among those parts (a var can hold a credential, and rotating one must not re-walk the table),
+so changing one neither restarts a running reset nor stops a restart from resuming one: when the
+new value changes what is sent, raise `reset_requested`. A run that started on its own —
+continuity lost, a new rule, triggers working again after an error, any reason but the request's
+own — is continued at its saved step too, on a boot where the rule kept its binlog position: the
+steps before the interrupted one had every batch answered, so the target confirmed their keys, and
+the rule's saved position never runs ahead of what the target has not yet seen, so the boot's own
+replay covers everything after it. A rule that starts the boot without a usable position re-syncs
+from step 1, as it does for any lost position, and a rule enabled again still runs its steps from
+the first one.
 The new process logs `reset steps resume at step N` for both resumes.
 
 A `reset_requested` raised under a reset that is already running is not folded into it: a run
@@ -1609,7 +1623,7 @@ operator who raised the flag during a run raises it again once the rule's `reset
 |---|---|
 | `binlog_file`, `binlog_pos` | every action for changes before this point met `expect`. `*`: where the stream resumes. The position is a transaction boundary: the end of the last event that closed a transaction (`Xid`, `XA PREPARE`, `COMMIT` / `ROLLBACK`, a statement on its own), never the position of a statement inside one — the events that open a group differ per server, the ones that close it do not, so the boundary is the same rule whether GTIDs are on or off |
 | `lag_ms` | age of the oldest change not yet confirmed (or how far the stream is behind) |
-| `reset_state` | `none`, `pending: <reason>`, `running: step i/n fp<digest> <step>: …`, `done: <time>`, `missing: <reason>` (continuity lost, the rule has no reset steps). The `fp…` token beside the step counter digests the rule's definition: only a line whose token matches the rule as it is loaded now lets a restart take a requested reset up at that step — [Reset steps](#reset-steps) |
+| `reset_state` | `none`, `pending: <reason>`, `running: step i/n fp<digest> <step>: …`, `done: <time>`, `missing: <reason>` (continuity lost, the rule has no reset steps). The `fp…` token beside the step counter digests the rule's definition and its target: only a line whose token matches the rule as it is loaded now lets a restart take a requested reset up at that step — [Reset steps](#reset-steps) |
 | `last_error`, `last_error_at` | the last failure |
 | `server_identity` | `*` only: the server the positions belong to |
 | `updated_at` | written when the position moves, and at least every 30 s |
@@ -1626,7 +1640,8 @@ matches (constant-time compare, 401 with `WWW-Authenticate: Bearer` otherwise), 
 | `select_ms` | the time of the rule's selects in its last flush |
 | `events` | the row changes that matched one of the rule's triggers since start (a row matching two triggers counts twice) |
 | `actions_ok`, `actions_failed` | the actions sent since start: one action may carry a batch of keys, so they are not key counts |
-| `stream_error` | instance only, not per rule: a binlog dump 1236 whose message says nothing about the requested position: the server's message with the position it failed at, shown while the dump is retried with that position kept, until the stream delivers events again; [Reset steps](#reset-steps) |
+| `stream_error` | instance only, not per rule: the error the stream is currently kept through — a binlog dump 1236 whose message says nothing about the requested position (the server's message with the position it failed at), or a binlog event this build cannot decode (the decoder's own words with the position it sits at) — shown while the dump is retried with that position kept, until the stream delivers events again; [Reset steps](#reset-steps) |
+| `undecodable` | instance only, not per rule: the binlog events this build could not decode since the start, counted at both sites — the refused event a round backs off from (a reader that comes back to the same bytes counts it again each round), and the refused rows of a watched table, which exit the process. Non-zero with the stream's `position` not moving and a non-null `stream_error` is a reader stuck on bytes this build cannot read: it waits for a new build, not for the source; the number standing back at 0 after every restart, next to that ERROR line, is the crash loop itself; [Reset steps](#reset-steps) |
 | `binlog_filtered_schemas` | instance only, not per rule: the checked schemas the server's binlog filters drop (sorted); [Binlog filters](server-setup.md#binlog-filters) |
 
 The counters are in memory only: they start at 0 at each start and are not written to
@@ -1644,6 +1659,7 @@ plain atomics.
 |---|---|---|
 | `lazywf_build_info` | gauge (always 1) | `version` |
 | `lazywf_binlog_lag_seconds` | gauge | — (the status table's stream lag, seconds) |
+| `lazywf_binlog_undecodable_total` | counter | — (binlog events this build could not decode: the reader keeps coming back to the position one of them sits at until a build that decodes it ships. The same source as the `/status` `undecodable` field; the position and the decoder's words stay in the log line) |
 | `lazywf_pending_keys` | gauge | `rule` |
 | `lazywf_flush_total` | counter | `rule`, `target`, `outcome` (`success`: expect met, `retry`: transient, kept pending, `refused`: permanent refusal) |
 | `lazywf_dropped_keys_total` | counter | `rule`, `target` (keys dropped after the fifth refusal) |
