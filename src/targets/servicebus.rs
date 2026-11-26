@@ -74,8 +74,9 @@
 //! - Released, Modified, a server-busy or throttling condition, a timeout without a
 //!   disposition, a lost link, an unknown condition and a missing ack: transient. The message
 //!   is not known to have reached the entity; only a retry can say.
-//! - A missing entity or an authorization failure (the attach refused with `amqp:not-found`
-//!   or `amqp:unauthorized-access`) is a whole-target refusal found once per attempt, not a
+//! - A missing entity, a claim without the right to send, or a disabled entity (the peer
+//!   names `amqp:not-found`, `amqp:unauthorized-access` or `com.microsoft:entity-disabled`,
+//!   at the attach or on a lost link) is a whole-target refusal found once per attempt, not a
 //!   per-message strike: the target does not create entities. So are a CBS reply that refuses
 //!   the token (status 400, 401, 403 or 404) and a SASL PLAIN failure.
 //!
@@ -101,7 +102,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use fe2o3_amqp::connection::ConnectionHandle;
-use fe2o3_amqp::link::{DetachError, Receiver, SendError, Sender, SenderAttachError};
+use fe2o3_amqp::link::{
+    DetachError, LinkStateError, Receiver, SendError, Sender, SenderAttachError,
+};
 use fe2o3_amqp::sasl_profile::SaslProfile;
 use fe2o3_amqp::session::SessionHandle;
 use fe2o3_amqp::types::definitions::{Error as PeerError, ErrorCondition};
@@ -154,9 +157,19 @@ const MESSAGE_CONDITIONS: &[&str] = &[
     "amqp:invalid-field",
 ];
 
-/// The attach conditions that refuse the whole target: the entity does not exist, or the
-/// token carries no right to send (a sender link needs the Send right — the protocol guide's
-/// rights table).
+/// The conditions that refuse the whole target, at the attach or on a lost link: the entity
+/// does not exist, the token carries no right to send (a sender link needs the Send right —
+/// the protocol guide's rights table), or the entity is switched off.
+///
+/// The three are the refusals of an operation on an entity that say the request is
+/// structurally fine and the entity itself is not, which is what the Microsoft page on
+/// messaging exceptions names for each: `amqp:not-found` for an entity that is not there,
+/// `amqp:unauthorized-access` for a claim that carries no right, and
+/// `com.microsoft:entity-disabled` for a "runtime operation on a disabled entity"
+/// (<https://learn.microsoft.com/en-us/azure/event-hubs/event-hubs-messaging-exceptions>).
+/// The Azure SDKs draw the same line: the Go SDK maps `entity is disabled in the portal` to
+/// a fatal (non-retryable) error kind, and the Python SDK lists `EntityDisabledError` among
+/// its no-retry conditions — a retry cannot help a disabled entity.
 const ENTITY_CONDITIONS: &[(&str, &str)] = &[
     (
         "amqp:not-found",
@@ -165,6 +178,10 @@ const ENTITY_CONDITIONS: &[(&str, &str)] = &[
     (
         "amqp:unauthorized-access",
         "the token cannot send to the entity (check vars.key_name, vars.key and the rule's Send right)",
+    ),
+    (
+        "com.microsoft:entity-disabled",
+        "the queue or topic is disabled (enable the entity or point the target at a live one)",
     ),
 ];
 
@@ -255,14 +272,17 @@ fn entity_path(shown: &str, path: &str, namespace: bool) -> Result<String> {
     if p.starts_with('$') {
         bail!("endpoint `{shown}`: an entity path does not start with `$`");
     }
+    // Named before the character set: a `/subscriptions/` segment holds a `/`, which the set
+    // below does not allow, so the set would speak for the subscription with a complaint
+    // about characters — the operator would read the wrong rule.
+    if p.to_ascii_lowercase().contains("/subscriptions/") {
+        bail!("endpoint `{shown}`: send to the topic, not to a subscription");
+    }
     if !p
         .bytes()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_'))
     {
-        bail!("endpoint `{shown}`: an entity path holds letters, digits, `-`, `.` and `_` (a subscription is not sent to: send to the topic)");
-    }
-    if p.to_ascii_lowercase().contains("/subscriptions/") {
-        bail!("endpoint `{shown}`: send to the topic, not to a subscription");
+        bail!("endpoint `{shown}`: an entity path holds letters, digits, `-`, `.` and `_`");
     }
     Ok(p.to_string())
 }
@@ -277,17 +297,20 @@ fn local_address(shown: &str, path: &str) -> Result<String> {
     if path.is_empty() {
         bail!("endpoint `{shown}`: no queue or topic in the path");
     }
-    if !path
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'/' | b'%'))
-    {
-        bail!("endpoint `{shown}`: a local broker's address holds letters, digits, `-`, `.`, `_`, `/` and `%`");
-    }
+    // The Service Bus refusals are asked before the character set, which does not allow `$`
+    // either: a system node is refused as the system node it is, and a subscription as a
+    // subscription — not as a character complaint (as `entity_path` does for the namespace).
     if path.starts_with('$') || path.starts_with("/$") {
         bail!("endpoint `{shown}`: an address does not start with `$`");
     }
     if path.to_ascii_lowercase().contains("/subscriptions/") {
         bail!("endpoint `{shown}`: send to the topic, not to a subscription");
+    }
+    if !path
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'/' | b'%'))
+    {
+        bail!("endpoint `{shown}`: a local broker's address holds letters, digits, `-`, `.`, `_`, `/` and `%`");
     }
     let p = if path.starts_with('/') {
         path.to_string()
@@ -693,12 +716,26 @@ fn attach_condition(err: &SenderAttachError) -> Option<String> {
     }
 }
 
-/// The condition a link loss carries, if the peer named one.
+/// The condition a link loss carries, if the peer named one: the error of the detach the
+/// client was watching for (the `on_detach` of `send_batch`' disposition wait).
 fn detach_condition(err: &DetachError) -> Option<String> {
     match err {
         DetachError::RemoteDetachedWithError(e) | DetachError::RemoteClosedWithError(e) => {
             Some(peer_condition(e))
         }
+        _ => None,
+    }
+}
+
+/// The condition a lost sender link carries on the client's own error. fe2o3 0.14.1 reports a
+/// peer's detach or close of an attached link as `SendError::LinkStateError` — its
+/// `SendError::Detached` variant exists but no path of the library builds it — and the peer's
+/// condition rides on the two error-carrying states of that error.
+fn link_loss_condition(e: &SendError) -> Option<String> {
+    match e {
+        SendError::LinkStateError(
+            LinkStateError::RemoteDetachedWithError(e) | LinkStateError::RemoteClosedWithError(e),
+        ) => Some(peer_condition(e)),
         _ => None,
     }
 }
@@ -904,24 +941,35 @@ impl Client {
                 }
             })?;
         // The session, the CBS node and the entity link are the peer's to answer, so the
-        // whole of it gets the same budget as the socket: an attach nobody replies to is a
-        // busy or stuck broker, and a worker stuck inside one fire is a worker that stops
-        // draining every other target.
-        tokio::time::timeout(self.timeout, self.open_rest(connection))
+        // whole of it gets one budget, the same as the socket's: an attach nobody replies to
+        // is a busy or stuck broker, and a worker stuck inside one fire is a worker that
+        // stops draining every other target. `open_rest` owns the deadline of that budget:
+        // every step of the open is timed against the same instant, so no step can restart
+        // the clock, and the step still waiting when it runs out is the one that says so.
+        self.open_rest(connection, tokio::time::Instant::now() + self.timeout)
             .await
-            .map_err(|_| {
-                anyhow!(
-                    "opening the session and sender link of {} timed out after {:?} \
-                     (the broker did not answer begin or attach)",
-                    self.url,
-                    self.timeout
-                )
-            })?
+    }
+
+    /// The text of an open step the peer never answered within the target's limit. Only
+    /// `open_rest`'s begin and attach steps carry it; the CBS steps name themselves.
+    fn open_timeout(&self) -> anyhow::Error {
+        anyhow!(
+            "opening the session and sender link of {} timed out after {:?} \
+             (the broker did not answer begin or attach)",
+            self.url,
+            self.timeout
+        )
     }
 
     /// The CBS negotiation and the entity attach of a fresh connection (split off `open` so
-    /// the unit tests can drive it with an established local connection).
-    async fn open_rest(&self, mut connection: ConnectionHandle<()>) -> Result<Inner> {
+    /// the unit tests can drive it with an established local connection). Every step that
+    /// belongs to the peer is awaited against the one `deadline`; each step maps its own
+    /// expiry, so the text names the step that was still waiting.
+    async fn open_rest(
+        &self,
+        mut connection: ConnectionHandle<()>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Inner> {
         let mut cbs = None;
         let token_exp = match &self.auth {
             Auth::Cbs { key_name, key_ref } => {
@@ -930,27 +978,44 @@ impl Client {
                 let audience = self.addr.audience();
                 let now = crate::time::unix_now_ms() / 1000;
                 let token = sas_token(&audience, key_name, &key, now, TOKEN_TTL_SECS)?;
-                let mut pair = Cbs::open(&mut connection).await?;
-                put_cbs_token(&mut pair.tx, &mut pair.rx, &token, &audience, self.timeout)
+                let mut pair = tokio::time::timeout_at(deadline, Cbs::open(&mut connection))
                     .await
-                    .map_err(|(fatal, why)| {
-                        if fatal {
-                            rejected(format!("{}: {why}", self.url))
-                        } else {
-                            anyhow!("{}: {why}", self.url)
-                        }
-                    })?;
+                    .map_err(|_| self.open_timeout())??;
+                put_cbs_token(
+                    &mut pair.tx,
+                    &mut pair.rx,
+                    &token,
+                    &audience,
+                    self.timeout,
+                    deadline,
+                )
+                .await
+                .map_err(|(fatal, why)| {
+                    if fatal {
+                        rejected(format!("{}: {why}", self.url))
+                    } else {
+                        anyhow!("{}: {why}", self.url)
+                    }
+                })?;
                 cbs = Some(pair);
                 now + TOKEN_TTL_SECS
             }
             _ => 0,
         };
-        let mut session = fe2o3_amqp::Session::begin(&mut connection)
-            .await
-            .map_err(|e| anyhow!("beginning the session of {} failed: {e}", self.url))?;
-        let sender = match Sender::attach(&mut session, "lwf-tx", self.addr.entity.clone()).await {
-            Ok(s) => s,
-            Err(e) => {
+        let mut session =
+            tokio::time::timeout_at(deadline, fe2o3_amqp::Session::begin(&mut connection))
+                .await
+                .map_err(|_| self.open_timeout())?
+                .map_err(|e| anyhow!("beginning the session of {} failed: {e}", self.url))?;
+        let sender = match tokio::time::timeout_at(
+            deadline,
+            Sender::attach(&mut session, "lwf-tx", self.addr.entity.clone()),
+        )
+        .await
+        {
+            Err(_) => return Err(self.open_timeout()),
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 let why = attach_condition(&e)
                     .as_deref()
                     .and_then(entity_refusal)
@@ -993,17 +1058,20 @@ impl Client {
                 let audience = self.addr.audience();
                 let token = sas_token(&audience, key_name, &key, now, TOKEN_TTL_SECS)?;
                 let (tx, rx) = (&mut cbs.tx, &mut cbs.rx);
-                match tokio::time::timeout(
+                // The refresh is one exchange with the CBS node: `put_cbs_token` owns its
+                // timer (an outer `timeout` of the same duration here only ever spoke for
+                // it, with a text that named no step).
+                match put_cbs_token(
+                    tx,
+                    rx,
+                    &token,
+                    &audience,
                     self.timeout,
-                    put_cbs_token(tx, rx, &token, &audience, self.timeout),
+                    tokio::time::Instant::now() + self.timeout,
                 )
                 .await
                 {
-                    Err(_) => {
-                        *slot = None;
-                        return Err(anyhow!("{}: the CBS token refresh timed out", self.url));
-                    }
-                    Ok(Err((fatal, why))) => {
+                    Err((fatal, why)) => {
                         *slot = None;
                         return Err(if fatal {
                             rejected(format!("{}: {why}", self.url))
@@ -1011,7 +1079,7 @@ impl Client {
                             anyhow!("{}: {why}", self.url)
                         });
                     }
-                    Ok(Ok(())) => inner.token_exp = now + TOKEN_TTL_SECS,
+                    Ok(()) => inner.token_exp = now + TOKEN_TTL_SECS,
                 }
             }
         }
@@ -1032,25 +1100,22 @@ impl Client {
                 continue;
             }
             let msg = action.wire(i);
+            // A send error here is about the link, never about the message: the value is
+            // encoded while the message is BUILT (`Action::parse`), and the library's encoder
+            // has nothing left to fail on when `send_batchable` serializes it (its
+            // `MessageEncodeError` is built by that serialization alone — see
+            // `an_answer_that_only_says_the_delivery_is_seen_waits`). So every error of this
+            // match is a lost link, and the peer names its reason on two of them
+            // (`link_loss_condition`).
             match tokio::time::timeout_at(deadline, inner.sender.send_batchable(msg)).await {
                 Err(_) => {
                     lost = Some(Lost::Slow);
                     futs.push(None);
                     break;
                 }
-                Ok(Err(SendError::MessageEncodeError)) => {
-                    // The message never left and never would: a deterministic verdict
-                    // on this message alone, the link is untouched.
-                    out[i] = Some(Outcome::Refused("the message could not be encoded".into()));
-                    futs.push(None);
-                }
                 Ok(Err(e)) => {
-                    let condition = match &e {
-                        SendError::Detached(d) => detach_condition(d),
-                        _ => None,
-                    };
                     lost = Some(Lost::Link {
-                        condition,
+                        condition: link_loss_condition(&e),
                         why: e.to_string(),
                     });
                     futs.push(None);
@@ -1075,22 +1140,36 @@ impl Client {
             if lost.is_some() {
                 continue; // the link is gone: every remaining message has no answer
             }
-            match tokio::time::timeout_at(deadline, f).await {
+            // The disposition, or the link going away under it. A peer's detach or close
+            // must end this wait at once — `Sender::on_detach` watches the link (its wait is
+            // cancel-safe), so the batch ends on the link, with the peer's condition, and
+            // not on the budget; the budget stays as the peer-silence fallback. `biased`
+            // keeps an answer already in hand outranking a detach that arrived with it:
+            // what the peer answered stays answered.
+            let settled = tokio::select! {
+                biased;
+                r = tokio::time::timeout_at(deadline, f) => r,
+                d = inner.sender.on_detach() => {
+                    lost = Some(Lost::Link {
+                        condition: detach_condition(&d),
+                        why: d.to_string(),
+                    });
+                    break;
+                }
+            };
+            match settled {
                 Err(_) => {
                     // No disposition within the target's limit: nothing is known.
                     lost = Some(Lost::Slow);
                     break;
                 }
                 Ok(Err(e)) => match &e {
-                    // The link itself went away: this message and every later one is
-                    // unknown until the reconnect says otherwise.
-                    SendError::Detached(_) | SendError::LinkStateError(_) => {
-                        let condition = match &e {
-                            SendError::Detached(d) => detach_condition(d),
-                            _ => None,
-                        };
+                    // The link itself went away while this disposition was awaited (the
+                    // client's own state check, or the session dropped): this message and
+                    // every later one is unknown until the reconnect says otherwise.
+                    SendError::LinkStateError(_) => {
                         lost = Some(Lost::Link {
-                            condition,
+                            condition: link_loss_condition(&e),
                             why: e.to_string(),
                         });
                         break;
@@ -1214,40 +1293,51 @@ fn cbs_put_token_msg(
         .build()
 }
 
-/// Puts one SAS token to `$cbs` and awaits the status of the reply (the protocol guide's
-/// `PutCbsToken`). `Err((true, ..))`: the token is refused outright (status 400, 401, 403
-/// or 404, or a SASL-class failure) — a whole-target refusal; `Err((false, ..))`: nothing
-/// is known — transient.
+/// Puts one SAS token to `$cbs` and awaits the reply (the protocol guide's `PutCbsToken`).
+/// The request send, its settlement and the reply read are one exchange: the whole of it is
+/// awaited against the one `deadline`, which is the only timer of the step — the callers give
+/// the open and the refresh their budget as an instant instead of stacking an equal-duration
+/// `timeout` over this function (one that always spoke first, since it started earlier and
+/// bounded the send this function's own timer never covered).
+/// `Err((true, ..))`: the token is refused outright (status 400, 401, 403 or 404, or a SASL-class
+/// failure) — a whole-target refusal; `Err((false, ..))`: nothing is known — transient, the
+/// expiry of the exchange among them. `ttl` is the token's own life, carried in the request's
+/// `expiration` property; `deadline` is the wait.
 async fn put_cbs_token(
     tx: &mut Sender,
     rx: &mut Receiver,
     token: &str,
     audience: &str,
-    timeout: Duration,
+    ttl: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<(), (bool, String)> {
-    let msg = cbs_put_token_msg(token, audience, crate::time::unix_now_ms(), timeout);
-    let sent = tx
-        .send(msg)
-        .await
-        .map_err(|e| (false, format!("sending the CBS token failed: {e}")))?;
-    if !matches!(sent, Disposition::Accepted(_)) {
-        return Err((
-            false,
-            format!("the CBS node did not accept the token request ({sent:?})"),
-        ));
-    }
-    let delivery = tokio::time::timeout(timeout, rx.recv::<Body<LazyValue>>())
-        .await
-        .map_err(|_| {
-            (
+    let msg = cbs_put_token_msg(token, audience, crate::time::unix_now_ms(), ttl);
+    tokio::time::timeout_at(deadline, async {
+        let sent = tx
+            .send(msg)
+            .await
+            .map_err(|e| (false, format!("sending the CBS token failed: {e}")))?;
+        if !matches!(sent, Disposition::Accepted(_)) {
+            return Err((
                 false,
-                "no CBS reply within the target's time limit".to_string(),
-            )
-        })?
-        .map_err(|e| (false, format!("reading the CBS reply failed: {e}")))?;
-    let parts = cbs_reply_parts(delivery.message().application_properties.as_ref());
-    let _ = rx.accept(&delivery).await;
-    cbs_verdict(parts.0, parts.1.as_deref())
+                format!("the CBS node did not accept the token request ({sent:?})"),
+            ));
+        }
+        let delivery = rx
+            .recv::<Body<LazyValue>>()
+            .await
+            .map_err(|e| (false, format!("reading the CBS reply failed: {e}")))?;
+        let parts = cbs_reply_parts(delivery.message().application_properties.as_ref());
+        let _ = rx.accept(&delivery).await;
+        cbs_verdict(parts.0, parts.1.as_deref())
+    })
+    .await
+    .map_err(|_| {
+        (
+            false,
+            "no CBS reply within the target's time limit".to_string(),
+        )
+    })?
 }
 
 /// Sends one rendered `once` action (no keys) and checks `expect` on every message.
