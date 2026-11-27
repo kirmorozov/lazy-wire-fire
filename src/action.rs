@@ -145,6 +145,39 @@ fn warn_once(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
 }
 
+/// One IO step of [`fence`] with the control connection's statement bound
+/// ([`crate::engine::CONTROL_STATEMENT_TIMEOUT`], because it is the same fault). The fence
+/// runs on the main account's pool (`LAZYWF_DSN`) — the role the control connection holds —
+/// so the held endpoint that stalls a control statement (backlog E-1) hangs `get_conn` and
+/// every statement on the connection it handed back in exactly the same way. Left unbounded,
+/// the flush that fences before firing never fires: its job task is lost for the outage, the
+/// keys sit in the buffer, and the engine has no answer to give. Bounded, a step that never
+/// answers is the transient failure the callers already have for a fence that fails. What the
+/// fence waits for *by design* is not IO and keeps its own budget (the 5 s GTID wait, the 5 s
+/// consistent-snapshot deadline, `LAZYWF_VISIBILITY_DELAY_MS`), and every IO around those
+/// waits answers or fails within this bound.
+///
+/// `Ok(r)`: the step answered (its own success or failure); `Err`: it never answered. The
+/// distinction is kept because two of the steps are *ruled on* by their caller: a probe that
+/// never answered must not be read as a probe that said "not ordered".
+async fn fence_io<T>(
+    step: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<Result<T>> {
+    match tokio::time::timeout(crate::engine::CONTROL_STATEMENT_TIMEOUT, fut).await {
+        Ok(r) => Ok(r),
+        Err(_) => bail!(
+            "the fence step `{step}` did not answer within {:?}",
+            crate::engine::CONTROL_STATEMENT_TIMEOUT
+        ),
+    }
+}
+
+/// [`fence_io`] where a step's failure is the fence's own failure: the result unwrapped.
+async fn fence_step<T>(step: &str, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    fence_io(step, fut).await?
+}
+
 /// Waits until every transaction up to `spec` is visible to readers (binlog events are shipped
 /// before the engine commit completes). MySQL / Percona with GTIDs:
 /// `WAIT_FOR_EXECUTED_GTID_SET`; the flavors whose consistent-snapshot position is a
@@ -152,13 +185,25 @@ fn warn_once(flag: &AtomicBool) -> bool {
 /// position. The MySQL family never waits on `binlog_snapshot_%` — its pair is the raw binlog write
 /// position, not a watermark — so without a GTID it goes straight to the commit fence
 /// (`commit_fence`), when commits are in binlog order. Else `LAZYWF_VISIBILITY_DELAY_MS`.
+/// Every IO here is bounded (see [`fence_io`]): the fence holds the flush, and a flush parked
+/// forever on a held control role is the outage the keys would never leave.
 pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
-    let mut conn = env.pool.get_conn().await.context("fence connection")?;
+    let mut conn = fence_step("the fence connection", async {
+        Ok(env.pool.get_conn().await?)
+    })
+    .await
+    .context("fence connection")?;
     if env.flavor.is_mysql_family() {
         if let Some(g) = &spec.gtid {
-            let r: Result<Option<Option<i64>>, _> = conn
-                .exec_first("SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)", (g,))
-                .await;
+            let r = fence_step("SELECT WAIT_FOR_EXECUTED_GTID_SET", async {
+                Ok(conn
+                    .exec_first::<Option<i64>, _, _>(
+                        "SELECT WAIT_FOR_EXECUTED_GTID_SET(?, 5)",
+                        (g,),
+                    )
+                    .await?)
+            })
+            .await;
             match r {
                 Ok(Some(Some(0))) => return Ok(()),
                 Ok(Some(Some(_))) => bail!("transaction {g} not visible after 5 s"),
@@ -181,22 +226,31 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut pause = Duration::from_millis(1);
         loop {
-            conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                .await?;
-            conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-                .await?;
-            let rows: Result<Vec<(String, String)>, _> = conn
-                .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
-                .await;
-            conn.query_drop("COMMIT").await?;
-            let (mut file, mut pos) = (None, None);
-            for (k, v) in rows.unwrap_or_default() {
-                match k.to_ascii_lowercase().as_str() {
-                    "binlog_snapshot_file" => file = Some(v),
-                    "binlog_snapshot_position" => pos = v.trim().parse::<u64>().ok(),
-                    _ => {}
+            // The isolation, the snapshot, the pair and the commit are one step: a held
+            // control role hangs all four together, so they are bounded together and the
+            // 5 s deadline below stays the only unbounded wait this arm performs.
+            let (file, pos) = fence_step("the consistent-snapshot probe", async {
+                conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    .await?;
+                conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                    .await?;
+                let rows: Vec<(String, String)> = conn
+                    .query("SHOW SESSION STATUS LIKE 'binlog_snapshot_%'")
+                    .await
+                    .unwrap_or_default();
+                conn.query_drop("COMMIT").await?;
+                let mut file = None;
+                let mut pos = None;
+                for (k, v) in rows {
+                    match k.to_ascii_lowercase().as_str() {
+                        "binlog_snapshot_file" => file = Some(v),
+                        "binlog_snapshot_position" => pos = v.trim().parse::<u64>().ok(),
+                        _ => {}
+                    }
                 }
-            }
+                Ok((file, pos))
+            })
+            .await?;
             match (file, pos) {
                 (Some(file), Some(pos)) if !file.is_empty() => {
                     env.snapshot_fence.store(1, Ordering::Relaxed);
@@ -219,7 +273,7 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
     // The commit fence runs whenever the consistent-snapshot wait is not the fence in force: the
     // flavor says its position is no watermark (the MySQL family, skipped above) or the server
     // ruled itself out by reporting no pair. Then the delay.
-    if env.flavor.is_mysql_family() && commit_fence(env, &mut conn, &spec.pos).await {
+    if env.flavor.is_mysql_family() && commit_fence(env, &mut conn, &spec.pos).await? {
         return Ok(());
     }
     if !env.visibility_delay.is_zero() {
@@ -233,14 +287,16 @@ pub async fn fence(env: &Env, spec: &FenceSpec) -> Result<()> {
 /// row change per boundary, so the binlog carries it and, with `binlog_order_commits`, it
 /// returns only after every transaction up to the boundary is committed. `false`: the fence did
 /// not apply (not ordered, probe or write failed), and the caller falls back to the delay. Each
-/// cause logs one WARN per process.
-async fn commit_fence(env: &Env, conn: &mut Conn, pos: &Position) -> bool {
+/// cause logs one WARN per process. `Err`: a step never answered (see [`fence_io`]) — which is
+/// *not* an answer, so it is not read as "not ordered" and the flush is not waved through on
+/// the visibility delay; the fence fails transiently and the flush retries.
+async fn commit_fence(env: &Env, conn: &mut Conn, pos: &Position) -> Result<bool> {
     let id = conn.id();
     let known = probe_cached(&probe_memo(env), id);
     let probe = match known {
         Some(p) => p,
         None => {
-            let p = match fence::probe(conn).await {
+            let p = match fence_io("the commit-fence probe", fence::probe(conn)).await? {
                 Ok(true) => Probe::Ordered,
                 Ok(false) => Probe::Unordered,
                 Err(e) => {
@@ -258,22 +314,22 @@ async fn commit_fence(env: &Env, conn: &mut Conn, pos: &Position) -> bool {
         if probe == Probe::Unordered && warn_once(&env.warned_unordered) {
             warn!("commit fence unavailable: binlog_order_commits is OFF; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead (ON gives an exact fence)");
         }
-        return false;
+        return Ok(false);
     }
     let mut last = env.fenced_at.lock().await;
     if already_fenced(&last, pos) {
-        return true;
+        return Ok(true);
     }
-    match fence::commit(conn, FENCE_ID).await {
+    match fence_io("the commit-fence write", fence::commit(conn, FENCE_ID)).await? {
         Ok(()) => {
             *last = Some(pos.clone());
-            true
+            Ok(true)
         }
         Err(e) => {
             if warn_once(&env.warned_write) {
                 warn!("commit fence write failed: {e:#}; flushes wait LAZYWF_VISIBILITY_DELAY_MS instead");
             }
-            false
+            Ok(false)
         }
     }
 }
