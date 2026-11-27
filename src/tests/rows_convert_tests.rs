@@ -450,6 +450,7 @@ fn latin1_layout() -> Layout {
         vec!["c".into()],
         vec![ColKind::Plain],
         vec![Charset::Latin1],
+        Vec::new(),
     )
 }
 
@@ -519,8 +520,11 @@ fn other_charsets_keep_the_lossy_path() {
 #[test]
 fn col_charset_reads_the_information_schema_name() {
     assert_eq!(col_charset(Some("latin1")), Charset::Latin1);
+    // the `binary` charset gets its own variant: same rendering as `Utf8`, but the key
+    // refusal sees it (see `Layout::key_unsafe`)
+    assert_eq!(col_charset(Some("binary")), Charset::Binary);
     for name in [
-        "utf8mb4", "utf8mb3", "utf8", "ascii", "binary", "gbk", "latin2", "ujis",
+        "utf8mb4", "utf8mb3", "utf8", "ascii", "gbk", "latin2", "ujis",
     ] {
         assert_eq!(
             col_charset(Some(name)),
@@ -533,34 +537,46 @@ fn col_charset_reads_the_information_schema_name() {
     }
 }
 
-/// `binlog_row_metadata=FULL`: a layout derived from the event's own names keeps the kinds
-/// and the charsets of the `information_schema` read it was derived from.
+/// `binlog_row_metadata=FULL`: a layout derived from the event's own names keeps the kinds,
+/// the charsets and the data types of the `information_schema` read it was derived from.
 #[test]
 fn layout_from_names_keeps_the_charsets() {
     let info = Layout::with_charsets(
         vec!["id".into(), "code".into(), "blob".into()],
         vec![ColKind::Unsigned(32), ColKind::Plain, ColKind::Plain],
-        vec![Charset::Utf8, Charset::Latin1, Charset::Utf8],
+        vec![Charset::Utf8, Charset::Latin1, Charset::Binary],
+        vec!["int".into(), "varchar".into(), "blob".into()],
     );
     // the event's own order, a column the read does not know, and the latin1 column by name
-    let names = vec!["code".to_string(), "id".to_string(), "extra".to_string()];
+    let names = vec![
+        "code".to_string(),
+        "id".to_string(),
+        "extra".to_string(),
+        "blob".to_string(),
+    ];
     let l = layout_from_names(&info, &names);
     let bytes = |b: Vec<u8>| Some(BinlogValue::Value(My::Bytes(b)));
-    let row = row3(bytes(vec![0xC9]));
+    let row = BinlogRow::new(vec![bytes(vec![0xC9]); 4], Arc::new([]));
     assert_eq!(
         l.value(&row, 0),
         Value::String("\u{c9}".into()),
         "the latin1 name found its charset"
     );
-    // the plain and the unknown columns keep the lossy path
-    let row = row3(bytes(vec![0xff]));
+    // the plain and the unknown columns keep the lossy path (the value is read again below)
+    let row = BinlogRow::new(vec![bytes(vec![0xff]); 4], Arc::new([]));
     assert_eq!(l.value(&row, 1), Value::String("\u{fffd}".into()));
     assert_eq!(l.value(&row, 2), Value::String("\u{fffd}".into()));
-}
-
-/// A three-column row of one value: for the derived layouts, whose columns are read by index.
-fn row3(v: Option<BinlogValue<'static>>) -> BinlogRow {
-    BinlogRow::new(vec![v.clone(), v.clone(), v], Arc::new([]))
+    assert_eq!(l.value(&row, 3), Value::String("\u{fffd}".into()));
+    // the types travel with them — the key refusal reads them from the derived layout too
+    assert_eq!(l.column_type(0), Some("varchar"));
+    assert_eq!(l.column_type(1), Some("int"));
+    // a key may stand on the decoded latin1 and the number, and on the unknown name (no
+    // refusal on a guess); the blob is unsafe wherever it stands
+    assert_eq!(l.key_unsafe(0), None);
+    assert_eq!(l.key_unsafe(1), None);
+    assert_eq!(l.column_type(2), Some(""));
+    assert_eq!(l.key_unsafe(2), None);
+    assert!(l.key_unsafe(3).is_some(), "the blob is unsafe by name");
 }
 
 /// Two latin1 payloads that differ stay different (cp1252 is one-to-one), so the changed
@@ -737,3 +753,107 @@ fn the_shortcut_only_skips_what_it_can_prove() {
     );
 }
 
+// ── the columns a key may stand on: bytes no charset defines are refused at rule load
+// (backlog B-1, refusal [A]) ──
+
+/// A one-column layout as `Catalog::load` builds it: name, charset, `DATA_TYPE`.
+fn typed(name: &str, charset: Charset, data_type: &str) -> Layout {
+    Layout::with_charsets(
+        vec![name.into()],
+        vec![col_kind(data_type, data_type)],
+        vec![charset],
+        vec![data_type.into()],
+    )
+}
+
+/// The `binary`-charset family — BINARY, VARBINARY and the BLOBs on both servers, and the
+/// text types with the BINARY attribute — cannot carry a key: no charset defines their bytes,
+/// so the key text is whatever `from_utf8_lossy` leaves. The type alone refuses too, for a
+/// server that reports the charset as `NULL`.
+#[test]
+fn binary_charset_columns_cannot_carry_a_key() {
+    for t in [
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+    ] {
+        let l = typed("c", Charset::Binary, t);
+        assert!(l.key_unsafe(0).is_some(), "{t} must be refused");
+    }
+    // `VARCHAR(16) BINARY`: a varchar in the binary charset is bytes too
+    assert!(typed("c", Charset::Binary, "varchar")
+        .key_unsafe(0)
+        .is_some());
+    for t in [
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+    ] {
+        let l = typed("c", Charset::Utf8, t);
+        assert!(l.key_unsafe(0).is_some(), "{t} is refused by type as well");
+    }
+}
+
+/// The geometry family: opaque WKB under a `NULL` charset, spelled as each server spells it
+/// (MySQL's `geomcollection` and `gis`, MariaDB's `geometrycollection`), plus MySQL 9's
+/// `VECTOR`. None of them can carry a key.
+#[test]
+fn geometry_columns_cannot_carry_a_key() {
+    for t in [
+        "geometry",
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+        "geomcollection",
+        "geometrycollection",
+        "gis",
+        "vector",
+    ] {
+        let l = typed("c", Charset::Utf8, t);
+        assert!(l.key_unsafe(0).is_some(), "{t} must be refused");
+    }
+}
+
+/// What the decoder answers exactly stays accepted — text in any charset the decode renders
+/// (or leaves lossless), numbers, and the types whose wire form is not bytes at all. The e2e
+/// pins a few of these end to end; this is the full list the refusal walks past.
+#[test]
+fn text_and_number_columns_carry_a_key() {
+    for (charset, t) in [
+        (Charset::Utf8, "varchar"),
+        (Charset::Latin1, "varchar"),
+        (Charset::Utf8, "text"),
+        (Charset::Utf8, "char"),
+        (Charset::Utf8, "int"),
+        (Charset::Utf8, "bigint"),
+        (Charset::Utf8, "decimal"),
+        (Charset::Utf8, "date"),
+        (Charset::Utf8, "json"),
+        (Charset::Utf8, "enum"),
+        (Charset::Utf8, "set"),
+        (Charset::Utf8, "bit"),
+    ] {
+        assert_eq!(
+            typed("c", charset, t).key_unsafe(0),
+            None,
+            "{t} must stay accepted"
+        );
+    }
+    // no type read (a layout built without the catalog): no refusal on a guess
+    assert_eq!(
+        Layout::new(vec!["c".into()], vec![ColKind::Plain]).key_unsafe(0),
+        None
+    );
+    // and were a server ever to report the `binary` charset on one of them, the charset
+    // rule answers first: bytes are bytes whatever the type says
+    assert!(typed("c", Charset::Binary, "json").key_unsafe(0).is_some());
+}

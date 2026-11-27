@@ -16886,6 +16886,26 @@ async fn charset_rule(db: &Db, mock: &Mock, select: &str) {
         .await;
 }
 
+/// A rule named `name` keyed by `key` on `table`, with one select carrying an `_op`
+/// column — `charset_rule` for a table other than `items`.
+async fn keyed_rule(db: &Db, mock: &Mock, name: &str, table: &str, key: &str, select: &str) {
+    db.target(
+        "search",
+        "http",
+        &mock.url(),
+        Some("JSON_CONTAINS(body, 'false', '$.errors')"),
+        "{}",
+    )
+    .await;
+    let selects = json!([select]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms, max_delay_ms) VALUES (?, 'search', ?, ?, 500, 2000)",
+        (name, selects.to_string(), BULK),
+    )
+    .await;
+    db.trigger(name, table, Some(key), None).await;
+}
+
 /// The keys that arrived at the mock in `{"delete":...}` lines.
 fn deleted_keys(reqs: &[Req]) -> Vec<String> {
     reqs.iter()
@@ -17032,17 +17052,16 @@ async fn utf8mb4_key_follows_the_row() {
     inst.stop().await;
 }
 
-/// A `BINARY(16)` key: no charset decodes these bytes, and today every byte ≥ 0x80 loses
-/// to U+FFFD — 0xF0..0xFF are sixteen invalid sequences, so the key renders as sixteen
-/// replacement characters, the select binds them, matches nothing, and the merger deletes
-/// the row's document while the row lives on. This pins that outcome as it stands on main
-/// (2026-11-27) — the byte-safe carrying of binary keys (refuse at rule load, or render
-/// them hex, as lazyview #394 does for its lookups) is open, with lwf-super (backlog B-1
-/// option (b)); whichever answer is built replaces this test.
+/// A `BINARY(16)` key: no charset decodes these bytes, and the lossy render turned 0xF0..0xFF
+/// into sixteen replacement characters — the key marked nothing, its select matched no row,
+/// and the DELETE removed a live row's document (measured on both servers on main, 2026-11-27).
+/// The trigger is now refused when the route is built: the rule carries the reason on
+/// `/status`, naming the rule, the table, the column and its type, and the trigger marks
+/// nothing at all — neither the row's document nor its delete ever reaches the target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn binary16_key_is_mangled_to_replacement_characters() {
+async fn binary_key_is_refused_at_load() {
     let root = need_db!();
-    let db = Db::fresh(&root, "keybin16").await;
+    let db = Db::fresh(&root, "keybinref").await;
     db.exec(
         "CREATE TABLE items (code BINARY(16) NOT NULL PRIMARY KEY, qty INT NOT NULL) ENGINE=InnoDB",
     )
@@ -17062,33 +17081,217 @@ async fn binary16_key_is_mangled_to_replacement_characters() {
     db.exec("INSERT INTO items VALUES (UNHEX('F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF'), 1)")
         .await;
     db.tick().await;
-    let hex: Vec<(String,)> = db.query("SELECT HEX(code) FROM items").await;
-    assert_eq!(hex[0].0, "F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF");
+    let err = wait_for(
+        Duration::from_secs(15),
+        "the refusal of the BINARY(16) key",
+        || async { db.status("items").await.and_then(|s| s.3) },
+    )
+    .await;
+    for want in ["items", "code", "binary", "STORED"] {
+        assert!(
+            err.to_lowercase().contains(&want.to_lowercase()),
+            "the refusal must name {want}: {err}"
+        );
+    }
+    // The refused trigger marks nothing: neither the row's write nor its delete can reach
+    // the target — the whole point of refusing at load rather than mangling at flush.
+    db.exec("DELETE FROM items WHERE qty = 1").await;
+    db.tick().await;
+    sleep_ms(2_000).await;
+    let reqs = mock.requests();
+    assert!(
+        reqs.is_empty(),
+        "the refused trigger still fired {} request(s), keys {:?} (status said: {err})",
+        reqs.len(),
+        mock.keys_received(),
+    );
+    inst.stop().await;
+}
 
-    let mangled = "\u{FFFD}".repeat(16);
+/// A `POINT` key: geometry arrives over the binlog as opaque WKB under a NULL charset, so
+/// its key text would be lossy bytes too — refused like the binary family, on each server's
+/// spelling of the type (`point`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn geometry_key_is_refused_at_load() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keypoint").await;
+    db.exec("CREATE TABLE places (id INT PRIMARY KEY, p POINT NOT NULL) ENGINE=InnoDB")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    keyed_rule(
+        &db,
+        &mock,
+        "places",
+        "places",
+        "{{new.p}}",
+        "SELECT id AS _key, ST_AsText(p) AS wkt, IF(id < 0, 'delete', NULL) AS _op \
+         FROM places WHERE id IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO places VALUES (1, ST_GeomFromText('POINT(1 2)'))")
+        .await;
+    db.tick().await;
+    let err = wait_for(
+        Duration::from_secs(15),
+        "the refusal of the POINT key",
+        || async { db.status("places").await.and_then(|s| s.3) },
+    )
+    .await;
+    for want in ["places", "point", "STORED"] {
+        assert!(
+            err.to_lowercase().contains(&want.to_lowercase()),
+            "the refusal must name {want}: {err}"
+        );
+    }
+    sleep_ms(1_000).await;
+    assert!(
+        mock.requests().is_empty(),
+        "the refused trigger fired a request, keys {:?}",
+        mock.keys_received(),
+    );
+    inst.stop().await;
+}
+
+/// The workaround the refusal message names, proven: a STORED generated column that
+/// projects the binary column as hex carries the key exactly — the bytes stay in `code`,
+/// the key is the utf8mb4 text of `code_hex`, and the document follows the row and its
+/// delete, on both servers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_hex_projection_carries_the_key() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keyhex").await;
+    db.exec(
+        "CREATE TABLE codes (id INT PRIMARY KEY, code BINARY(4) NOT NULL, \
+         code_hex CHAR(32) AS (HEX(code)) STORED, qty INT NOT NULL) ENGINE=InnoDB",
+    )
+    .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    keyed_rule(
+        &db,
+        &mock,
+        "codes",
+        "codes",
+        "{{new.code_hex}}",
+        "SELECT code_hex AS _key, qty AS qty, IF(qty < 0, 'delete', NULL) AS _op \
+         FROM codes WHERE code_hex IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO codes (id, code, qty) VALUES (1, UNHEX('F09F9880'), 5)")
+        .await;
+    db.tick().await;
+    let upsert = |qty: i64| {
+        let mock = &mock;
+        move || async move {
+            let reqs = mock.requests();
+            let dels = deleted_keys(&reqs);
+            assert!(
+                dels.is_empty(),
+                "a live row's document was deleted: {dels:?} (keys seen: {:?})",
+                mock.keys_received()
+            );
+            last_docs(&reqs)
+                .get("F09F9880")
+                .cloned()
+                .flatten()
+                .filter(|v| v["qty"] == json!(qty))
+        }
+    };
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert under F09F9880",
+        upsert(5),
+    )
+    .await;
+    db.exec("DELETE FROM codes WHERE id = 1").await;
+    db.tick().await;
     let dels = wait_for(
         Duration::from_secs(15),
-        "the delete of the mangled key",
+        "the delete under F09F9880",
         || async {
-            let d = deleted_keys(&mock.requests());
+            let d: Vec<String> = deleted_keys(&mock.requests())
+                .into_iter()
+                .filter(|k| k == "F09F9880")
+                .collect();
             (!d.is_empty()).then_some(d)
         },
     )
     .await;
-    let uniq: std::collections::BTreeSet<String> = dels.into_iter().collect();
-    assert_eq!(
-        uniq,
-        std::collections::BTreeSet::from([mangled.clone()]),
-        "the BINARY key must reach the target as exactly sixteen replacement characters"
-    );
-    let docs = last_docs(&mock.requests());
+    assert_eq!(dels, vec!["F09F9880".to_string()]);
+    inst.stop().await;
+}
+
+/// A `BIT(8)` key stays accepted: the decoder reads BIT as an integer, so its key text is
+/// exact — the refusal walks past it. The document follows the row and its DELETE arrives
+/// under the same key, proving the key round-trips through the select as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bit_key_follows_the_row() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keybit").await;
+    db.exec(
+        "CREATE TABLE flags (id INT PRIMARY KEY, bits BIT(8) NOT NULL, tag VARCHAR(20) NOT NULL) ENGINE=InnoDB",
+    )
+    .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    keyed_rule(
+        &db,
+        &mock,
+        "flags",
+        "flags",
+        "{{new.bits}}",
+        "SELECT bits AS _key, tag AS tag, IF(id < 0, 'delete', NULL) AS _op \
+         FROM flags WHERE bits IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO flags VALUES (1, b'11010001', 'a')")
+        .await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert under the BIT key 209",
+        || async {
+            last_docs(&mock.requests())
+                .get("209")
+                .cloned()
+                .flatten()
+                .filter(|v| v["tag"] == json!("a"))
+        },
+    )
+    .await;
+    db.exec("DELETE FROM flags WHERE id = 1").await;
+    db.tick().await;
+    let dels = wait_for(
+        Duration::from_secs(15),
+        "the delete under the BIT key 209",
+        || async {
+            let d: Vec<String> = deleted_keys(&mock.requests())
+                .into_iter()
+                .filter(|k| k == "209")
+                .collect();
+            (!d.is_empty()).then_some(d)
+        },
+    )
+    .await;
+    assert_eq!(dels, vec!["209".to_string()]);
+    // and the rule stands unrefused: no load-time error on it
+    let st = db.status("flags").await;
     assert!(
-        docs.values().all(Option::is_none),
-        "a BINARY key must be matched by no select: {docs:?}"
-    );
-    assert!(
-        docs.contains_key(&mangled),
-        "the live row's document was deleted under {mangled:?}"
+        st.as_ref()
+            .and_then(|s| s.3.as_ref())
+            .is_none_or(|e| !e.contains("refuses")),
+        "the BIT key was refused: {:?}",
+        st.and_then(|s| s.3)
     );
     inst.stop().await;
 }

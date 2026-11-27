@@ -842,6 +842,9 @@ pub struct Engine {
     virtual_first: HashMap<(String, String), Option<(usize, String)>>,
     /// Triggers already reported as unreadable (see `refuse_virtual_reads`), warned about once.
     virtual_refusals: HashSet<(String, u64)>,
+    /// Triggers already reported as keying on bytes no charset defines (see
+    /// `refuse_binary_keys`), warned about once.
+    binary_refusals: HashSet<(String, u64)>,
     tx: mpsc::UnboundedSender<Done>,
     last_persist: Instant,
     clear_retry: Option<Instant>,
@@ -967,6 +970,106 @@ fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<V
         .iter()
         .find(|(_, i)| *i >= from)
         .map(|(c, _)| VirtualRead::Col((*c).to_string()))
+}
+
+/// The path segments a Handlebars key template names inside its `{{ }}` tags: `{{new.code}}`,
+/// `{{code}}` and `{{helper arg=this.code}}` all yield `code`, while literal text outside the
+/// tags, comments and raw-block content — none of which resolve paths — cannot. A quoted
+/// argument spelled like a column name does count, which errs towards refusing. Roots
+/// (`new`, `row`, …) and literals (`true`, …) are filtered: a column cannot be named one of
+/// those and resolve.
+fn hb_refs(source: &str) -> Vec<&str> {
+    // `get` everywhere instead of indexing: the offsets are proven by the `find`s and the
+    // `starts_with` guards around them, and the panic-site gate reads the indexing, not
+    // the argument.
+    fn from(t: &str, n: usize) -> &str {
+        t.get(n..).unwrap_or("")
+    }
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("{{") {
+        let tag = from(rest, open);
+        // What is never rendered passes unscanned, the way `resolve_roots` leaves it untouched.
+        let skip_to = if tag.starts_with("{{!--") {
+            tag.get(5..).and_then(|t| t.find("--}}")).map(|n| 5 + n + 4)
+        } else if tag.starts_with("{{!") {
+            tag.get(3..).and_then(|t| t.find("}}")).map(|n| 3 + n + 2)
+        } else if tag.starts_with("{{{{") {
+            // `{{{{raw}}}} … {{{{/raw}}}}`
+            tag.get(4..)
+                .and_then(|t| t.find("{{{{/"))
+                .map(|n| 4 + n)
+                .and_then(|close| {
+                    tag.get(close..)
+                        .and_then(|t| t.find("}}}}"))
+                        .map(|m| close + m + 4)
+                })
+                .or(Some(tag.len()))
+        } else {
+            None
+        };
+        let (body, next): (&str, &str) = if let Some(end) = skip_to {
+            ("", from(tag, end))
+        } else {
+            match tag.get(2..).and_then(|t| t.find("}}")) {
+                // The whole tag: paths, helper names and arguments alike — the scan does not
+                // parse, it finds names.
+                Some(close) => {
+                    let close = 2 + close + 2;
+                    (tag.get(2..close - 2).unwrap_or(""), from(tag, close))
+                }
+                None => ("", ""),
+            }
+        };
+        for seg in body
+            .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '@' | '.' | '/')))
+            .flat_map(|tok| tok.split(['.', '/']))
+        {
+            if !seg.is_empty()
+                && !seg.starts_with('@')
+                && !matches!(seg, "this" | "true" | "false" | "null")
+                && !template::KEY_ROOTS.contains(&seg)
+            {
+                out.push(seg);
+            }
+        }
+        rest = next;
+    }
+    out
+}
+
+/// The columns a trigger builds its key from, as layout indices: the `Seg::Col` names of a
+/// `Simple` key (exact), the names a Handlebars key makes inside its tags (see [`hb_refs`]),
+/// and the columns bound to its `keys_sql` — the bound values reach the user's statement as
+/// decoded text, so bytes with no charset reach the `WHERE` as replacement characters too and
+/// can answer with another row's `_key`. A trigger's `changed_columns` are not key reads and
+/// do not count: they only compare two images of the same row.
+fn key_column_reads(t: &crate::rule::Trigger, layout: &Layout) -> Vec<usize> {
+    let mut out = Vec::new();
+    match &t.key {
+        Some(KeyTemplate::Simple(lines)) => {
+            for seg in lines.iter().flatten() {
+                if let template::Seg::Col(c) = seg {
+                    out.extend(layout.index(c));
+                }
+            }
+        }
+        Some(KeyTemplate::Full(_)) => {
+            // The source the compiled templates were registered from — what the user wrote.
+            if let Some(src) = &t.def.key {
+                for c in hb_refs(src) {
+                    out.extend(layout.index(c));
+                }
+            }
+        }
+        None => {}
+    }
+    if let Some(ks) = &t.keys_sql {
+        for c in &ks.columns {
+            out.extend(layout.index(c));
+        }
+    }
+    out
 }
 
 /// The first VIRTUAL generated column of `rows`, which are the table's columns in
@@ -1244,6 +1347,7 @@ pub async fn run(
         maria_skips_virtual: skips_virtual,
         virtual_first: HashMap::new(),
         virtual_refusals: HashSet::new(),
+        binary_refusals: HashSet::new(),
         tx,
         last_persist: Instant::now(),
         clear_retry: None,
@@ -2604,6 +2708,7 @@ impl Engine {
                 let triggers = self
                     .refuse_virtual_reads(&nkey, &layout, &key.0, &key.1, triggers)
                     .await?;
+                let triggers = self.refuse_binary_keys(&layout, &key.0, &key.1, triggers);
                 let any_full = triggers.iter().any(|(_, rule, i)| {
                     matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
                 });
@@ -2761,6 +2866,64 @@ impl Engine {
             }
         }
         Ok(kept)
+    }
+
+    /// Refuses the triggers that build a key out of bytes no charset can turn into exact
+    /// text, and returns those that may keep running.
+    ///
+    /// The key text names the document at the target and in the buffer. A `binary`-charset
+    /// column — BINARY, VARBINARY, the BLOB family, a text type with the BINARY attribute —
+    /// and the geometry types come over the binlog as opaque bytes, and the lossy UTF-8
+    /// decode renders every impossible byte as U+FFFD: two rows can then share a key, and
+    /// the DELETE of one carries the other's key and removes its document (measured on both
+    /// test servers: a BINARY(16) key deleted a live row's document). The catalog answers
+    /// the charset and the data type that make this known when the route is built (see
+    /// [`Layout::key_unsafe`]), so such a trigger never marks at all, the way an unreadable
+    /// read does not (see [`Engine::refuse_virtual_reads`]), and the rule carries the
+    /// reason on `/status`.
+    fn refuse_binary_keys(
+        &mut self,
+        layout: &Layout,
+        schema: &str,
+        table: &str,
+        triggers: Vec<(String, Arc<Rule>, usize)>,
+    ) -> Vec<(String, Arc<Rule>, usize)> {
+        let mut kept = Vec::with_capacity(triggers.len());
+        for (name, rule, ti) in triggers {
+            // `get`, not indexing: a route's trigger index is trusted, and the panic-site
+            // gate keeps the one allowlisted index to `refuse_virtual_reads` alone.
+            let Some(t) = rule.triggers.get(ti) else {
+                kept.push((name, rule, ti));
+                continue;
+            };
+            let bad = key_column_reads(t, layout)
+                .into_iter()
+                .find_map(|i| layout.key_unsafe(i).map(|why| (i, why)));
+            let Some((i, why)) = bad else {
+                kept.push((name, rule, ti));
+                continue;
+            };
+            // Refused whether or not it was reported: the key it would mark is wrong either way.
+            if self.binary_refusals.insert((name.clone(), t.def.id)) {
+                let col = layout.column_name(i).unwrap_or("?");
+                let ty = layout.column_type(i).unwrap_or("binary");
+                let msg = format!(
+                    "rule `{name}` trigger {}: `{schema}`.`{table}` keys on column `{col}` \
+                     of type `{ty}` — {why}, so its key would be replacement characters, not \
+                     the row's value: the row marks nothing and its DELETE can remove another \
+                     row's document; lazy-wire-fire refuses the trigger (key on a text or \
+                     number column, or on a STORED generated column that projects it, for \
+                     example `AS (HEX(`{col}`)) STORED` and a key over that column)",
+                    t.def.id
+                );
+                warn!(rule = %name, "{msg}");
+                if let Some(st) = self.rules.get_mut(&name) {
+                    st.last_error = Some((msg, crate::time::unix_now_ms()));
+                    st.dirty = true;
+                }
+            }
+        }
+        kept
     }
 
     /// Reports (once) trigger columns the table does not have: such a trigger marks nothing.
@@ -4688,6 +4851,9 @@ mod hotpath_alloc_tests;
 #[path = "tests/engine_flush_alloc_tests.rs"]
 mod flush_alloc_tests;
 
+#[cfg(test)]
+#[path = "tests/engine_binary_key_tests.rs"]
+mod binary_key_tests;
 #[cfg(test)]
 #[path = "tests/engine_skip_kinds_tests.rs"]
 mod skip_kinds_tests;

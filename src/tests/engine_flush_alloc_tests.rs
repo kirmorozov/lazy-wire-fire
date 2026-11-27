@@ -197,6 +197,7 @@ async fn engine_with_flush_ready(
         maria_skips_virtual: false,
         virtual_first: HashMap::new(),
         virtual_refusals: HashSet::new(),
+        binary_refusals: HashSet::new(),
         tx,
         last_persist: now,
         clear_retry: None,

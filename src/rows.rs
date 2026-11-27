@@ -38,16 +38,24 @@ pub enum Charset {
     /// difference between a latin1 key that matches its row and one that loses to U+FFFD,
     /// marks nothing, and has its live document deleted as a missing row (backlog B-1).
     Latin1,
+    /// The `binary` charset: BINARY, VARBINARY and the BLOB family, and the text types with
+    /// the BINARY attribute. Their bytes are not text at all — no charset defines them — so
+    /// `convert` renders them exactly as [`Charset::Utf8`] does (lossily), and the variant
+    /// exists only so [`Layout::key_unsafe`] can see them: bytes no charset defines cannot
+    /// make an exact key, and a key that does not describe its row deletes another row's
+    /// document (backlog B-1, refusal [A]).
+    Binary,
 }
 
 /// The `information_schema.COLUMNS.CHARACTER_SET_NAME` of a column, as a [`Charset`]. The
 /// names lazywf decodes are matched exactly (they are stored lower case); anything else —
-/// including `NULL` (no charset: numbers, dates, and the `binary` of BLOB and BINARY, whose
-/// bytes are not text at all) and the single-byte and multi-byte charsets whose tables are
-/// not built yet — keeps the lossy path it has always had.
+/// including `NULL` (no charset: numbers, dates and the geometry types, whose bytes are not
+/// text at all) and the single-byte and multi-byte charsets whose tables are not built
+/// yet — keeps the lossy path it has always had.
 pub fn col_charset(name: Option<&str>) -> Charset {
     match name {
         Some("latin1") => Charset::Latin1,
+        Some("binary") => Charset::Binary,
         _ => Charset::Utf8,
     }
 }
@@ -65,7 +73,7 @@ const CP1252_80_9F: [char; 32] = [
 fn from_latin1(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len());
     for &x in b {
-        s.push(if x < 0x80 || x >= 0xA0 {
+        s.push(if !(0x80..0xA0).contains(&x) {
             char::from(x)
         } else {
             // `x - 0x80` is 0..32 for the bytes that reach here; `get` keeps the table's
@@ -84,21 +92,27 @@ pub struct Layout {
     kinds: Vec<ColKind>,
     /// The charset of each column, parallel to `kinds`; a missing entry is [`Charset::Utf8`].
     charsets: Vec<Charset>,
+    /// The `information_schema.COLUMNS.DATA_TYPE` of each column, parallel to `kinds`; a
+    /// missing entry means the server's answer was not read (the DDL and event-metadata
+    /// paths), which [`Layout::key_unsafe`] treats as safe.
+    types: Vec<String>,
     by_name: HashMap<String, usize>,
 }
 
 impl Layout {
     pub fn new(names: Vec<String>, kinds: Vec<ColKind>) -> Layout {
         let charsets = vec![Charset::Utf8; kinds.len()];
-        Layout::with_charsets(names, kinds, charsets)
+        Layout::with_charsets(names, kinds, charsets, Vec::new())
     }
 
-    /// A layout whose columns also carry their `information_schema` charsets. A `charsets`
-    /// shorter than `kinds` completes with [`Charset::Utf8`]: today's path.
+    /// A layout whose columns also carry their `information_schema` charsets and data types.
+    /// A `charsets` shorter than `kinds` completes with [`Charset::Utf8`]: today's path; a
+    /// shorter `types` simply leaves those columns' types unknown.
     pub fn with_charsets(
         names: Vec<String>,
         kinds: Vec<ColKind>,
         charsets: Vec<Charset>,
+        types: Vec<String>,
     ) -> Layout {
         let by_name = names
             .iter()
@@ -109,6 +123,7 @@ impl Layout {
             names,
             kinds,
             charsets,
+            types,
             by_name,
         }
     }
@@ -126,6 +141,37 @@ impl Layout {
 
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
+    }
+
+    /// The column's name as the catalog (or the event) named it.
+    pub fn column_name(&self, i: usize) -> Option<&str> {
+        self.names.get(i).map(String::as_str)
+    }
+
+    /// The column's `information_schema` `DATA_TYPE`, when it was read.
+    pub fn column_type(&self, i: usize) -> Option<&str> {
+        self.types.get(i).map(String::as_str)
+    }
+
+    /// Whether a key on column `i` could not be made from the row's bytes exactly, with the
+    /// reason (`None` = safe): a `binary`-charset column (BINARY, VARBINARY, the BLOB family,
+    /// the text types with the BINARY attribute — no charset defines their bytes) or one of
+    /// the geometry types (opaque WKB under a NULL charset) and `VECTOR`. All of them come
+    /// through the binlog as bytes and render through `String::from_utf8_lossy`, which turns
+    /// every impossible byte into U+FFFD: two rows can then share a key, and a DELETE can
+    /// carry another row's key. A column whose charset or type was never read passes — the
+    /// refusal only fires on what the catalog answered, never on a guess.
+    pub fn key_unsafe(&self, i: usize) -> Option<&'static str> {
+        if self.charsets.get(i).copied() == Some(Charset::Binary) {
+            return Some("its charset is `binary`: the bytes are not text");
+        }
+        match self.column_type(i)? {
+            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+            | "geometry" | "point" | "linestring" | "polygon" | "multipoint"
+            | "multilinestring" | "multipolygon" | "geomcollection" | "geometrycollection"
+            | "gis" | "vector" => Some("no charset defines its bytes"),
+            _ => None,
+        }
     }
 
     /// One column of a row image as JSON.
@@ -326,25 +372,32 @@ pub fn table_map_names(tme: &TableMapEvent<'_>) -> Option<Vec<String>> {
     None
 }
 
-/// The layout an event's own column names describe: every column keeps the kind and the
-/// charset of the `information_schema` column of the same name (a name the read does not
-/// know is plain, in the lossy default charset). Pure: the same `info` and the same names
-/// always derive the same layout.
+/// The layout an event's own column names describe: every column keeps the kind, the
+/// charset and the data type of the `information_schema` column of the same name (a name
+/// the read does not know is plain, in the lossy default charset, with no type). Pure: the
+/// same `info` and the same names always derive the same layout.
 pub fn layout_from_names(info: &Layout, names: &[String]) -> Arc<Layout> {
-    let (kinds, charsets): (Vec<_>, Vec<_>) = names
-        .iter()
-        .map(|n| {
-            info.index(n)
-                .map(|i| {
-                    (
-                        info.kinds.get(i).cloned().unwrap_or(ColKind::Plain),
-                        info.charsets.get(i).copied().unwrap_or(Charset::Utf8),
-                    )
-                })
-                .unwrap_or((ColKind::Plain, Charset::Utf8))
-        })
-        .unzip();
-    Arc::new(Layout::with_charsets(names.to_vec(), kinds, charsets))
+    let (mut kinds, mut charsets, mut types) = (Vec::new(), Vec::new(), Vec::new());
+    for n in names {
+        match info.index(n) {
+            Some(i) => {
+                kinds.push(info.kinds.get(i).cloned().unwrap_or(ColKind::Plain));
+                charsets.push(info.charsets.get(i).copied().unwrap_or(Charset::Utf8));
+                types.push(info.column_type(i).unwrap_or_default().to_string());
+            }
+            None => {
+                kinds.push(ColKind::Plain);
+                charsets.push(Charset::Utf8);
+                types.push(String::new());
+            }
+        }
+    }
+    Arc::new(Layout::with_charsets(
+        names.to_vec(),
+        kinds,
+        charsets,
+        types,
+    ))
 }
 
 /// The `information_schema` layouts, cached per table — and, keyed by those names, the
@@ -533,12 +586,16 @@ impl Catalog {
         let mut names = Vec::new();
         let mut kinds = Vec::new();
         let mut charsets = Vec::new();
+        let mut types = Vec::new();
         for (n, d, c, cs) in rows {
             names.push(n);
             kinds.push(col_kind(&d, &c));
             charsets.push(col_charset(cs.as_deref()));
+            types.push(d.to_ascii_lowercase());
         }
-        Ok(Arc::new(Layout::with_charsets(names, kinds, charsets)))
+        Ok(Arc::new(Layout::with_charsets(
+            names, kinds, charsets, types,
+        )))
     }
 
     /// The layout for rows described by `tme`.
