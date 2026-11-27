@@ -22,7 +22,16 @@ House rules for commits, branches and pull requests on this repository.
   image jobs. The MariaDB pre-release matrix entries are advisory
   (`continue-on-error`) and never block.
 - Merge by squashing, so `main` stays a linear history of one commit per
-  change, and delete the branch afterwards.
+  change, and delete the branch afterwards. The squash message is a pointer:
+  subject `<the PR title> (#<n>)`, body `Squash-merged PR #<n>.` — not the
+  branch's commit message, not the PR body (lazyview practice, 2026-11-27).
+- Before merging a code pull request (anything outside `docs/` and
+  `README.md`) whose head does not already hold main's tip, the keeper
+  merges it with `origin/main` in a scratch worktree (under `tmp/`, never
+  pushed, removed after) and runs `make lint` on the combined tree; it
+  merges only when that passes, and reports a failure to lwf-super and the
+  author. Nobody merges main into a PR branch of its own unless it actually
+  conflicts (owner rule).
 
 ## Hand-offs from workers
 
