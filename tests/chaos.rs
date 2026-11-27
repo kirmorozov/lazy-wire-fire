@@ -13,9 +13,11 @@
 //! that started on its own (the first start's walk, killed with the rule's position
 //! persisted), P3
 //! `graceful_sigterm` is the cheap shutdown control (exit 0 within the
-//! stop grace, running actions finished, position saved for the next child), and C1
+//! stop grace, running actions finished, position saved for the next child), C1
 //! `target_down_while_source_flaps` is the combined outage that proves "outage ≠ data loss"
-//! end to end. `h1` and `h2`
+//! end to end, and E1 `control_stall_keeps_the_stream` holds the CONTROL role (backlog E-1:
+//! every control-connection statement carries the per-statement bound, so a held connection
+//! costs a once-logged transient heal and never the loop). `h1` and `h2`
 //! are harness self-tests, and they are the reason two of the sampler's invariants can be trusted:
 //! each forges a row that *should* be refused — a position below a declared XA floor, and a position
 //! at the checkpoint of a phase whose keys never arrived — and requires the refusal. An invariant
@@ -4690,6 +4692,271 @@ async fn c1_target_down_while_source_flaps() {
         tprog.refusals(),
         st.flap_cuts,
         drained_in
+    );
+    assert_no_undelivered(&lazy);
+    lazy.kill();
+    sp.stop();
+}
+
+// --------------------------------------------------------------------------- E1 control
+
+/// E1 (design §2, backlog E-1): the control role held — the `LAZYWF_DSN` proxy answers
+/// nothing on any connection, new or already relayed — while the binlog and query roles stay
+/// live. The engine runs every control-connection statement inline on the stream loop's own
+/// task (the config reload, the status write behind `lock::verify`, the source-clock
+/// question, the reset clear) and fences every flush on the same role's pool, so one
+/// unbounded await parks the loop inside the first of them that comes due: the binlog stops
+/// being read, nothing fires again, and `/livez` — a separate task — keeps answering 200 for
+/// 60 s and then 503 "main loop stalled". The per-statement bound must turn that hold into a
+/// once-logged transient control error on the existing heal path. Properties:
+/// * the fault is a fact where it is performed — zero server→client bytes through the
+///   control proxy for the whole hold (its own counter, S2's pattern) — and a NEW control
+///   connection is accepted there while the hold still stands: the engine's own heal
+///   attempt, not anything the seed did;
+/// * the loop keeps beating for the whole hold, past the 60 s floor of `health::STALL`:
+///   every `/livez` probe of the hold answers 200 (on main the park makes it 503);
+/// * a flush that cannot fence does not deliver: the keys written during the hold are NOT
+///   at the mock while the hold stands — and they are not lost either, they all arrive after
+///   the heal. The suppression is the engine's own: a flush that comes due while the control
+///   plane is not trusted parks (`FlushParked`) rather than fire, because `action::fence`
+///   rides a pool connection of that same role and a fence answered there would be a fire on
+///   a boundary whose lock the heal path has not confirmed; the fence's own per-step bound is
+///   what covers a flush that started before the stall was known;
+/// * never advance a position on a timed-out write: the rule row sits unmoved (read twice a
+///   status period apart) and below the checkpoint of the writes made during the hold, and
+///   never backwards (P6);
+/// * the stall is logged once per episode, not once per due tick;
+/// * after the heal everything drains within the bound: the row walks past the checkpoint,
+///   all 400 keys are delivered, and no undelivered event (P5) remains.
+///
+/// Red on main: without the bound the loop parks in the first persist/reload due after
+/// arming and never beats again, so the probes of the hold read `/livez` 503 "main loop
+/// stalled for Ns"; nothing names the stall in the log and no heal connection is ever tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e1_control_stall_keeps_the_stream() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "chaos_e1").await;
+    chaos_shop(&db).await;
+    let log = FaultLog::new();
+    let mock = Mock::start().await;
+    mock.set_fault_log(log.clone());
+    mock.tag("e1-hook");
+    let host = server_addr(&root);
+    let mainp = FaultProxy::start(&host, "main", Some(log.clone())).await;
+    let binp = FaultProxy::start(&host, "binlog", Some(log.clone())).await;
+    let qp = FaultProxy::start(&host, "query", Some(log.clone())).await;
+    db.target("hook", "http", &mock.url(), None, "{}").await;
+    join_rule(&db, "o", "hook", "orders").await;
+    let (dsn_main, dsn_bin, dsn_q) = (
+        via(&root, mainp.addr(), &db.schema),
+        via(&root, binp.addr(), &db.schema),
+        via(&root, qp.addr(), &db.schema),
+    );
+    let mut lazy = Lazy::start(
+        "e1_control_stall_keeps_the_stream",
+        &db,
+        &proxy_env(&dsn_main, &dsn_bin, &dsn_q),
+        Some(log.clone()),
+    );
+    ready_or_skip!(lazy, 60);
+    let sp = Sampler::start(&db, log.clone());
+    sp.add_proxy(&mainp);
+    sp.add_proxy(&binp);
+    sp.add_proxy(&qp);
+    sp.add_log(&lazy.log_path);
+
+    // Phase 1 flows cleanly first, so the hold is the only thing that can stop phase 2
+    // and the status row has a real baseline to sit on while the writes time out.
+    bulk_orders(&db, 1, 200).await;
+    let cp1 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase("o", "phase 1", cp1.clone(), keyset(1, 200), &mock);
+    drain(&sp, &lazy, &db, "o", cp1.clone(), 60).await;
+
+    // The fault: the control role held. The binlog and query roles stay live — what can
+    // stop the loop is an inline control statement, and the harness runs the persist
+    // (LAZYWF_STATUS_MS=200) and the reload (LAZYWF_CONFIG_POLL_MS=1000) due every
+    // heartbeat, so the loop reaches one within a second of arming.
+    let conns_at_arm = mainp.conns();
+    let delivered_at_arm = mainp.delivered_s2c();
+    mainp.stall(true);
+    log.add("control role held: the main proxy accepts every connection, relays nothing");
+    let (pinned_f, pinned_p, _, _) = db.status("o").await.expect("row at the moment of arming");
+
+    // Phase 2 is written after a wait on the FAULT's period (the first due lands well
+    // inside these 3 s), not on any delivery: what races here is "did the loop reach a
+    // control statement yet", never "did the binlog catch up".
+    sleep_ms(3_000).await;
+    bulk_orders(&db, 201, 400).await;
+    let cp2 = binlog_end(&db).await;
+    db.tick().await;
+    sp.add_phase(
+        "o",
+        "phase 2 (written during the hold)",
+        cp2.clone(),
+        keyset(201, 400),
+        &mock,
+    );
+
+    // The fault where it is implemented: while armed the control proxy handed the engine
+    // no answer bytes at all — the proxy's own counter, the one measurement that can say
+    // "the engine was allowed to see nothing" without racing the engine's pipeline.
+    let delivered_now = mainp.delivered_s2c();
+    assert_eq!(
+        delivered_now,
+        delivered_at_arm,
+        "the control proxy passed {} more server->client bytes to the engine while held \
+         ({} at arming): the control role was never deaf, so every claim below is about a \
+         connection that was still being answered",
+        delivered_now - delivered_at_arm,
+        delivered_at_arm
+    );
+
+    // The hold, past the floor. `/livez` is served by a task of its own, so it answers for
+    // as long as the loop beats: this is the loop's own heartbeat measured from outside, and
+    // it is what the bound buys. On main the loop parks in the first control statement due
+    // after arming and never beats again, so the probe reads 503 "main loop stalled for Ns"
+    // once the 60 s floor of `health::STALL` has passed — the hold therefore has to outlive
+    // the floor, and every probe of it is an assertion.
+    let held = Instant::now();
+    let mut probes = 0usize;
+    while held.elapsed() < Duration::from_secs(70) {
+        assert!(
+            lazy_wire_fire::health::probe(lazy.health, "/livez").await,
+            "/livez stopped answering {} s into the hold: the stream loop waits for a control \
+             statement inline and stopped beating",
+            held.elapsed().as_secs()
+        );
+        probes += 1;
+        sleep_ms(2_000).await;
+    }
+    assert!(
+        probes >= 25,
+        "the hold was meant to outlive the 60 s floor of health::STALL and managed only \
+         {probes} /livez probes: the fault did not stay armed for the whole window"
+    );
+
+    // The keys written during the hold are NOT at the mock yet — and must not be. A flush
+    // fences on this same held role before it fires (`action::fence` runs on the main
+    // account's pool), and a flush that cannot fence delivers nothing: the honest shape of
+    // this fault is a loop that keeps beating and buffering while the deliveries wait for
+    // the role, not deliveries bought by firing through a fence that never answered. That
+    // none of them was lost is the drain below.
+    let got = mock.keys_received();
+    let early: Vec<String> = (201..=400)
+        .map(|i| i.to_string())
+        .filter(|k| got.contains(k))
+        .collect();
+    assert!(
+        early.is_empty(),
+        "{early:?} of the phase-2 keys reached the mock while the fence could not answer: a \
+         flush must not fire on a boundary it was never allowed to fence"
+    );
+
+    // And the suppression is the engine's own decision, not an accident of the fence timing:
+    // a flush that comes due while the control plane is not trusted parks (`FlushParked`)
+    // instead of asking a fence it cannot trust — the fence rides a pool connection of the
+    // same role, so it is exactly the thing that could answer on a session whose lock the
+    // heal path has not confirmed. Its line is the record of that call being made.
+    let parked_lines = lazy
+        .log_lines_matching("firing waits for the heal path")
+        .len();
+    assert!(
+        parked_lines >= 1,
+        "no flush of the hold said why it did not fire: the loop is expected to park behind \
+         the unconfirmed lock (FlushParked) rather than fire on a fence it cannot trust"
+    );
+
+    // And the heal never once mistook its own closing session for a peer: waiting for the server
+    // to finish with the session that owned the lock is what the take's wait is for, and the
+    // sentence that means "a peer has taken my place" is fatal — this node is still streaming (the
+    // probes above), so it must never have been said. The peer's own case is proven the other way
+    // by e2e's `instance_lock_taken_during_control_loss_is_fatal`, which dies on exactly it.
+    let peer_lines = lazy.log_lines_matching("taken by another instance");
+    assert!(
+        peer_lines.is_empty(),
+        "the heal path declared a peer that took the lock while this node went on streaming: the \
+         refusal came from its own session the server had not reaped, and only a holder that is \
+         not that session may be called a peer ({peer_lines:?})"
+    );
+
+    // The fault stayed a fact for the whole window: still no answer bytes through the
+    // control proxy since arming — the proxy's own counter, not the engine's word.
+    let delivered_now = mainp.delivered_s2c();
+    assert_eq!(
+        delivered_now,
+        delivered_at_arm,
+        "the control proxy passed {} more server->client bytes over the hold ({} at arming): \
+         the control role was not held for the whole window",
+        delivered_now - delivered_at_arm,
+        delivered_at_arm
+    );
+
+    // The heal is the engine's own initiative: a NEW control connection arrived at the proxy
+    // while the hold still stood (S2's pattern — the proxy's counter is what makes "the
+    // engine retried" the proxy's claim to make, not the seed's hope).
+    let conns_end = mainp.conns();
+    assert!(
+        conns_end > conns_at_arm,
+        "the engine never asked for the control connection back over {} s of the hold ({} \
+         accepts at arming, {conns_end} at its end): a loop parked in one unbounded await \
+         never reaches the heal path",
+        held.elapsed().as_secs(),
+        conns_at_arm
+    );
+
+    // The stall is reported, once: the timed-out statement is named in the child's log.
+    // Every due tick of the hold ran a bounded attempt, so per-due logging would put this
+    // count in the dozens across the window above; per episode it is one.
+    let stall_lines = lazy.log_lines_matching("control statement `").len();
+    assert!(
+        (1..=5).contains(&stall_lines),
+        "the held control connection was named in the child's log {stall_lines} times: the \
+         honest answer is between 1 and 5 — once per episode, not once per due tick, not never"
+    );
+
+    // Never advance a position on a timed-out write: the rule row, read twice a status
+    // period apart, unmoved — and below the checkpoint of the writes made during the hold,
+    // whose keys the loop had buffered but could not fire. It never went backwards over the
+    // fault either (P6).
+    let (f1, p1, _, _) = db.status("o").await.expect("row during the hold");
+    sleep_ms(600).await;
+    let (f2, p2, _, _) = db
+        .status("o")
+        .await
+        .expect("row during the hold, second read");
+    assert_eq!(
+        (f2.clone(), p2),
+        (f1.clone(), p1),
+        "the rule row advanced while every status write was timing out: {f1}:{p1} and \
+         then {f2}:{p2} — a write that timed out must never count as written"
+    );
+    assert!(
+        (f2.clone(), p2) < cp2.clone(),
+        "the rule row reached {f2}:{p2}, at or past the checkpoint of the writes made \
+         during the hold ({}:{}), while every persist attempt ended as a timeout",
+        cp2.0,
+        cp2.1
+    );
+    assert!(
+        (f2.clone(), p2) >= (pinned_f.clone(), pinned_p),
+        "P6: the rule row went backwards over the hold: it is {f2}:{p2} and was \
+         {pinned_f}:{pinned_p} when the hold was armed"
+    );
+
+    // Heal. The stream never stopped, so what remains is the held writes landing and the
+    // row walking past the checkpoint.
+    log.add("control role healed");
+    mainp.heal();
+    drain(&sp, &lazy, &db, "o", cp2.clone(), 90).await;
+    assert_all_keys(&mock, 1, 400, "E1");
+    let (delivered, repeated) = delivery_report(&mock);
+    eprintln!(
+        "E1: 400 write-once keys through a held control connection: the loop kept \
+         streaming and beating, {parked_lines} flushes parked rather than fire on a fence it \
+         could not trust, the row sat at {f2}:{p2} through the hold (stall logged \
+         {stall_lines}x), after the heal everything drained (deliveries={delivered}, \
+         repeated={repeated})",
     );
     assert_no_undelivered(&lazy);
     lazy.kill();
