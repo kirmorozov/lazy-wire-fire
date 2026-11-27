@@ -68,7 +68,7 @@ fn object_names_every_column_with_its_kind() {
 /// A `BIT(n)` column arrives as big-endian bytes; the number is what they spell.
 #[test]
 fn bit_columns_are_big_endian_and_bounded() {
-    let bit = |b: Vec<u8>| convert(val(My::Bytes(b)).as_ref(), &ColKind::Bit);
+    let bit = |b: Vec<u8>| convert(val(My::Bytes(b)).as_ref(), &ColKind::Bit, Charset::Utf8);
     assert_eq!(bit(vec![0x00]), json!(0u64));
     assert_eq!(bit(vec![0xff]), json!(255u64));
     assert_eq!(bit(vec![0x01, 0x00]), json!(256u64));
@@ -84,14 +84,16 @@ fn bit_columns_are_big_endian_and_bounded() {
     );
     assert_eq!(bit(vec![]), json!(0u64));
     // A `BIT` column whose value is SQL NULL is null, not zero.
-    assert_eq!(convert(None, &ColKind::Bit), Value::Null);
+    assert_eq!(convert(None, &ColKind::Bit, Charset::Utf8), Value::Null);
 }
 
 /// `JSON` columns come over as JSONB: scalars decode, and a value that cannot be a JSON value
 /// (`Opaque`, invalid UTF-8) is null rather than a broken document.
 #[test]
 fn jsonb_columns_decode_or_are_null() {
-    let j = |v: jsonb::Value<'static>| convert(Some(&BinlogValue::Jsonb(v)), &ColKind::Plain);
+    let j = |v: jsonb::Value<'static>| {
+        convert(Some(&BinlogValue::Jsonb(v)), &ColKind::Plain, Charset::Utf8)
+    };
     assert_eq!(j(jsonb::Value::Null), json!(null));
     assert_eq!(j(jsonb::Value::Bool(true)), json!(true));
     assert_eq!(j(jsonb::Value::I64(-7)), json!(-7));
@@ -120,7 +122,11 @@ fn jsonb_columns_decode_or_are_null() {
     );
     // A partial JSON update carries no full value: null, so the rule re-reads the row.
     assert_eq!(
-        convert(Some(&BinlogValue::JsonDiff(Vec::new())), &ColKind::Plain,),
+        convert(
+            Some(&BinlogValue::JsonDiff(Vec::new())),
+            &ColKind::Plain,
+            Charset::Utf8,
+        ),
         Value::Null
     );
 }
@@ -128,7 +134,7 @@ fn jsonb_columns_decode_or_are_null() {
 /// The unsigned masks (one per width), the enum labels, and the set mask.
 #[test]
 fn unsigned_enums_and_sets() {
-    let c = |v: My, k: ColKind| convert(val(v).as_ref(), &k);
+    let c = |v: My, k: ColKind| convert(val(v).as_ref(), &k, Charset::Utf8);
     for (bits, want) in [
         (8u32, 255u64),
         (16, 65_535),
@@ -179,7 +185,7 @@ fn unsigned_enums_and_sets() {
 /// Values no kind claims go through the same conversion a query result uses.
 #[test]
 fn plain_values_use_the_query_conversion() {
-    let c = |v: My| convert(val(v).as_ref(), &ColKind::Plain);
+    let c = |v: My| convert(val(v).as_ref(), &ColKind::Plain, Charset::Utf8);
     assert_eq!(c(My::Int(7)), json!(7));
     assert_eq!(c(My::UInt(8)), json!(8));
     assert_eq!(c(My::NULL), Value::Null);
@@ -189,9 +195,16 @@ fn plain_values_use_the_query_conversion() {
         json!("2024-01-02 03:04:05")
     );
     // A `NULL` under a kind that would have decoded it is still null.
-    assert_eq!(convert(val(My::NULL).as_ref(), &ColKind::Bit), Value::Null);
     assert_eq!(
-        convert(val(My::NULL).as_ref(), &ColKind::Enum(vec!["a".into()])),
+        convert(val(My::NULL).as_ref(), &ColKind::Bit, Charset::Utf8),
+        Value::Null
+    );
+    assert_eq!(
+        convert(
+            val(My::NULL).as_ref(),
+            &ColKind::Enum(vec!["a".into()]),
+            Charset::Utf8
+        ),
         Value::Null
     );
 }

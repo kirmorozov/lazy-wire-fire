@@ -16857,3 +16857,238 @@ async fn source_lag_ages_a_stuck_rule_and_reads_zero_when_caught_up() {
     );
     inst.stop().await;
 }
+
+// ── keys whose binlog bytes are not UTF-8 (backlog B-1) ─────────────────────────────
+//
+// A row image carries each key column in the bytes of the column's own charset, and
+// `rows::convert` renders it as text before the key template and the keys_sql parameters
+// ever see it. What a key column's bytes make of that rendering is what these probes pin:
+// the rule is created before its first row, so every key here arrives through the binlog.
+
+/// The `items` rule of the key-charset probes: one select with an `_op` column, so a key
+/// no select returns a row for is a delete (the merger's contract, `Merger::finish`).
+async fn charset_rule(db: &Db, mock: &Mock, select: &str) {
+    db.target(
+        "search",
+        "http",
+        &mock.url(),
+        Some("JSON_CONTAINS(body, 'false', '$.errors')"),
+        "{}",
+    )
+    .await;
+    let selects = json!([select]);
+    db.exec_params(
+        "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms, max_delay_ms) VALUES ('items', 'search', ?, ?, 500, 2000)",
+        (selects.to_string(), BULK),
+    )
+    .await;
+    db.trigger("items", "items", Some("{{new.code}}"), None)
+        .await;
+}
+
+/// The keys that arrived at the mock in `{"delete":...}` lines.
+fn deleted_keys(reqs: &[Req]) -> Vec<String> {
+    reqs.iter()
+        .flat_map(|r| r.ndjson())
+        .filter_map(|l| {
+            l.get("delete")
+                .and_then(|d| d["_id"].as_str().map(String::from))
+        })
+        .collect()
+}
+
+/// A latin1 key: 0xC9 in the binlog is `É` in cp1252, which is what MySQL's latin1 is.
+/// The row lives throughout: its document must follow the row, and nothing may delete it.
+/// The wrong outcome this catches (measured on main, 2026-11-27): the key bytes lose to
+/// `String::from_utf8_lossy` (`rows::convert` → `docs::to_json_ref`), so the binlog side
+/// marks U+FFFD, the select binds the replacement characters, matches nothing, and the
+/// merger reads a missing row as a delete — the target deletes the document of a live row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latin1_key_follows_the_row() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keylatin1").await;
+    db.exec("CREATE TABLE items (code VARCHAR(20) CHARACTER SET latin1 NOT NULL PRIMARY KEY, qty INT NOT NULL) ENGINE=InnoDB")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    charset_rule(
+        &db,
+        &mock,
+        "SELECT code AS _key, qty AS qty, IF(qty < 0, 'delete', NULL) AS _op \
+         FROM items WHERE code IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO items VALUES ('É', 1)").await;
+    db.tick().await;
+    let hex: Vec<(String,)> = db.query("SELECT HEX(code) FROM items").await;
+    assert_eq!(
+        hex[0].0, "C9",
+        "the column must hold latin1's single byte for É"
+    );
+
+    let upsert = |qty: i64| {
+        let mock = &mock;
+        move || async move {
+            let reqs = mock.requests();
+            let dels = deleted_keys(&reqs);
+            assert!(
+                dels.is_empty(),
+                "a live row's document was deleted: {dels:?} (keys seen: {:?})",
+                mock.keys_received()
+            );
+            last_docs(&reqs)
+                .get("É")
+                .cloned()
+                .flatten()
+                .filter(|v| v["qty"] == json!(qty))
+        }
+    };
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert of É at qty 1",
+        upsert(1),
+    )
+    .await;
+    db.exec("UPDATE items SET qty = 2 WHERE code = 'É'").await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert of É at qty 2",
+        upsert(2),
+    )
+    .await;
+    assert_eq!(
+        last_docs(&mock.requests()).get("É").cloned().flatten(),
+        Some(json!({"qty": 2})),
+        "the document of the latin1 key"
+    );
+    inst.stop().await;
+}
+
+/// A utf8mb4 key is its own UTF-8 in the binlog, so the key path must not change a byte
+/// of it: this pins what works today against the charset decoding of the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn utf8mb4_key_follows_the_row() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keyutf8mb4").await;
+    db.exec("CREATE TABLE items (code VARCHAR(20) CHARACTER SET utf8mb4 NOT NULL PRIMARY KEY, qty INT NOT NULL) ENGINE=InnoDB")
+        .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    charset_rule(
+        &db,
+        &mock,
+        "SELECT code AS _key, qty AS qty, IF(qty < 0, 'delete', NULL) AS _op \
+         FROM items WHERE code IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO items VALUES ('É😀', 1)").await;
+    db.tick().await;
+    let hex: Vec<(String,)> = db.query("SELECT HEX(code) FROM items").await;
+    assert_eq!(hex[0].0, "C389F09F9880", "the column holds the key's UTF-8");
+
+    let upsert = |qty: i64| {
+        let mock = &mock;
+        move || async move {
+            let reqs = mock.requests();
+            let dels = deleted_keys(&reqs);
+            assert!(
+                dels.is_empty(),
+                "a live row's document was deleted: {dels:?} (keys seen: {:?})",
+                mock.keys_received()
+            );
+            last_docs(&reqs)
+                .get("É😀")
+                .cloned()
+                .flatten()
+                .filter(|v| v["qty"] == json!(qty))
+        }
+    };
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert of É😀 at qty 1",
+        upsert(1),
+    )
+    .await;
+    db.exec("UPDATE items SET qty = 2 WHERE code = 'É😀'").await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert of É😀 at qty 2",
+        upsert(2),
+    )
+    .await;
+    assert_eq!(
+        last_docs(&mock.requests()).get("É😀").cloned().flatten(),
+        Some(json!({"qty": 2})),
+        "the document of the utf8mb4 key"
+    );
+    inst.stop().await;
+}
+
+/// A `BINARY(16)` key: no charset decodes these bytes, and today every byte ≥ 0x80 loses
+/// to U+FFFD — 0xF0..0xFF are sixteen invalid sequences, so the key renders as sixteen
+/// replacement characters, the select binds them, matches nothing, and the merger deletes
+/// the row's document while the row lives on. This pins that outcome as it stands on main
+/// (2026-11-27) — the byte-safe carrying of binary keys (refuse at rule load, or render
+/// them hex, as lazyview #394 does for its lookups) is open, with lwf-super (backlog B-1
+/// option (b)); whichever answer is built replaces this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binary16_key_is_mangled_to_replacement_characters() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keybin16").await;
+    db.exec(
+        "CREATE TABLE items (code BINARY(16) NOT NULL PRIMARY KEY, qty INT NOT NULL) ENGINE=InnoDB",
+    )
+    .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    charset_rule(
+        &db,
+        &mock,
+        "SELECT code AS _key, HEX(code) AS hex_id, qty AS qty, IF(qty < 0, 'delete', NULL) AS _op \
+         FROM items WHERE code IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO items VALUES (UNHEX('F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF'), 1)")
+        .await;
+    db.tick().await;
+    let hex: Vec<(String,)> = db.query("SELECT HEX(code) FROM items").await;
+    assert_eq!(hex[0].0, "F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF");
+
+    let mangled = "\u{FFFD}".repeat(16);
+    let dels = wait_for(
+        Duration::from_secs(15),
+        "the delete of the mangled key",
+        || async {
+            let d = deleted_keys(&mock.requests());
+            (!d.is_empty()).then_some(d)
+        },
+    )
+    .await;
+    let uniq: std::collections::BTreeSet<String> = dels.into_iter().collect();
+    assert_eq!(
+        uniq,
+        std::collections::BTreeSet::from([mangled.clone()]),
+        "the BINARY key must reach the target as exactly sixteen replacement characters"
+    );
+    let docs = last_docs(&mock.requests());
+    assert!(
+        docs.values().all(Option::is_none),
+        "a BINARY key must be matched by no select: {docs:?}"
+    );
+    assert!(
+        docs.contains_key(&mangled),
+        "the live row's document was deleted under {mangled:?}"
+    );
+    inst.stop().await;
+}

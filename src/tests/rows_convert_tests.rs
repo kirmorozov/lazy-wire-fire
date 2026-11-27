@@ -442,6 +442,154 @@ fn the_borrowed_verdict_matches_the_owned_comparison() {
     }
 }
 
+// ── the binlog bytes of a text column, decoded by the column's own charset (backlog B-1) ──
+
+/// A one-column latin1 layout.
+fn latin1_layout() -> Layout {
+    Layout::with_charsets(
+        vec!["c".into()],
+        vec![ColKind::Plain],
+        vec![Charset::Latin1],
+    )
+}
+
+/// A latin1 key column's bytes are cp1252 (MySQL's latin1), not broken UTF-8: 0xC9 is `É`,
+/// the bytes ≥ 0x80 keep their one character each, and none of it loses to U+FFFD — which
+/// is what let the binlog side of a latin1 key mark a key the target's select could never
+/// match, and delete the document of a live row.
+#[test]
+fn latin1_bytes_render_as_their_text() {
+    let layout = latin1_layout();
+    let cases: &[(&[u8], &str)] = &[
+        (&[0x41], "A"),
+        (&[0xC9], "\u{c9}"),   // É, the measured key of the e2e case
+        (&[0xE9], "\u{e9}"),   // é
+        (&[0x80], "\u{20ac}"), // €  (cp1252)
+        (&[0x99], "\u{2122}"), // ™  (cp1252)
+        (&[0x9F], "\u{178}"),  // Ÿ  (cp1252)
+        (&[0x81], "\u{81}"),   // MySQL's latin1 keeps the five unused cp1252 slots as C1
+        (&[0x8d], "\u{8d}"),
+        (&[0x8f], "\u{8f}"),
+        (&[0x90], "\u{90}"),
+        (&[0x9d], "\u{9d}"),
+        (&[0xA0], "\u{a0}"),
+        (&[0xFF], "\u{ff}"), // ÿ
+        (b"caf\xe9", "caf\u{e9}"),
+        (&[], ""),
+    ];
+    for (bytes, want) in cases {
+        let row = row_of(Some(BinlogValue::Value(My::Bytes(bytes.to_vec()))));
+        assert_eq!(
+            layout.value(&row, 0),
+            Value::String((*want).into()),
+            "bytes {bytes:02x?}"
+        );
+    }
+}
+
+/// What the charset does not decode stays exactly as it was: the default (and unknown)
+/// charset keeps the lossy path, so utf8mb4 keys and BINARY keys are byte-for-byte the
+/// behaviour the corpus pins above.
+#[test]
+fn other_charsets_keep_the_lossy_path() {
+    // `Layout::new` knows no charset: today's answers, pinned by the corpus, unchanged.
+    let layout = layout_of(ColKind::Plain);
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xff, 0xfe]))));
+    assert_eq!(
+        layout.value(&row, 0),
+        Value::String("\u{fffd}\u{fffd}".into())
+    );
+    // valid UTF-8 is untouched by the decoding: the default layout renders it as the text it is
+    let e = "É😀".as_bytes().to_vec();
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(e.clone()))));
+    assert_eq!(
+        layout_of(ColKind::Plain).value(&row, 0),
+        Value::String("É😀".into())
+    );
+    // a latin1 column holds latin1 bytes: six bytes, six characters — decoding is what the
+    // column's charset says, not what happens to parse (and cp1252 is not ISO-8859-1: the
+    // 0x80..0x9F bytes are the Windows specials, 89 is ‰ and 9F is Ÿ)
+    assert_eq!(
+        latin1_layout().value(&row, 0),
+        Value::String("\u{c3}\u{2030}\u{f0}\u{178}\u{2dc}\u{20ac}".into())
+    );
+}
+
+/// The `information_schema` names that decide the decoding.
+#[test]
+fn col_charset_reads_the_information_schema_name() {
+    assert_eq!(col_charset(Some("latin1")), Charset::Latin1);
+    for name in [
+        "utf8mb4", "utf8mb3", "utf8", "ascii", "binary", "gbk", "latin2", "ujis",
+    ] {
+        assert_eq!(
+            col_charset(Some(name)),
+            Charset::Utf8,
+            "{name} keeps today's path"
+        );
+    }
+    for name in [None, Some("")] {
+        assert_eq!(col_charset(name), Charset::Utf8);
+    }
+}
+
+/// `binlog_row_metadata=FULL`: a layout derived from the event's own names keeps the kinds
+/// and the charsets of the `information_schema` read it was derived from.
+#[test]
+fn layout_from_names_keeps_the_charsets() {
+    let info = Layout::with_charsets(
+        vec!["id".into(), "code".into(), "blob".into()],
+        vec![ColKind::Unsigned(32), ColKind::Plain, ColKind::Plain],
+        vec![Charset::Utf8, Charset::Latin1, Charset::Utf8],
+    );
+    // the event's own order, a column the read does not know, and the latin1 column by name
+    let names = vec!["code".to_string(), "id".to_string(), "extra".to_string()];
+    let l = layout_from_names(&info, &names);
+    let bytes = |b: Vec<u8>| Some(BinlogValue::Value(My::Bytes(b)));
+    let row = row3(bytes(vec![0xC9]));
+    assert_eq!(
+        l.value(&row, 0),
+        Value::String("\u{c9}".into()),
+        "the latin1 name found its charset"
+    );
+    // the plain and the unknown columns keep the lossy path
+    let row = row3(bytes(vec![0xff]));
+    assert_eq!(l.value(&row, 1), Value::String("\u{fffd}".into()));
+    assert_eq!(l.value(&row, 2), Value::String("\u{fffd}".into()));
+}
+
+/// A three-column row of one value: for the derived layouts, whose columns are read by index.
+fn row3(v: Option<BinlogValue<'static>>) -> BinlogRow {
+    BinlogRow::new(vec![v.clone(), v.clone(), v], Arc::new([]))
+}
+
+/// Two latin1 payloads that differ stay different (cp1252 is one-to-one), so the changed
+/// shortcut still decides them by the conversion it must make — and identical bytes still
+/// cost nothing.
+#[test]
+fn latin1_changed_keeps_the_shortcut_and_the_verdict() {
+    let layout = latin1_layout();
+    let a = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xC9]))));
+    let b = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xE9]))));
+    assert!(
+        layout.changed(&a, &b, 0),
+        "\u{c9} and \u{e9} are different text"
+    );
+    // where the old lossy path saw one replacement char in both and called it unchanged
+    let f = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xff]))));
+    let e = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xfe]))));
+    assert!(
+        layout.changed(&f, &e, 0),
+        "\u{ff} and \u{fe} are different characters, whatever lossy made of them"
+    );
+    let ((), n) = alloc_measure::count(|| {
+        for _ in 0..20 {
+            std::hint::black_box(layout.changed(&a, &a, 0));
+        }
+    });
+    assert_eq!(n, 0, "identical latin1 bytes were converted anyway");
+}
+
 /// One `Value::String` of these bytes: the cost the borrowed conversion pays for a text column.
 fn bytes_cost() -> usize {
     let (_, n) = alloc_measure::count(|| {
@@ -588,3 +736,4 @@ fn the_shortcut_only_skips_what_it_can_prove() {
         owned_changed(&layout, &j, &one, 0)
     );
 }
+
