@@ -70,6 +70,174 @@ const STREAM_BACKOFF_FIRST: Duration = Duration::from_millis(500);
 const STREAM_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const STREAM_FAST_PATH: Duration = Duration::from_millis(200);
 
+/// The per-statement bound on the control connection ([`ctl`]). Every control statement is
+/// small — a probe, a `GET_LOCK`/`IS_USED_LOCK`, one status UPSERT per rule, a read of the
+/// three config tables — so one that outlives this is not slow, it is stuck: a half-open
+/// session the kernel has not given up on, or a statement parked behind another session's
+/// lock on `lazy_wire_fire_status` or the rule table. The mysql_async options carry no read
+/// timeout (`tcp_keepalive` cannot see a server that answers TCP but not the query), so
+/// without this bound the await hangs the stream loop, which runs it inline. 10 s matches the
+/// reconnect budgets around it (`connect_wait`'s and `heal_control`'s connects, the binlog
+/// filter probe); a statement that legitimately needs longer fails transiently and is retried
+/// by the heal path — no position is ever advanced on a timed-out write.
+pub(crate) const CONTROL_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// While the control connection is known-stalled, [`Engine::housekeeping`] retries a
+/// replacement at this cadence instead of per tick, so a held connection costs one bounded
+/// connect per retry and the stream loop keeps beating between them.
+const CONTROL_RETRY_WAIT: Duration = Duration::from_secs(5);
+/// How long the heal path lets the server hold its `GET_LOCK` answer while it waits for the
+/// lock (see [`lock::reacquire`]): the session this node just closed owns the lock until the
+/// server notices, and that is normally milliseconds but must not be raced. Well inside
+/// [`CONTROL_STATEMENT_TIMEOUT`], which bounds the statement around it.
+const CONTROL_LOCK_WAIT: Duration = Duration::from_secs(5);
+/// A lock this node cannot take at all belongs to a live peer, and a node whose place is taken
+/// must say so and stop — and the heal path says so at once when the server's holder is not this
+/// node's own session (see [`lock::holder`]). This many refusals whose holder proves nothing
+/// (the lock read as free, or the holder could not be read) are tolerated first, each one having
+/// already waited [`CONTROL_LOCK_WAIT`]: enough for a server slow to reap the session it is
+/// replacing, and a bound on how long a node may stream without a confirmed lock. A refusal
+/// whose holder IS that closing session is not counted at all — it names no peer, and the wait
+/// for the server to finish with a session of our own is bounded by the server's own read
+/// timeout, not by a count.
+const CONTROL_LOCK_DENIES: u32 = 3;
+
+/// A control-connection statement that did not answer within [`CONTROL_STATEMENT_TIMEOUT`].
+/// A transient control-connection error like a broken one (the heal path replaces the
+/// connection), except that the connection is not trusted for further statements meanwhile:
+/// the abandoned statement may leave its answer unread on the socket (mysql_async cleans a
+/// dropped result on next use, which under the same fault would hang on the drain — bounded
+/// by this very timeout, but the heal path is the point). `Engine::control_stalled` carries
+/// that fact; `heal_control` insists on replacing the connection while it stands.
+#[derive(Debug)]
+pub(crate) struct ControlStalled(&'static str);
+
+impl std::fmt::Display for ControlStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "control statement `{}` did not answer within {CONTROL_STATEMENT_TIMEOUT:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ControlStalled {}
+
+/// A flush that must not fire yet: the control plane is not trusted (see [`ControlStalled`]) or
+/// the heal path has not confirmed this node holds the instance lock (`Engine::lock_unconfirmed`)
+/// — the two are separate facts, and either one is enough. It needs its own error because the
+/// fence does not ride the control connection — `action::fence` takes a pool connection — so a
+/// fence *could* answer in that window, and firing on it would be firing without a confirmed
+/// lock, which is the one thing the instance lock exists to prevent. The keys stay buffered and
+/// no position moves, exactly as for a fence that does not answer.
+#[derive(Debug)]
+struct FlushParked;
+
+impl std::fmt::Display for FlushParked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately without the words "instance lock": housekeeping reads that phrase as
+        // "we lost our place" and exits on it (see `persist`), and this error says the
+        // opposite — the node is holding still until the heal path proves otherwise.
+        f.write_str(
+            "the control connection is stalled: firing waits for the heal path to confirm \
+             this node still holds the lock",
+        )
+    }
+}
+
+impl std::error::Error for FlushParked {}
+
+/// Whether a flush may fire now: the control plane is trusted **and** the instance lock is
+/// confirmed. Either fact alone is enough to hold the keys back — the fence rides a pool
+/// connection, so it can answer for a node that has neither (see [`FlushParked`]).
+fn may_fire(control_stalled: bool, lock_unconfirmed: bool) -> bool {
+    !control_stalled && !lock_unconfirmed
+}
+
+/// Whether a refused take of the instance lock was refused by a **peer**: the server names a
+/// holder and it is not the session this node was using. Anything else is not proof of a
+/// takeover and must not kill the node — no holder at all (the lock is free this instant, so the
+/// next take should get it), or no recorded id of our own to compare with. Those are retried,
+/// parked, and only [`CONTROL_LOCK_DENIES`] of them become the fatal.
+fn denied_by_peer(holder: Option<&str>, ours: Option<&str>) -> bool {
+    matches!((holder, ours), (Some(h), Some(o)) if h != o)
+}
+
+/// Whether an unproven refusal is the last one: past this many of them the node says so and
+/// stops. It exists as a function of its own because the budget is what makes
+/// [`denied_by_peer`]'s uncertainty survivable: a refusal the server cannot explain — including
+/// the one case it can never tell apart, a **peer that holds the lock under the very id we
+/// recorded**, because connection ids start again after a server restart — is retried, but only
+/// this many times, each having already waited [`CONTROL_LOCK_WAIT`]. So an unprovable peer can
+/// delay the same fatal by a few bounded rounds; it cannot prevent it.
+fn unproven_refusal_is_final(denies: u32) -> bool {
+    denies >= CONTROL_LOCK_DENIES
+}
+
+/// Whether `e` is (or wraps) a transient control-plane error — a statement that timed out or
+/// a flush parked behind one — for which [`ctl`] already said so once for the episode: the
+/// caller's own WARN on every due tick would be noise, so the arms of housekeeping keep quiet
+/// for these errors alone.
+fn control_stalled_err(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ControlStalled>().is_some() || e.downcast_ref::<FlushParked>().is_some()
+}
+
+/// The bookkeeping of one timed-out control statement: the event is logged once per stall
+/// episode (until `heal_control` clears the flag), not once per due tick.
+fn ctl_note(stalled: &mut bool, what: &str) {
+    if !*stalled {
+        warn!(
+            "control statement `{what}` did not answer within \
+             {CONTROL_STATEMENT_TIMEOUT:?}: treating it as a broken control connection (the \
+             stream loop keeps streaming; the connection is replaced on the heal path)"
+        );
+    }
+    *stalled = true;
+}
+
+/// Awaits one operation on the control connection under `timeout` (every caller passes
+/// [`CONTROL_STATEMENT_TIMEOUT`]; the parameter is what lets a unit test watch a stall in
+/// milliseconds). A timeout becomes [`ControlStalled`] and marks `stalled` — the caller's
+/// existing transient error path (warn + `heal_control`) then replaces the connection.
+pub(crate) async fn ctl<T, F>(
+    stalled: &mut bool,
+    what: &'static str,
+    timeout: Duration,
+    fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            ctl_note(stalled, what);
+            Err(ControlStalled(what).into())
+        }
+    }
+}
+
+/// [`ctl`] for a `mysql_async` call directly on the connection, so the sites that use the
+/// prelude methods do not each wrap the error by hand.
+pub(crate) async fn ctl_my<T, F>(
+    stalled: &mut bool,
+    what: &'static str,
+    timeout: Duration,
+    fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = mysql_async::Result<T>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            ctl_note(stalled, what);
+            Err(ControlStalled(what).into())
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Backoff {
     failures: u32,
@@ -775,6 +943,28 @@ pub struct Engine {
     opts: Opts,
     binlog_opts: Opts,
     control: Conn,
+    /// A control statement timed out ([`ControlStalled`]) and the connection behind
+    /// `control` has not been replaced yet: further statements wait for the heal path
+    /// rather than hang one bound each, `heal_control` skips its ping and reconnects, and a
+    /// flush parks instead of firing (see [`FlushParked`]) until the lock is confirmed again.
+    control_stalled: bool,
+    /// When to next retry a replacement while `control_stalled` stands (the cadence of
+    /// [`CONTROL_RETRY_WAIT`], kept so a held connection costs one bounded connect per retry).
+    next_control_try: Instant,
+    /// How many times in a row the heal path has been refused the instance lock by an answer
+    /// that proved nothing. A refusal whose holder is some other session is a peer and is fatal
+    /// at once (see [`lock::holder`] and [`denied_by_peer`]); these are the ones the node waits
+    /// out instead, for [`CONTROL_LOCK_DENIES`] of them before it says so and stops.
+    lock_denies: u32,
+    /// This node's own lock is not confirmed: the control session that held it has been
+    /// replaced and the take has not answered yet (a refusal, a timed-out take). Nothing fires
+    /// while it stands (see [`FlushParked`]) — the fence rides a pool connection and could
+    /// answer for a node that no longer holds the lock. Cleared by the take that succeeds.
+    lock_unconfirmed: bool,
+    /// The id of the control session that last took the lock, as [`lock::connection_id`] words
+    /// it. The heal path compares the holder of a refused take against it: the same id is this
+    /// node's own closing session, a different one is a peer that has taken its place.
+    control_conn_id: Option<String>,
     env: Arc<Env>,
     flavor: Flavor,
     identity: String,
@@ -1238,19 +1428,68 @@ pub async fn run(
     let Some(mut control) = connect_wait(&opts, &health, &mut shutdown).await? else {
         return Ok(());
     };
-    model::ensure(&mut control).await?;
+    // The startup statements ride the same per-statement bound as the loop's: a control
+    // connection that hangs after connecting must leave a failed start (the supervisor
+    // retries), not a process parked on a frozen socket with /livez green for a minute.
+    // The flag carries into the Engine: a timed-out statement marks the connection to be
+    // replaced on the first heal.
+    let mut control_stalled = false;
+    ctl(
+        &mut control_stalled,
+        "CREATE TABLE if-needed",
+        CONTROL_STATEMENT_TIMEOUT,
+        model::ensure(&mut control),
+    )
+    .await?;
     let lock_name = lock::name(&cfg.schema, &cfg.instance);
     if !lock::acquire(&mut control, &opts, &lock_name, &health, &mut shutdown).await? {
         return Ok(());
     }
+    // Which session the server says owns the lock, recorded now while the connection is known
+    // good: the heal path compares the holder of a refused take against it, and a session that
+    // is already broken cannot answer the question. Losing it costs only the fast proof of a
+    // peer — a refusal then waits out the denial budget instead of exiting at once.
+    let control_conn_id = ctl(
+        &mut control_stalled,
+        "SELECT CONNECTION_ID for the instance lock",
+        CONTROL_STATEMENT_TIMEOUT,
+        lock::connection_id(&mut control),
+    )
+    .await
+    .ok();
     health.set_phase("starting");
-    let info = binlog::server_info(&mut control).await?;
-    managed_service_checks(&mut control, info.flavor).await;
-    let identity = server_identity(&mut control, info.flavor).await?;
-    let lower: Option<i64> = control
-        .query_first("SELECT @@lower_case_table_names")
-        .await
-        .unwrap_or(None);
+    let info = ctl(
+        &mut control_stalled,
+        "reading the server version and binlog settings",
+        CONTROL_STATEMENT_TIMEOUT,
+        binlog::server_info(&mut control),
+    )
+    .await?;
+    let _ = ctl(
+        &mut control_stalled,
+        "the managed-service probes",
+        CONTROL_STATEMENT_TIMEOUT,
+        async {
+            managed_service_checks(&mut control, info.flavor).await;
+            Ok(())
+        },
+    )
+    .await;
+    let identity = ctl(
+        &mut control_stalled,
+        "reading the server identity",
+        CONTROL_STATEMENT_TIMEOUT,
+        server_identity(&mut control, info.flavor),
+    )
+    .await?;
+    let lower: Option<i64> = ctl_my(
+        &mut control_stalled,
+        "SELECT @@lower_case_table_names",
+        CONTROL_STATEMENT_TIMEOUT,
+        control.query_first("SELECT @@lower_case_table_names"),
+    )
+    .await
+    .unwrap_or(None);
     let pool_opts = || {
         PoolOpts::default()
             .with_constraints(PoolConstraints::new(0, cfg.pool_size).expect("0 <= max"))
@@ -1262,15 +1501,28 @@ pub async fn run(
     let query = if query_account {
         let query_opts = binlog::replica_opts(&cfg.query_dsn)?;
         let query = Pool::new(OptsBuilder::from_opts(query_opts).pool_opts(pool_opts()));
-        let mut probe = query
-            .get_conn()
-            .await
-            .map_err(|e| anyhow!("LAZYWF_QUERY_* account cannot connect to the server: {e}"))?;
-        probe
-            .query_drop("SELECT 1")
-            .await
-            .context("LAZYWF_QUERY_* account: SELECT 1")?;
-        drop(probe);
+        // The startup probe is awaited on the loop task too: bounded, so a held query role
+        // fails the start (the supervisor retries) instead of parking the process.
+        let probe = async {
+            let mut probe = query
+                .get_conn()
+                .await
+                .map_err(|e| anyhow!("LAZYWF_QUERY_* account cannot connect to the server: {e}"))?;
+            probe
+                .query_drop("SELECT 1")
+                .await
+                .context("LAZYWF_QUERY_* account: SELECT 1")?;
+            Ok::<(), anyhow::Error>(())
+        };
+        match tokio::time::timeout(CONTROL_STATEMENT_TIMEOUT, probe).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "LAZYWF_QUERY_* account: the probe did not answer within \
+                     {CONTROL_STATEMENT_TIMEOUT:?}"
+                ))
+            }
+        }
         query
     } else {
         pool.clone()
@@ -1282,7 +1534,13 @@ pub async fn run(
         cfg.visibility_delay,
         cfg.send_concurrency,
     ));
-    let saved = status::load(&mut control, &cfg.instance).await?;
+    let saved = ctl(
+        &mut control_stalled,
+        "reading lazy_wire_fire_status",
+        CONTROL_STATEMENT_TIMEOUT,
+        status::load(&mut control, &cfg.instance),
+    )
+    .await?;
     let query_user = if cfg.query_account {
         query_opts_user(&cfg.query_dsn)
     } else {
@@ -1321,6 +1579,11 @@ pub async fn run(
         opts,
         binlog_opts,
         control,
+        control_stalled,
+        lock_unconfirmed: false,
+        control_conn_id,
+        next_control_try: Instant::now(),
+        lock_denies: 0,
         env,
         flavor: info.flavor,
         identity,
@@ -1753,7 +2016,13 @@ impl Engine {
             }
             return Ok(());
         }
-        let current = binlog::current_position(&mut self.control).await?;
+        let current = ctl(
+            &mut self.control_stalled,
+            "SHOW MASTER STATUS",
+            CONTROL_STATEMENT_TIMEOUT,
+            binlog::current_position(&mut self.control),
+        )
+        .await?;
         let old = self.boundary.clone();
         warn!("binlog position {old} is no longer available ({e:#}); continuing from {current} and running the reset steps");
         self.rebase(&current);
@@ -1809,12 +2078,21 @@ impl Engine {
 
     /// The current binlog position and the binlog files the server still has.
     async fn binlog_files(&mut self) -> Result<(Position, HashSet<String>)> {
-        let current = binlog::current_position(&mut self.control).await?;
-        let logs: Vec<mysql_async::Row> = self
-            .control
-            .query("SHOW BINARY LOGS")
-            .await
-            .context("SHOW BINARY LOGS")?;
+        let current = ctl(
+            &mut self.control_stalled,
+            "SHOW MASTER STATUS",
+            CONTROL_STATEMENT_TIMEOUT,
+            binlog::current_position(&mut self.control),
+        )
+        .await?;
+        let logs: Vec<mysql_async::Row> = ctl_my(
+            &mut self.control_stalled,
+            "SHOW BINARY LOGS",
+            CONTROL_STATEMENT_TIMEOUT,
+            self.control.query("SHOW BINARY LOGS"),
+        )
+        .await
+        .context("SHOW BINARY LOGS")?;
         let files = logs
             .iter()
             .filter_map(|r| r.get_opt::<String, _>(0).and_then(|v| v.ok()))
@@ -1825,7 +2103,13 @@ impl Engine {
     // ---- configuration ---------------------------------------------------------------------
 
     async fn reload_config(&mut self, initial: bool) -> Result<bool> {
-        let raw = model::load(&mut self.control).await?;
+        let raw = ctl(
+            &mut self.control_stalled,
+            "reading the rule, trigger and target tables",
+            CONTROL_STATEMENT_TIMEOUT,
+            model::load(&mut self.control),
+        )
+        .await?;
         let fp = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             format!("{raw:?}").hash(&mut h);
@@ -1877,10 +2161,33 @@ impl Engine {
             sources.extend(defs.iter().map(|d| d.schema.clone()));
             // The configuration's SQL is prepared (and checked) on the query account.
             let mut rule = if self.cfg.query_account {
-                let mut qc = self.env.query.get_conn().await?;
+                // The query-account connection is opened (and its statements prepared) on
+                // the loop task, so it carries the same bound: a held query role must cost
+                // one retried reload, not the stream.
+                let mut qc = match tokio::time::timeout(
+                    CONTROL_STATEMENT_TIMEOUT,
+                    self.env.query.get_conn(),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "the query account did not answer within {CONTROL_STATEMENT_TIMEOUT:?} \
+                             while preparing the rules"
+                        ))
+                    }
+                };
                 rule::compile(&mut qc, def, defs, &targets).await
             } else {
-                rule::compile(&mut self.control, def, defs, &targets).await
+                ctl(
+                    &mut self.control_stalled,
+                    "preparing the rule's queries",
+                    CONTROL_STATEMENT_TIMEOUT,
+                    async { Ok(rule::compile(&mut self.control, def, defs, &targets).await) },
+                )
+                .await?
             };
             if let Some(e) = parse_err {
                 rule.error = Some(match rule.error.take() {
@@ -1918,8 +2225,13 @@ impl Engine {
                     if let Some(reg) = &self.metrics {
                         reg.remove_rule(&name);
                     }
-                    if let Err(e) =
-                        status::delete(&mut self.control, &self.cfg.instance, &name).await
+                    if let Err(e) = ctl(
+                        &mut self.control_stalled,
+                        "DELETE FROM lazy_wire_fire_status",
+                        CONTROL_STATEMENT_TIMEOUT,
+                        status::delete(&mut self.control, &self.cfg.instance, &name),
+                    )
+                    .await
                     {
                         warn!(rule = %name, "removing its status row: {e:#}");
                     }
@@ -1963,13 +2275,17 @@ impl Engine {
     /// and each source schema of an enabled trigger (see [`filters`]). Advisory: a schema whose
     /// filters cannot be read is logged at debug and checked again on the next reload.
     async fn check_binlog_filters(&mut self, sources: &BTreeSet<String>) {
-        let own: Option<String> = self
-            .control
-            .query_first::<Option<String>, _>("SELECT DATABASE()")
-            .await
-            .ok()
-            .flatten()
-            .flatten();
+        let own: Option<String> = ctl_my(
+            &mut self.control_stalled,
+            "SELECT DATABASE()",
+            CONTROL_STATEMENT_TIMEOUT,
+            self.control
+                .query_first::<Option<String>, _>("SELECT DATABASE()"),
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten();
         let todo = filters::to_check(own.as_deref(), sources, &self.filter_checked);
         if todo.is_empty() {
             return;
@@ -1977,7 +2293,14 @@ impl Engine {
         let (own_todo, src_todo): (Vec<_>, Vec<_>) =
             todo.into_iter().partition(|(_, r)| *r == Role::Own);
         if !own_todo.is_empty() {
-            match binlog::binlog_filters(&mut self.control).await {
+            match ctl(
+                &mut self.control_stalled,
+                "reading the binlog filters",
+                CONTROL_STATEMENT_TIMEOUT,
+                binlog::binlog_filters(&mut self.control),
+            )
+            .await
+            {
                 Ok(f) => self.record_filters(f, own_todo),
                 Err(e) => debug!("reading the binlog filters of the status schema: {e:#}"),
             }
@@ -2437,7 +2760,19 @@ impl Engine {
         if let Err(e) = self.persist(true).await {
             warn!("saving positions at shutdown: {e:#}");
         }
-        lock::release(&mut self.control, &self.lock).await;
+        // Bounded like every other control statement: a held connection must not hold the
+        // stop grace open — the lock is the server's own session state and dies with the
+        // socket when the process exits anyway.
+        let _ = ctl(
+            &mut self.control_stalled,
+            "DO RELEASE_LOCK",
+            CONTROL_STATEMENT_TIMEOUT,
+            async {
+                lock::release(&mut self.control, &self.lock).await;
+                Ok(())
+            },
+        )
+        .await;
         info!("stopped");
         Ok(())
     }
@@ -2720,10 +3055,13 @@ impl Engine {
         let Some(list) = self.routes.get(&nkey).cloned() else {
             return Ok(Route::Ignore);
         };
-        match self
-            .catalog
-            .layout(&mut self.control, &key.0, &key.1, tme)
-            .await
+        match ctl(
+            &mut self.control_stalled,
+            "reading the columns of the watched table",
+            CONTROL_STATEMENT_TIMEOUT,
+            self.catalog.layout(&mut self.control, &key.0, &key.1, tme),
+        )
+        .await
         {
             Ok(layout) => {
                 self.mismatched.remove(&nkey);
@@ -2793,7 +3131,13 @@ impl Engine {
         // An image whose columns cannot be read is an image that must not be read: a server that
         // will not answer them is an error, as it is for the layout read above, and the caller
         // retries. A table that is really gone fails there too, not here.
-        let found = read_generated_first(&mut self.control, schema, table).await?;
+        let found = ctl(
+            &mut self.control_stalled,
+            "reading the generated columns of the table",
+            CONTROL_STATEMENT_TIMEOUT,
+            read_generated_first(&mut self.control, schema, table),
+        )
+        .await?;
         self.generated_first.insert(key.clone(), found.clone());
         Ok(found)
     }
@@ -3615,6 +3959,14 @@ impl Engine {
             pos: self.boundary.clone(),
         };
         let (env, tx) = (self.env.clone(), self.tx.clone());
+        // Whether the control plane is trusted right now: taken here, with the engine, because
+        // the job that reads it no longer has one (see `flush_job`'s first arm). It is a
+        // snapshot of the instant the job is spawned: a control failure that begins afterwards
+        // can still be outrun by that one flush, exactly as a fence has always been able to
+        // answer for a node whose control connection died a millisecond ago. Tightening that
+        // means handing the flags to the jobs (a shared cell on `Env`), which is a wider change
+        // than the bound this one is.
+        let lock_confirmed = may_fire(self.control_stalled, self.lock_unconfirmed);
         let st = self.rules.get_mut(name).expect("present");
         let buf = &mut st.buffer;
         // The whole buffer in one generation, taken at once (unbounded, as always).
@@ -3670,7 +4022,7 @@ impl Engine {
         let mrule = st.mrule.clone();
         spawn_job(tx, name, incarnation, failed, async move {
             let start = Instant::now();
-            let out = flush_job(&env, &rule, spec, keys, &queries).await;
+            let out = flush_job(&env, &rule, spec, keys, &queries, lock_confirmed).await;
             // The flush duration is the job's own wall time (fence + resolve + fire); recorded
             // through the pre-resolved handle: one bucket bump, no name to the registry.
             if let Some(m) = &mrule {
@@ -4158,6 +4510,25 @@ impl Engine {
 
     async fn housekeeping(&mut self) -> Result<()> {
         let now = Instant::now();
+        // Either the control plane cannot answer (a statement timed out) or a take of the
+        // instance lock is still owed: in both cases the tick runs no further statements here —
+        // on a connection that may be untrusted, and one whose lock nothing has confirmed, where
+        // `persist` would ask `lock::verify` a question it must answer wrongly. It does keep
+        // trying, on the bounded cadence below, and the loop beats between the bounded attempts:
+        // that is what keeps the stream streaming and `/livez` honest through a held role.
+        if self.control_stalled || self.lock_unconfirmed {
+            // The cadence is armed *after* the attempt, because an attempt that burns its whole
+            // connect bound would otherwise be due again the moment it returned: the loop then
+            // spent the entire outage parked in one bounded connect after another and stopped
+            // streaming, which is the very fault this fix is for. Arming it after the attempt
+            // leaves a whole `CONTROL_RETRY_WAIT` of streaming between the attempts, and the loop
+            // beats inside that gap.
+            if now >= self.next_control_try {
+                self.heal_control().await?;
+                self.next_control_try = Instant::now() + CONTROL_RETRY_WAIT;
+            }
+            return Ok(());
+        }
         let clears: Vec<String> = if self.clear_retry.is_some_and(|t| now < t) {
             Vec::new()
         } else {
@@ -4191,13 +4562,16 @@ impl Engine {
                 );
                 continue;
             }
-            match self
-                .control
-                .exec_drop(
+            match ctl_my(
+                &mut self.control_stalled,
+                "clearing reset_requested",
+                CONTROL_STATEMENT_TIMEOUT,
+                self.control.exec_drop(
                     "UPDATE `lazy_wire_fire_rule` SET `reset_requested` = 0 WHERE `name` = ?",
                     (&n,),
-                )
-                .await
+                ),
+            )
+            .await
             {
                 Ok(()) => {
                     if let Some(st) = self.rules.get_mut(&n) {
@@ -4205,30 +4579,50 @@ impl Engine {
                     }
                 }
                 Err(e) => {
-                    warn!(rule = %n, "clearing reset_requested: {e}; retrying in 5 s");
+                    if !control_stalled_err(&e) {
+                        warn!(rule = %n, "clearing reset_requested: {e}; retrying in 5 s");
+                    }
                     self.clear_retry = Some(now + Duration::from_secs(5));
                     self.heal_control().await?;
+                    if self.control_stalled || self.lock_unconfirmed {
+                        // No further statements on a connection already known bad, and none while
+                        // the lock is owed: the rest of the tick would end in `persist`.
+                        return Ok(());
+                    }
                 }
             }
         }
         let dirty = self.config_dirty.is_some_and(|t| now >= t);
         if dirty || now >= self.next_poll {
             if dirty {
-                // The change was read from the binlog: wait until it is visible.
+                // The change was read from the binlog: wait until it is visible. The fence
+                // reads the fence table on a pool connection (the control DSN, not the
+                // control connection) and bounds every step of it itself (see
+                // `action::fence_io`), so the loop task cannot be parked by a held control
+                // role here either; a fence that does not answer is skipped exactly like one
+                // that fails.
                 let spec = FenceSpec {
                     gtid: self.last_gtid.clone(),
                     pos: self.boundary.clone(),
                 };
-                if let Err(e) = action::fence(&self.env, &spec).await {
-                    debug!("config fence: {e:#}");
+                match action::fence(&self.env, &spec).await {
+                    Ok(()) => {}
+                    Err(e) => debug!("config fence: {e:#}"),
                 }
             }
             self.config_dirty = None;
             self.next_poll = now + self.cfg.config_poll;
             if let Err(e) = self.reload_config(false).await {
-                warn!("reloading the configuration: {e:#}; retrying");
+                if !control_stalled_err(&e) {
+                    warn!("reloading the configuration: {e:#}; retrying");
+                }
                 self.config_dirty = Some(now + Duration::from_secs(1));
                 self.heal_control().await?;
+                if self.control_stalled || self.lock_unconfirmed {
+                    // The rest of the tick would only burn bounds on a known-bad connection, and
+                    // end in `persist` while the lock is owed.
+                    return Ok(());
+                }
             }
             self.schedule();
         }
@@ -4238,21 +4632,52 @@ impl Engine {
             self.last_clock = Instant::now();
             self.refresh_source_clock().await;
         }
+        if self.control_stalled || self.lock_unconfirmed {
+            // The clock question timed out, or the lock is owed: either way `persist` would only
+            // ask `lock::verify` a question it must answer wrongly (we do not hold the lock until
+            // the take succeeds), and that error is the fatal loss of the lock. Retry on a healed
+            // connection instead.
+            return Ok(());
+        }
         if now >= self.last_persist + self.cfg.status_every {
             if let Err(e) = self.persist(false).await {
                 if e.to_string().contains("instance lock") {
                     return Err(e);
                 }
-                warn!("writing lazy_wire_fire_status: {e:#}");
+                if !control_stalled_err(&e) {
+                    warn!("writing lazy_wire_fire_status: {e:#}");
+                }
                 self.heal_control().await?;
             }
         }
         Ok(())
     }
 
-    /// Reconnects the control connection if it is broken, taking the instance lock again.
+    /// Reconnects the control connection if it is broken, and makes sure this node holds the
+    /// instance lock again. A stalled connection is replaced unconditionally — the abandoned
+    /// statement's answer may still be unread on the socket, so a ping that seems to answer
+    /// proves nothing — and the ping itself carries the statement bound: a half-open session
+    /// hangs a `COM_PING` exactly like a query, and the heal must not hang the way the statement
+    /// it heals did. Every await here is bounded, so a caller on the stream loop task can call
+    /// it and come back; `housekeeping` calls it on the retry cadence, and the loop streams in
+    /// the gaps (see the note there).
+    ///
+    /// A healthy ping is not the whole question: when a previous take was refused, the lock is
+    /// still owed, and that retry rides the connection it has (no reconnect).
     async fn heal_control(&mut self) -> Result<()> {
-        if self.control.ping().await.is_ok() {
+        if !self.control_stalled
+            && ctl_my(
+                &mut self.control_stalled,
+                "COM_PING",
+                CONTROL_STATEMENT_TIMEOUT,
+                self.control.ping(),
+            )
+            .await
+            .is_ok()
+        {
+            if self.lock_unconfirmed {
+                return self.take_control_lock().await;
+            }
             return Ok(());
         }
         let conn = match tokio::time::timeout(Duration::from_secs(10), Conn::new(self.opts.clone()))
@@ -4266,8 +4691,95 @@ impl Engine {
             Err(_) => return Ok(()),
         };
         self.control = conn;
-        lock::reacquire(&mut self.control, &self.lock).await?;
-        info!("control connection re-established");
+        // The connection this node was using goes with that assignment: the server lets the lock
+        // go only when it sees that session close, so the take below waits for its own FIN — and
+        // until it answers, nothing this node does may look like it holds the lock. That is the
+        // case the connection-refused return above is NOT: there the session that owns the lock
+        // is untouched, and the engine carries on as it did before this method existed.
+        self.lock_unconfirmed = true;
+        self.take_control_lock().await
+    }
+
+    /// Takes the instance lock again on the current control connection and settles the flags
+    /// that say whether this node may fire.
+    ///
+    /// The take waits ([`CONTROL_LOCK_WAIT`]) rather than asking once: this path closes the
+    /// session that owns the lock and asks for it in the same instant, and a session the server
+    /// has not reaped yet keeps the lock. A refusal cannot tell that dying session of ours from a
+    /// peer that has taken the node's place, and that difference is the whole question — so the
+    /// server is asked who holds it ([`lock::holder`], compared with the id recorded when this
+    /// node took the lock). A holder that is not our own session is a peer, and that is the loud
+    /// "a peer has taken my place" the node has always had, at once rather than after a count. A
+    /// refusal that names no peer — our own closing session, or nothing the server would name —
+    /// says nothing about a peer: the node keeps streaming, fires nothing (see [`FlushParked`]),
+    /// and tries again on the cadence, for [`CONTROL_LOCK_DENIES`] of those before it says so and
+    /// stops. Waiting out a session of our own is bounded by the server's own read timeout; the
+    /// count here bounds only how long an unreadable answer may keep the node parked.
+    async fn take_control_lock(&mut self) -> Result<()> {
+        let was_unconfirmed = self.lock_unconfirmed;
+        match ctl(
+            &mut self.control_stalled,
+            "GET_LOCK on the re-established control connection",
+            CONTROL_STATEMENT_TIMEOUT,
+            lock::reacquire(&mut self.control, &self.lock, CONTROL_LOCK_WAIT),
+        )
+        .await
+        {
+            Ok(()) => {}
+            // Still owed: the flags stand, the retry cadence in `housekeeping` keeps trying.
+            Err(e) if control_stalled_err(&e) => return Ok(()),
+            Err(e) if e.downcast_ref::<lock::LockDenied>().is_some() => {
+                let holder = ctl(
+                    &mut self.control_stalled,
+                    "SELECT IS_USED_LOCK on a refused take",
+                    CONTROL_STATEMENT_TIMEOUT,
+                    lock::holder(&mut self.control, &self.lock),
+                )
+                .await
+                .unwrap_or(None);
+                // Proven peer: the fatal the node has always had, and the reason the wait below
+                // is safe to have at all.
+                if denied_by_peer(holder.as_deref(), self.control_conn_id.as_deref()) {
+                    return Err(e);
+                }
+                // Not proof of a takeover: our own session the server is still closing, an
+                // answer the server would not give, or (unavoidably) a peer that holds the lock
+                // under the very id we recorded because the server restarted and ids began
+                // again. Retry parked; the node fires nothing until the take succeeds, and the
+                // budget is what keeps even the last of those from lasting forever.
+                self.lock_denies += 1;
+                if !unproven_refusal_is_final(self.lock_denies) {
+                    warn!(
+                        denies = self.lock_denies,
+                        of = CONTROL_LOCK_DENIES,
+                        holder = holder.as_deref().unwrap_or("unreadable"),
+                        own = self.control_conn_id.as_deref().unwrap_or("unknown"),
+                        "the instance lock is still held and the holder is no peer this node \
+                         knows: streaming without firing until the take succeeds"
+                    );
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
+        self.lock_denies = 0;
+        self.lock_unconfirmed = false;
+        self.control_stalled = false;
+        // Which session the server now says owns the lock: the answer to the next refusal.
+        self.control_conn_id = ctl(
+            &mut self.control_stalled,
+            "SELECT CONNECTION_ID on the re-established control connection",
+            CONTROL_STATEMENT_TIMEOUT,
+            lock::connection_id(&mut self.control),
+        )
+        .await
+        .ok();
+        if was_unconfirmed {
+            info!("the instance lock is taken again: deliveries resume");
+        } else {
+            info!("control connection re-established");
+        }
         Ok(())
     }
 
@@ -4278,10 +4790,19 @@ impl Engine {
     /// per [`CLOCK_REFRESH`] tick — never per event, and no new write anywhere. A failed question
     /// keeps the last offset: the figures ride the previous measurement until the next tick.
     async fn refresh_source_clock(&mut self) {
-        match self
-            .control
-            .query_first::<i64, _>("SELECT UNIX_TIMESTAMP()")
-            .await
+        if self.control_stalled {
+            // The connection is not trusted until the heal path replaces it; the figures
+            // ride the previous offset meanwhile, as they do for any failed question.
+            return;
+        }
+        match ctl_my(
+            &mut self.control_stalled,
+            "SELECT UNIX_TIMESTAMP()",
+            CONTROL_STATEMENT_TIMEOUT,
+            self.control
+                .query_first::<i64, _>("SELECT UNIX_TIMESTAMP()"),
+        )
+        .await
         {
             Ok(Some(src_now)) if src_now > 0 => {
                 // Saturating, not raw: the offset is a measured difference, and a server that
@@ -4296,7 +4817,16 @@ impl Engine {
     /// Writes the positions that moved (and every row now and then).
     async fn persist(&mut self, force: bool) -> Result<()> {
         self.last_persist = Instant::now();
-        lock::verify(&mut self.control, &self.lock).await?;
+        // The label names the SQL, not the lock: housekeeping's persist arm reads the
+        // "instance lock" phrase as "we lost the lock" and exits — a stalled statement is
+        // not a lost lock, and must go to the heal path instead.
+        ctl(
+            &mut self.control_stalled,
+            "SELECT IS_USED_LOCK",
+            CONTROL_STATEMENT_TIMEOUT,
+            lock::verify(&mut self.control, &self.lock),
+        )
+        .await?;
         let mut rows = Vec::new();
         let mut summary = Map::new();
         let now = Instant::now();
@@ -4433,7 +4963,18 @@ impl Engine {
         if rows.is_empty() {
             return Ok(());
         }
-        status::write(&mut self.control, &self.cfg.instance, &rows).await?;
+        // The write is one transaction: on a timeout the whole attempt is abandoned and
+        // the rows stay dirty, so no position is marked written and the next tick retries
+        // the same idempotent UPSERTs — a timed-out write never advances a position. The
+        // connection is dropped by the heal path; the server rolls its orphan transaction
+        // back when the socket closes.
+        ctl(
+            &mut self.control_stalled,
+            "the lazy_wire_fire_status write",
+            CONTROL_STATEMENT_TIMEOUT,
+            status::write(&mut self.control, &self.cfg.instance, &rows),
+        )
+        .await?;
         for w in rows {
             if w.rule == INSTANCE_ROW {
                 self.star_written = Some((w.pos.clone(), now));
@@ -4905,6 +5446,7 @@ async fn flush_job(
     spec: FenceSpec,
     keys: Arc<Vec<String>>,
     queries: &[(String, KeyQuery)],
+    lock_confirmed: bool,
 ) -> Outcome {
     let fail = |e: anyhow::Error, keys: &[String]| Outcome::Flush {
         fired: Fired {
@@ -4915,6 +5457,13 @@ async fn flush_job(
         keep_queries: true,
         resolved: Vec::new(),
     };
+    // No fire without a confirmed lock, even on a fence that answers: the fence rides a pool
+    // connection rather than the control connection (see `action::fence_io`), so it can be
+    // served while the heal path is still waiting to take the instance lock back. Transient,
+    // like a fence that does not answer: the keys go back to the buffer and no position moves.
+    if !lock_confirmed {
+        return fail(FlushParked.into(), &keys);
+    }
     if let Err(e) = action::fence(env, &spec).await {
         return fail(e, &keys);
     }
@@ -4999,3 +5548,7 @@ mod route_cache_tests;
 #[cfg(test)]
 #[path = "tests/engine_source_clock_tests.rs"]
 mod source_clock_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_control_stall_tests.rs"]
+mod control_stall_tests;
