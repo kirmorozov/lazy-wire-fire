@@ -1,7 +1,7 @@
 # Files copied byte for byte from lazyview (https://github.com/kirmorozov/lazyview, MIT,
 # Copyright (c) 2026 Kirill Morozov). Written by scripts/sync-lazyview.sh: never edit the files
 # it lists, change lazyview and sync instead.
-commit 2b5a6cae7a37425090677126f2ec953a2adf3322
+commit e236ef924fca3ced806ccf04fc39f3d63d6f17e7
 glob src/access.rs
 glob src/access/**
 glob src/analyze.rs
@@ -27,9 +27,9 @@ file src/analyze/build.rs a82a8d2f56d681daf3eda6f56b1100f44b79eebadd34023737fcdd
 file src/analyze/columns.rs 4606f8fad131f75f28fdfc686cc5ba612dda14d34c641ca3595f2dcafdab21c6
 file src/analyze/expr.rs a7f497303cb0a39a57f7827131e2d047eddaabc39348e3fb7a86aa8f452629df
 file src/analyze/parse.rs d5f30009eb52fab1959b5d2cb3184dc5f6c1277561a9162231d6c5d3018761af
-file src/analyze/plan.rs b595c9f2b78a2ceb8f5b3f529f2c92403aa64afea8b4d7c1ae19c1f3708580b6
+file src/analyze/plan.rs 4c186fa2d62dfcc93a83e94b2ea16050ad9079d40ac8fa8602369329a48858d9
 file src/analyze/routes.rs c7f1f9e59258e7a804826c5af13d981abbd8d1e47dbc02a014311b49ec718047
-file src/analyze/tests.rs 734958fcfdecd9373cd083270490d5c23d6bf391f4db1c9aa4149c5b75335b1f
+file src/analyze/tests.rs aadd44a7e2782f705ec45a1be07d73a6b8072a97b85425fd90cce526bcef8c99
 file src/analyze/vocab.rs 8714013d8f22c3c8cc6f5c9f808ed2e28dc2e2dcafff46402e4409836695bb49
 file src/analyzer/ast.rs 1b8bde5fe03cce9ae5fa0961d833b87cf858fd7737a54c94371f4df3180cf04d
 file src/analyzer/build.rs f084d9d6b9f87c661b06bd1fb06a4aef096366a397e5df2119c45dc0e695290b
@@ -44,7 +44,7 @@ file src/analyzer/rename.rs 25288dbf4658026068a4e91ff5d398cad5b5fe608ad2a9864371
 file src/analyzer/scope.rs db352447ec714bcd598c3537130ff3da9d9c95ba0639a3cc5f3a0dea106607ff
 file src/analyzer/source.rs ec40bc4d74cbbd8a80aefd9ec272e0be6024d3dfc83e7bcaaf428dfd1220734f
 file src/analyzer/tests.rs 03b70fd1b002586c6ad359f5a93df5c048048e92aac8f579e18b88f178420233
-file src/analyzer/tests/catalog_formulations.rs dfdb67ea17e271541634bc16e36fda9a9a96f064365089be4211188906678019
+file src/analyzer/tests/catalog_formulations.rs f29138a6f753ced0b8196eb93c5ea3ac479d06ad7c897be2bc71203fcfb46ccb
 file src/analyzer/tests/cte_inlining.rs d1249b443eda063cc3c48378df10cc1e86b9ab00c78f63f7c01f6bf4031da482
 file src/analyzer/tests/differential.rs ab03511ca2f89abec2dc2ef0d26b74fd4c7361787d61c84ad082cc5aa13a5b9c
 file src/analyzer/tests/expr_keys.rs 8c2f6e71aa8ea8aa2dd1d30088790755d8a1aef3b6f2adf24de7ae9abd2453f9
