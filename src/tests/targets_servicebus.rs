@@ -824,7 +824,14 @@ async fn the_fake_peer_takes_the_token_and_the_messages() {
     let p = Peer::start(Script::happy()).await;
     let c = fake_client_budget(p.port(), &fake_vars(r#", "dedup": true"#), budget);
     let out = went_in(&p, outcomes(&c, &msgs(&[msg("A"), msg("B")]), 2).await);
-    assert_eq!(out, vec![Outcome::Ok, Outcome::Ok]);
+    // The frame trace belongs to the failure message, not only to a failed `send_batch`:
+    // a lost disposition (flake F-6) left the assert in CI with no trace at all.
+    assert_eq!(
+        out,
+        vec![Outcome::Ok, Outcome::Ok],
+        "the peer saw:\n{}",
+        p.trace()
+    );
 
     let seen = p.seen();
     assert_eq!(seen.put_tokens.len(), 1, "one token per connection");
@@ -868,6 +875,127 @@ async fn the_fake_peer_takes_the_token_and_the_messages() {
     };
     let (a, b) = (id_of(&seen.bodies[0]), id_of(&seen.bodies[1]));
     assert!(a.len() == 64 && b.len() == 64 && a != b, "{a} / {b}");
+}
+
+/// The TLS of the kind stays lazywf's own: `open` hands the connector the `ClientConfig` of
+/// [`tls_config`] (ring provider, verify mode, CA store). The two tests below pin both halves
+/// of that against a TLS front of the test's own, so the fe2o3 upgrade to 0.18 (flake F-6)
+/// cannot quietly move the handshake onto the library's own rustls defaults: an untrusted
+/// certificate must fail, and a CA configured through `tls.ca` must be the trust that passes.
+/// `ServerConfig`/rcgen usage follows [`crate::tests::tls`].
+async fn tls_front(
+    cert: rcgen::Certificate,
+    key: rcgen::KeyPair,
+) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
+    use tokio::net::TcpListener;
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            key.serialize_der(),
+        )),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = done.clone();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok((mut tcp, _)) = listener.accept().await else {
+            return;
+        };
+        // The AMQP TLS protocol header exchange first (spec §5.3.1.3, what the shipped client
+        // sends and what a real broker answers before the handshake starts).
+        let mut head = [0u8; 8];
+        if tcp.read_exact(&mut head).await.is_err() || head != *b"AMQP\x02\x01\x00\x00" {
+            return;
+        }
+        if tcp.write_all(b"AMQP\x02\x01\x00\x00").await.is_err() {
+            return;
+        }
+        // A refused handshake (the untrusted-CA case) simply leaves `done` false: that flag
+        // is what the tests assert on, together with the client's own error.
+        if let Ok(mut tls) = acceptor.accept(tcp).await {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Let the client's first bytes (its AMQP header attempt) arrive, then end it:
+            // the client fails later, over the transport, never over trust.
+            let mut buf = [0u8; 8];
+            let _ = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await;
+        }
+    });
+    (addr, done)
+}
+
+fn self_signed_ip_cert() -> (rcgen::Certificate, rcgen::KeyPair) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    (params.self_signed(&key).unwrap(), key)
+}
+
+fn fake_client_tls(port: u16, tls: TlsSpec) -> Client {
+    let def = TargetDef {
+        name: "sb".into(),
+        kind: crate::model::Kind::ServiceBus,
+        endpoints: vec![],
+        tls,
+        // Generous: this test asserts on the TLS outcome, and waits for nothing past it.
+        timeout: Duration::from_secs(2),
+        expect: None,
+        vars: vars("{}"),
+    };
+    let (_ctx, client) = Client::new(&def, &format!("sb://127.0.0.1:{port}/orders")).unwrap();
+    client
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tls_send_refuses_an_untrusted_ca() {
+    let (cert, key) = self_signed_ip_cert();
+    let (addr, done) = tls_front(cert, key).await;
+    let c = fake_client_tls(addr.port(), TlsSpec::parse(Some("verify-full")).unwrap());
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    let text = e.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("certificate") || text.contains("issuer"),
+        "a self-signed server must fail on trust: {text}"
+    );
+    assert!(
+        !done.load(std::sync::atomic::Ordering::SeqCst),
+        "the server completed no handshake: lazywf's verifier is the one that refused"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tls_send_trusts_the_configured_ca() {
+    let (cert, key) = self_signed_ip_cert();
+    let pem = cert.pem().to_string();
+    let (addr, done) = tls_front(cert, key).await;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let ca = std::env::temp_dir().join(format!("lazywf-sb-ca-{}-{nonce}.pem", std::process::id()));
+    std::fs::write(&ca, &pem).unwrap();
+    let mut spec = TlsSpec::parse(Some("verify-full")).unwrap();
+    spec.ca = vec![ca.to_string_lossy().into_owned()];
+    let c = fake_client_tls(addr.port(), spec);
+    let e = outcomes(&c, &msgs(&[msg("A")]), 1).await.unwrap_err();
+    let _ = std::fs::remove_file(&ca);
+    assert!(
+        done.load(std::sync::atomic::Ordering::SeqCst),
+        "with tls.ca configured the handshake completes: the trust store used is lazywf's"
+    );
+    let text = e.to_string().to_ascii_lowercase();
+    assert!(
+        !text.contains("certificate") && !text.contains("issuer"),
+        "past the handshake the failure is the front dropping the conversation, not trust: {text}"
+    );
 }
 
 #[tokio::test]
