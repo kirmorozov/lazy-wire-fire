@@ -501,11 +501,12 @@ fn the_statement_dml_line_carries_no_statement() {
     );
 }
 
-/// The versions that stopped writing VIRTUAL generated columns into UPDATE and DELETE row images
-/// are the ones lazywf refuses reads for — and only those: 10.6 and 10.11 (tested on 10.6.28 and
-/// 10.11.19) and the MySQL family (tested on 8.0.46, 8.4.13, 9.7.4, Percona 8.4.11) send them.
+/// The versions that stopped writing generated columns — VIRTUAL or STORED — into UPDATE and
+/// DELETE row images are the ones lazywf refuses reads for — and only those: 10.6 and 10.11
+/// (tested on 10.6.28 and 10.11.19) and the MySQL family (tested on 8.0.46, 8.4.13, 9.7.4,
+/// Percona 8.4.11) send them.
 #[test]
-fn maria_skips_virtual_reads_the_version() {
+fn maria_skips_generated_reads_the_version() {
     let skipped = [
         "11.4.0-MariaDB",
         "11.4.13-MariaDB-1:11.4.13+maria~ubu2404",
@@ -518,7 +519,7 @@ fn maria_skips_virtual_reads_the_version() {
         "5.5.5-13.0.2-MariaDB",
     ];
     for v in skipped {
-        assert!(maria_skips_virtual(v), "{v} writes no VIRTUAL columns");
+        assert!(maria_skips_generated(v), "{v} writes no VIRTUAL columns");
     }
     let writes = [
         "10.6.28-MariaDB-1:10.6.28+maria~ubu2204",
@@ -534,16 +535,16 @@ fn maria_skips_virtual_reads_the_version() {
         "unknown",
     ];
     for v in writes {
-        assert!(!maria_skips_virtual(v), "{v} writes them");
+        assert!(!maria_skips_generated(v), "{v} writes them");
     }
 }
 
 /// A rule is refused for the column it reads that the image shifted out — the VIRTUAL one itself
 /// and everything after it — and left alone when it reads only columns before it. A STORED column
-/// after a VIRTUAL one is refused too: the image skips the VIRTUAL one, so the STORED value moves
-/// up a place as well.
+/// after a generated one is refused too: the image skips the generated column, so the value that
+/// stood behind it moves up a place as well.
 #[test]
-fn unreadable_read_refuses_reads_past_the_virtual_column() {
+fn unreadable_read_refuses_reads_past_the_generated_column() {
     // id, price, price_x2 (VIRTUAL), name, stock
     let all = [
         ("id", 0usize),
@@ -554,7 +555,7 @@ fn unreadable_read_refuses_reads_past_the_virtual_column() {
     ];
     assert_eq!(
         unreadable_read(&all, false, 2),
-        Some(VirtualRead::Col("price_x2".into())),
+        Some(ShortRead::Col("price_x2".into())),
         "the VIRTUAL column itself is the first read that cannot be carried"
     );
     assert_eq!(
@@ -564,7 +565,7 @@ fn unreadable_read_refuses_reads_past_the_virtual_column() {
     );
     assert_eq!(
         unreadable_read(&[("id", 0), ("price_stored", 3)], false, 2),
-        Some(VirtualRead::Col("price_stored".into())),
+        Some(ShortRead::Col("price_stored".into())),
         "a STORED column after a VIRTUAL one is shifted too"
     );
     assert_eq!(
@@ -574,20 +575,20 @@ fn unreadable_read_refuses_reads_past_the_virtual_column() {
     );
     assert_eq!(
         unreadable_read(&[("id", 0)], true, 4),
-        Some(VirtualRead::Full),
-        "a Full key renders the whole row, so a table with a VIRTUAL column is refused outright"
+        Some(ShortRead::Full),
+        "a Full key renders the whole row, so a table with a generated column is refused outright"
     );
     assert_eq!(
         unreadable_read(&[("stock", 4), ("name", 3)], false, 3),
-        Some(VirtualRead::Col("stock".into())),
+        Some(ShortRead::Col("stock".into())),
         "the first unreadable read of the rule is the one reported"
     );
 }
 
-/// The VIRTUAL generated column of a table, in the order the layout is built in: `information_schema`
-/// says which columns are generated VIRTUAL, and the first of them is where the row image runs short.
+/// The first generated column of a table, in the order the layout is built in: `information_schema`
+/// says which columns are generated, and the first of them is where the row image runs short.
 #[test]
-fn virtual_first_of_finds_the_generated_column() {
+fn generated_first_of_finds_the_generated_column() {
     let rows = |pairs: &[(&str, &str)]| {
         pairs
             .iter()
@@ -595,7 +596,7 @@ fn virtual_first_of_finds_the_generated_column() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        virtual_first_of(&rows(&[
+        generated_first_of(&rows(&[
             ("id", ""),
             ("price", "STATIC"),
             ("price_x2", "VIRTUAL GENERATED"),
@@ -606,28 +607,38 @@ fn virtual_first_of_finds_the_generated_column() {
         "the first VIRTUAL column, by its position among all columns"
     );
     assert_eq!(
-        virtual_first_of(&rows(&[("id", ""), ("price_stored", "STORED GENERATED")])),
-        None,
-        "a STORED column is in the image, so nothing is refused"
+        generated_first_of(&rows(&[("id", ""), ("price_hex", "STORED GENERATED")])),
+        Some((1, "price_hex".to_string())),
+        "a MariaDB that skips them skips the STORED ones too, so they decide as well"
     );
     assert_eq!(
-        virtual_first_of(&rows(&[
+        generated_first_of(&rows(&[
             ("a", "STORED GENERATED"),
             ("b", "VIRTUAL GENERATED"),
             ("c", "VIRTUAL GENERATED"),
         ])),
-        Some((1, "b".to_string())),
-        "with two of them, the first decides"
+        Some((0, "a".to_string())),
+        "with two kinds in the table, the column that stands first decides"
     );
     assert_eq!(
-        virtual_first_of(&rows(&[])),
+        generated_first_of(&rows(&[])),
         None,
         "a table with no columns"
     );
     assert_eq!(
-        virtual_first_of(&rows(&[("id", ""), ("n", "virtual generated")])),
+        generated_first_of(&rows(&[("id", ""), ("n", "virtual generated")])),
         Some((1, "n".to_string())),
         "the wording is matched whatever its case"
+    );
+    assert_eq!(
+        generated_first_of(&rows(&[
+            ("id", ""),
+            ("slug", "DEFAULT_GENERATED"),
+            ("n", "STORED GENERATED"),
+        ])),
+        Some((2, "n".to_string())),
+        "`DEFAULT_GENERATED` is MySQL's mark for an expression DEFAULT, not a column the \
+         image skips"
     );
 }
 

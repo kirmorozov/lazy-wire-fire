@@ -833,15 +833,16 @@ pub struct Engine {
     /// Tables whose binlog layout does not match (reported once).
     mismatched: HashSet<(String, String)>,
     column_warnings: HashSet<(String, u64, String)>,
-    /// The server is a MariaDB 11.4 or newer, whose UPDATE and DELETE row images leave VIRTUAL
-    /// generated columns out (see `maria_skips_virtual`).
-    maria_skips_virtual: bool,
-    /// Per watched table, the index and name of its first VIRTUAL generated column (`None` when
-    /// it has none). Read once per table like the layout, and dropped with it: `on_statement` and
-    /// the mismatch path invalidate both, so a DDL that adds a VIRTUAL column is seen again.
-    virtual_first: HashMap<(String, String), Option<(usize, String)>>,
-    /// Triggers already reported as unreadable (see `refuse_virtual_reads`), warned about once.
-    virtual_refusals: HashSet<(String, u64)>,
+    /// The server is a MariaDB 11.4 or newer, whose UPDATE and DELETE row images leave generated
+    /// columns — VIRTUAL or STORED — out (see `maria_skips_generated`).
+    maria_skips_generated: bool,
+    /// Per watched table, the index and name of its first generated column, of either kind
+    /// (`None` when it has none). Read once per table like the layout, and dropped with it:
+    /// `on_statement` and the mismatch path invalidate both, so a DDL that adds a generated
+    /// column is seen again.
+    generated_first: HashMap<(String, String), Option<(usize, String)>>,
+    /// Triggers already reported as unreadable (see `refuse_generated_reads`), warned about once.
+    generated_refusals: HashSet<(String, u64)>,
     /// Triggers already reported as keying on bytes no charset defines (see
     /// `refuse_binary_keys`), warned about once.
     binary_refusals: HashSet<(String, u64)>,
@@ -924,18 +925,24 @@ fn binlog_unusable(e: &anyhow::Error) -> bool {
             && position_unavailable(e))
 }
 
-/// Whether this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row images.
+/// Whether this MariaDB leaves generated columns — VIRTUAL **or STORED** — out of its UPDATE and
+/// DELETE row images.
 ///
-/// It stopped doing that at 11.4: 10.6.28 and 10.11.19 still write them, as do MySQL 8.0.46,
-/// 8.4.13, 9.7.4 and Percona 8.4.11. Such an image carries one value less than the table map
-/// names, and the reader pairs values with columns by position, so every column from the first
-/// VIRTUAL one on is read as its neighbour's value — a key built from the wrong value, with
-/// nothing logged. A version that cannot be read counts as unaffected: refusing on a parse
-/// failure would stop a working installation over a version string.
-// Temporary: remove this and `Engine::refuse_virtual_reads` when the vendored reader learns to
+/// It stopped writing them at 11.4: 10.6.28 and 10.11.19 still write them, as do MySQL 8.0.46,
+/// 8.4.13, 9.7.4 and Percona 8.4.11. Measured on 11.4.13 and 11.8.9 (the compose servers,
+/// `binlog_row_image=FULL`, a table with `code_hex CHAR(32) AS (HEX(code)) STORED` beside an
+/// identical one with a real `CHAR(32)`): the INSERT event carries every column, the UPDATE and
+/// DELETE events carry one value less than the table map names, while the table with the real
+/// column carries all of them — MariaDB stopped writing generated columns into those images and
+/// the two kinds are left out together. Such an image and the reader that pairs values with
+/// columns by position make every column from the first generated one on read as its neighbour's
+/// value — a key built from the wrong value, with nothing logged. A version that cannot be read
+/// counts as unaffected: refusing on a parse failure would stop a working installation over a
+/// version string.
+// Temporary: remove this and `Engine::refuse_generated_reads` when the vendored reader learns to
 // decode images whose values skip columns (lazyview issue #7); until then lazywf refuses the
 // triggers that would read them, which is visible on `/status` instead of silently wrong.
-fn maria_skips_virtual(version: &str) -> bool {
+fn maria_skips_generated(version: &str) -> bool {
     // A replication proxy reports the server it fronts as `5.5.5-<its version>`.
     let v = version.strip_prefix("5.5.5-").unwrap_or(version);
     let mut parts = v.split('.');
@@ -948,28 +955,28 @@ fn maria_skips_virtual(version: &str) -> bool {
 
 /// What a trigger reads of a row image the server left short.
 #[derive(Debug, PartialEq, Eq)]
-enum VirtualRead {
-    /// A column standing at or after the table's first VIRTUAL generated column.
+enum ShortRead {
+    /// A column standing at or after the table's first generated column.
     Col(String),
     /// The whole row. A `KeyTemplate::Full` is any Handlebars template, so there is no telling
     /// from the rule whether it names the shifted columns: it may read every column, so it is
-    /// refused for any table that has a VIRTUAL one.
+    /// refused for any table that has a generated one.
     Full,
 }
 
-/// The first thing `reads` takes from an image that skips its VIRTUAL columns: `reads` holds the
+/// The first thing `reads` takes from an image that skips its generated columns: `reads` holds the
 /// columns the trigger names together with their index in the layout (columns the table does not
 /// have are left out — `check_columns` reports those), `full` says whether the trigger renders
-/// the whole row, and `from` is the index of the table's first VIRTUAL generated column. A rule
+/// the whole row, and `from` is the index of the table's first generated column. A rule
 /// that reads only columns before `from` reads values the image does carry, so it stays allowed.
-fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<VirtualRead> {
+fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<ShortRead> {
     if full {
-        return Some(VirtualRead::Full);
+        return Some(ShortRead::Full);
     }
     reads
         .iter()
         .find(|(_, i)| *i >= from)
-        .map(|(c, _)| VirtualRead::Col((*c).to_string()))
+        .map(|(c, _)| ShortRead::Col((*c).to_string()))
 }
 
 /// The path segments a Handlebars key template names inside its `{{ }}` tags: `{{new.code}}`,
@@ -1072,18 +1079,25 @@ fn key_column_reads(t: &crate::rule::Trigger, layout: &Layout) -> Vec<usize> {
     out
 }
 
-/// The first VIRTUAL generated column of `rows`, which are the table's columns in
+/// The first generated column of `rows`, which are the table's columns in
 /// `information_schema` order as (name, EXTRA): its index in that order (the order
-/// `rows::Catalog::load` builds a layout from) and its name.
-fn virtual_first_of(rows: &[(String, String)]) -> Option<(usize, String)> {
+/// `rows::Catalog::load` builds a layout from) and its name. Either kind counts, because a
+/// server that leaves generated columns out of its UPDATE and DELETE images leaves both out
+/// (`maria_skips_generated`). Only the two generated wordings match: `DEFAULT_GENERATED`,
+/// which MySQL writes for a column with an expression default, describes a default and not a
+/// column the image skips.
+fn generated_first_of(rows: &[(String, String)]) -> Option<(usize, String)> {
     rows.iter()
         .enumerate()
-        .find(|(_, (_, extra))| extra.to_ascii_uppercase().contains("VIRTUAL GENERATED"))
+        .find(|(_, (_, extra))| {
+            let e = extra.to_ascii_uppercase();
+            e.contains("VIRTUAL GENERATED") || e.contains("STORED GENERATED")
+        })
         .map(|(i, (name, _))| (i, name.clone()))
 }
 
 /// The columns of one table, in `information_schema` order, as (name, EXTRA).
-async fn read_virtual_first(
+async fn read_generated_first(
     conn: &mut Conn,
     schema: &str,
     table: &str,
@@ -1097,7 +1111,7 @@ async fn read_virtual_first(
         )
         .await
         .with_context(|| format!("reading the columns of `{schema}`.`{table}`"))?;
-    Ok(virtual_first_of(&rows))
+    Ok(generated_first_of(&rows))
 }
 
 async fn connect_wait(
@@ -1283,14 +1297,14 @@ pub async fn run(
         ),
         None => info!("no allow-list: target endpoints may use any host (tests only)"),
     }
-    // Whether the server's row images can come up short (see `maria_skips_virtual`). Read once:
+    // Whether the server's row images can come up short (see `maria_skips_generated`). Read once:
     // the server does not change underneath a running engine.
-    let skips_virtual = info.flavor == Flavor::MariaDb && maria_skips_virtual(&info.version);
-    if skips_virtual {
+    let skips_generated = info.flavor == Flavor::MariaDb && maria_skips_generated(&info.version);
+    if skips_generated {
         info!(
             server = %info.version,
-            "this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row \
-             images: a trigger that reads a column from the first one on is refused"
+            "this MariaDB leaves generated columns (VIRTUAL or STORED) out of its UPDATE and \
+             DELETE row images: a trigger that reads a column from the first one on is refused"
         );
     }
     let (tx, rx) = mpsc::unbounded_channel();
@@ -1344,9 +1358,9 @@ pub async fn run(
         target_backoff: HashMap::new(),
         mismatched: HashSet::new(),
         column_warnings: HashSet::new(),
-        maria_skips_virtual: skips_virtual,
-        virtual_first: HashMap::new(),
-        virtual_refusals: HashSet::new(),
+        maria_skips_generated: skips_generated,
+        generated_first: HashMap::new(),
+        generated_refusals: HashSet::new(),
         binary_refusals: HashSet::new(),
         tx,
         last_persist: Instant::now(),
@@ -2706,7 +2720,7 @@ impl Engine {
                     .collect();
                 self.check_columns(&layout, &key.0, &key.1, &triggers);
                 let triggers = self
-                    .refuse_virtual_reads(&nkey, &layout, &key.0, &key.1, triggers)
+                    .refuse_generated_reads(&nkey, &layout, &key.0, &key.1, triggers)
                     .await?;
                 let triggers = self.refuse_binary_keys(&layout, &key.0, &key.1, triggers);
                 let any_full = triggers.iter().any(|(_, rule, i)| {
@@ -2722,7 +2736,7 @@ impl Engine {
                 });
                 // Cached until the rules change (`rebuild_routes` clears this cache), a reset
                 // starts (`start_reset` does too), or the layout behind it is dropped:
-                // `forget_columns` takes the entry with the catalog entry and `virtual_first`,
+                // `forget_columns` takes the entry with the catalog entry and `generated_first`,
                 // and every other catalog invalidation is caught by the generation the entry
                 // was stamped with. The probe's identity check is what a stale entry must
                 // still fail on its own.
@@ -2745,42 +2759,42 @@ impl Engine {
         }
     }
 
-    /// The index and name of the table's first VIRTUAL generated column, on a server that leaves
-    /// those columns out of its row images; `Ok(None)` everywhere else and for a table without
-    /// one. Read once per table, like the layout cache it lives and dies with.
+    /// The index and name of the table's first generated column, of either kind, on a server that
+    /// leaves those columns out of its row images; `Ok(None)` everywhere else and for a table
+    /// without one. Read once per table, like the layout cache it lives and dies with.
     ///
     /// `key` is the table's identity as [`Engine::route`] knows it, so a cached answer costs no
     /// allocation; `schema` and `table` are the names to ask the server about.
-    async fn first_virtual_column(
+    async fn first_generated_column(
         &mut self,
         key: &(String, String),
         schema: &str,
         table: &str,
     ) -> Result<Option<(usize, String)>> {
-        if !self.maria_skips_virtual {
+        if !self.maria_skips_generated {
             return Ok(None);
         }
-        if let Some(found) = self.virtual_first.get(key) {
+        if let Some(found) = self.generated_first.get(key) {
             return Ok(found.clone());
         }
         // An image whose columns cannot be read is an image that must not be read: a server that
         // will not answer them is an error, as it is for the layout read above, and the caller
         // retries. A table that is really gone fails there too, not here.
-        let found = read_virtual_first(&mut self.control, schema, table).await?;
-        self.virtual_first.insert(key.clone(), found.clone());
+        let found = read_generated_first(&mut self.control, schema, table).await?;
+        self.generated_first.insert(key.clone(), found.clone());
         Ok(found)
     }
 
     /// Drops what is cached about a table's columns, so both the layout and the position of its
-    /// first VIRTUAL column are read again: a DDL changed the table, or its layout did not match
+    /// first generated column are read again: a DDL changed the table, or its layout did not match
     /// the binlog. The built route goes with them — a DDL changes the columns a `Watched` decodes.
     fn forget_columns(&mut self, schema: &str, table: &str) {
         self.catalog.invalidate(schema, table);
         let key = self.norm(schema, table);
         if table == "*" {
-            self.virtual_first.retain(|(s, _), _| *s != key.0);
+            self.generated_first.retain(|(s, _), _| *s != key.0);
         } else {
-            self.virtual_first.remove(&key);
+            self.generated_first.remove(&key);
         }
         self.route_cache.forget(&key);
     }
@@ -2789,12 +2803,18 @@ impl Engine {
     /// that may keep running.
     ///
     /// On MariaDB 11.4+ an UPDATE or DELETE image holds one value less than the table map names
-    /// (the VIRTUAL generated columns are not written), and the reader pairs values with columns
-    /// by position, so the first VIRTUAL column and every column after it are read as their
-    /// neighbour's value. Such a trigger marks keys that do not describe the row, so it marks
-    /// nothing at all and carries the reason on `/status` the way an unknown column does.
-    /// Temporary, see [`maria_skips_virtual`].
-    async fn refuse_virtual_reads(
+    /// (its generated columns, VIRTUAL or STORED alike, are not written), and the reader pairs
+    /// values with columns by position, so the first generated column and every column after it
+    /// are read as their neighbour's value. Such a trigger marks keys that do not describe the
+    /// row, so it marks nothing at all and carries the reason on `/status` the way an unknown
+    /// column does. Every read of an image counts, not only the key: `changed_columns` (a
+    /// comparison of the two images that would compare shifted values), the columns a `Simple`
+    /// key names and the columns a `keys_sql` binds, and the whole row for a Handlebars key,
+    /// which may name any column of it and is therefore refused for a table that has a generated
+    /// column at all. The rule's own `selects` and its doc template read the selects' rows, not
+    /// the image, so they are not reads of it.
+    /// Temporary, see [`maria_skips_generated`].
+    async fn refuse_generated_reads(
         &mut self,
         key: &(String, String),
         layout: &Layout,
@@ -2802,14 +2822,16 @@ impl Engine {
         table: &str,
         triggers: Vec<(String, Arc<Rule>, usize)>,
     ) -> Result<Vec<(String, Arc<Rule>, usize)>> {
-        let Some((from, virtual_col)) = self.first_virtual_column(key, schema, table).await? else {
+        let Some((from, gen_col)) = self.first_generated_column(key, schema, table).await? else {
             return Ok(triggers);
         };
         let mut kept = Vec::with_capacity(triggers.len());
         for (name, rule, ti) in triggers {
             let t = &rule.triggers[ti];
-            // What the trigger reads of an image: the same columns `check_columns` looks at, and
-            // the whole row for a Full key.
+            // Every read of an image the trigger has: the same columns `check_columns` looks at
+            // (its `changed_columns`, its key's columns and the columns its `keys_sql` binds),
+            // and the whole row for a Full key. A Handlebars key is not scanned for names: it may
+            // read any column, so a table with a generated column refuses it outright.
             let mut reads: Vec<(&str, usize)> = Vec::new();
             for c in &t.def.changed_columns {
                 if let Some(i) = layout.index(c) {
@@ -2838,23 +2860,24 @@ impl Engine {
                 continue;
             };
             // Refused whether or not it was reported: what it would mark is wrong either way.
-            if self.virtual_refusals.insert((name.clone(), t.def.id)) {
+            if self.generated_refusals.insert((name.clone(), t.def.id)) {
                 let msg = match &read {
-                    VirtualRead::Col(c) => format!(
+                    ShortRead::Col(c) => format!(
                         "trigger {}: `{schema}`.`{table}` reads `{c}`; this MariaDB leaves the \
-                         VIRTUAL generated column `{virtual_col}` out of its UPDATE and DELETE \
-                         row images, and every column after it moves up a place, so lazywf \
-                         cannot read `{c}` and refuses the trigger (make `{virtual_col}` STORED, \
-                         or read only columns before it)",
+                         generated column `{gen_col}` (VIRTUAL or STORED) out of its UPDATE and \
+                         DELETE row images, and every column after it moves up a place, so \
+                         lazywf cannot read `{c}` and refuses the trigger (move `{gen_col}` \
+                         after every column this trigger reads, or read a plain column the \
+                         application keeps)",
                         t.def.id
                     ),
-                    VirtualRead::Full => format!(
+                    ShortRead::Full => format!(
                         "trigger {}: `{schema}`.`{table}` uses a Handlebars key template, which \
-                         can read any column of the row, including the VIRTUAL generated column \
-                         `{virtual_col}` and the columns after it that this MariaDB's UPDATE \
-                         and DELETE row images shift; lazywf refuses the trigger (make \
-                         `{virtual_col}` STORED, or use a plain {{{{new.col}}}} key over columns \
-                         before it)",
+                         can read any column of the row, including the generated column \
+                         `{gen_col}` and the columns after it that this MariaDB's UPDATE and \
+                         DELETE row images shift; lazywf refuses the trigger (move `{gen_col}` \
+                         after every column the template reads, or use a plain {{{{new.col}}}} \
+                         key over columns before it)",
                         t.def.id
                     ),
                 };
@@ -2879,7 +2902,7 @@ impl Engine {
     /// test servers: a BINARY(16) key deleted a live row's document). The catalog answers
     /// the charset and the data type that make this known when the route is built (see
     /// [`Layout::key_unsafe`]), so such a trigger never marks at all, the way an unreadable
-    /// read does not (see [`Engine::refuse_virtual_reads`]), and the rule carries the
+    /// read does not (see [`Engine::refuse_generated_reads`]), and the rule carries the
     /// reason on `/status`.
     fn refuse_binary_keys(
         &mut self,
@@ -2891,7 +2914,7 @@ impl Engine {
         let mut kept = Vec::with_capacity(triggers.len());
         for (name, rule, ti) in triggers {
             // `get`, not indexing: a route's trigger index is trusted, and the panic-site
-            // gate keeps the one allowlisted index to `refuse_virtual_reads` alone.
+            // gate keeps the one allowlisted index to `refuse_generated_reads` alone.
             let Some(t) = rule.triggers.get(ti) else {
                 kept.push((name, rule, ti));
                 continue;
@@ -2907,13 +2930,30 @@ impl Engine {
             if self.binary_refusals.insert((name.clone(), t.def.id)) {
                 let col = layout.column_name(i).unwrap_or("?");
                 let ty = layout.column_type(i).unwrap_or("binary");
+                // The workaround has to work on the server the rule runs on. A generated column
+                // projects the bytes exactly, but a MariaDB that leaves generated columns out of
+                // its UPDATE and DELETE images cannot key on one either (see
+                // `refuse_generated_reads`), so there the advice is the plain column the
+                // application keeps; both shapes carry `HEX`, which is the point of them.
+                let advice = if self.maria_skips_generated {
+                    format!(
+                        "key on a text or number column, or on a plain column the application \
+                         keeps, for example `{col}_hex CHAR(64)` written as HEX(`{col}`) and a \
+                         key over that column (a generated column cannot carry a key on this \
+                         server: its UPDATE and DELETE images leave generated columns out)"
+                    )
+                } else {
+                    format!(
+                        "key on a text or number column, or on a STORED generated column that \
+                         projects it, for example `AS (HEX(`{col}`)) STORED` and a key over \
+                         that column"
+                    )
+                };
                 let msg = format!(
                     "rule `{name}` trigger {}: `{schema}`.`{table}` keys on column `{col}` \
                      of type `{ty}` — {why}, so its key would be replacement characters, not \
                      the row's value: the row marks nothing and its DELETE can remove another \
-                     row's document; lazy-wire-fire refuses the trigger (key on a text or \
-                     number column, or on a STORED generated column that projects it, for \
-                     example `AS (HEX(`{col}`)) STORED` and a key over that column)",
+                     row's document; lazy-wire-fire refuses the trigger ({advice})",
                     t.def.id
                 );
                 warn!(rule = %name, "{msg}");

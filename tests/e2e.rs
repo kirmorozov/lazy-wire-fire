@@ -2771,7 +2771,7 @@ async fn virtual_generated_column_between_real_columns() {
         let err = err.expect("the refused trigger reports why it marks nothing");
         println!("vcol last_error: {err}");
         for want in [
-            "VIRTUAL generated column `price_x2`",
+            "generated column `price_x2`",
             "UPDATE and DELETE row images",
             "refuses the trigger",
         ] {
@@ -2809,8 +2809,9 @@ async fn virtual_generated_column_between_real_columns() {
         println!("vcol handlebars last_error: {err}");
         for want in [
             "Handlebars key template",
-            "VIRTUAL generated column `note`",
-            "STORED",
+            "generated column `note`",
+            "UPDATE and DELETE row images",
+            "refuses the trigger",
         ] {
             assert!(err.contains(want), "the refusal says {err:?}, not `{want}`");
         }
@@ -16897,6 +16898,13 @@ async fn keyed_rule(db: &Db, mock: &Mock, name: &str, table: &str, key: &str, se
         "{}",
     )
     .await;
+    bulk_rule(db, name, table, key, select).await;
+}
+
+/// The rule and its trigger of [`keyed_rule`], over the `search` target that helper created:
+/// several rules of one probe share that one endpoint, the way several rules of one installation
+/// share one OpenSearch.
+async fn bulk_rule(db: &Db, name: &str, table: &str, key: &str, select: &str) {
     let selects = json!([select]);
     db.exec_params(
         "INSERT INTO lazy_wire_fire_rule (name, target, selects, template, debounce_ms, max_delay_ms) VALUES (?, 'search', ?, ?, 500, 2000)",
@@ -16904,6 +16912,20 @@ async fn keyed_rule(db: &Db, mock: &Mock, name: &str, table: &str, key: &str, se
     )
     .await;
     db.trigger(name, table, Some(key), None).await;
+}
+
+/// Every key the mock has seen in a `_bulk` body: the `_id` of an update line or a delete line.
+/// `Mock::keys_received` reads the keys a template renders with `{{join keys ","}}`, which the
+/// `_bulk` template does not, so what a key really was is read out of the actions themselves.
+fn bulk_keys(reqs: &[Req]) -> std::collections::BTreeSet<String> {
+    reqs.iter()
+        .flat_map(|r| r.ndjson())
+        .filter_map(|l| {
+            l.get("update")
+                .or_else(|| l.get("delete"))
+                .and_then(|d| d["_id"].as_str().map(String::from))
+        })
+        .collect()
 }
 
 /// The keys that arrived at the mock in `{"delete":...}` lines.
@@ -16957,7 +16979,7 @@ async fn latin1_key_follows_the_row() {
             assert!(
                 dels.is_empty(),
                 "a live row's document was deleted: {dels:?} (keys seen: {:?})",
-                mock.keys_received()
+                bulk_keys(&reqs)
             );
             last_docs(&reqs)
                 .get("É")
@@ -17021,7 +17043,7 @@ async fn utf8mb4_key_follows_the_row() {
             assert!(
                 dels.is_empty(),
                 "a live row's document was deleted: {dels:?} (keys seen: {:?})",
-                mock.keys_received()
+                bulk_keys(&reqs)
             );
             last_docs(&reqs)
                 .get("É😀")
@@ -17087,7 +17109,7 @@ async fn binary_key_is_refused_at_load() {
         || async { db.status("items").await.and_then(|s| s.3) },
     )
     .await;
-    for want in ["items", "code", "binary", "STORED"] {
+    for want in ["items", "code", "binary", "generated column", "HEX"] {
         assert!(
             err.to_lowercase().contains(&want.to_lowercase()),
             "the refusal must name {want}: {err}"
@@ -17141,7 +17163,7 @@ async fn geometry_key_is_refused_at_load() {
         || async { db.status("places").await.and_then(|s| s.3) },
     )
     .await;
-    for want in ["places", "point", "STORED"] {
+    for want in ["places", "point", "generated column", "HEX"] {
         assert!(
             err.to_lowercase().contains(&want.to_lowercase()),
             "the refusal must name {want}: {err}"
@@ -17156,10 +17178,13 @@ async fn geometry_key_is_refused_at_load() {
     inst.stop().await;
 }
 
-/// The workaround the refusal message names, proven: a STORED generated column that
-/// projects the binary column as hex carries the key exactly — the bytes stay in `code`,
-/// the key is the utf8mb4 text of `code_hex`, and the document follows the row and its
-/// delete, on both servers.
+/// The workaround the refusal message names, proven on a server that writes generated columns
+/// into its row images: a STORED generated column that projects the binary column as hex carries
+/// the key exactly — the bytes stay in `code`, the key is the utf8mb4 text of `code_hex`, and the
+/// document follows the row and its delete. A MariaDB 11.4+ cannot use that workaround at all:
+/// the projection is one of the columns its UPDATE and DELETE images run short of, so there the
+/// same trigger is refused with the reason on `/status` instead of keying on shifted values.
+/// Which of the two worlds the run is in comes from the printed wire facts, not the version.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stored_hex_projection_carries_the_key() {
     let root = need_db!();
@@ -17170,6 +17195,42 @@ async fn a_stored_hex_projection_carries_the_key() {
     )
     .await;
     tables(&db).await;
+
+    // The wire first: an image of four values is one that carries the projection, and the rules
+    // below are judged by that, the way the `VIRTUAL` probe judges its server.
+    let facts = wire_facts(&db, "codes", 3, || async {
+        db.exec("INSERT INTO codes (id, code, qty) VALUES (1, UNHEX('AABBCCDD'), 1)")
+            .await;
+        db.exec("UPDATE codes SET qty = 2 WHERE id = 1").await;
+        db.exec("DELETE FROM codes WHERE id = 1").await;
+    })
+    .await;
+    for line in &facts {
+        println!("keyhex {line}");
+    }
+    let images: Vec<&String> = facts.iter().filter(|l| l.contains("value(s)")).collect();
+    assert_eq!(
+        images.len(),
+        3,
+        "the wire facts, one line per row event:\n{}",
+        facts.join("\n")
+    );
+    for line in &images {
+        for want in [
+            "table map 4 columns",
+            "layout [id,code,code_hex,qty]",
+        ] {
+            assert!(
+                line.contains(want),
+                "no `{want}` in {line}\nthe wire facts:\n{}",
+                facts.join("\n")
+            );
+        }
+    }
+    let short = images
+        .iter()
+        .any(|l| l.starts_with("Update") && !l.contains("row image 4 value(s)"));
+
     let mock = Mock::start().await;
     mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
     keyed_rule(
@@ -17187,6 +17248,36 @@ async fn a_stored_hex_projection_carries_the_key() {
     db.exec("INSERT INTO codes (id, code, qty) VALUES (1, UNHEX('F09F9880'), 5)")
         .await;
     db.tick().await;
+    if short {
+        // This server's image does not carry the projection, so the key would be the shifted
+        // value of `code`: refused, and nothing of it reaches the target.
+        let err = wait_for(
+            Duration::from_secs(15),
+            "the refusal of a key over a STORED generated column",
+            || async { db.status("codes").await.and_then(|s| s.3) },
+        )
+        .await;
+        println!("keyhex last_error: {err}");
+        for want in [
+            "generated column `code_hex`",
+            "UPDATE and DELETE row images",
+            "refuses the trigger",
+        ] {
+            assert!(err.contains(want), "the refusal says {err:?}, not `{want}`");
+        }
+        db.exec("DELETE FROM codes WHERE id = 1").await;
+        db.tick().await;
+        sleep_ms(2_000).await;
+        assert!(
+            mock.requests().is_empty(),
+            "the refused trigger still fired {} request(s), keys {:?}",
+            mock.requests().len(),
+            bulk_keys(&mock.requests()),
+        );
+        inst.stop().await;
+        return;
+    }
+
     let upsert = |qty: i64| {
         let mock = &mock;
         move || async move {
@@ -17195,7 +17286,7 @@ async fn a_stored_hex_projection_carries_the_key() {
             assert!(
                 dels.is_empty(),
                 "a live row's document was deleted: {dels:?} (keys seen: {:?})",
-                mock.keys_received()
+                bulk_keys(&reqs)
             );
             last_docs(&reqs)
                 .get("F09F9880")
@@ -17225,6 +17316,303 @@ async fn a_stored_hex_projection_carries_the_key() {
     )
     .await;
     assert_eq!(dels, vec!["F09F9880".to_string()]);
+    let status = db.status("codes").await.expect("the rule's status row");
+    assert!(
+        status.3.is_none(),
+        "the rule that can read its columns reports {:?}",
+        status.3
+    );
+    inst.stop().await;
+}
+
+/// The workaround every server can use: a plain column the application keeps, written as
+/// `HEX(code)`, carries the key exactly — no generated column involved, so the row image holds
+/// it wherever the run happens. The refused rule of `binary_key_is_refused_at_load` works as
+/// soon as it keys on this column instead of on the `BINARY(4)` one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_hex_column_carries_the_key() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keyplain").await;
+    db.exec(
+        "CREATE TABLE codes (id INT PRIMARY KEY, code BINARY(4) NOT NULL, \
+         code_hex CHAR(8) NOT NULL, qty INT NOT NULL) ENGINE=InnoDB",
+    )
+    .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    keyed_rule(
+        &db,
+        &mock,
+        "codes",
+        "codes",
+        "{{new.code_hex}}",
+        "SELECT code_hex AS _key, qty AS qty, IF(qty < 0, 'delete', NULL) AS _op \
+         FROM codes WHERE code_hex IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    // The application writes the hex itself, which is the point of the workaround: the bytes
+    // stay in `code` and nothing but a text column stands between the row and its key.
+    db.exec(
+        "INSERT INTO codes (id, code, code_hex, qty) VALUES (1, UNHEX('F09F9880'), \
+         HEX(UNHEX('F09F9880')), 5)",
+    )
+    .await;
+    db.tick().await;
+    let upsert = |qty: i64| {
+        let mock = &mock;
+        move || async move {
+            let reqs = mock.requests();
+            let dels = deleted_keys(&reqs);
+            assert!(
+                dels.is_empty(),
+                "a live row's document was deleted: {dels:?} (keys seen: {:?})",
+                bulk_keys(&reqs)
+            );
+            last_docs(&reqs)
+                .get("F09F9880")
+                .cloned()
+                .flatten()
+                .filter(|v| v["qty"] == json!(qty))
+        }
+    };
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert under F09F9880",
+        upsert(5),
+    )
+    .await;
+    // The column is the application's, so an update of it moves the document: the old key goes
+    // out as a delete and the new one arrives. (The rule sees both keys, each in its own row.)
+    db.exec(
+        "UPDATE codes SET code = UNHEX('00112233'), code_hex = HEX(UNHEX('00112233')) \
+         WHERE id = 1",
+    )
+    .await;
+    db.tick().await;
+    wait_for(
+        Duration::from_secs(15),
+        "the upsert under 00112233",
+        upsert(5),
+    )
+    .await;
+    db.exec("DELETE FROM codes WHERE id = 1").await;
+    db.tick().await;
+    let dels = wait_for(
+        Duration::from_secs(15),
+        "the delete under 00112233",
+        || async {
+            let d: Vec<String> = deleted_keys(&mock.requests())
+                .into_iter()
+                .filter(|k| k == "00112233")
+                .collect();
+            (!d.is_empty()).then_some(d)
+        },
+    )
+    .await;
+    assert_eq!(dels, vec!["00112233".to_string()]);
+    let status = db.status("codes").await.expect("the rule's status row");
+    assert!(status.3.is_none(), "the rule reports {:?}", status.3);
+    inst.stop().await;
+}
+
+/// A STORED generated column leaves the UPDATE and DELETE images of a MariaDB 11.4+ just as a
+/// VIRTUAL one does, so a rule reading a *plain* column that stands behind it is refused there —
+/// the value the layout would name `name` is the one written for the projection. Two things this
+/// pins that the `VIRTUAL` probe does not:
+///
+/// * the refusal is about what the rule READS, not about the image being short: the control rule
+///   reads only columns standing before the projection, on a table whose image runs short in the
+///   same way, and marks its keys correctly on every server;
+/// * on a server that does write the projection (MariaDB before 11.4, MySQL, Percona) the same
+///   two rules run untouched, with the values the server computed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rule_reading_past_a_stored_column_is_refused_where_images_run_short() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "storedread").await;
+    db.exec(
+        "CREATE TABLE items (id INT PRIMARY KEY, price INT NOT NULL, \
+         price_hex CHAR(32) AS (HEX(price)) STORED, name VARCHAR(60) NOT NULL) ENGINE=InnoDB",
+    )
+    .await;
+    // The control: same shape, and the projection stands LAST, so every column the rule reads is
+    // one the image carries even where it runs short.
+    db.exec(
+        "CREATE TABLE kept (id INT PRIMARY KEY, name VARCHAR(60) NOT NULL, stock INT NOT NULL, \
+         note_hex CHAR(32) AS (HEX(stock)) STORED) ENGINE=InnoDB",
+    )
+    .await;
+    tables(&db).await;
+
+    let facts = wire_facts(&db, "items", 3, || async {
+        db.exec("INSERT INTO items (id, price, name) VALUES (1, 5, 'probe')")
+            .await;
+        db.exec("UPDATE items SET price = 6 WHERE id = 1").await;
+        db.exec("DELETE FROM items WHERE id = 1").await;
+    })
+    .await;
+    for line in &facts {
+        println!("storedread {line}");
+    }
+    let kept_facts = wire_facts(&db, "kept", 3, || async {
+        db.exec("INSERT INTO kept (id, name, stock) VALUES (1, 'probe', 1)")
+            .await;
+        db.exec("UPDATE kept SET stock = 2 WHERE id = 1").await;
+        db.exec("DELETE FROM kept WHERE id = 1").await;
+    })
+    .await;
+    for line in &kept_facts {
+        println!("storedread {line}");
+    }
+    let images: Vec<&String> = facts.iter().filter(|l| l.contains("value(s)")).collect();
+    assert_eq!(images.len(), 3, "the wire facts:\n{}", facts.join("\n"));
+    for line in &images {
+        for want in ["table map 4 columns", "layout [id,price,price_hex,name]"] {
+            assert!(
+                line.contains(want),
+                "no `{want}` in {line}\n{}",
+                facts.join("\n")
+            );
+        }
+    }
+    let short = images
+        .iter()
+        .any(|l| l.starts_with("Update") && !l.contains("row image 4 value(s)"));
+    // The control's image runs short in exactly the same way where this server skips STORED
+    // columns — which is what makes its keys the proof that reads before the projection are safe.
+    let kept_images: Vec<&String> = kept_facts
+        .iter()
+        .filter(|l| l.contains("value(s)"))
+        .collect();
+    let kept_short = kept_images
+        .iter()
+        .any(|l| l.starts_with("Update") && !l.contains("row image 4 value(s)"));
+    assert_eq!(
+        kept_short, short,
+        "both tables have a STORED column, so both images run short together: \n{}\n{}",
+        facts.join("\n"),
+        kept_facts.join("\n")
+    );
+    if short {
+        for line in kept_images
+            .iter()
+            .filter(|l| l.starts_with("Update") || l.starts_with("Delete"))
+        {
+            assert!(
+                line.contains("layout [id,name,stock,note_hex]"),
+                "the control's layout: {line}"
+            );
+        }
+    }
+
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    keyed_rule(
+        &db,
+        &mock,
+        "items",
+        "items",
+        "{{new.name}}",
+        "SELECT name AS _key, price AS price, IF(price < 0, 'delete', NULL) AS _op \
+         FROM items WHERE name IN (:keys)",
+    )
+    .await;
+    // The control rule shares the endpoint: one target, two rules, and the keys say which is
+    // which (`alpha`/`beta` are the control's own names).
+    bulk_rule(
+        &db,
+        "kept",
+        "kept",
+        "{{new.name}}",
+        "SELECT name AS _key, stock AS stock, IF(stock < 0, 'delete', NULL) AS _op \
+         FROM kept WHERE name IN (:keys)",
+    )
+    .await;
+    let inst = Instance::ready(config(&db, &[])).await;
+
+    db.exec("INSERT INTO items (id, price, name) VALUES (2, 7, 'gadget'), (3, 1, 'bolt')")
+        .await;
+    db.exec("INSERT INTO kept (id, name, stock) VALUES (2, 'alpha', 5), (3, 'beta', 6)")
+        .await;
+    db.tick().await;
+
+    // The control rule: correct keys on every server, and no refusal anywhere.
+    let got = wait_for(
+        Duration::from_secs(15),
+        "the control rule's names",
+        || async {
+            let got: std::collections::BTreeSet<String> = bulk_keys(&mock.requests())
+                .into_iter()
+                .filter(|k| k == "alpha" || k == "beta")
+                .collect();
+            (got.contains("alpha") && got.contains("beta")).then_some(got)
+        },
+    )
+    .await;
+    assert_eq!(
+        got,
+        ["alpha".to_string(), "beta".to_string()].into_iter().collect(),
+        "the rule that reads before the projection marked {got:?}"
+    );
+    let kept = db.status("kept").await.expect("the control rule's status row");
+    assert!(
+        kept.3.is_none(),
+        "the rule that reads before the projection reports {:?}",
+        kept.3
+    );
+
+    if short {
+        // The image skips the projection, so `name` is not the value its name says: refused,
+        // and none of its keys — right or shifted — reach the target. Waiting for the report is
+        // also how the test knows these rows were read at all, so the empty log below is a
+        // statement about a rule that ran, not about rows that never arrived.
+        let err = wait_for(
+            Duration::from_secs(15),
+            "the refusal of the read past the STORED column",
+            || async { db.status("items").await.and_then(|s| s.3) },
+        )
+        .await;
+        println!("storedread last_error: {err}");
+        for want in [
+            "generated column `price_hex`",
+            "UPDATE and DELETE row images",
+            "reads `name`",
+            "refuses the trigger",
+        ] {
+            assert!(err.contains(want), "the refusal says {err:?}, not `{want}`");
+        }
+        sleep_ms(1_000).await;
+        let got: Vec<String> = bulk_keys(&mock.requests())
+            .into_iter()
+            .filter(|k| k == "gadget" || k == "bolt")
+            .collect();
+        assert!(
+            got.is_empty(),
+            "the refused rule marked {got:?} (status said: {err})"
+        );
+    } else {
+        let err = db.status("items").await.and_then(|s| s.3);
+        assert!(err.is_none(), "the rule reports {err:?}");
+        let got = wait_for(
+            Duration::from_secs(15),
+            "the names of both rows",
+            || async {
+                let got: std::collections::BTreeSet<String> = bulk_keys(&mock.requests())
+                    .into_iter()
+                    .filter(|k| k == "gadget" || k == "bolt")
+                    .collect();
+                (got.contains("gadget") && got.contains("bolt")).then_some(got)
+            },
+        )
+        .await;
+        assert_eq!(
+            got,
+            ["gadget".to_string(), "bolt".to_string()].into_iter().collect(),
+            "the rule that reads a plain column after a STORED one marked {got:?}"
+        );
+    }
     inst.stop().await;
 }
 
