@@ -62,9 +62,13 @@ lint:
 	scripts/sync-lazyview.sh --check $(if $(CI),--upstream)
 
 servers:
+	@set -e; \
+	$(SUITE_GUARD); \
 	$(COMPOSE) up -d --wait
 
 servers-down:
+	@set -e; \
+	$(SUITE_GUARD); \
 	$(COMPOSE) --profile search --profile varnish --profile matrix --profile prerelease \
 	  --profile sqs --profile kinesis --profile amqp --profile pubsub --profile smtp \
 	  --profile kafka --profile eventbridge --profile sns --profile pgsrc --profile fences down -v
@@ -76,6 +80,48 @@ E2E_THREADS ?= 4
 # The target services of the default profile a run talks to besides the server under test.
 E2E_TARGETS := redis valkey postgres s3
 
+# The suite lock (2026-11-27). `lazywf-test` has fixed container names and fixed host ports, so one
+# run of it is a host-wide resource, not a private one: two suites at once collide on a port
+# (2026-11-27: `failed to bind host port 127.0.0.1:34432: address already in use`), and the second
+# `compose up` recreates the first run's containers under it mid-suite. So every target that brings
+# the project up, or runs its tests against it (`coverage-e2e`), holds this lock for its whole body —
+# `up`, the tests, the teardown — and it is the same lock `tmp/e2e-shared.sh` takes. It resolves to
+# `<main checkout>/tmp/out/lwf-heavy-suite.lock`, read from `git rev-parse --git-common-dir`: one
+# file for the host, so a worktree queues on the main checkout's file too (plain $(CURDIR) would hand
+# every worktree its own and leave the collision), and on a plain checkout — CI, a tarball, where git
+# answers `.git` or nothing — it is that checkout's own `tmp/out`, which the recipe creates. Override
+# SUITE_LOCK to put it elsewhere.
+# A caller that already holds it must never wait for itself: LWF_HEAVY_HELD=1 — what
+# `tmp/e2e-shared.sh` exports to everything it runs from inside its own locked subshell, and what a
+# locked recipe exports for its own `$(MAKE)` — or an inherited descriptor open on the lock file that
+# `flock -n` answers at once (the same open description, so that descriptor holds it:
+# `flock -w N <lock> make ...` hands its child the held fd) both mean held, and the body runs without
+# locking, as the script's own guard does and for its same reason (2026-11-25, 2026-11-27: a second
+# `flock` on a fresh descriptor waited forever on the caller's lock). On CI it is uncontended: one
+# job per runner.
+SUITE_DIR := $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed -e 's:/\.git$$::' -e 's:/*$$::')
+SUITE_LOCK ?= $(if $(SUITE_DIR),$(SUITE_DIR),$(CURDIR))/tmp/out/lwf-heavy-suite.lock
+# The guard, expanded at the head of every locked recipe. It runs in that recipe's own shell because
+# the descriptor it locks (9) has to stay open for the length of the body: a helper script would
+# release the lock when it exited. The backslashes make it one shell command.
+SUITE_GUARD = mkdir -p "$$(dirname "$(SUITE_LOCK)")"; : >"$(SUITE_LOCK)"; \
+  held=$${LWF_HEAVY_HELD:-0}; \
+  if [ "$$held" != 1 ]; then \
+    real=$$(readlink -f "$(SUITE_LOCK)" 2>/dev/null || true); \
+    if [ -n "$$real" ]; then \
+      for fdp in /proc/$$$$/fd/*; do \
+        [ "$$(readlink -f "$$fdp" 2>/dev/null)" = "$$real" ] || continue; \
+        n=$$(basename "$$fdp"); \
+        if flock -n "$$n" 2>/dev/null; then held=1; break; fi; \
+      done; \
+    fi; \
+  fi; \
+  if [ "$$held" != 1 ]; then \
+    exec 9>"$(SUITE_LOCK)"; \
+    flock -n 9 || { echo "make: another run holds the suite lock; waiting for $(SUITE_LOCK)"; flock 9; }; \
+  fi; \
+  LWF_HEAVY_HELD=1; export LWF_HEAVY_HELD
+
 # Owner rule (2026-11-16): a test server is a composition for the run, not a container that stays up
 # for days. `test-e2e`, `test-e2e-all`, `test-chaos`, `test-chaos-all`, `test-e2e-search`,
 # `test-e2e-queues`, `test-e2e-pgsrc` and `test-matrix` (`test-prerelease` delegates to it) each
@@ -84,9 +130,10 @@ E2E_TARGETS := redis valkey postgres s3
 # leaves the rest alone, where `down` would take the whole `lazywf-test` project away — including the
 # standing `make servers` set another session may be using — so dropping everything stays
 # `make servers-down`'s job, where an operator asks for it.
-# These targets own the compose project `lazywf-test` for the length of a run, so on a shared host run
-# them ONE AT A TIME: two runs side by side tear down each other's servers. Take whatever host-wide
-# lock your harness already uses for docker around a run.
+# These targets own the compose project `lazywf-test` for the length of a run, so each of them runs
+# its whole body under the suite lock, `flock $(SUITE_LOCK)` (the block above): on a shared host the
+# users of the project take turns instead of colliding on the fixed ports and recreating each other's
+# containers, and a caller that already holds that lock is never made to wait for itself.
 # The removal sits in a trap on EXIT, with INT and TERM made to exit through it, so a run that fails
 # or is killed cleans up too. KEEP_SERVERS=1 leaves the services to the caller: CI pre-starts its
 # services, reads `docker compose logs` after a failed run, and tears the set down itself.
@@ -94,6 +141,7 @@ E2E_TARGETS := redis valkey postgres s3
 # Integration tests against MySQL 8.4 (GTIDs on) and the target services.
 test-e2e:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 $(E2E_TARGETS) >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait mysql84 $(E2E_TARGETS); \
@@ -105,6 +153,7 @@ test-e2e:
 # the MariaDB run, as before.
 test-e2e-all:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 mariadb1011 $(E2E_TARGETS) >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait mysql84 mariadb1011 $(E2E_TARGETS); \
@@ -117,9 +166,11 @@ test-e2e-all:
 # in-process mock and the proxies are in-process, so this brings up `mysql84` alone — no
 # services of $(E2E_TARGETS) — and removes it again on the rule above.
 # On a host shared with another heavy suite, serialize against it: two chaos runs at once is
-# how engine children get killed and `h1`/`h2` then false-fail.
+# how engine children get killed and `h1`/`h2` then false-fail — the suite lock the target runs under
+# (see SUITE_LOCK above) is what does the serializing.
 test-chaos:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait mysql84; \
@@ -130,6 +181,7 @@ test-chaos:
 # second. The MySQL run goes first and a failure of it stops the MariaDB run, as before.
 test-chaos-all:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) rm -sfv mysql84 mariadb1011 >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait mysql84 mariadb1011; \
@@ -143,6 +195,7 @@ test-chaos-all:
 E2E_DB := LAZYWF_TEST_DSN=$(E2E_DSN)
 test-e2e-search:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile search rm -sfv mysql84 opensearch es7 es8 >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) --profile search up -d --wait mysql84 opensearch; \
@@ -169,6 +222,7 @@ QUEUE_SERVICES := elasticmq kinesis-mock rabbitmq pubsub-emulator mailpit kafka 
 QUEUE_SERVERS := mysql84 s3 redis $(QUEUE_SERVICES)
 test-e2e-queues:
 	@set -e; rc=0; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) $(QUEUE_PROFILES) rm -sfv $(QUEUE_SERVERS) >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) $(QUEUE_PROFILES) up -d --wait $(QUEUE_SERVERS); \
@@ -201,6 +255,7 @@ test-e2e-queues:
 E2E_PG_DSN ?= host=127.0.0.1 port=34532 user=lwfsrc password=lwfsrcpw dbname=lwfsrc
 test-e2e-pgsrc:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile pgsrc rm -sfv pgsrc >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) --profile pgsrc up -d --wait pgsrc; \
@@ -218,6 +273,7 @@ MATRIX := mysql80:34180 mysql97:34197 mysql2610:34210 percona84:34284 percona97:
 MATRIX_SERVICES := $(foreach sp,$(MATRIX),$(firstword $(subst :, ,$(sp))))
 test-matrix:
 	@set -e; \
+	$(SUITE_GUARD); \
 	trap '[ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile matrix --profile prerelease rm -sfv $(MATRIX_SERVICES) $(E2E_TARGETS) >/dev/null 2>&1 || true' EXIT; \
 	trap 'exit 1' INT TERM; \
 	$(COMPOSE) up -d --wait $(E2E_TARGETS); \
@@ -226,7 +282,8 @@ test-matrix:
 	  LAZYWF_TEST_DSN=mysql://root:root@127.0.0.1:$$p $(CARGO) test --test e2e -- --test-threads=4 || { [ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile matrix --profile prerelease rm -sfv $$s; exit 1; }; \
 	  [ -n "$(KEEP_SERVERS)" ] || $(COMPOSE) --profile matrix --profile prerelease rm -sfv $$s; done
 
-# The advisory pre-releases (MariaDB RC and preview): the same, never required.
+# The advisory pre-releases (MariaDB RC and preview): the same, never required. It takes no lock of
+# its own: its body is only `make test-matrix`, which holds the suite lock for its whole run.
 PRERELEASE := mariadb131-rc:34131 mariadb132-pre:34132
 test-prerelease:
 	@$(MAKE) --no-print-directory test-matrix MATRIX="$(PRERELEASE)"
@@ -249,6 +306,8 @@ coverage-unit:
 	$(COV_ENV) $(CARGO) llvm-cov --no-report --lib --bins
 
 coverage-e2e:
+	@set -e; \
+	$(SUITE_GUARD); \
 	$(E2E_DB) $(COV_ENV) $(CARGO) llvm-cov --no-report --test e2e -- --test-threads=$(E2E_THREADS)
 
 coverage-report:
@@ -288,6 +347,8 @@ docker-smoke:
 # The image against the compose MySQL 8.4 and Redis: ready, healthy, uid 65532, a row fires a
 # Redis SET, exit 0 on SIGTERM.
 docker-e2e:
+	@set -e; \
+	$(SUITE_GUARD); \
 	scripts/docker-e2e.sh "$(IMAGE)"
 
 # The current multi-arch index digests, to refresh the pins in the Dockerfile.
