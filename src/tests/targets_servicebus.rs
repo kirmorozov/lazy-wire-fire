@@ -824,7 +824,9 @@ async fn the_fake_peer_takes_the_token_and_the_messages() {
     let p = Peer::start(Script::happy()).await;
     let c = fake_client_budget(p.port(), &fake_vars(r#", "dedup": true"#), budget);
     let out = went_in(&p, outcomes(&c, &msgs(&[msg("A"), msg("B")]), 2).await);
-    assert_eq!(out, vec![Outcome::Ok, Outcome::Ok]);
+    // The frame trace belongs to the failure message, not only to a failed `send_batch`:
+    // a lost disposition (flake F-6) left the assert in CI with no trace at all.
+    assert_eq!(out, vec![Outcome::Ok, Outcome::Ok], "the peer saw:\n{}", p.trace());
 
     let seen = p.seen();
     assert_eq!(seen.put_tokens.len(), 1, "one token per connection");
