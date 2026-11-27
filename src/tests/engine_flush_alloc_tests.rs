@@ -198,6 +198,7 @@ async fn engine_with_flush_ready(
         generated_first: HashMap::new(),
         generated_refusals: HashSet::new(),
         binary_refusals: HashSet::new(),
+        lossy_refusals: HashSet::new(),
         tx,
         last_persist: now,
         clear_retry: None,

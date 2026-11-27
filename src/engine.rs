@@ -742,7 +742,9 @@ impl KeyScratch {
 /// this transaction has marked so far, `rules` their buffers, `scratch` the string a key line is
 /// built in, `render_warnings` the Full keys that did not render, `invalid` the keys holding
 /// control characters and `invalid_keys` how many were ever reported (the invalid ones are
-/// reported once the rows are done).
+/// reported once the rows are done), and `lossy` the keys whose bytes no charset could be read
+/// as — collected here and reported by [`Engine::on_rows`] once per trigger through
+/// `lossy_refusals` (the decode-point guard, see [`Layout::key_is_lossy`]).
 struct RowCtx<'a> {
     marks: &'a mut HashMap<String, Marks>,
     rules: &'a mut BTreeMap<String, RuleState>,
@@ -750,6 +752,8 @@ struct RowCtx<'a> {
     render_warnings: &'a mut u64,
     invalid_keys: &'a mut u64,
     invalid: &'a mut Vec<(String, u64, String)>,
+    lossy: &'a mut Vec<(String, u64, String)>,
+    lossy_refusals: &'a mut HashSet<(String, u64)>,
 }
 
 struct XaTxn {
@@ -846,6 +850,10 @@ pub struct Engine {
     /// Triggers already reported as keying on bytes no charset defines (see
     /// `refuse_binary_keys`), warned about once.
     binary_refusals: HashSet<(String, u64)>,
+    /// Triggers already reported as holding a key whose bytes no charset could be read as, row
+    /// by row (see `Layout::key_is_lossy`), warned about once. The rows themselves are dropped
+    /// either way; this only holds the report back.
+    lossy_refusals: HashSet<(String, u64)>,
     tx: mpsc::UnboundedSender<Done>,
     last_persist: Instant,
     clear_retry: Option<Instant>,
@@ -1362,6 +1370,7 @@ pub async fn run(
         generated_first: HashMap::new(),
         generated_refusals: HashSet::new(),
         binary_refusals: HashSet::new(),
+        lossy_refusals: HashSet::new(),
         tx,
         last_persist: Instant::now(),
         clear_retry: None,
@@ -2556,9 +2565,11 @@ impl Engine {
                             key_scratch,
                             render_warnings,
                             invalid_keys,
+                            lossy_refusals,
                             ..
                         } = self;
                         let mut invalid = Vec::new();
+                        let mut lossy = Vec::new();
                         let mut ctx = RowCtx {
                             marks: txn_marks,
                             rules,
@@ -2566,6 +2577,8 @@ impl Engine {
                             render_warnings,
                             invalid_keys,
                             invalid: &mut invalid,
+                            lossy: &mut lossy,
+                            lossy_refusals,
                         };
                         Engine::on_rows(&w, kind, || reader.rows(table_id, &event), &mut ctx)?;
                     }
@@ -3058,8 +3071,38 @@ impl Engine {
                 render_warnings: &mut *ctx.render_warnings,
                 invalid_keys: &mut *ctx.invalid_keys,
                 invalid: &mut *ctx.invalid,
+                lossy: &mut *ctx.lossy,
+                lossy_refusals: &mut *ctx.lossy_refusals,
             };
             Self::row_keys(w, kind, before, after, &mut row);
+        }
+        // The keys whose bytes no charset could be read as: the row marked nothing under them
+        // (see `row_keys`), and this is where that becomes visible — once per trigger, on the
+        // rule, the way a key that cannot be rendered is.
+        for (name, trigger, column) in std::mem::take(&mut *ctx.lossy) {
+            if !ctx.lossy_refusals.insert((name.clone(), trigger)) {
+                continue;
+            }
+            let ty = w
+                .layout
+                .index(&column)
+                .and_then(|i| w.layout.column_type(i))
+                .unwrap_or("?");
+            let msg = format!(
+                "trigger {trigger}: `{}`.`{column}` of type `{ty}` holds bytes its charset does \
+                 not make text of, so its key came out through the decoder's replacement \
+                 character: lazy-wire-fire marks no key it cannot read, and neither a lookup, a \
+                 document nor a delete goes out for such a row (key on a column in a charset \
+                 lazy-wire-fire decodes — utf8mb4 or latin1 — or on a plain column the \
+                 application keeps, for example `{column}_hex CHAR(64)` written as \
+                 HEX(`{column}`))",
+                w.table
+            );
+            warn!(rule = %name, "{msg}");
+            if let Some(st) = ctx.rules.get_mut(&name) {
+                st.last_error = Some((msg, crate::time::unix_now_ms()));
+                st.dirty = true;
+            }
         }
         for (name, trigger, k) in std::mem::take(&mut *ctx.invalid) {
             *ctx.invalid_keys += 1;
@@ -3163,6 +3206,7 @@ impl Engine {
             scratch,
             render_warnings,
             invalid,
+            lossy,
             ..
         } = ctx;
         for (name, rule, ti) in &w.triggers {
@@ -3211,10 +3255,23 @@ impl Engine {
                                 match seg {
                                     template::Seg::Lit(s) => k.push_str(s),
                                     template::Seg::Col(c) => {
-                                        match w.layout.index(c).map(|i| w.layout.value(img, i)) {
-                                            None | Some(Value::Null) => continue 'line,
-                                            Some(v) => template::push_text(&v, k),
+                                        let Some(i) = w.layout.index(c) else {
+                                            continue 'line;
+                                        };
+                                        let v = w.layout.value(img, i);
+                                        if v.is_null() {
+                                            continue 'line;
                                         }
+                                        // The decode-point guard: bytes no charset can be read
+                                        // as text make a key that does not describe this row —
+                                        // it would mark nothing and its DELETE could carry
+                                        // another row's key. Such a line marks nothing at all
+                                        // (see [`Layout::key_is_lossy`]).
+                                        if w.layout.key_is_lossy(img, i, &v) {
+                                            lossy.push((name.clone(), t.def.id, c.clone()));
+                                            continue 'line;
+                                        }
+                                        template::push_text(&v, k);
                                     }
                                 }
                             }
@@ -3250,6 +3307,27 @@ impl Engine {
                             match rule.templates.render(tpl, &ctx) {
                                 Ok(s) => {
                                     let k = s.trim();
+                                    // A rendered key holding a replacement character may hold
+                                    // the decoder's own: the columns the template names are
+                                    // asked, but only now — a key without one is never looked
+                                    // at (see [`Layout::key_is_lossy`]).
+                                    if k.contains(char::REPLACEMENT_CHARACTER) {
+                                        let bad = key_column_reads(t, &w.layout)
+                                            .into_iter()
+                                            .find(|&i| {
+                                                w.layout.key_is_lossy(
+                                                    img,
+                                                    i,
+                                                    &w.layout.value(img, i),
+                                                )
+                                            })
+                                            .and_then(|i| w.layout.column_name(i))
+                                            .map(str::to_string);
+                                        if let Some(col) = bad {
+                                            lossy.push((name.clone(), t.def.id, col));
+                                            continue;
+                                        }
+                                    }
                                     if template::valid_key(k) {
                                         let (s2, key) =
                                             rules.get_mut(name).expect("present").buffer.locate(k);
@@ -3281,15 +3359,28 @@ impl Engine {
                     None => {}
                 }
                 if let Some(ks) = &t.keys_sql {
-                    let params = ks
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            w.layout
-                                .index(c)
-                                .map_or(Value::Null, |i| w.layout.value(img, i))
-                        })
-                        .collect();
+                    // The bound values are the row's decoded text: one of them made of
+                    // replacement characters would answer the user's statement with another
+                    // row's `_key`, so the query does not go out at all.
+                    let mut params = Vec::with_capacity(ks.columns.len());
+                    let mut bad = None;
+                    for c in &ks.columns {
+                        match w.layout.index(c) {
+                            Some(i) => {
+                                let v = w.layout.value(img, i);
+                                if w.layout.key_is_lossy(img, i, &v) {
+                                    bad = Some(c.clone());
+                                    break;
+                                }
+                                params.push(v);
+                            }
+                            None => params.push(Value::Null),
+                        }
+                    }
+                    if let Some(col) = bad {
+                        lossy.push((name.clone(), t.def.id, col));
+                        continue;
+                    }
                     let q = KeyQuery {
                         trigger: t.def.id,
                         sql: ks.sql.clone(),
@@ -4894,6 +4985,9 @@ mod flush_alloc_tests;
 #[cfg(test)]
 #[path = "tests/engine_binary_key_tests.rs"]
 mod binary_key_tests;
+#[cfg(test)]
+#[path = "tests/engine_lossy_key_tests.rs"]
+mod lossy_key_tests;
 #[cfg(test)]
 #[path = "tests/engine_skip_kinds_tests.rs"]
 mod skip_kinds_tests;

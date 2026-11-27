@@ -523,17 +523,25 @@ fn col_charset_reads_the_information_schema_name() {
     // the `binary` charset gets its own variant: same rendering as `Utf8`, but the key
     // refusal sees it (see `Layout::key_unsafe`)
     assert_eq!(col_charset(Some("binary")), Charset::Binary);
-    for name in [
-        "utf8mb4", "utf8mb3", "utf8", "ascii", "gbk", "latin2", "ujis",
-    ] {
+    // the UTF-8 family and `ascii`: bytes the column's own definition makes valid UTF-8,
+    // so the lossy path renders them exactly
+    for name in ["utf8mb4", "utf8mb3", "utf8", "ascii"] {
+        assert_eq!(col_charset(Some(name)), Charset::Utf8, "{name} is exact");
+    }
+    // everything else is a name lazywf has no table for: the same rendering as `Utf8`, but
+    // under a variant that says nothing about those bytes is text — the one the decode-point
+    // guard watches (see `Layout::key_is_lossy`)
+    for name in ["gbk", "latin2", "ujis", "big5", "ucs2", "utf16le", "koi8r"] {
         assert_eq!(
             col_charset(Some(name)),
-            Charset::Utf8,
-            "{name} keeps today's path"
+            Charset::Unknown,
+            "{name} keeps today's path, under a name that says nothing about its bytes"
         );
     }
+    // NULL is the columns that have no charset at all: numbers and dates, whose bytes the
+    // guard never reads, and the geometry family, whose bytes it does
     for name in [None, Some("")] {
-        assert_eq!(col_charset(name), Charset::Utf8);
+        assert_eq!(col_charset(name), Charset::Unknown, "no charset named");
     }
 }
 
@@ -764,6 +772,98 @@ fn typed(name: &str, charset: Charset, data_type: &str) -> Layout {
         vec![charset],
         vec![data_type.into()],
     )
+}
+
+/// The decode-point guard (`Layout::key_is_lossy`): which bytes the decoder invented a
+/// character for, and which the row really holds.
+fn guard_row(b: &[u8]) -> (Layout, BinlogRow) {
+    let l = typed("c", Charset::Unknown, "varchar");
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(b.to_vec()))));
+    (l, row)
+}
+
+/// Bytes no charset reads as text: the replacement character in the key is the decoder's own,
+/// so the guard says so — this is the case that used to mark a key of U+FFFDs and let its
+/// DELETE remove another row's document.
+#[test]
+fn impossible_bytes_of_an_unknown_charset_are_the_decoders_text() {
+    let (l, row) = guard_row(&[0xFF, 0xFE, 0x41]);
+    assert!(
+        l.value(&row, 0)
+            .as_str()
+            .is_some_and(|s| s.contains(char::REPLACEMENT_CHARACTER)),
+        "the lossy path renders what it always rendered"
+    );
+    assert!(l.key_is_lossy(&row, 0, &l.value(&row, 0)));
+}
+
+/// A value that really holds U+FFFD is the row's own: its bytes are valid UTF-8, and the key
+/// that names them is exact. The guard tells the two apart by the bytes, not by the text.
+#[test]
+fn a_legal_replacement_character_stays_the_rows_key() {
+    let (l, row) = guard_row("a\u{FFFD}b".as_bytes());
+    assert_eq!(l.value(&row, 0), Value::String("a\u{FFFD}b".into()));
+    assert!(
+        !l.key_is_lossy(&row, 0, &l.value(&row, 0)),
+        "the row holds the character, the decoder did not make it"
+    );
+}
+
+/// What keeps the guard off the hot path: a column whose charset says what its bytes are
+/// never has them looked at. `utf8mb4` promises valid UTF-8, `latin1` is decoded exactly and
+/// cp1252 has no replacement character to give; the other kinds are not bytes of a text
+/// charset at all, and a column the row does not have cannot be anyone's key.
+#[test]
+fn a_charset_that_names_its_bytes_is_never_read_by_the_guard() {
+    let bytes = vec![0xFFu8, 0xFE];
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(bytes.clone()))));
+    for charset in [Charset::Utf8, Charset::Latin1] {
+        let l = typed("c", charset, "varchar");
+        assert!(
+            !l.key_is_lossy(&row, 0, &l.value(&row, 0)),
+            "{charset:?}: a charset lazywf decodes cannot owe the guard a look"
+        );
+    }
+    // the `binary` family is refused as a key at load, and the guard holds the line too
+    let l = typed("c", Charset::Binary, "binary");
+    assert!(l.key_is_lossy(&row, 0, &l.value(&row, 0)));
+    // a number under an unknown charset: no bytes, so nothing to read
+    let n = row_of(Some(BinlogValue::Value(My::Int(7))));
+    let l = typed("n", Charset::Unknown, "int");
+    assert!(!l.key_is_lossy(&n, 0, &l.value(&n, 0)));
+    // a label list whose label holds U+FFFD is the label, not broken bytes
+    let labels = Layout::with_charsets(
+        vec!["c".into()],
+        vec![ColKind::Set(vec!["\u{FFFD}".into()])],
+        vec![Charset::Unknown],
+        vec!["set".into()],
+    );
+    let set = row_of(Some(BinlogValue::Value(My::Bytes(vec![1]))));
+    assert_eq!(labels.value(&set, 0), Value::String("\u{FFFD}".into()));
+    assert!(
+        !labels.key_is_lossy(&set, 0, &labels.value(&set, 0)),
+        "a mask never renders bytes as text, so it cannot hold the decoder's character"
+    );
+    // a column the row does not have
+    assert!(!l.key_is_lossy(&empty_row(), 0, &Value::String("x\u{FFFD}".into())));
+}
+
+/// The layout a table map's own names derive (`layout_from_names`) leaves a column the
+/// `information_schema` read does not know in [`Charset::Unknown`]: nothing said what its
+/// bytes are, which is exactly what the guard asks about.
+#[test]
+fn a_column_no_read_names_is_unknown_to_the_guard() {
+    let info = typed("known", Charset::Utf8, "varchar");
+    let l = layout_from_names(&info, &["known".to_string(), "surprise".to_string()]);
+    let row = BinlogRow::new(
+        vec![
+            Some(BinlogValue::Value(My::Bytes(b"ok".to_vec()))),
+            Some(BinlogValue::Value(My::Bytes(vec![0xC3, 0x28, 0xA0]))),
+        ],
+        Arc::new([]),
+    );
+    assert!(l.key_is_lossy(&row, 1, &l.value(&row, 1)));
+    assert!(!l.key_is_lossy(&row, 0, &l.value(&row, 0)));
 }
 
 /// The `binary`-charset family — BINARY, VARBINARY and the BLOBs on both servers, and the

@@ -31,8 +31,9 @@ pub enum ColKind {
 /// always rendered, through `String::from_utf8_lossy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Charset {
-    /// UTF-8 (`utf8mb4`, `utf8mb3`, `utf8`) and everything lazywf does not decode: today's
-    /// lossy path, exact for valid UTF-8 — which every UTF-8-family key is, at no extra cost.
+    /// UTF-8 (`utf8mb4`, `utf8mb3`, `utf8`) and `ascii`, whose bytes are a subset of it: the
+    /// names whose bytes `String::from_utf8` renders exactly, so a key column in one of them
+    /// never asks the decode-point guard to read its bytes (see [`Layout::key_is_lossy`]).
     Utf8,
     /// MySQL's latin1, which is Windows cp1252: one byte, one character. Decoding it is the
     /// difference between a latin1 key that matches its row and one that loses to U+FFFD,
@@ -45,18 +46,29 @@ pub enum Charset {
     /// make an exact key, and a key that does not describe its row deletes another row's
     /// document (backlog B-1, refusal [A]).
     Binary,
+    /// No charset lazywf decodes, and no charset at all where the server named none: `latin2`,
+    /// `gbk`, `ujis`, the geometry types' `NULL`, and any name added after this list. It
+    /// renders as [`Charset::Utf8`] does — `convert` has no table for it either — and the
+    /// variant exists for [`Layout::key_is_lossy`], the decode-point guard: here the bytes may
+    /// be ones no decoder can read, and the only proof is the row's own bytes, so a key whose
+    /// text came out through U+FFFD is refused per row rather than sent out as the row's.
+    Unknown,
 }
 
 /// The `information_schema.COLUMNS.CHARACTER_SET_NAME` of a column, as a [`Charset`]. The
 /// names lazywf decodes are matched exactly (they are stored lower case); anything else —
 /// including `NULL` (no charset: numbers, dates and the geometry types, whose bytes are not
 /// text at all) and the single-byte and multi-byte charsets whose tables are not built
-/// yet — keeps the lossy path it has always had.
+/// yet — keeps the lossy path it has always had, under [`Charset::Unknown`]: the charset the
+/// guard watches, because nothing says those bytes can be read as text at all.
 pub fn col_charset(name: Option<&str>) -> Charset {
     match name {
         Some("latin1") => Charset::Latin1,
         Some("binary") => Charset::Binary,
-        _ => Charset::Utf8,
+        // The UTF-8 family, exact through `String::from_utf8`, and `ascii`, whose bytes are a
+        // subset of it. Everything else is a name lazywf has no table for.
+        Some("utf8mb4") | Some("utf8mb3") | Some("utf8") | Some("ascii") => Charset::Utf8,
+        _ => Charset::Unknown,
     }
 }
 
@@ -172,6 +184,53 @@ impl Layout {
             | "gis" | "vector" => Some("no charset defines its bytes"),
             _ => None,
         }
+    }
+
+    /// Whether `v` is text the decoder invented for column `i` rather than what the column's
+    /// bytes say: a string, in a charset lazywf has no table for, that holds a replacement
+    /// character *and* whose row bytes are not valid UTF-8 — so that character is the decoder's
+    /// own, not the row's. Nothing else can produce it: `utf8mb4` bytes are valid UTF-8 by the
+    /// server's promise, `latin1` is decoded exactly and cp1252 has no replacement character to
+    /// give, the `binary` family is refused as a key at load, and the other kinds (masks, label
+    /// lists, bitmaps) never render bytes as text.
+    ///
+    /// A key built from such text does not describe its row: it marks nothing, and its DELETE
+    /// can carry another row's key and remove that row's document. This is the decode-point
+    /// guard (backlog B-1): the catalog's answer is not always there — a privilege gap, a table
+    /// it does not list, a race with DDL — and where no charset is known to decode the bytes, an
+    /// impossible byte must cost a refusal, never a wrong delete. It reads the row's own bytes
+    /// rather than trusting the charset, so a charset the server named wrongly cannot smuggle a
+    /// lossy key through either.
+    ///
+    /// Cheapest test first, because a key column asks this on every row: the kinds and the
+    /// charsets are array reads, and the two scans of the bytes run only for a plain column in
+    /// an unknown charset, which is the only one that can need them.
+    pub fn key_is_lossy(&self, row: &BinlogRow, i: usize, v: &Value) -> bool {
+        if !matches!(v, Value::String(_)) {
+            return false;
+        }
+        if self.kinds.get(i) != Some(&ColKind::Plain) {
+            return false;
+        }
+        if !matches!(
+            self.charsets.get(i),
+            Some(Charset::Unknown) | Some(Charset::Binary)
+        ) {
+            return false;
+        }
+        // The two scans, last: the text must hold a replacement character at all, and the bytes
+        // behind it must fail to be UTF-8. A legal U+FFFD — a value the row really holds —
+        // reads as valid UTF-8 and stays the row's own key.
+        if !v
+            .as_str()
+            .is_some_and(|s| s.contains(char::REPLACEMENT_CHARACTER))
+        {
+            return false;
+        }
+        matches!(
+            row.as_ref(i),
+            Some(BinlogValue::Value(My::Bytes(b))) if std::str::from_utf8(b).is_err()
+        )
     }
 
     /// One column of a row image as JSON.
@@ -374,8 +433,9 @@ pub fn table_map_names(tme: &TableMapEvent<'_>) -> Option<Vec<String>> {
 
 /// The layout an event's own column names describe: every column keeps the kind, the
 /// charset and the data type of the `information_schema` column of the same name (a name
-/// the read does not know is plain, in the lossy default charset, with no type). Pure: the
-/// same `info` and the same names always derive the same layout.
+/// the read does not know is plain, in [`Charset::Unknown`] — nobody said what its bytes
+/// are — with no type). Pure: the same `info` and the same names always derive the same
+/// layout.
 pub fn layout_from_names(info: &Layout, names: &[String]) -> Arc<Layout> {
     let (mut kinds, mut charsets, mut types) = (Vec::new(), Vec::new(), Vec::new());
     for n in names {
@@ -387,7 +447,9 @@ pub fn layout_from_names(info: &Layout, names: &[String]) -> Arc<Layout> {
             }
             None => {
                 kinds.push(ColKind::Plain);
-                charsets.push(Charset::Utf8);
+                // A column the read does not name is a column whose charset nobody told us:
+                // it renders through the lossy path, and the guard treats it as unknown.
+                charsets.push(Charset::Unknown);
                 types.push(String::new());
             }
         }

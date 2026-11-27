@@ -17010,6 +17010,136 @@ async fn latin1_key_follows_the_row() {
     inst.stop().await;
 }
 
+/// A key in a charset lazywf has no table for, holding bytes no decoder reads as text: the
+/// guard at the decode point drops it, so the row costs the target nothing at all — no
+/// `keys_sql` lookup, no document, no delete. The ASCII row of the same table, written and
+/// deleted beside it, proves the rule is running: its keys and its delete arrive as they
+/// always did. (Measured on main: the key lost to `String::from_utf8_lossy`, the select bound
+/// the replacement characters and matched nothing, so the merger read a missing row as a
+/// delete — and a DELETE of such a row could carry another row's key.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_key_never_reaches_the_target() {
+    let root = need_db!();
+    let db = Db::fresh(&root, "keylatin2").await;
+    db.exec(
+        "CREATE TABLE items (id INT PRIMARY KEY, \
+         code VARCHAR(20) CHARACTER SET latin2 NOT NULL, qty INT NOT NULL) ENGINE=InnoDB",
+    )
+    .await;
+    tables(&db).await;
+    let mock = Mock::start().await;
+    mock.respond(|_| (200, r#"{"errors":false,"items":[]}"#.into()));
+    charset_rule(
+        &db,
+        &mock,
+        "SELECT code AS _key, qty AS qty, IF(qty < 0, 'delete', NULL) AS _op \
+         FROM items WHERE code IN (:keys)",
+    )
+    .await;
+
+    // What this test proves rests on two facts about the server, checked rather than assumed:
+    // the column really is latin2, and the row really holds a byte no UTF-8 decoder reads. If
+    // either stopped holding, the test would have nothing to say — so it says so here instead
+    // of passing quietly.
+    let cs: Vec<(Option<String>,)> = db
+        .query(
+            "SELECT CHARACTER_SET_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'items' AND COLUMN_NAME = 'code'",
+        )
+        .await;
+    assert_eq!(
+        cs.first().and_then(|r| r.0.as_deref()),
+        Some("latin2"),
+        "the column's charset is what decides the decoding, and this case is latin2's"
+    );
+    let inst = Instance::ready(config(&db, &[])).await;
+    // 0xB5 is latin2's `đ`: one byte, no valid UTF-8 sequence begins with it
+    db.exec("INSERT INTO items (id, code, qty) VALUES (1, _latin2 0xB5, 5)")
+        .await;
+    db.exec("INSERT INTO items (id, code, qty) VALUES (2, 'plain', 6)")
+        .await;
+    let hex: Vec<(String,)> = db.query("SELECT HEX(code) FROM items ORDER BY id").await;
+    assert_eq!(hex[0].0, "B5", "the row must hold latin2's own byte");
+    assert_eq!(hex[1].0, "706C61696E", "the ASCII row is its own bytes");
+    db.tick().await;
+
+    // The row the decoder can read: written, and deleted, exactly as any other.
+    let docs = wait_for(
+        Duration::from_secs(15),
+        "the upsert of the readable row",
+        || async {
+            let got = last_docs(&mock.requests());
+            (got.get("plain").cloned().flatten().is_some()).then_some(got)
+        },
+    )
+    .await;
+    assert_eq!(
+        docs.get("plain").cloned().flatten(),
+        Some(json!({"qty": 6})),
+        "the document of the readable row"
+    );
+    // The rule says why the other row marked nothing: waiting for the report is also how the
+    // test knows that row was read at all, so what follows is not a race the unreadable key
+    // could win by arriving late.
+    let err = wait_for(
+        Duration::from_secs(15),
+        "the refusal of the unreadable key",
+        || async { db.status("items").await.and_then(|s| s.3) },
+    )
+    .await;
+    println!("keylatin2 last_error: {err}");
+    for want in [
+        "items",
+        "`code`",
+        "varchar",
+        "replacement character",
+        "lazy-wire-fire marks no key",
+        "lookup",
+    ] {
+        assert!(err.contains(want), "the refusal says {err:?}, not `{want}`");
+    }
+    // The unreadable row marks nothing: no key of it, and no key of the decoder's own
+    // characters either — the whole target log is the readable row's.
+    let seen = bulk_keys(&mock.requests());
+    assert!(
+        seen.iter()
+            .all(|k| !k.contains(char::REPLACEMENT_CHARACTER)),
+        "a key of the decoder's own characters reached the target: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["plain"],
+        "the unreadable row marked {seen:?}"
+    );
+
+    // Both rows go: the readable one's delete arrives under its own key, and the unreadable
+    // one still costs nothing — no delete of its invented key, and no delete of anyone else's.
+    mock.clear();
+    db.exec("DELETE FROM items WHERE id IN (1, 2)").await;
+    db.tick().await;
+    let dels = wait_for(
+        Duration::from_secs(15),
+        "the delete of the readable row",
+        || async {
+            let d: Vec<String> = deleted_keys(&mock.requests())
+                .into_iter()
+                .filter(|k| k == "plain")
+                .collect();
+            (!d.is_empty()).then_some(d)
+        },
+    )
+    .await;
+    assert_eq!(dels, vec!["plain".to_string()]);
+    sleep_ms(2_000).await;
+    let dels = deleted_keys(&mock.requests());
+    assert_eq!(
+        dels,
+        vec!["plain".to_string()],
+        "the unreadable row's DELETE went out too, or carried another key"
+    );
+    inst.stop().await;
+}
+
 /// A utf8mb4 key is its own UTF-8 in the binlog, so the key path must not change a byte
 /// of it: this pins what works today against the charset decoding of the fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -17216,10 +17346,7 @@ async fn a_stored_hex_projection_carries_the_key() {
         facts.join("\n")
     );
     for line in &images {
-        for want in [
-            "table map 4 columns",
-            "layout [id,code,code_hex,qty]",
-        ] {
+        for want in ["table map 4 columns", "layout [id,code,code_hex,qty]"] {
             assert!(
                 line.contains(want),
                 "no `{want}` in {line}\nthe wire facts:\n{}",
@@ -17490,7 +17617,8 @@ async fn a_rule_reading_past_a_stored_column_is_refused_where_images_run_short()
         .iter()
         .any(|l| l.starts_with("Update") && !l.contains("row image 4 value(s)"));
     assert_eq!(
-        kept_short, short,
+        kept_short,
+        short,
         "both tables have a STORED column, so both images run short together: \n{}\n{}",
         facts.join("\n"),
         kept_facts.join("\n")
@@ -17553,10 +17681,15 @@ async fn a_rule_reading_past_a_stored_column_is_refused_where_images_run_short()
     .await;
     assert_eq!(
         got,
-        ["alpha".to_string(), "beta".to_string()].into_iter().collect(),
+        ["alpha".to_string(), "beta".to_string()]
+            .into_iter()
+            .collect(),
         "the rule that reads before the projection marked {got:?}"
     );
-    let kept = db.status("kept").await.expect("the control rule's status row");
+    let kept = db
+        .status("kept")
+        .await
+        .expect("the control rule's status row");
     assert!(
         kept.3.is_none(),
         "the rule that reads before the projection reports {:?}",
@@ -17609,7 +17742,9 @@ async fn a_rule_reading_past_a_stored_column_is_refused_where_images_run_short()
         .await;
         assert_eq!(
             got,
-            ["gadget".to_string(), "bolt".to_string()].into_iter().collect(),
+            ["gadget".to_string(), "bolt".to_string()]
+                .into_iter()
+                .collect(),
             "the rule that reads a plain column after a STORED one marked {got:?}"
         );
     }
