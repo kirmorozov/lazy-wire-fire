@@ -1112,7 +1112,10 @@ grows no native AMQP dependency.
   is a load error: they belong in `vars`), no query string, no fragment, and no
   `tls.server_name` (the endpoint's own host is the one checked). The entity is 1 to 260 letters,
   digits, `-`, `.` or `_`, does not start with `$` (the system nodes) and carries no
-  `/subscriptions/` segment: a sender writes to the topic and the namespace fans the copy out.
+  `/subscriptions/` segment: a sender writes to the topic and the namespace fans the copy out. The
+  `$` and the subscription are asked before that character set, so each is refused as the thing it
+  is (`an entity path does not start with $`, `send to the topic, not to a subscription`) and not
+  as a complaint about the characters they carry.
   The target creates nothing: a queue or topic that is not there refuses the target (below).
   The endpoint context names the entity (`endpoint.entity`) next to `host`, `port` and `url`, and
   [LAZYWF_ALLOWED_HOSTS](#security) matches the host.
@@ -1120,8 +1123,9 @@ grows no native AMQP dependency.
   for tests and self-hosted brokers — `sb://<host>:<port>/<address>`, the integration suite
   pointing it at its own RabbitMQ — where the path is the AMQP 1.0 address the broker is
   given verbatim (its leading `/` kept, `%` allowed for a percent-encoded segment: RabbitMQ's own
-  form is `/queues/<name>`) and `tls: disabled` is allowed. The `$` and subscription refusals
-  stand there too, so a typo cannot reach a system node.
+  form is `/queues/<name>`) and `tls: disabled` is allowed. Its own set is letters, digits, `-`,
+  `.`, `_`, `/` and `%`, and the `$` and subscription refusals are asked ahead of it there too, in
+  their own words (`an address does not start with $`), so a typo cannot reach a system node.
 * **Credentials: a SAS rule.** `vars.key_name` (the authorization rule name) together with
   `vars.key` (the key: a reference, `env:` or `file:`, never a literal; one without the other is
   a load error). The token is put to the connection's `$cbs` node and refreshed before it
@@ -1167,18 +1171,36 @@ grows no native AMQP dependency.
   refuses that message alone. Everything else is transient, because nothing there says the message
   did not arrive: `Released`, `Modified`, a server-busy or throttling condition, a condition this
   kind does not know, a timeout with no disposition, a missing ack, a lost link. Only a positive
-  verdict about a message costs that key a strike. A missing entity or an attach refused for lack
-  of the Send right (`amqp:not-found`, `amqp:unauthorized-access`) refuses the **whole target**
-  once per attempt — the target creates no entities and holds no rights — and so does a CBS reply
-  that refuses the token (400, 401, 403 or 404: a malformed token, a wrong key or rule name, no
-  right, an unknown audience, none of which a retry can fix) and a failed SASL PLAIN handshake;
-  any other CBS reply (5xx, a malformed answer, 408 or 429) says nothing about the token and stays
-  transient.
+  verdict about a message costs that key a strike. The condition of a **closed link** is read the
+  same way, whether it comes at the attach or on a link the broker takes away mid-batch, and the
+  three that speak about the entity and not about one message — `amqp:not-found`, an entity that is
+  not there, `amqp:unauthorized-access`, a claim that carries no right, and
+  `com.microsoft:entity-disabled`, a switched-off entity, the three states
+  [Microsoft's messaging-exceptions page](https://learn.microsoft.com/en-us/azure/event-hubs/event-hubs-messaging-exceptions)
+  describes and which the Azure SDKs refuse to retry — refuse the **whole target** once per
+  attempt: the target creates no entities, holds no rights and cannot enable one. As for any
+  refusal of a whole flush, nothing is struck there: the keys wait, with the refusal in
+  `last_error`. Every other condition, at the attach or on a closed link, stays transient with the
+  condition kept in `last_error`. A link lost *after* the sends is unknown, not refused: those
+  deliveries are already on the wire, so the unanswered messages go transient and a message the
+  peer had answered keeps its answer — a detach while answers are awaited ends the wait at once, on
+  the link and not on the budget — and such a close refuses the target only while the batch holds
+  no answer yet. A CBS reply that refuses the token (400, 401, 403 or 404: a malformed token, a
+  wrong key or rule name, no right, an unknown audience, none of which a retry can fix) refuses the
+  whole target the same way, as does a failed SASL PLAIN handshake; any other CBS reply (5xx, a
+  malformed answer, 408 or 429) says nothing about the token and stays transient.
 * **One send at a time.** One connection and one sender link per endpoint, held across actions
   behind the endpoint's lock, so one action at a time per endpoint (as `kafka` and `amqp` hold
   theirs) while different targets and rules run in parallel. Any failure that leaves the state
   unknown drops the connection: the next action reconnects, re-puts the token and re-attaches.
-  Every step of an action is bounded by the target's `timeout_ms`.
+  Every step of an action is bounded by the target's `timeout_ms`, one budget per stage and no
+  stage restarting another's clock: the socket's open gets its own, the CBS negotiation, the
+  session's begin and the sender attach share the one that starts once the socket stands (the step
+  still waiting when it runs out names itself — `no CBS reply within the target's time limit` for
+  the token put, `opening the session and sender link of <endpoint> timed out after …` for a begin
+  or an attach the broker never answers), a token refreshed mid-action gets its own for that one
+  exchange with `$cbs`, and the sends and dispositions of a batch are timed against the per-action
+  limit, which starts once the connection and the token stand.
 * **Reset steps.** The kind only appends: a message sent cannot be recalled and the target cannot
   list keys, so a `for_each: stray` step does not load. Still allowed: `once` (one batch of
   keyless messages, an announcement for example), `for_each: snapshot` (every key sent again, as
@@ -1543,13 +1565,16 @@ came back answered, so the target confirmed their keys — are not sent again, a
 in runs again from its own beginning, at-least-once like every step (the keys still to send lived
 in memory and died with the process). What vouches for the two runs being the same reset is the
 `fp<8 hex>` token a `running:` line carries beside the step counter: a short digest of the rule's
-fingerprint, the string its whole definition folds into (its steps and their listing SQL, the
-templates, the selects, the batch sizes, the target: its name, kind, endpoints without their
-userinfo, TLS, timeout and `expect`, and its `vars` by name, not by value). So editing the rule
-while the process was down — any part of what that string holds — starts the walk over from step
-1, and so do a line an older version wrote without the token, a line whose token digests a
-different definition, and a run that never reached a step (`pending:`). A target var's value is
-not among those parts (a var can hold a credential, and rotating one must not re-walk the table),
+fingerprint — the fixed string the built rule keeps, made of its definition and its target's and of
+nothing else (its steps and their listing SQL, the templates, the selects, the batch sizes and the
+timings, the rule's own `vars`, values included, and the target: its name, kind, endpoints without
+their userinfo, TLS, timeout and `expect`, and its `vars` by name, not by value). The rule's name
+and its `enabled` and `reset_requested` are not in that string, and neither are its triggers. So
+editing the rule while the process was down — any part of what that string holds — starts the walk
+over from step 1, and so do a line an older version wrote without the token, a line whose token
+digests a different definition, and a run that never reached a step (`pending:`). A target var's
+value is not among those parts (a var can hold a credential, and rotating one must not re-walk
+the table),
 so changing one neither restarts a running reset nor stops a restart from resuming one: when the
 new value changes what is sent, raise `reset_requested`. A run that started on its own —
 continuity lost, a new rule, triggers working again after an error, any reason but the request's
@@ -1637,10 +1662,12 @@ matches (constant-time compare, 401 with `WWW-Authenticate: Bearer` otherwise), 
 |---|---|
 | `pending_keys` | the keys in memory that still wait for a flush whose actions met `expect` |
 | `firing` | the rule's one lane is busy: a flush or a reset batch |
+| `source_lag_seconds` | how far behind the **source** this rule is, on the source's own clock: the source's `UNIX_TIMESTAMP()`, asked on the control connection at each connect and on each 30 s housekeeping tick, so no difference between this host's clock and the source's enters the number. It reads `0` only when the stream is proven at the source's head — a heartbeat, or the newest change the reader handed over, of any table, no older than one heartbeat period (the dump's `LAZYWF_HEARTBEAT_MS`) on that clock — the reader is connected with nothing half-read, and the rule has applied everything it was handed with nothing of its own left pending (no keys, no lane, no prep, no reset, no rule or trigger error, no freeze, no backoff of its own or its target's). Anything else is the real age: the age of the rule's last applied change on that clock, so a rule a slow target holds back ages here even while the stream is current. `lag_ms` and `stream_lag_ms` keep their meanings (ages on this host's clock), and nothing of this field is written to `lazy_wire_fire_status` |
 | `select_ms` | the time of the rule's selects in its last flush |
 | `events` | the row changes that matched one of the rule's triggers since start (a row matching two triggers counts twice) |
 | `actions_ok`, `actions_failed` | the actions sent since start: one action may carry a batch of keys, so they are not key counts |
 | `stream_error` | instance only, not per rule: the error the stream is currently kept through — a binlog dump 1236 whose message says nothing about the requested position (the server's message with the position it failed at), or a binlog event this build cannot decode (the decoder's own words with the position it sits at) — shown while the dump is retried with that position kept, until the stream delivers events again; [Reset steps](#reset-steps) |
+| `statement_events_ignored` | instance only, not per rule: the DML that reached this build as a **statement-format** `QUERY` event since the start — an `INSERT` / `REPLACE` / `UPDATE` / `DELETE` logged by a session that set its own `binlog_format` away from `ROW`, so its rows are not in the binlog at all and the rules on that table missed those changes until the target is rebuilt. Nothing is marked and no reset starts: the engine cannot see the rows. One WARN per table per minute names it (`DML logged in statement format: its rows are not in the binlog, the rules on this table missed this change`, with the kind, schema, table and position and never the statement text, which in this format carries the row values) and counts the events folded into it; past 1000 such tables the lines stop and only the count goes on |
 | `undecodable` | instance only, not per rule: the binlog events this build could not decode since the start, counted at both sites — the refused event a round backs off from (a reader that comes back to the same bytes counts it again each round), and the refused rows of a watched table, which exit the process. Non-zero with the stream's `position` not moving and a non-null `stream_error` is a reader stuck on bytes this build cannot read: it waits for a new build, not for the source; the number standing back at 0 after every restart, next to that ERROR line, is the crash loop itself; [Reset steps](#reset-steps) |
 | `binlog_filtered_schemas` | instance only, not per rule: the checked schemas the server's binlog filters drop (sorted); [Binlog filters](server-setup.md#binlog-filters) |
 
@@ -1659,8 +1686,10 @@ plain atomics.
 |---|---|---|
 | `lazywf_build_info` | gauge (always 1) | `version` |
 | `lazywf_binlog_lag_seconds` | gauge | — (the status table's stream lag, seconds) |
+| `lazywf_statement_events_ignored_total` | counter | — (DML that arrived as a statement-format QUERY event: a session switched its own `binlog_format` away from `ROW`, so its rows are not in the binlog and the rules on its table missed those changes until they are rebuilt. The same source as the `/status` `statement_events_ignored` field; the table belongs to the WARN line, not to a label) |
 | `lazywf_binlog_undecodable_total` | counter | — (binlog events this build could not decode: the reader keeps coming back to the position one of them sits at until a build that decodes it ships. The same source as the `/status` `undecodable` field; the position and the decoder's words stay in the log line) |
 | `lazywf_pending_keys` | gauge | `rule` |
+| `lazywf_source_lag_seconds` | gauge | `rule` (how far behind the source the rule is, on the source's own clock; the same source as the `/status` `source_lag_seconds` field, and deliberately **not** `lazywf_binlog_lag_seconds`, which is the reader's own distance) |
 | `lazywf_flush_total` | counter | `rule`, `target`, `outcome` (`success`: expect met, `retry`: transient, kept pending, `refused`: permanent refusal) |
 | `lazywf_dropped_keys_total` | counter | `rule`, `target` (keys dropped after the fifth refusal) |
 | `lazywf_flush_duration_seconds` | histogram | `rule` (the flush's wall time) |
