@@ -95,10 +95,13 @@ const CONTROL_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// node's own session (see [`lock::holder`]). This many refusals whose holder proves nothing
 /// (the lock read as free, or the holder could not be read) are tolerated first, each one having
 /// already waited [`CONTROL_LOCK_WAIT`]: enough for a server slow to reap the session it is
-/// replacing, and a bound on how long a node may stream without a confirmed lock. A refusal
-/// whose holder IS that closing session is not counted at all — it names no peer, and the wait
-/// for the server to finish with a session of our own is bounded by the server's own read
-/// timeout, not by a count.
+/// replacing, and a bound on how long a node may stream without a confirmed lock. The count
+/// takes EVERY refusal that names no peer, including the one whose holder is this node's own
+/// closing session: that answer is not fatal at once (it names no peer, and the wait for the
+/// server to finish with a session of our own is bounded by the server's own read timeout), but
+/// it is also exactly the answer a peer gives when it holds the lock under the very id this node
+/// recorded — ids start again after a server restart — and the budget is what makes that
+/// unprovable case finite (see [`unproven_refusal_is_final`]).
 const CONTROL_LOCK_DENIES: u32 = 3;
 
 /// A control-connection statement that did not answer within [`CONTROL_STATEMENT_TIMEOUT`].
