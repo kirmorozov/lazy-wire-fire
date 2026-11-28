@@ -1,6 +1,7 @@
 //! The instance lock: one active lazywf per schema and instance name (`GET_LOCK` on the control
 //! connection). A second copy stands by and takes over when the first one stops.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -36,14 +37,14 @@ pub async fn acquire(
     let mut wait = Duration::from_millis(250);
     // One stall episode logs once (see `crate::engine::ctl`): the standby probes every few
     // seconds, and a held connection is one fact, not one per attempt.
-    let mut stalled = false;
+    let stalled = AtomicBool::new(false);
     loop {
         // `GET_LOCK(?, 0)` answers at once on a responsive server, so the control
         // connection's per-statement bound fits the probe: anything slower is a stuck
         // connection, not a wait, and is treated as one (reconnect; the standby loop keeps
         // waiting and beating as it did).
         let got = crate::engine::ctl_my(
-            &mut stalled,
+            &stalled,
             "SELECT GET_LOCK for the instance lock",
             crate::engine::CONTROL_STATEMENT_TIMEOUT,
             conn.exec_first::<Option<i64>, _, _>("SELECT GET_LOCK(?, 0)", (lock,)),

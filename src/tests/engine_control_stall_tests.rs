@@ -22,25 +22,28 @@ const BOUND: Duration = Duration::from_millis(50);
 
 #[tokio::test]
 async fn ctl_passes_a_normal_answer_through() {
-    let mut stalled = false;
+    let stalled = AtomicBool::new(false);
     assert_eq!(
-        ctl(&mut stalled, "SELECT 1", BOUND, async { Ok(7i64) })
+        ctl(&stalled, "SELECT 1", BOUND, async { Ok(7i64) })
             .await
             .unwrap(),
         7
     );
-    assert!(!stalled, "an answered statement is not a stall episode");
+    assert!(
+        !stalled.load(Ordering::Relaxed),
+        "an answered statement is not a stall episode"
+    );
 }
 
 #[tokio::test]
 async fn ctl_turns_a_silent_statement_into_a_transient_control_error() {
-    let mut stalled = false;
+    let stalled = AtomicBool::new(false);
     // A statement that never answers (the half-open session, the parked metadata lock):
     // the bound ends the await with a named, typed error the existing arms (warn once +
     // `heal_control`) take, and the connection is marked to be replaced — the abandoned
     // statement may leave its answer unread on the socket, so nothing else may run on it.
     let e = ctl(
-        &mut stalled,
+        &stalled,
         "SELECT UNIX_TIMESTAMP()",
         BOUND,
         std::future::pending::<Result<i64>>(),
@@ -55,7 +58,7 @@ async fn ctl_turns_a_silent_statement_into_a_transient_control_error() {
          lock-lost and exits — it must go to the heal path instead ({e})"
     );
     assert!(
-        stalled,
+        stalled.load(Ordering::Relaxed),
         "a timed-out statement must mark the connection to be replaced"
     );
 }
@@ -65,10 +68,10 @@ async fn ctl_a_stall_stands_until_cleared_and_logs_once() {
     // The flag is what the log-once gate reads (`ctl_note` warns only on the transition
     // into the episode) and what `housekeeping` short-circuits on: it must stand across
     // further timeouts and clear only when the heal path replaces the connection.
-    let mut stalled = false;
+    let stalled = AtomicBool::new(false);
     for _ in 0..3 {
         let e = ctl(
-            &mut stalled,
+            &stalled,
             "the lazy_wire_fire_status write",
             BOUND,
             std::future::pending::<Result<()>>(),
@@ -76,20 +79,20 @@ async fn ctl_a_stall_stands_until_cleared_and_logs_once() {
         .await
         .unwrap_err();
         assert!(e.downcast_ref::<ControlStalled>().is_some());
-        assert!(stalled);
+        assert!(stalled.load(Ordering::Relaxed));
     }
     // `heal_control` clears it after a successful reconnect + re-take of the lock; from
     // here the tick runs statements again, and a fresh timeout would warn afresh (a new
     // episode is worth one line).
-    stalled = false;
-    assert!(!stalled);
+    stalled.store(false, Ordering::Relaxed);
+    assert!(!stalled.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
 async fn ctl_my_passes_answers_and_server_errors_through_unmarked() {
-    let mut stalled = false;
+    let stalled = AtomicBool::new(false);
     assert_eq!(
-        ctl_my(&mut stalled, "COM_PING", BOUND, async { Ok(()) })
+        ctl_my(&stalled, "COM_PING", BOUND, async { Ok(()) })
             .await
             .unwrap(),
         ()
@@ -97,7 +100,7 @@ async fn ctl_my_passes_answers_and_server_errors_through_unmarked() {
     // An ordinary driver error is exactly the old broken-connection path: the arms that
     // match it (`heal_control`'s ping, lock.rs's standby) keep working, and it is not a
     // stall episode — the flag is for the fault no error byte ever arrived for.
-    let e = ctl_my::<(), _>(&mut stalled, "COM_PING", BOUND, async {
+    let e = ctl_my::<(), _>(&stalled, "COM_PING", BOUND, async {
         Err(mysql_async::Error::Driver(
             mysql_async::DriverError::ConnectionClosed,
         ))
@@ -105,14 +108,14 @@ async fn ctl_my_passes_answers_and_server_errors_through_unmarked() {
     .await
     .unwrap_err();
     assert!(e.downcast_ref::<mysql_async::Error>().is_some(), "{e:#}");
-    assert!(!stalled);
+    assert!(!stalled.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
 async fn ctl_my_marks_only_the_silence() {
-    let mut stalled = false;
+    let stalled = AtomicBool::new(false);
     let e = ctl_my(
-        &mut stalled,
+        &stalled,
         "SELECT GET_LOCK for the instance lock",
         BOUND,
         std::future::pending::<mysql_async::Result<Option<i64>>>(),
@@ -120,7 +123,7 @@ async fn ctl_my_marks_only_the_silence() {
     .await
     .unwrap_err();
     assert!(e.downcast_ref::<ControlStalled>().is_some(), "{e:#}");
-    assert!(stalled);
+    assert!(stalled.load(Ordering::Relaxed));
 }
 
 /// A flush of a stalled control plane parks in front of the fence instead of asking for one:
@@ -163,7 +166,16 @@ async fn a_flush_parks_rather_than_fire_on_an_unconfirmed_lock() {
             pos: 4,
         },
     };
-    let out = flush_job(&env, &rule, spec, Arc::clone(&keys), &[], false).await;
+    let out = flush_job(
+        &env,
+        &rule,
+        spec,
+        Arc::clone(&keys),
+        &[],
+        false,
+        Arc::new(FireGate::default()),
+    )
+    .await;
     let Outcome::Flush {
         fired,
         keep_queries,

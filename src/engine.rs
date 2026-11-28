@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -95,10 +96,13 @@ const CONTROL_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// node's own session (see [`lock::holder`]). This many refusals whose holder proves nothing
 /// (the lock read as free, or the holder could not be read) are tolerated first, each one having
 /// already waited [`CONTROL_LOCK_WAIT`]: enough for a server slow to reap the session it is
-/// replacing, and a bound on how long a node may stream without a confirmed lock. A refusal
-/// whose holder IS that closing session is not counted at all — it names no peer, and the wait
-/// for the server to finish with a session of our own is bounded by the server's own read
-/// timeout, not by a count.
+/// replacing, and a bound on how long a node may stream without a confirmed lock. The count
+/// takes EVERY refusal that names no peer, including the one whose holder is this node's own
+/// closing session: that answer is not fatal at once (it names no peer, and the wait for the
+/// server to finish with a session of our own is bounded by the server's own read timeout), but
+/// it is also exactly the answer a peer gives when it holds the lock under the very id this node
+/// recorded — ids start again after a server restart — and the budget is what makes that
+/// unprovable case finite (see [`unproven_refusal_is_final`]).
 const CONTROL_LOCK_DENIES: u32 = 3;
 
 /// A control-connection statement that did not answer within [`CONTROL_STATEMENT_TIMEOUT`].
@@ -154,6 +158,35 @@ fn may_fire(control_stalled: bool, lock_unconfirmed: bool) -> bool {
     !control_stalled && !lock_unconfirmed
 }
 
+/// The two facts that hold a flush back, in the shared form the spawned jobs read: `control_stalled`
+/// (a control statement timed out — see [`ControlStalled`]) and `lock_unconfirmed` (the heal path
+/// replaced the lock's owner without yet taking it back). `Engine` owns the one `Arc` and writes it
+/// where a flag changes — a `ctl` timeout sets `control_stalled`, `heal_control`/`take_control_lock`
+/// settle both — and `flush_job` reads it at the last point before its first send (E-2). A plain
+/// `bool` on the engine could not close that window: the job runs on another task, so a flag set
+/// after the job was spawned must still be visible to it, hence atomics rather than the spawn-time
+/// copy `flush_job`'s before-the-fence arm reads.
+#[derive(Debug, Default)]
+pub(crate) struct FireGate {
+    /// Written by `ctl`/`ctl_my` on a control-statement timeout, cleared by `heal_control`.
+    control_stalled: AtomicBool,
+    /// Set by `heal_control` when it replaces the connection that owned the lock, cleared by the
+    /// `take_control_lock` that succeeds.
+    lock_unconfirmed: AtomicBool,
+}
+
+impl FireGate {
+    /// Whether a flush must hold its keys back right now: either fact alone is enough (see
+    /// [`may_fire`]). `flush_job` calls this once per flush at the send point — a couple of relaxed
+    /// loads, never per key — and no flush allocates to ask it.
+    fn parked(&self) -> bool {
+        !may_fire(
+            self.control_stalled.load(Ordering::Relaxed),
+            self.lock_unconfirmed.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Whether a refused take of the instance lock was refused by a **peer**: the server names a
 /// holder and it is not the session this node was using. Anything else is not proof of a
 /// takeover and must not kill the node — no holder at all (the lock is free this instant, so the
@@ -184,15 +217,15 @@ fn control_stalled_err(e: &anyhow::Error) -> bool {
 
 /// The bookkeeping of one timed-out control statement: the event is logged once per stall
 /// episode (until `heal_control` clears the flag), not once per due tick.
-fn ctl_note(stalled: &mut bool, what: &str) {
-    if !*stalled {
+fn ctl_note(stalled: &AtomicBool, what: &str) {
+    if !stalled.load(Ordering::Relaxed) {
         warn!(
             "control statement `{what}` did not answer within \
              {CONTROL_STATEMENT_TIMEOUT:?}: treating it as a broken control connection (the \
              stream loop keeps streaming; the connection is replaced on the heal path)"
         );
     }
-    *stalled = true;
+    stalled.store(true, Ordering::Relaxed);
 }
 
 /// Awaits one operation on the control connection under `timeout` (every caller passes
@@ -200,7 +233,7 @@ fn ctl_note(stalled: &mut bool, what: &str) {
 /// milliseconds). A timeout becomes [`ControlStalled`] and marks `stalled` — the caller's
 /// existing transient error path (warn + `heal_control`) then replaces the connection.
 pub(crate) async fn ctl<T, F>(
-    stalled: &mut bool,
+    stalled: &AtomicBool,
     what: &'static str,
     timeout: Duration,
     fut: F,
@@ -220,7 +253,7 @@ where
 /// [`ctl`] for a `mysql_async` call directly on the connection, so the sites that use the
 /// prelude methods do not each wrap the error by hand.
 pub(crate) async fn ctl_my<T, F>(
-    stalled: &mut bool,
+    stalled: &AtomicBool,
     what: &'static str,
     timeout: Duration,
     fut: F,
@@ -943,11 +976,11 @@ pub struct Engine {
     opts: Opts,
     binlog_opts: Opts,
     control: Conn,
-    /// A control statement timed out ([`ControlStalled`]) and the connection behind
-    /// `control` has not been replaced yet: further statements wait for the heal path
-    /// rather than hang one bound each, `heal_control` skips its ping and reconnects, and a
-    /// flush parks instead of firing (see [`FlushParked`]) until the lock is confirmed again.
-    control_stalled: bool,
+    /// The two facts that hold a flush back — control-connection stall and the lock-confirmation
+    /// state — in one cell shared with the spawned flush jobs (see [`FireGate`]). The reads that
+    /// used to consult the `control_stalled` / `lock_unconfirmed` flags now go through it, so a
+    /// flag set after a job is spawned is still visible to that job before it sends (E-2).
+    gate: Arc<FireGate>,
     /// When to next retry a replacement while `control_stalled` stands (the cadence of
     /// [`CONTROL_RETRY_WAIT`], kept so a held connection costs one bounded connect per retry).
     next_control_try: Instant,
@@ -956,11 +989,6 @@ pub struct Engine {
     /// at once (see [`lock::holder`] and [`denied_by_peer`]); these are the ones the node waits
     /// out instead, for [`CONTROL_LOCK_DENIES`] of them before it says so and stops.
     lock_denies: u32,
-    /// This node's own lock is not confirmed: the control session that held it has been
-    /// replaced and the take has not answered yet (a refusal, a timed-out take). Nothing fires
-    /// while it stands (see [`FlushParked`]) — the fence rides a pool connection and could
-    /// answer for a node that no longer holds the lock. Cleared by the take that succeeds.
-    lock_unconfirmed: bool,
     /// The id of the control session that last took the lock, as [`lock::connection_id`] words
     /// it. The heal path compares the holder of a refused take against it: the same id is this
     /// node's own closing session, a different one is a peer that has taken its place.
@@ -1431,11 +1459,11 @@ pub async fn run(
     // The startup statements ride the same per-statement bound as the loop's: a control
     // connection that hangs after connecting must leave a failed start (the supervisor
     // retries), not a process parked on a frozen socket with /livez green for a minute.
-    // The flag carries into the Engine: a timed-out statement marks the connection to be
-    // replaced on the first heal.
-    let mut control_stalled = false;
+    // The fire gate is built before the startup statements so a timed-out one marks it stalled
+    // (the flag carries into the Engine: the connection is replaced on the first heal).
+    let gate = Arc::new(FireGate::default());
     ctl(
-        &mut control_stalled,
+        &gate.control_stalled,
         "CREATE TABLE if-needed",
         CONTROL_STATEMENT_TIMEOUT,
         model::ensure(&mut control),
@@ -1450,7 +1478,7 @@ pub async fn run(
     // is already broken cannot answer the question. Losing it costs only the fast proof of a
     // peer — a refusal then waits out the denial budget instead of exiting at once.
     let control_conn_id = ctl(
-        &mut control_stalled,
+        &gate.control_stalled,
         "SELECT CONNECTION_ID for the instance lock",
         CONTROL_STATEMENT_TIMEOUT,
         lock::connection_id(&mut control),
@@ -1459,14 +1487,14 @@ pub async fn run(
     .ok();
     health.set_phase("starting");
     let info = ctl(
-        &mut control_stalled,
+        &gate.control_stalled,
         "reading the server version and binlog settings",
         CONTROL_STATEMENT_TIMEOUT,
         binlog::server_info(&mut control),
     )
     .await?;
     let _ = ctl(
-        &mut control_stalled,
+        &gate.control_stalled,
         "the managed-service probes",
         CONTROL_STATEMENT_TIMEOUT,
         async {
@@ -1476,14 +1504,14 @@ pub async fn run(
     )
     .await;
     let identity = ctl(
-        &mut control_stalled,
+        &gate.control_stalled,
         "reading the server identity",
         CONTROL_STATEMENT_TIMEOUT,
         server_identity(&mut control, info.flavor),
     )
     .await?;
     let lower: Option<i64> = ctl_my(
-        &mut control_stalled,
+        &gate.control_stalled,
         "SELECT @@lower_case_table_names",
         CONTROL_STATEMENT_TIMEOUT,
         control.query_first("SELECT @@lower_case_table_names"),
@@ -1535,7 +1563,7 @@ pub async fn run(
         cfg.send_concurrency,
     ));
     let saved = ctl(
-        &mut control_stalled,
+        &gate.control_stalled,
         "reading lazy_wire_fire_status",
         CONTROL_STATEMENT_TIMEOUT,
         status::load(&mut control, &cfg.instance),
@@ -1579,8 +1607,7 @@ pub async fn run(
         opts,
         binlog_opts,
         control,
-        control_stalled,
-        lock_unconfirmed: false,
+        gate,
         control_conn_id,
         next_control_try: Instant::now(),
         lock_denies: 0,
@@ -1673,6 +1700,21 @@ fn query_opts_user(dsn: &str) -> String {
 }
 
 impl Engine {
+    /// Whether the control plane is not trusted right now: a control statement timed out and the
+    /// connection behind `control` has not been replaced yet (see [`FireGate`], [`ControlStalled`]).
+    /// While it stands, `heal_control` insists on replacing the connection and a flush parks.
+    fn control_stalled(&self) -> bool {
+        self.gate.control_stalled.load(Ordering::Relaxed)
+    }
+
+    /// Whether this node's instance lock is not confirmed: the control session that held it has
+    /// been replaced and the take has not answered yet (see [`FireGate`]). Nothing fires while it
+    /// stands — the fence rides a pool connection and could answer for a node that no longer holds
+    /// the lock. Cleared by the take that succeeds.
+    fn lock_unconfirmed(&self) -> bool {
+        self.gate.lock_unconfirmed.load(Ordering::Relaxed)
+    }
+
     fn norm(&self, schema: &str, table: &str) -> (String, String) {
         if self.lower_names {
             (schema.to_lowercase(), table.to_lowercase())
@@ -2017,7 +2059,7 @@ impl Engine {
             return Ok(());
         }
         let current = ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SHOW MASTER STATUS",
             CONTROL_STATEMENT_TIMEOUT,
             binlog::current_position(&mut self.control),
@@ -2079,14 +2121,14 @@ impl Engine {
     /// The current binlog position and the binlog files the server still has.
     async fn binlog_files(&mut self) -> Result<(Position, HashSet<String>)> {
         let current = ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SHOW MASTER STATUS",
             CONTROL_STATEMENT_TIMEOUT,
             binlog::current_position(&mut self.control),
         )
         .await?;
         let logs: Vec<mysql_async::Row> = ctl_my(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SHOW BINARY LOGS",
             CONTROL_STATEMENT_TIMEOUT,
             self.control.query("SHOW BINARY LOGS"),
@@ -2104,7 +2146,7 @@ impl Engine {
 
     async fn reload_config(&mut self, initial: bool) -> Result<bool> {
         let raw = ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "reading the rule, trigger and target tables",
             CONTROL_STATEMENT_TIMEOUT,
             model::load(&mut self.control),
@@ -2182,7 +2224,7 @@ impl Engine {
                 rule::compile(&mut qc, def, defs, &targets).await
             } else {
                 ctl(
-                    &mut self.control_stalled,
+                    &self.gate.control_stalled,
                     "preparing the rule's queries",
                     CONTROL_STATEMENT_TIMEOUT,
                     async { Ok(rule::compile(&mut self.control, def, defs, &targets).await) },
@@ -2226,7 +2268,7 @@ impl Engine {
                         reg.remove_rule(&name);
                     }
                     if let Err(e) = ctl(
-                        &mut self.control_stalled,
+                        &self.gate.control_stalled,
                         "DELETE FROM lazy_wire_fire_status",
                         CONTROL_STATEMENT_TIMEOUT,
                         status::delete(&mut self.control, &self.cfg.instance, &name),
@@ -2276,7 +2318,7 @@ impl Engine {
     /// filters cannot be read is logged at debug and checked again on the next reload.
     async fn check_binlog_filters(&mut self, sources: &BTreeSet<String>) {
         let own: Option<String> = ctl_my(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SELECT DATABASE()",
             CONTROL_STATEMENT_TIMEOUT,
             self.control
@@ -2294,7 +2336,7 @@ impl Engine {
             todo.into_iter().partition(|(_, r)| *r == Role::Own);
         if !own_todo.is_empty() {
             match ctl(
-                &mut self.control_stalled,
+                &self.gate.control_stalled,
                 "reading the binlog filters",
                 CONTROL_STATEMENT_TIMEOUT,
                 binlog::binlog_filters(&mut self.control),
@@ -2764,7 +2806,7 @@ impl Engine {
         // stop grace open — the lock is the server's own session state and dies with the
         // socket when the process exits anyway.
         let _ = ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "DO RELEASE_LOCK",
             CONTROL_STATEMENT_TIMEOUT,
             async {
@@ -3056,7 +3098,7 @@ impl Engine {
             return Ok(Route::Ignore);
         };
         match ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "reading the columns of the watched table",
             CONTROL_STATEMENT_TIMEOUT,
             self.catalog.layout(&mut self.control, &key.0, &key.1, tme),
@@ -3132,7 +3174,7 @@ impl Engine {
         // will not answer them is an error, as it is for the layout read above, and the caller
         // retries. A table that is really gone fails there too, not here.
         let found = ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "reading the generated columns of the table",
             CONTROL_STATEMENT_TIMEOUT,
             read_generated_first(&mut self.control, schema, table),
@@ -3959,14 +4001,16 @@ impl Engine {
             pos: self.boundary.clone(),
         };
         let (env, tx) = (self.env.clone(), self.tx.clone());
-        // Whether the control plane is trusted right now: taken here, with the engine, because
-        // the job that reads it no longer has one (see `flush_job`'s first arm). It is a
-        // snapshot of the instant the job is spawned: a control failure that begins afterwards
-        // can still be outrun by that one flush, exactly as a fence has always been able to
-        // answer for a node whose control connection died a millisecond ago. Tightening that
-        // means handing the flags to the jobs (a shared cell on `Env`), which is a wider change
-        // than the bound this one is.
-        let lock_confirmed = may_fire(self.control_stalled, self.lock_unconfirmed);
+        // Whether the control plane is trusted AND the lock confirmed at the instant the job is
+        // spawned — the cheap before-the-fence early-out (see `flush_job`'s first arm). It is only
+        // a snapshot: a control failure or an unconfirmed lock that begins afterwards used to be
+        // outrun by that one flush (the fence rides a pool connection and answers regardless). To
+        // close that window the job also carries the shared `FireGate` and re-reads it at the last
+        // point before it sends (E-2, see `flush_job`'s send arm). `lock_confirmed` and the gate
+        // read the same two facts now; the bool just lets a flush spawned already-parked skip the
+        // fence entirely.
+        let lock_confirmed = !self.gate.parked();
+        let gate = Arc::clone(&self.gate);
         let st = self.rules.get_mut(name).expect("present");
         let buf = &mut st.buffer;
         // The whole buffer in one generation, taken at once (unbounded, as always).
@@ -4022,7 +4066,7 @@ impl Engine {
         let mrule = st.mrule.clone();
         spawn_job(tx, name, incarnation, failed, async move {
             let start = Instant::now();
-            let out = flush_job(&env, &rule, spec, keys, &queries, lock_confirmed).await;
+            let out = flush_job(&env, &rule, spec, keys, &queries, lock_confirmed, gate).await;
             // The flush duration is the job's own wall time (fence + resolve + fire); recorded
             // through the pre-resolved handle: one bucket bump, no name to the registry.
             if let Some(m) = &mrule {
@@ -4516,7 +4560,7 @@ impl Engine {
         // `persist` would ask `lock::verify` a question it must answer wrongly. It does keep
         // trying, on the bounded cadence below, and the loop beats between the bounded attempts:
         // that is what keeps the stream streaming and `/livez` honest through a held role.
-        if self.control_stalled || self.lock_unconfirmed {
+        if self.gate.parked() {
             // The cadence is armed *after* the attempt, because an attempt that burns its whole
             // connect bound would otherwise be due again the moment it returned: the loop then
             // spent the entire outage parked in one bounded connect after another and stopped
@@ -4563,7 +4607,7 @@ impl Engine {
                 continue;
             }
             match ctl_my(
-                &mut self.control_stalled,
+                &self.gate.control_stalled,
                 "clearing reset_requested",
                 CONTROL_STATEMENT_TIMEOUT,
                 self.control.exec_drop(
@@ -4584,7 +4628,7 @@ impl Engine {
                     }
                     self.clear_retry = Some(now + Duration::from_secs(5));
                     self.heal_control().await?;
-                    if self.control_stalled || self.lock_unconfirmed {
+                    if self.gate.parked() {
                         // No further statements on a connection already known bad, and none while
                         // the lock is owed: the rest of the tick would end in `persist`.
                         return Ok(());
@@ -4618,7 +4662,7 @@ impl Engine {
                 }
                 self.config_dirty = Some(now + Duration::from_secs(1));
                 self.heal_control().await?;
-                if self.control_stalled || self.lock_unconfirmed {
+                if self.gate.parked() {
                     // The rest of the tick would only burn bounds on a known-bad connection, and
                     // end in `persist` while the lock is owed.
                     return Ok(());
@@ -4632,7 +4676,7 @@ impl Engine {
             self.last_clock = Instant::now();
             self.refresh_source_clock().await;
         }
-        if self.control_stalled || self.lock_unconfirmed {
+        if self.gate.parked() {
             // The clock question timed out, or the lock is owed: either way `persist` would only
             // ask `lock::verify` a question it must answer wrongly (we do not hold the lock until
             // the take succeeds), and that error is the fatal loss of the lock. Retry on a healed
@@ -4665,9 +4709,9 @@ impl Engine {
     /// A healthy ping is not the whole question: when a previous take was refused, the lock is
     /// still owed, and that retry rides the connection it has (no reconnect).
     async fn heal_control(&mut self) -> Result<()> {
-        if !self.control_stalled
+        if !self.control_stalled()
             && ctl_my(
-                &mut self.control_stalled,
+                &self.gate.control_stalled,
                 "COM_PING",
                 CONTROL_STATEMENT_TIMEOUT,
                 self.control.ping(),
@@ -4675,7 +4719,7 @@ impl Engine {
             .await
             .is_ok()
         {
-            if self.lock_unconfirmed {
+            if self.lock_unconfirmed() {
                 return self.take_control_lock().await;
             }
             return Ok(());
@@ -4696,7 +4740,7 @@ impl Engine {
         // until it answers, nothing this node does may look like it holds the lock. That is the
         // case the connection-refused return above is NOT: there the session that owns the lock
         // is untouched, and the engine carries on as it did before this method existed.
-        self.lock_unconfirmed = true;
+        self.gate.lock_unconfirmed.store(true, Ordering::Relaxed);
         self.take_control_lock().await
     }
 
@@ -4716,9 +4760,9 @@ impl Engine {
     /// stops. Waiting out a session of our own is bounded by the server's own read timeout; the
     /// count here bounds only how long an unreadable answer may keep the node parked.
     async fn take_control_lock(&mut self) -> Result<()> {
-        let was_unconfirmed = self.lock_unconfirmed;
+        let was_unconfirmed = self.lock_unconfirmed();
         match ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "GET_LOCK on the re-established control connection",
             CONTROL_STATEMENT_TIMEOUT,
             lock::reacquire(&mut self.control, &self.lock, CONTROL_LOCK_WAIT),
@@ -4730,7 +4774,7 @@ impl Engine {
             Err(e) if control_stalled_err(&e) => return Ok(()),
             Err(e) if e.downcast_ref::<lock::LockDenied>().is_some() => {
                 let holder = ctl(
-                    &mut self.control_stalled,
+                    &self.gate.control_stalled,
                     "SELECT IS_USED_LOCK on a refused take",
                     CONTROL_STATEMENT_TIMEOUT,
                     lock::holder(&mut self.control, &self.lock),
@@ -4764,11 +4808,11 @@ impl Engine {
             Err(e) => return Err(e),
         }
         self.lock_denies = 0;
-        self.lock_unconfirmed = false;
-        self.control_stalled = false;
+        self.gate.lock_unconfirmed.store(false, Ordering::Relaxed);
+        self.gate.control_stalled.store(false, Ordering::Relaxed);
         // Which session the server now says owns the lock: the answer to the next refusal.
         self.control_conn_id = ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SELECT CONNECTION_ID on the re-established control connection",
             CONTROL_STATEMENT_TIMEOUT,
             lock::connection_id(&mut self.control),
@@ -4790,13 +4834,13 @@ impl Engine {
     /// per [`CLOCK_REFRESH`] tick — never per event, and no new write anywhere. A failed question
     /// keeps the last offset: the figures ride the previous measurement until the next tick.
     async fn refresh_source_clock(&mut self) {
-        if self.control_stalled {
+        if self.control_stalled() {
             // The connection is not trusted until the heal path replaces it; the figures
             // ride the previous offset meanwhile, as they do for any failed question.
             return;
         }
         match ctl_my(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SELECT UNIX_TIMESTAMP()",
             CONTROL_STATEMENT_TIMEOUT,
             self.control
@@ -4821,7 +4865,7 @@ impl Engine {
         // "instance lock" phrase as "we lost the lock" and exits — a stalled statement is
         // not a lost lock, and must go to the heal path instead.
         ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "SELECT IS_USED_LOCK",
             CONTROL_STATEMENT_TIMEOUT,
             lock::verify(&mut self.control, &self.lock),
@@ -4969,7 +5013,7 @@ impl Engine {
         // connection is dropped by the heal path; the server rolls its orphan transaction
         // back when the socket closes.
         ctl(
-            &mut self.control_stalled,
+            &self.gate.control_stalled,
             "the lazy_wire_fire_status write",
             CONTROL_STATEMENT_TIMEOUT,
             status::write(&mut self.control, &self.cfg.instance, &rows),
@@ -5439,7 +5483,10 @@ fn warn_statement_dml(d: &crate::sql::StmtDml, at: &Position, count: u64) {
 /// One flush: the fence, the `keys_sql` keys, then every key in groups. `keys` is the
 /// flush's own list as `spawn_flush` built it, in an `Arc` it shares with its panic
 /// fallback: the list is copied only when `keys_sql` resolves keys to add to it, because
-/// that is the one thing that must extend it.
+/// that is the one thing that must extend it. `lock_confirmed` is the spawn-time snapshot that
+/// holds a flush already-parked before its fence; `gate` is the live view of the same two facts,
+/// re-read at the last point before the first send so a control failure or an unconfirmed lock
+/// that begins during the fence cannot be outrun by this flush (E-2, see the send arm).
 async fn flush_job(
     env: &Env,
     rule: &Rule,
@@ -5447,6 +5494,7 @@ async fn flush_job(
     keys: Arc<Vec<String>>,
     queries: &[(String, KeyQuery)],
     lock_confirmed: bool,
+    gate: Arc<FireGate>,
 ) -> Outcome {
     let fail = |e: anyhow::Error, keys: &[String]| Outcome::Flush {
         fired: Fired {
@@ -5492,6 +5540,16 @@ async fn flush_job(
             keep_queries: false,
             resolved,
         };
+    }
+    // E-2: the last look before the send. `lock_confirmed` above is the spawn-time snapshot; the
+    // fence rode a pool connection and answered for a node the control connection has since left
+    // behind, and `resolve_keys` ran on the query pool — so either flag can have flipped while
+    // this flush was busy, and firing on that would be firing without a confirmed lock. A park
+    // here is exactly the before-the-fence park: the flush's keys go back to the buffer, no
+    // position moves, no strike is counted, and the `keys_sql` findings are simply owed to the
+    // retry (the queries are kept). One read of the shared pair per flush, never per key.
+    if gate.parked() {
+        return fail(FlushParked.into(), &keys);
     }
     let fired = if found_keys.is_empty() {
         action::fire_keys(env, rule, &keys, rule::ACTION, Value::Null, None).await
@@ -5552,3 +5610,7 @@ mod source_clock_tests;
 #[cfg(test)]
 #[path = "tests/engine_control_stall_tests.rs"]
 mod control_stall_tests;
+
+#[cfg(test)]
+#[path = "tests/engine_fire_gate_tests.rs"]
+mod fire_gate_tests;
