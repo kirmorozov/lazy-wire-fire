@@ -1189,6 +1189,14 @@ grows no native AMQP dependency.
   wrong key or rule name, no right, an unknown audience, none of which a retry can fix) refuses the
   whole target the same way, as does a failed SASL PLAIN handshake; any other CBS reply (5xx, a
   malformed answer, 408 or 429) says nothing about the token and stays transient.
+* **A settled send is not sent again.** A disposition the broker settles while the transfer is
+  still on its way reaches the client, so the send is answered and that message is not re-sent:
+  only an answer that really never came is the `no disposition within the target's …` timeout
+  above. This is what the `fe2o3-amqp` 0.18 line the kind ships is for — the 0.14 one registered a
+  delivery after its transfer frame had already left, and a disposition that arrived in that window
+  was lost, so a message the entity had taken went out a second time. Nothing to configure: no
+  `vars` field and no `expect` change is involved, and a reader that keeps the newest message per
+  key is still the contract.
 * **One send at a time.** One connection and one sender link per endpoint, held across actions
   behind the endpoint's lock, so one action at a time per endpoint (as `kafka` and `amqp` hold
   theirs) while different targets and rules run in parallel. Any failure that leaves the state
@@ -1673,6 +1681,66 @@ matches (constant-time compare, 401 with `WWW-Authenticate: Bearer` otherwise), 
 
 The counters are in memory only: they start at 0 at each start and are not written to
 `lazy_wire_fire_status`, which keeps only what a restart needs.
+
+### The control connection
+
+The engine keeps one connection to the server for its own housekeeping: the rule, trigger and
+target tables it re-reads, the `lazy_wire_fire_status` writes, the instance lock (`GET_LOCK`,
+`IS_USED_LOCK`, `DO RELEASE_LOCK`) and the source's clock question (`SELECT UNIX_TIMESTAMP()`) that
+`source_lag_seconds` is measured on. The commit fence a flush rides before it delivers
+(`lazy_wire_fire_fence`) is not on that connection — it goes on a pooled one of the main account —
+but it is bounded the same way, because a flush that cannot fence is a flush that never returns.
+
+Every one of those statements is awaited under a **10 s** bound — the shutdown's `DO RELEASE_LOCK`
+included, so a held connection cannot hold the stop grace open either: the lock is the server's own
+session state and dies with the socket when the process exits. A statement that does not answer in
+time is treated as the transient fault the engine already had for a broken control connection, not
+as a hang:
+
+* it is logged **once per stall episode** rather than once per tick, and the connection is replaced
+  on the heal path (the abandoned statement's answer may still be unread on the socket, so a ping
+  that seems to answer proves nothing there);
+* the stream loop, which runs this work inline, keeps streaming in the gaps between the bounded
+  retries (they repeat every 5 s), so a control connection the server holds open without answering
+  costs a slice of each window instead of the node. `/livez` reads the main loop's own heartbeat and
+  never a control round-trip, so it stays green while the stream keeps going and
+  `lazywf healthcheck` keeps the container healthy;
+* **a timed-out status write marks nothing**: the write is one transaction and a rule's position
+  becomes written only after it answers, so the same keys are sent again on the next tick. A stalled
+  control plane costs latency and never costs data;
+* the connection the fence asks from the pool and every step on it (the GTID wait, the
+  consistent-snapshot probe, the fence probe and write) carry that same bound, so a step that never
+  answers is the transient failure the rule already retries rather than a job task lost for the
+  outage.
+
+Once the connection heals, the engine takes the **instance lock** again before it delivers
+anything:
+
+* the take waits up to **5 s** for the server to retire the session this node just closed: that
+  session owns the lock until the server notices the connection went away, so asking for it in the
+  same instant reads as somebody else holding it;
+* a refusal is then read, not counted: the server is asked **who** holds the lock
+  (`IS_USED_LOCK`). A holder that is not this node's own session is another instance, and the node
+  exits with the line it has always logged for that —
+  `the instance lock \`<lock>\` was taken by another instance while the control connection was down`;
+* an answer that proves nothing is retried before that same exit: no holder at all, this node's own
+  session the server is still closing, or a peer that holds the lock under the id this node recorded
+  before the server restarted and handed ids out again (which is the one case the answer cannot
+  settle). Two of those are waited out and the third is the exit; each has already waited the 5 s
+  above, so a peer the server cannot explain delays the exit by a bounded few rounds and cannot
+  escape it;
+* **no action fires while the lock is unconfirmed**: a due flush parks before its fence, its keys go
+  back to the buffer and no position moves — no strike is counted either. A node that is healing
+  streams and delivers nothing, and everything it held back arrives once the take succeeds.
+
+The lines an operator sees, the first once per episode and the last when the wait ends:
+
+| line | meaning |
+|---|---|
+| `control statement \`…\` did not answer within 10s: treating it as a broken control connection (the stream loop keeps streaming; the connection is replaced on the heal path)` | one of the statements above hit its bound; the connection is being replaced |
+| `the control connection is stalled: firing waits for the heal path to confirm this node still holds the lock` | a flush parked: its keys stay in the buffer, nothing is sent, no position moves |
+| `the instance lock is still held and the holder is no peer this node knows: streaming without firing until the take succeeds` (fields `denies`, `of`, `holder`, `own`) | a refusal that names no peer is being waited out; the node streams and fires nothing |
+| `the instance lock is taken again: deliveries resume` | the take succeeded: the parked keys fire and deliveries go on |
 
 ### Prometheus metrics
 

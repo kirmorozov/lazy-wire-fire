@@ -218,7 +218,10 @@ triggers. To filter for dropped keys in a log pipeline, match the top-level `tar
   configuration gets, because an engine that cannot be told to stop must not run — and a panicked
   engine task prints `lazywf: the engine task panicked; see the message above` on stderr before
   exit 1. Every other exit code is unchanged.
-* `/livez`: the main loop turns. `/readyz`: this instance is active and streaming. `/status`:
+* `/livez`: the main loop turns — a control statement of the engine's own that never answers cannot
+  take it down: the stream keeps going and container health stays green through such a stall
+  ([the control connection](docs/reference.md#the-control-connection)). `/readyz`: this instance is
+  active and streaming. `/status`:
   per rule the position, lag, pending keys, reset state, counters and errors (JSON,
   [the fields](docs/reference.md#status)); with `LAZYWF_HEALTH_TOKEN` set it answers 401 with
   `WWW-Authenticate: Bearer` unless the request carries `Authorization: Bearer <token>`
@@ -387,6 +390,17 @@ key); the default is what the integration suite and the published image use.
 
 On macOS the test servers (`make servers`) need Docker. On Windows, develop inside WSL 2, with
 Docker for the test servers.
+
+The compose project these targets bring up has fixed container names and fixed host ports, so it is
+one host's resource rather than a run's own: every target that brings it up or runs its tests
+against it — `servers`, `servers-down`, `test-e2e`, `test-e2e-all`, `test-e2e-search`,
+`test-e2e-queues`, `test-e2e-pgsrc`, `test-chaos`, `test-chaos-all`, `test-matrix`
+(`test-prerelease` delegates to it), `coverage-e2e`, `docker-e2e` — holds one **suite lock** for its
+whole body, `up`, tests and teardown alike, so two runs take turns instead of colliding on a port or
+recreating each other's containers. The lock is `tmp/out/lwf-heavy-suite.lock` of the main checkout
+(`SUITE_LOCK=` moves it), which is why the worktrees of one repository queue behind each other;
+`make` prints what it is waiting for, and a caller that already holds the lock —
+`LWF_HEAVY_HELD=1`, or the file open on an inherited descriptor — is never made to wait for itself.
 
 CI ([ci.yml](.github/workflows/ci.yml)) runs on every push and pull request, weekly and on demand:
 lint, unit tests (with the grpc streaming suite: `make test` runs `make test-grpc`), the
