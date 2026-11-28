@@ -1,6 +1,6 @@
 //! Binlog row images as named JSON values.
 //!
-//! Column names and types come from `information_schema`. With `binlog_row_metadata=FULL`
+//! Column names, types and charsets come from `information_schema`. With `binlog_row_metadata=FULL`
 //! the table map carries the names itself, which stays exact while a DDL is in flight (events
 //! read from before an `ALTER` keep their old layout); otherwise the layout is trusted when the
 //! column counts agree.
@@ -25,15 +25,107 @@ pub enum ColKind {
     Bit,
 }
 
+/// What a bytes column's binlog payload means as text: how `convert` renders it. The binlog
+/// carries string columns in the bytes of the column's own charset, and `information_schema`
+/// names that charset; a column whose charset lazywf does not decode renders as it has
+/// always rendered, through `String::from_utf8_lossy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Charset {
+    /// UTF-8 (`utf8mb4`, `utf8mb3`, `utf8`) and `ascii`, whose bytes are a subset of it: the
+    /// names whose bytes `String::from_utf8` renders exactly, so a key column in one of them
+    /// never asks the decode-point guard to read its bytes (see [`Layout::key_is_lossy`]).
+    Utf8,
+    /// MySQL's latin1, which is Windows cp1252: one byte, one character. Decoding it is the
+    /// difference between a latin1 key that matches its row and one that loses to U+FFFD,
+    /// marks nothing, and has its live document deleted as a missing row (backlog B-1).
+    Latin1,
+    /// The `binary` charset: BINARY, VARBINARY and the BLOB family, and the text types with
+    /// the BINARY attribute. Their bytes are not text at all — no charset defines them — so
+    /// `convert` renders them exactly as [`Charset::Utf8`] does (lossily), and the variant
+    /// exists only so [`Layout::key_unsafe`] can see them: bytes no charset defines cannot
+    /// make an exact key, and a key that does not describe its row deletes another row's
+    /// document (backlog B-1, refusal [A]).
+    Binary,
+    /// No charset lazywf decodes, and no charset at all where the server named none: `latin2`,
+    /// `gbk`, `ujis`, the geometry types' `NULL`, and any name added after this list. It
+    /// renders as [`Charset::Utf8`] does — `convert` has no table for it either — and the
+    /// variant exists for [`Layout::key_is_lossy`], the decode-point guard: here the bytes may
+    /// be ones no decoder can read, and the only proof is the row's own bytes, so a key whose
+    /// text came out through U+FFFD is refused per row rather than sent out as the row's.
+    Unknown,
+}
+
+/// The `information_schema.COLUMNS.CHARACTER_SET_NAME` of a column, as a [`Charset`]. The
+/// names lazywf decodes are matched exactly (they are stored lower case); anything else —
+/// including `NULL` (no charset: numbers, dates and the geometry types, whose bytes are not
+/// text at all) and the single-byte and multi-byte charsets whose tables are not built
+/// yet — keeps the lossy path it has always had, under [`Charset::Unknown`]: the charset the
+/// guard watches, because nothing says those bytes can be read as text at all.
+pub fn col_charset(name: Option<&str>) -> Charset {
+    match name {
+        Some("latin1") => Charset::Latin1,
+        Some("binary") => Charset::Binary,
+        // The UTF-8 family, exact through `String::from_utf8`, and `ascii`, whose bytes are a
+        // subset of it. Everything else is a name lazywf has no table for.
+        Some("utf8mb4") | Some("utf8mb3") | Some("utf8") | Some("ascii") => Charset::Utf8,
+        _ => Charset::Unknown,
+    }
+}
+
+/// MySQL's latin1 is Windows cp1252: `0x00..0x7F` and `0xA0..0xFF` are their own code
+/// points, `0x80..0x9F` the cp1252 specials, and the five slots cp1252 leaves unused keep
+/// the byte's C1 code point — exactly MySQL's `latin1.xml` (one byte, one character).
+const CP1252_80_9F: [char; 32] = [
+    '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}',
+    '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}', '\u{178}',
+];
+
+fn from_latin1(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len());
+    for &x in b {
+        s.push(if !(0x80..0xA0).contains(&x) {
+            char::from(x)
+        } else {
+            // `x - 0x80` is 0..32 for the bytes that reach here; `get` keeps the table's
+            // bounds check honest rather than arguing the arithmetic at review.
+            *CP1252_80_9F
+                .get(usize::from(x - 0x80))
+                .unwrap_or(&char::from(x))
+        });
+    }
+    s
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     pub names: Vec<String>,
     kinds: Vec<ColKind>,
+    /// The charset of each column, parallel to `kinds`; a missing entry is [`Charset::Utf8`].
+    charsets: Vec<Charset>,
+    /// The `information_schema.COLUMNS.DATA_TYPE` of each column, parallel to `kinds`; a
+    /// missing entry means the server's answer was not read (the DDL and event-metadata
+    /// paths), which [`Layout::key_unsafe`] treats as safe.
+    types: Vec<String>,
     by_name: HashMap<String, usize>,
 }
 
 impl Layout {
     pub fn new(names: Vec<String>, kinds: Vec<ColKind>) -> Layout {
+        let charsets = vec![Charset::Utf8; kinds.len()];
+        Layout::with_charsets(names, kinds, charsets, Vec::new())
+    }
+
+    /// A layout whose columns also carry their `information_schema` charsets and data types.
+    /// A `charsets` shorter than `kinds` completes with [`Charset::Utf8`]: today's path; a
+    /// shorter `types` simply leaves those columns' types unknown.
+    pub fn with_charsets(
+        names: Vec<String>,
+        kinds: Vec<ColKind>,
+        charsets: Vec<Charset>,
+        types: Vec<String>,
+    ) -> Layout {
         let by_name = names
             .iter()
             .enumerate()
@@ -42,6 +134,8 @@ impl Layout {
         Layout {
             names,
             kinds,
+            charsets,
+            types,
             by_name,
         }
     }
@@ -61,9 +155,91 @@ impl Layout {
         self.names.is_empty()
     }
 
+    /// The column's name as the catalog (or the event) named it.
+    pub fn column_name(&self, i: usize) -> Option<&str> {
+        self.names.get(i).map(String::as_str)
+    }
+
+    /// The column's `information_schema` `DATA_TYPE`, when it was read.
+    pub fn column_type(&self, i: usize) -> Option<&str> {
+        self.types.get(i).map(String::as_str)
+    }
+
+    /// Whether a key on column `i` could not be made from the row's bytes exactly, with the
+    /// reason (`None` = safe): a `binary`-charset column (BINARY, VARBINARY, the BLOB family,
+    /// the text types with the BINARY attribute — no charset defines their bytes) or one of
+    /// the geometry types (opaque WKB under a NULL charset) and `VECTOR`. All of them come
+    /// through the binlog as bytes and render through `String::from_utf8_lossy`, which turns
+    /// every impossible byte into U+FFFD: two rows can then share a key, and a DELETE can
+    /// carry another row's key. A column whose charset or type was never read passes — the
+    /// refusal only fires on what the catalog answered, never on a guess.
+    pub fn key_unsafe(&self, i: usize) -> Option<&'static str> {
+        if self.charsets.get(i).copied() == Some(Charset::Binary) {
+            return Some("its charset is `binary`: the bytes are not text");
+        }
+        match self.column_type(i)? {
+            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+            | "geometry" | "point" | "linestring" | "polygon" | "multipoint"
+            | "multilinestring" | "multipolygon" | "geomcollection" | "geometrycollection"
+            | "gis" | "vector" => Some("no charset defines its bytes"),
+            _ => None,
+        }
+    }
+
+    /// Whether `v` is text the decoder invented for column `i` rather than what the column's
+    /// bytes say: a string, in a charset lazywf has no table for, that holds a replacement
+    /// character *and* whose row bytes are not valid UTF-8 — so that character is the decoder's
+    /// own, not the row's. Nothing else can produce it: `utf8mb4` bytes are valid UTF-8 by the
+    /// server's promise, `latin1` is decoded exactly and cp1252 has no replacement character to
+    /// give, the `binary` family is refused as a key at load, and the other kinds (masks, label
+    /// lists, bitmaps) never render bytes as text.
+    ///
+    /// A key built from such text does not describe its row: it marks nothing, and its DELETE
+    /// can carry another row's key and remove that row's document. This is the decode-point
+    /// guard (backlog B-1): the catalog's answer is not always there — a privilege gap, a table
+    /// it does not list, a race with DDL — and where no charset is known to decode the bytes, an
+    /// impossible byte must cost a refusal, never a wrong delete. It reads the row's own bytes
+    /// rather than trusting the charset, so a charset the server named wrongly cannot smuggle a
+    /// lossy key through either.
+    ///
+    /// Cheapest test first, because a key column asks this on every row: the kinds and the
+    /// charsets are array reads, and the two scans of the bytes run only for a plain column in
+    /// an unknown charset, which is the only one that can need them.
+    pub fn key_is_lossy(&self, row: &BinlogRow, i: usize, v: &Value) -> bool {
+        if !matches!(v, Value::String(_)) {
+            return false;
+        }
+        if self.kinds.get(i) != Some(&ColKind::Plain) {
+            return false;
+        }
+        if !matches!(
+            self.charsets.get(i),
+            Some(Charset::Unknown) | Some(Charset::Binary)
+        ) {
+            return false;
+        }
+        // The two scans, last: the text must hold a replacement character at all, and the bytes
+        // behind it must fail to be UTF-8. A legal U+FFFD — a value the row really holds —
+        // reads as valid UTF-8 and stays the row's own key.
+        if !v
+            .as_str()
+            .is_some_and(|s| s.contains(char::REPLACEMENT_CHARACTER))
+        {
+            return false;
+        }
+        matches!(
+            row.as_ref(i),
+            Some(BinlogValue::Value(My::Bytes(b))) if std::str::from_utf8(b).is_err()
+        )
+    }
+
     /// One column of a row image as JSON.
     pub fn value(&self, row: &BinlogRow, i: usize) -> Value {
-        convert(row.as_ref(i), self.kinds.get(i).unwrap_or(&ColKind::Plain))
+        convert(
+            row.as_ref(i),
+            self.kinds.get(i).unwrap_or(&ColKind::Plain),
+            self.charsets.get(i).copied().unwrap_or(Charset::Utf8),
+        )
     }
 
     /// Whether the two images of a row differ in column `i`: the same answer as
@@ -71,18 +247,19 @@ impl Layout {
     /// shown to be equal.
     ///
     /// Only the equal case is skipped, and only where it is certain: `convert` is a function of the
-    /// value and the column's kind, so identical input cannot give a different output. Anything the
-    /// rule below does not cover — a `Jsonb`, two payloads that differ, one of the two missing — is
-    /// converted and compared exactly as before. Inferring *difference* from the payloads would be a
-    /// different matter (two `i64` can share an `Unsigned` mask, two byte strings can lose to the
-    /// same `from_utf8_lossy` text), so it is not tried.
+    /// value and the column's kind and charset, so identical input cannot give a different output.
+    /// Anything the rule below does not cover — a `Jsonb`, two payloads that differ, one of the two
+    /// missing — is converted and compared exactly as before. Inferring *difference* from the
+    /// payloads would be a different matter (two `i64` can share an `Unsigned` mask, two byte
+    /// strings can lose to the same `from_utf8_lossy` text), so it is not tried.
     pub fn changed(&self, b: &BinlogRow, a: &BinlogRow, i: usize) -> bool {
         let kind = self.kinds.get(i).unwrap_or(&ColKind::Plain);
+        let charset = self.charsets.get(i).copied().unwrap_or(Charset::Utf8);
         let (b, a) = (b.as_ref(i), a.as_ref(i));
         if same_value(b, a) {
             return false;
         }
-        convert(b, kind) != convert(a, kind)
+        convert(b, kind, charset) != convert(a, kind, charset)
     }
 
     /// The whole image as an object.
@@ -146,7 +323,7 @@ fn parse_labels(column_type: &str) -> Vec<String> {
     out
 }
 
-fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind) -> Value {
+fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind, charset: Charset) -> Value {
     let v = match v {
         None => return Value::Null,
         Some(BinlogValue::Value(v)) => v,
@@ -158,6 +335,12 @@ fn convert(v: Option<&BinlogValue<'_>>, kind: &ColKind) -> Value {
     };
     match (kind, v) {
         (_, My::NULL) => Value::Null,
+        // A latin1 text column: the bytes are cp1252, one character each — never valid-or-
+        // broken UTF-8, so this arm replaces the lossy one `to_json_ref` would take. Only the
+        // plain kind: the masks and the label lists are not bytes of a text charset.
+        (ColKind::Plain, My::Bytes(b)) if charset == Charset::Latin1 => {
+            Value::String(from_latin1(b))
+        }
         (ColKind::Unsigned(bits), My::Int(i)) => {
             let mask = if *bits >= 64 {
                 u64::MAX
@@ -248,19 +431,35 @@ pub fn table_map_names(tme: &TableMapEvent<'_>) -> Option<Vec<String>> {
     None
 }
 
-/// The layout an event's own column names describe: every column keeps the kind of the
-/// `information_schema` column of the same name (a name the read does not know is plain).
-/// Pure: the same `info` and the same names always derive the same layout.
+/// The layout an event's own column names describe: every column keeps the kind, the
+/// charset and the data type of the `information_schema` column of the same name (a name
+/// the read does not know is plain, in [`Charset::Unknown`] — nobody said what its bytes
+/// are — with no type). Pure: the same `info` and the same names always derive the same
+/// layout.
 pub fn layout_from_names(info: &Layout, names: &[String]) -> Arc<Layout> {
-    let kinds = names
-        .iter()
-        .map(|n| {
-            info.index(n)
-                .and_then(|i| info.kinds.get(i).cloned())
-                .unwrap_or(ColKind::Plain)
-        })
-        .collect();
-    Arc::new(Layout::new(names.to_vec(), kinds))
+    let (mut kinds, mut charsets, mut types) = (Vec::new(), Vec::new(), Vec::new());
+    for n in names {
+        match info.index(n) {
+            Some(i) => {
+                kinds.push(info.kinds.get(i).cloned().unwrap_or(ColKind::Plain));
+                charsets.push(info.charsets.get(i).copied().unwrap_or(Charset::Utf8));
+                types.push(info.column_type(i).unwrap_or_default().to_string());
+            }
+            None => {
+                kinds.push(ColKind::Plain);
+                // A column the read does not name is a column whose charset nobody told us:
+                // it renders through the lossy path, and the guard treats it as unknown.
+                charsets.push(Charset::Unknown);
+                types.push(String::new());
+            }
+        }
+    }
+    Arc::new(Layout::with_charsets(
+        names.to_vec(),
+        kinds,
+        charsets,
+        types,
+    ))
 }
 
 /// The `information_schema` layouts, cached per table — and, keyed by those names, the
@@ -435,19 +634,30 @@ impl Catalog {
     }
 
     async fn load(conn: &mut Conn, schema: &str, table: &str) -> Result<Arc<Layout>> {
-        let rows: Vec<(String, String, String)> = conn
+        // The charset decides what the bytes of a bytes column mean as text (`Charset`);
+        // `CHARACTER_SET_NAME` is NULL for the columns that have none — numbers, dates, and
+        // the `binary` of BLOB and BINARY, whose bytes are not text at all.
+        let rows: Vec<(String, String, String, Option<String>)> = conn
             .exec(
-                "SELECT CAST(COLUMN_NAME AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(COLUMN_TYPE AS CHAR) \
+                "SELECT CAST(COLUMN_NAME AS CHAR), CAST(DATA_TYPE AS CHAR), CAST(COLUMN_TYPE AS CHAR), CAST(CHARACTER_SET_NAME AS CHAR) \
                  FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                 (schema, table),
             )
             .await
             .with_context(|| format!("reading the columns of `{schema}`.`{table}`"))?;
-        let (names, kinds) = rows
-            .into_iter()
-            .map(|(n, d, c)| (n, col_kind(&d, &c)))
-            .unzip();
-        Ok(Arc::new(Layout::new(names, kinds)))
+        let mut names = Vec::new();
+        let mut kinds = Vec::new();
+        let mut charsets = Vec::new();
+        let mut types = Vec::new();
+        for (n, d, c, cs) in rows {
+            names.push(n);
+            kinds.push(col_kind(&d, &c));
+            charsets.push(col_charset(cs.as_deref()));
+            types.push(d.to_ascii_lowercase());
+        }
+        Ok(Arc::new(Layout::with_charsets(
+            names, kinds, charsets, types,
+        )))
     }
 
     /// The layout for rows described by `tme`.
@@ -507,27 +717,33 @@ mod tests {
         );
         let u = BinlogValue::Value(My::Int(-1));
         assert_eq!(
-            convert(Some(&u), &ColKind::Unsigned(32)),
+            convert(Some(&u), &ColKind::Unsigned(32), Charset::Utf8),
             Value::from(4_294_967_295u64)
         );
         let e = BinlogValue::Value(My::Int(2));
         assert_eq!(
-            convert(Some(&e), &ColKind::Enum(vec!["x".into(), "y".into()])),
+            convert(
+                Some(&e),
+                &ColKind::Enum(vec!["x".into(), "y".into()]),
+                Charset::Utf8
+            ),
             Value::from("y")
         );
         let s = BinlogValue::Value(My::Bytes(vec![0b101]));
         assert_eq!(
             convert(
                 Some(&s),
-                &ColKind::Set(vec!["a".into(), "b".into(), "c".into()])
+                &ColKind::Set(vec!["a".into(), "b".into(), "c".into()]),
+                Charset::Utf8
             ),
             Value::from("a,c")
         );
-        assert_eq!(convert(None, &ColKind::Plain), Value::Null);
+        assert_eq!(convert(None, &ColKind::Plain, Charset::Utf8), Value::Null);
         assert_eq!(
             convert(
                 Some(&BinlogValue::Value(My::Bytes(b"sku-1".to_vec()))),
-                &ColKind::Plain
+                &ColKind::Plain,
+                Charset::Utf8
             ),
             Value::from("sku-1")
         );

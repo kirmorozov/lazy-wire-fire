@@ -442,6 +442,178 @@ fn the_borrowed_verdict_matches_the_owned_comparison() {
     }
 }
 
+// ── the binlog bytes of a text column, decoded by the column's own charset (backlog B-1) ──
+
+/// A one-column latin1 layout.
+fn latin1_layout() -> Layout {
+    Layout::with_charsets(
+        vec!["c".into()],
+        vec![ColKind::Plain],
+        vec![Charset::Latin1],
+        Vec::new(),
+    )
+}
+
+/// A latin1 key column's bytes are cp1252 (MySQL's latin1), not broken UTF-8: 0xC9 is `É`,
+/// the bytes ≥ 0x80 keep their one character each, and none of it loses to U+FFFD — which
+/// is what let the binlog side of a latin1 key mark a key the target's select could never
+/// match, and delete the document of a live row.
+#[test]
+fn latin1_bytes_render_as_their_text() {
+    let layout = latin1_layout();
+    let cases: &[(&[u8], &str)] = &[
+        (&[0x41], "A"),
+        (&[0xC9], "\u{c9}"),   // É, the measured key of the e2e case
+        (&[0xE9], "\u{e9}"),   // é
+        (&[0x80], "\u{20ac}"), // €  (cp1252)
+        (&[0x99], "\u{2122}"), // ™  (cp1252)
+        (&[0x9F], "\u{178}"),  // Ÿ  (cp1252)
+        (&[0x81], "\u{81}"),   // MySQL's latin1 keeps the five unused cp1252 slots as C1
+        (&[0x8d], "\u{8d}"),
+        (&[0x8f], "\u{8f}"),
+        (&[0x90], "\u{90}"),
+        (&[0x9d], "\u{9d}"),
+        (&[0xA0], "\u{a0}"),
+        (&[0xFF], "\u{ff}"), // ÿ
+        (b"caf\xe9", "caf\u{e9}"),
+        (&[], ""),
+    ];
+    for (bytes, want) in cases {
+        let row = row_of(Some(BinlogValue::Value(My::Bytes(bytes.to_vec()))));
+        assert_eq!(
+            layout.value(&row, 0),
+            Value::String((*want).into()),
+            "bytes {bytes:02x?}"
+        );
+    }
+}
+
+/// What the charset does not decode stays exactly as it was: the default (and unknown)
+/// charset keeps the lossy path, so utf8mb4 keys and BINARY keys are byte-for-byte the
+/// behaviour the corpus pins above.
+#[test]
+fn other_charsets_keep_the_lossy_path() {
+    // `Layout::new` knows no charset: today's answers, pinned by the corpus, unchanged.
+    let layout = layout_of(ColKind::Plain);
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xff, 0xfe]))));
+    assert_eq!(
+        layout.value(&row, 0),
+        Value::String("\u{fffd}\u{fffd}".into())
+    );
+    // valid UTF-8 is untouched by the decoding: the default layout renders it as the text it is
+    let e = "É😀".as_bytes().to_vec();
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(e.clone()))));
+    assert_eq!(
+        layout_of(ColKind::Plain).value(&row, 0),
+        Value::String("É😀".into())
+    );
+    // a latin1 column holds latin1 bytes: six bytes, six characters — decoding is what the
+    // column's charset says, not what happens to parse (and cp1252 is not ISO-8859-1: the
+    // 0x80..0x9F bytes are the Windows specials, 89 is ‰ and 9F is Ÿ)
+    assert_eq!(
+        latin1_layout().value(&row, 0),
+        Value::String("\u{c3}\u{2030}\u{f0}\u{178}\u{2dc}\u{20ac}".into())
+    );
+}
+
+/// The `information_schema` names that decide the decoding.
+#[test]
+fn col_charset_reads_the_information_schema_name() {
+    assert_eq!(col_charset(Some("latin1")), Charset::Latin1);
+    // the `binary` charset gets its own variant: same rendering as `Utf8`, but the key
+    // refusal sees it (see `Layout::key_unsafe`)
+    assert_eq!(col_charset(Some("binary")), Charset::Binary);
+    // the UTF-8 family and `ascii`: bytes the column's own definition makes valid UTF-8,
+    // so the lossy path renders them exactly
+    for name in ["utf8mb4", "utf8mb3", "utf8", "ascii"] {
+        assert_eq!(col_charset(Some(name)), Charset::Utf8, "{name} is exact");
+    }
+    // everything else is a name lazywf has no table for: the same rendering as `Utf8`, but
+    // under a variant that says nothing about those bytes is text — the one the decode-point
+    // guard watches (see `Layout::key_is_lossy`)
+    for name in ["gbk", "latin2", "ujis", "big5", "ucs2", "utf16le", "koi8r"] {
+        assert_eq!(
+            col_charset(Some(name)),
+            Charset::Unknown,
+            "{name} keeps today's path, under a name that says nothing about its bytes"
+        );
+    }
+    // NULL is the columns that have no charset at all: numbers and dates, whose bytes the
+    // guard never reads, and the geometry family, whose bytes it does
+    for name in [None, Some("")] {
+        assert_eq!(col_charset(name), Charset::Unknown, "no charset named");
+    }
+}
+
+/// `binlog_row_metadata=FULL`: a layout derived from the event's own names keeps the kinds,
+/// the charsets and the data types of the `information_schema` read it was derived from.
+#[test]
+fn layout_from_names_keeps_the_charsets() {
+    let info = Layout::with_charsets(
+        vec!["id".into(), "code".into(), "blob".into()],
+        vec![ColKind::Unsigned(32), ColKind::Plain, ColKind::Plain],
+        vec![Charset::Utf8, Charset::Latin1, Charset::Binary],
+        vec!["int".into(), "varchar".into(), "blob".into()],
+    );
+    // the event's own order, a column the read does not know, and the latin1 column by name
+    let names = vec![
+        "code".to_string(),
+        "id".to_string(),
+        "extra".to_string(),
+        "blob".to_string(),
+    ];
+    let l = layout_from_names(&info, &names);
+    let bytes = |b: Vec<u8>| Some(BinlogValue::Value(My::Bytes(b)));
+    let row = BinlogRow::new(vec![bytes(vec![0xC9]); 4], Arc::new([]));
+    assert_eq!(
+        l.value(&row, 0),
+        Value::String("\u{c9}".into()),
+        "the latin1 name found its charset"
+    );
+    // the plain and the unknown columns keep the lossy path (the value is read again below)
+    let row = BinlogRow::new(vec![bytes(vec![0xff]); 4], Arc::new([]));
+    assert_eq!(l.value(&row, 1), Value::String("\u{fffd}".into()));
+    assert_eq!(l.value(&row, 2), Value::String("\u{fffd}".into()));
+    assert_eq!(l.value(&row, 3), Value::String("\u{fffd}".into()));
+    // the types travel with them — the key refusal reads them from the derived layout too
+    assert_eq!(l.column_type(0), Some("varchar"));
+    assert_eq!(l.column_type(1), Some("int"));
+    // a key may stand on the decoded latin1 and the number, and on the unknown name (no
+    // refusal on a guess); the blob is unsafe wherever it stands
+    assert_eq!(l.key_unsafe(0), None);
+    assert_eq!(l.key_unsafe(1), None);
+    assert_eq!(l.column_type(2), Some(""));
+    assert_eq!(l.key_unsafe(2), None);
+    assert!(l.key_unsafe(3).is_some(), "the blob is unsafe by name");
+}
+
+/// Two latin1 payloads that differ stay different (cp1252 is one-to-one), so the changed
+/// shortcut still decides them by the conversion it must make — and identical bytes still
+/// cost nothing.
+#[test]
+fn latin1_changed_keeps_the_shortcut_and_the_verdict() {
+    let layout = latin1_layout();
+    let a = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xC9]))));
+    let b = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xE9]))));
+    assert!(
+        layout.changed(&a, &b, 0),
+        "\u{c9} and \u{e9} are different text"
+    );
+    // where the old lossy path saw one replacement char in both and called it unchanged
+    let f = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xff]))));
+    let e = row_of(Some(BinlogValue::Value(My::Bytes(vec![0xfe]))));
+    assert!(
+        layout.changed(&f, &e, 0),
+        "\u{ff} and \u{fe} are different characters, whatever lossy made of them"
+    );
+    let ((), n) = alloc_measure::count(|| {
+        for _ in 0..20 {
+            std::hint::black_box(layout.changed(&a, &a, 0));
+        }
+    });
+    assert_eq!(n, 0, "identical latin1 bytes were converted anyway");
+}
+
 /// One `Value::String` of these bytes: the cost the borrowed conversion pays for a text column.
 fn bytes_cost() -> usize {
     let (_, n) = alloc_measure::count(|| {
@@ -587,4 +759,201 @@ fn the_shortcut_only_skips_what_it_can_prove() {
         layout.changed(&j, &one, 0),
         owned_changed(&layout, &j, &one, 0)
     );
+}
+
+// ── the columns a key may stand on: bytes no charset defines are refused at rule load
+// (backlog B-1, refusal [A]) ──
+
+/// A one-column layout as `Catalog::load` builds it: name, charset, `DATA_TYPE`.
+fn typed(name: &str, charset: Charset, data_type: &str) -> Layout {
+    Layout::with_charsets(
+        vec![name.into()],
+        vec![col_kind(data_type, data_type)],
+        vec![charset],
+        vec![data_type.into()],
+    )
+}
+
+/// The decode-point guard (`Layout::key_is_lossy`): which bytes the decoder invented a
+/// character for, and which the row really holds.
+fn guard_row(b: &[u8]) -> (Layout, BinlogRow) {
+    let l = typed("c", Charset::Unknown, "varchar");
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(b.to_vec()))));
+    (l, row)
+}
+
+/// Bytes no charset reads as text: the replacement character in the key is the decoder's own,
+/// so the guard says so — this is the case that used to mark a key of U+FFFDs and let its
+/// DELETE remove another row's document.
+#[test]
+fn impossible_bytes_of_an_unknown_charset_are_the_decoders_text() {
+    let (l, row) = guard_row(&[0xFF, 0xFE, 0x41]);
+    assert!(
+        l.value(&row, 0)
+            .as_str()
+            .is_some_and(|s| s.contains(char::REPLACEMENT_CHARACTER)),
+        "the lossy path renders what it always rendered"
+    );
+    assert!(l.key_is_lossy(&row, 0, &l.value(&row, 0)));
+}
+
+/// A value that really holds U+FFFD is the row's own: its bytes are valid UTF-8, and the key
+/// that names them is exact. The guard tells the two apart by the bytes, not by the text.
+#[test]
+fn a_legal_replacement_character_stays_the_rows_key() {
+    let (l, row) = guard_row("a\u{FFFD}b".as_bytes());
+    assert_eq!(l.value(&row, 0), Value::String("a\u{FFFD}b".into()));
+    assert!(
+        !l.key_is_lossy(&row, 0, &l.value(&row, 0)),
+        "the row holds the character, the decoder did not make it"
+    );
+}
+
+/// What keeps the guard off the hot path: a column whose charset says what its bytes are
+/// never has them looked at. `utf8mb4` promises valid UTF-8, `latin1` is decoded exactly and
+/// cp1252 has no replacement character to give; the other kinds are not bytes of a text
+/// charset at all, and a column the row does not have cannot be anyone's key.
+#[test]
+fn a_charset_that_names_its_bytes_is_never_read_by_the_guard() {
+    let bytes = vec![0xFFu8, 0xFE];
+    let row = row_of(Some(BinlogValue::Value(My::Bytes(bytes.clone()))));
+    for charset in [Charset::Utf8, Charset::Latin1] {
+        let l = typed("c", charset, "varchar");
+        assert!(
+            !l.key_is_lossy(&row, 0, &l.value(&row, 0)),
+            "{charset:?}: a charset lazywf decodes cannot owe the guard a look"
+        );
+    }
+    // the `binary` family is refused as a key at load, and the guard holds the line too
+    let l = typed("c", Charset::Binary, "binary");
+    assert!(l.key_is_lossy(&row, 0, &l.value(&row, 0)));
+    // a number under an unknown charset: no bytes, so nothing to read
+    let n = row_of(Some(BinlogValue::Value(My::Int(7))));
+    let l = typed("n", Charset::Unknown, "int");
+    assert!(!l.key_is_lossy(&n, 0, &l.value(&n, 0)));
+    // a label list whose label holds U+FFFD is the label, not broken bytes
+    let labels = Layout::with_charsets(
+        vec!["c".into()],
+        vec![ColKind::Set(vec!["\u{FFFD}".into()])],
+        vec![Charset::Unknown],
+        vec!["set".into()],
+    );
+    let set = row_of(Some(BinlogValue::Value(My::Bytes(vec![1]))));
+    assert_eq!(labels.value(&set, 0), Value::String("\u{FFFD}".into()));
+    assert!(
+        !labels.key_is_lossy(&set, 0, &labels.value(&set, 0)),
+        "a mask never renders bytes as text, so it cannot hold the decoder's character"
+    );
+    // a column the row does not have
+    assert!(!l.key_is_lossy(&empty_row(), 0, &Value::String("x\u{FFFD}".into())));
+}
+
+/// The layout a table map's own names derive (`layout_from_names`) leaves a column the
+/// `information_schema` read does not know in [`Charset::Unknown`]: nothing said what its
+/// bytes are, which is exactly what the guard asks about.
+#[test]
+fn a_column_no_read_names_is_unknown_to_the_guard() {
+    let info = typed("known", Charset::Utf8, "varchar");
+    let l = layout_from_names(&info, &["known".to_string(), "surprise".to_string()]);
+    let row = BinlogRow::new(
+        vec![
+            Some(BinlogValue::Value(My::Bytes(b"ok".to_vec()))),
+            Some(BinlogValue::Value(My::Bytes(vec![0xC3, 0x28, 0xA0]))),
+        ],
+        Arc::new([]),
+    );
+    assert!(l.key_is_lossy(&row, 1, &l.value(&row, 1)));
+    assert!(!l.key_is_lossy(&row, 0, &l.value(&row, 0)));
+}
+
+/// The `binary`-charset family — BINARY, VARBINARY and the BLOBs on both servers, and the
+/// text types with the BINARY attribute — cannot carry a key: no charset defines their bytes,
+/// so the key text is whatever `from_utf8_lossy` leaves. The type alone refuses too, for a
+/// server that reports the charset as `NULL`.
+#[test]
+fn binary_charset_columns_cannot_carry_a_key() {
+    for t in [
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+    ] {
+        let l = typed("c", Charset::Binary, t);
+        assert!(l.key_unsafe(0).is_some(), "{t} must be refused");
+    }
+    // `VARCHAR(16) BINARY`: a varchar in the binary charset is bytes too
+    assert!(typed("c", Charset::Binary, "varchar")
+        .key_unsafe(0)
+        .is_some());
+    for t in [
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+    ] {
+        let l = typed("c", Charset::Utf8, t);
+        assert!(l.key_unsafe(0).is_some(), "{t} is refused by type as well");
+    }
+}
+
+/// The geometry family: opaque WKB under a `NULL` charset, spelled as each server spells it
+/// (MySQL's `geomcollection` and `gis`, MariaDB's `geometrycollection`), plus MySQL 9's
+/// `VECTOR`. None of them can carry a key.
+#[test]
+fn geometry_columns_cannot_carry_a_key() {
+    for t in [
+        "geometry",
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+        "geomcollection",
+        "geometrycollection",
+        "gis",
+        "vector",
+    ] {
+        let l = typed("c", Charset::Utf8, t);
+        assert!(l.key_unsafe(0).is_some(), "{t} must be refused");
+    }
+}
+
+/// What the decoder answers exactly stays accepted — text in any charset the decode renders
+/// (or leaves lossless), numbers, and the types whose wire form is not bytes at all. The e2e
+/// pins a few of these end to end; this is the full list the refusal walks past.
+#[test]
+fn text_and_number_columns_carry_a_key() {
+    for (charset, t) in [
+        (Charset::Utf8, "varchar"),
+        (Charset::Latin1, "varchar"),
+        (Charset::Utf8, "text"),
+        (Charset::Utf8, "char"),
+        (Charset::Utf8, "int"),
+        (Charset::Utf8, "bigint"),
+        (Charset::Utf8, "decimal"),
+        (Charset::Utf8, "date"),
+        (Charset::Utf8, "json"),
+        (Charset::Utf8, "enum"),
+        (Charset::Utf8, "set"),
+        (Charset::Utf8, "bit"),
+    ] {
+        assert_eq!(
+            typed("c", charset, t).key_unsafe(0),
+            None,
+            "{t} must stay accepted"
+        );
+    }
+    // no type read (a layout built without the catalog): no refusal on a guess
+    assert_eq!(
+        Layout::new(vec!["c".into()], vec![ColKind::Plain]).key_unsafe(0),
+        None
+    );
+    // and were a server ever to report the `binary` charset on one of them, the charset
+    // rule answers first: bytes are bytes whatever the type says
+    assert!(typed("c", Charset::Binary, "json").key_unsafe(0).is_some());
 }

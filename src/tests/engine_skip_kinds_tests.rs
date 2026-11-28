@@ -134,6 +134,8 @@ struct Skip {
     render_warnings: u64,
     invalid_keys: u64,
     invalid: Vec<(String, u64, String)>,
+    lossy: Vec<(String, u64, String)>,
+    lossy_refusals: HashSet<(String, u64)>,
 }
 
 impl Skip {
@@ -162,6 +164,8 @@ impl Skip {
             render_warnings: 0,
             invalid_keys: 0,
             invalid: Vec::new(),
+            lossy: Vec::new(),
+            lossy_refusals: HashSet::new(),
         }
     }
 
@@ -179,6 +183,8 @@ impl Skip {
             render_warnings,
             invalid_keys,
             invalid,
+            lossy,
+            lossy_refusals,
         } = self;
         let mut ctx = RowCtx {
             marks,
@@ -187,6 +193,8 @@ impl Skip {
             render_warnings,
             invalid_keys,
             invalid,
+            lossy,
+            lossy_refusals,
         };
         Engine::on_rows(w, kind, decode, &mut ctx)
     }
@@ -203,6 +211,8 @@ impl Skip {
                 render_warnings,
                 invalid_keys,
                 invalid,
+                lossy,
+                lossy_refusals,
             } = self;
             let mut ctx = RowCtx {
                 marks,
@@ -211,6 +221,8 @@ impl Skip {
                 render_warnings,
                 invalid_keys,
                 invalid,
+                lossy,
+                lossy_refusals,
             };
             Engine::row_keys(w, kind, before, after, &mut ctx);
         }

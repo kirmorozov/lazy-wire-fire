@@ -910,7 +910,9 @@ impl KeyScratch {
 /// this transaction has marked so far, `rules` their buffers, `scratch` the string a key line is
 /// built in, `render_warnings` the Full keys that did not render, `invalid` the keys holding
 /// control characters and `invalid_keys` how many were ever reported (the invalid ones are
-/// reported once the rows are done).
+/// reported once the rows are done), and `lossy` the keys whose bytes no charset could be read
+/// as — collected here and reported by [`Engine::on_rows`] once per trigger through
+/// `lossy_refusals` (the decode-point guard, see [`Layout::key_is_lossy`]).
 struct RowCtx<'a> {
     marks: &'a mut HashMap<String, Marks>,
     rules: &'a mut BTreeMap<String, RuleState>,
@@ -918,6 +920,8 @@ struct RowCtx<'a> {
     render_warnings: &'a mut u64,
     invalid_keys: &'a mut u64,
     invalid: &'a mut Vec<(String, u64, String)>,
+    lossy: &'a mut Vec<(String, u64, String)>,
+    lossy_refusals: &'a mut HashSet<(String, u64)>,
 }
 
 struct XaTxn {
@@ -1023,15 +1027,23 @@ pub struct Engine {
     /// Tables whose binlog layout does not match (reported once).
     mismatched: HashSet<(String, String)>,
     column_warnings: HashSet<(String, u64, String)>,
-    /// The server is a MariaDB 11.4 or newer, whose UPDATE and DELETE row images leave VIRTUAL
-    /// generated columns out (see `maria_skips_virtual`).
-    maria_skips_virtual: bool,
-    /// Per watched table, the index and name of its first VIRTUAL generated column (`None` when
-    /// it has none). Read once per table like the layout, and dropped with it: `on_statement` and
-    /// the mismatch path invalidate both, so a DDL that adds a VIRTUAL column is seen again.
-    virtual_first: HashMap<(String, String), Option<(usize, String)>>,
-    /// Triggers already reported as unreadable (see `refuse_virtual_reads`), warned about once.
-    virtual_refusals: HashSet<(String, u64)>,
+    /// The server is a MariaDB 11.4 or newer, whose UPDATE and DELETE row images leave generated
+    /// columns — VIRTUAL or STORED — out (see `maria_skips_generated`).
+    maria_skips_generated: bool,
+    /// Per watched table, the index and name of its first generated column, of either kind
+    /// (`None` when it has none). Read once per table like the layout, and dropped with it:
+    /// `on_statement` and the mismatch path invalidate both, so a DDL that adds a generated
+    /// column is seen again.
+    generated_first: HashMap<(String, String), Option<(usize, String)>>,
+    /// Triggers already reported as unreadable (see `refuse_generated_reads`), warned about once.
+    generated_refusals: HashSet<(String, u64)>,
+    /// Triggers already reported as keying on bytes no charset defines (see
+    /// `refuse_binary_keys`), warned about once.
+    binary_refusals: HashSet<(String, u64)>,
+    /// Triggers already reported as holding a key whose bytes no charset could be read as, row
+    /// by row (see `Layout::key_is_lossy`), warned about once. The rows themselves are dropped
+    /// either way; this only holds the report back.
+    lossy_refusals: HashSet<(String, u64)>,
     tx: mpsc::UnboundedSender<Done>,
     last_persist: Instant,
     clear_retry: Option<Instant>,
@@ -1111,18 +1123,24 @@ fn binlog_unusable(e: &anyhow::Error) -> bool {
             && position_unavailable(e))
 }
 
-/// Whether this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row images.
+/// Whether this MariaDB leaves generated columns — VIRTUAL **or STORED** — out of its UPDATE and
+/// DELETE row images.
 ///
-/// It stopped doing that at 11.4: 10.6.28 and 10.11.19 still write them, as do MySQL 8.0.46,
-/// 8.4.13, 9.7.4 and Percona 8.4.11. Such an image carries one value less than the table map
-/// names, and the reader pairs values with columns by position, so every column from the first
-/// VIRTUAL one on is read as its neighbour's value — a key built from the wrong value, with
-/// nothing logged. A version that cannot be read counts as unaffected: refusing on a parse
-/// failure would stop a working installation over a version string.
-// Temporary: remove this and `Engine::refuse_virtual_reads` when the vendored reader learns to
+/// It stopped writing them at 11.4: 10.6.28 and 10.11.19 still write them, as do MySQL 8.0.46,
+/// 8.4.13, 9.7.4 and Percona 8.4.11. Measured on 11.4.13 and 11.8.9 (the compose servers,
+/// `binlog_row_image=FULL`, a table with `code_hex CHAR(32) AS (HEX(code)) STORED` beside an
+/// identical one with a real `CHAR(32)`): the INSERT event carries every column, the UPDATE and
+/// DELETE events carry one value less than the table map names, while the table with the real
+/// column carries all of them — MariaDB stopped writing generated columns into those images and
+/// the two kinds are left out together. Such an image and the reader that pairs values with
+/// columns by position make every column from the first generated one on read as its neighbour's
+/// value — a key built from the wrong value, with nothing logged. A version that cannot be read
+/// counts as unaffected: refusing on a parse failure would stop a working installation over a
+/// version string.
+// Temporary: remove this and `Engine::refuse_generated_reads` when the vendored reader learns to
 // decode images whose values skip columns (lazyview issue #7); until then lazywf refuses the
 // triggers that would read them, which is visible on `/status` instead of silently wrong.
-fn maria_skips_virtual(version: &str) -> bool {
+fn maria_skips_generated(version: &str) -> bool {
     // A replication proxy reports the server it fronts as `5.5.5-<its version>`.
     let v = version.strip_prefix("5.5.5-").unwrap_or(version);
     let mut parts = v.split('.');
@@ -1135,42 +1153,149 @@ fn maria_skips_virtual(version: &str) -> bool {
 
 /// What a trigger reads of a row image the server left short.
 #[derive(Debug, PartialEq, Eq)]
-enum VirtualRead {
-    /// A column standing at or after the table's first VIRTUAL generated column.
+enum ShortRead {
+    /// A column standing at or after the table's first generated column.
     Col(String),
     /// The whole row. A `KeyTemplate::Full` is any Handlebars template, so there is no telling
     /// from the rule whether it names the shifted columns: it may read every column, so it is
-    /// refused for any table that has a VIRTUAL one.
+    /// refused for any table that has a generated one.
     Full,
 }
 
-/// The first thing `reads` takes from an image that skips its VIRTUAL columns: `reads` holds the
+/// The first thing `reads` takes from an image that skips its generated columns: `reads` holds the
 /// columns the trigger names together with their index in the layout (columns the table does not
 /// have are left out — `check_columns` reports those), `full` says whether the trigger renders
-/// the whole row, and `from` is the index of the table's first VIRTUAL generated column. A rule
+/// the whole row, and `from` is the index of the table's first generated column. A rule
 /// that reads only columns before `from` reads values the image does carry, so it stays allowed.
-fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<VirtualRead> {
+fn unreadable_read(reads: &[(&str, usize)], full: bool, from: usize) -> Option<ShortRead> {
     if full {
-        return Some(VirtualRead::Full);
+        return Some(ShortRead::Full);
     }
     reads
         .iter()
         .find(|(_, i)| *i >= from)
-        .map(|(c, _)| VirtualRead::Col((*c).to_string()))
+        .map(|(c, _)| ShortRead::Col((*c).to_string()))
 }
 
-/// The first VIRTUAL generated column of `rows`, which are the table's columns in
+/// The path segments a Handlebars key template names inside its `{{ }}` tags: `{{new.code}}`,
+/// `{{code}}` and `{{helper arg=this.code}}` all yield `code`, while literal text outside the
+/// tags, comments and raw-block content — none of which resolve paths — cannot. A quoted
+/// argument spelled like a column name does count, which errs towards refusing. Roots
+/// (`new`, `row`, …) and literals (`true`, …) are filtered: a column cannot be named one of
+/// those and resolve.
+fn hb_refs(source: &str) -> Vec<&str> {
+    // `get` everywhere instead of indexing: the offsets are proven by the `find`s and the
+    // `starts_with` guards around them, and the panic-site gate reads the indexing, not
+    // the argument.
+    fn from(t: &str, n: usize) -> &str {
+        t.get(n..).unwrap_or("")
+    }
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("{{") {
+        let tag = from(rest, open);
+        // What is never rendered passes unscanned, the way `resolve_roots` leaves it untouched.
+        let skip_to = if tag.starts_with("{{!--") {
+            tag.get(5..).and_then(|t| t.find("--}}")).map(|n| 5 + n + 4)
+        } else if tag.starts_with("{{!") {
+            tag.get(3..).and_then(|t| t.find("}}")).map(|n| 3 + n + 2)
+        } else if tag.starts_with("{{{{") {
+            // `{{{{raw}}}} … {{{{/raw}}}}`
+            tag.get(4..)
+                .and_then(|t| t.find("{{{{/"))
+                .map(|n| 4 + n)
+                .and_then(|close| {
+                    tag.get(close..)
+                        .and_then(|t| t.find("}}}}"))
+                        .map(|m| close + m + 4)
+                })
+                .or(Some(tag.len()))
+        } else {
+            None
+        };
+        let (body, next): (&str, &str) = if let Some(end) = skip_to {
+            ("", from(tag, end))
+        } else {
+            match tag.get(2..).and_then(|t| t.find("}}")) {
+                // The whole tag: paths, helper names and arguments alike — the scan does not
+                // parse, it finds names.
+                Some(close) => {
+                    let close = 2 + close + 2;
+                    (tag.get(2..close - 2).unwrap_or(""), from(tag, close))
+                }
+                None => ("", ""),
+            }
+        };
+        for seg in body
+            .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '@' | '.' | '/')))
+            .flat_map(|tok| tok.split(['.', '/']))
+        {
+            if !seg.is_empty()
+                && !seg.starts_with('@')
+                && !matches!(seg, "this" | "true" | "false" | "null")
+                && !template::KEY_ROOTS.contains(&seg)
+            {
+                out.push(seg);
+            }
+        }
+        rest = next;
+    }
+    out
+}
+
+/// The columns a trigger builds its key from, as layout indices: the `Seg::Col` names of a
+/// `Simple` key (exact), the names a Handlebars key makes inside its tags (see [`hb_refs`]),
+/// and the columns bound to its `keys_sql` — the bound values reach the user's statement as
+/// decoded text, so bytes with no charset reach the `WHERE` as replacement characters too and
+/// can answer with another row's `_key`. A trigger's `changed_columns` are not key reads and
+/// do not count: they only compare two images of the same row.
+fn key_column_reads(t: &crate::rule::Trigger, layout: &Layout) -> Vec<usize> {
+    let mut out = Vec::new();
+    match &t.key {
+        Some(KeyTemplate::Simple(lines)) => {
+            for seg in lines.iter().flatten() {
+                if let template::Seg::Col(c) = seg {
+                    out.extend(layout.index(c));
+                }
+            }
+        }
+        Some(KeyTemplate::Full(_)) => {
+            // The source the compiled templates were registered from — what the user wrote.
+            if let Some(src) = &t.def.key {
+                for c in hb_refs(src) {
+                    out.extend(layout.index(c));
+                }
+            }
+        }
+        None => {}
+    }
+    if let Some(ks) = &t.keys_sql {
+        for c in &ks.columns {
+            out.extend(layout.index(c));
+        }
+    }
+    out
+}
+
+/// The first generated column of `rows`, which are the table's columns in
 /// `information_schema` order as (name, EXTRA): its index in that order (the order
-/// `rows::Catalog::load` builds a layout from) and its name.
-fn virtual_first_of(rows: &[(String, String)]) -> Option<(usize, String)> {
+/// `rows::Catalog::load` builds a layout from) and its name. Either kind counts, because a
+/// server that leaves generated columns out of its UPDATE and DELETE images leaves both out
+/// (`maria_skips_generated`). Only the two generated wordings match: `DEFAULT_GENERATED`,
+/// which MySQL writes for a column with an expression default, describes a default and not a
+/// column the image skips.
+fn generated_first_of(rows: &[(String, String)]) -> Option<(usize, String)> {
     rows.iter()
         .enumerate()
-        .find(|(_, (_, extra))| extra.to_ascii_uppercase().contains("VIRTUAL GENERATED"))
+        .find(|(_, (_, extra))| {
+            let e = extra.to_ascii_uppercase();
+            e.contains("VIRTUAL GENERATED") || e.contains("STORED GENERATED")
+        })
         .map(|(i, (name, _))| (i, name.clone()))
 }
 
 /// The columns of one table, in `information_schema` order, as (name, EXTRA).
-async fn read_virtual_first(
+async fn read_generated_first(
     conn: &mut Conn,
     schema: &str,
     table: &str,
@@ -1184,7 +1309,7 @@ async fn read_virtual_first(
         )
         .await
         .with_context(|| format!("reading the columns of `{schema}`.`{table}`"))?;
-    Ok(virtual_first_of(&rows))
+    Ok(generated_first_of(&rows))
 }
 
 async fn connect_wait(
@@ -1438,14 +1563,14 @@ pub async fn run(
         ),
         None => info!("no allow-list: target endpoints may use any host (tests only)"),
     }
-    // Whether the server's row images can come up short (see `maria_skips_virtual`). Read once:
+    // Whether the server's row images can come up short (see `maria_skips_generated`). Read once:
     // the server does not change underneath a running engine.
-    let skips_virtual = info.flavor == Flavor::MariaDb && maria_skips_virtual(&info.version);
-    if skips_virtual {
+    let skips_generated = info.flavor == Flavor::MariaDb && maria_skips_generated(&info.version);
+    if skips_generated {
         info!(
             server = %info.version,
-            "this MariaDB leaves VIRTUAL generated columns out of its UPDATE and DELETE row \
-             images: a trigger that reads a column from the first one on is refused"
+            "this MariaDB leaves generated columns (VIRTUAL or STORED) out of its UPDATE and \
+             DELETE row images: a trigger that reads a column from the first one on is refused"
         );
     }
     let (tx, rx) = mpsc::unbounded_channel();
@@ -1504,9 +1629,11 @@ pub async fn run(
         target_backoff: HashMap::new(),
         mismatched: HashSet::new(),
         column_warnings: HashSet::new(),
-        maria_skips_virtual: skips_virtual,
-        virtual_first: HashMap::new(),
-        virtual_refusals: HashSet::new(),
+        maria_skips_generated: skips_generated,
+        generated_first: HashMap::new(),
+        generated_refusals: HashSet::new(),
+        binary_refusals: HashSet::new(),
+        lossy_refusals: HashSet::new(),
         tx,
         last_persist: Instant::now(),
         clear_retry: None,
@@ -2773,9 +2900,11 @@ impl Engine {
                             key_scratch,
                             render_warnings,
                             invalid_keys,
+                            lossy_refusals,
                             ..
                         } = self;
                         let mut invalid = Vec::new();
+                        let mut lossy = Vec::new();
                         let mut ctx = RowCtx {
                             marks: txn_marks,
                             rules,
@@ -2783,6 +2912,8 @@ impl Engine {
                             render_warnings,
                             invalid_keys,
                             invalid: &mut invalid,
+                            lossy: &mut lossy,
+                            lossy_refusals,
                         };
                         Engine::on_rows(&w, kind, || reader.rows(table_id, &event), &mut ctx)?;
                     }
@@ -2940,8 +3071,9 @@ impl Engine {
                     .collect();
                 self.check_columns(&layout, &key.0, &key.1, &triggers);
                 let triggers = self
-                    .refuse_virtual_reads(&nkey, &layout, &key.0, &key.1, triggers)
+                    .refuse_generated_reads(&nkey, &layout, &key.0, &key.1, triggers)
                     .await?;
+                let triggers = self.refuse_binary_keys(&layout, &key.0, &key.1, triggers);
                 let any_full = triggers.iter().any(|(_, rule, i)| {
                     matches!(rule.triggers[*i].key, Some(KeyTemplate::Full(_)))
                 });
@@ -2955,7 +3087,7 @@ impl Engine {
                 });
                 // Cached until the rules change (`rebuild_routes` clears this cache), a reset
                 // starts (`start_reset` does too), or the layout behind it is dropped:
-                // `forget_columns` takes the entry with the catalog entry and `virtual_first`,
+                // `forget_columns` takes the entry with the catalog entry and `generated_first`,
                 // and every other catalog invalidation is caught by the generation the entry
                 // was stamped with. The probe's identity check is what a stale entry must
                 // still fail on its own.
@@ -2978,22 +3110,22 @@ impl Engine {
         }
     }
 
-    /// The index and name of the table's first VIRTUAL generated column, on a server that leaves
-    /// those columns out of its row images; `Ok(None)` everywhere else and for a table without
-    /// one. Read once per table, like the layout cache it lives and dies with.
+    /// The index and name of the table's first generated column, of either kind, on a server that
+    /// leaves those columns out of its row images; `Ok(None)` everywhere else and for a table
+    /// without one. Read once per table, like the layout cache it lives and dies with.
     ///
     /// `key` is the table's identity as [`Engine::route`] knows it, so a cached answer costs no
     /// allocation; `schema` and `table` are the names to ask the server about.
-    async fn first_virtual_column(
+    async fn first_generated_column(
         &mut self,
         key: &(String, String),
         schema: &str,
         table: &str,
     ) -> Result<Option<(usize, String)>> {
-        if !self.maria_skips_virtual {
+        if !self.maria_skips_generated {
             return Ok(None);
         }
-        if let Some(found) = self.virtual_first.get(key) {
+        if let Some(found) = self.generated_first.get(key) {
             return Ok(found.clone());
         }
         // An image whose columns cannot be read is an image that must not be read: a server that
@@ -3003,23 +3135,23 @@ impl Engine {
             &mut self.control_stalled,
             "reading the generated columns of the table",
             CONTROL_STATEMENT_TIMEOUT,
-            read_virtual_first(&mut self.control, schema, table),
+            read_generated_first(&mut self.control, schema, table),
         )
         .await?;
-        self.virtual_first.insert(key.clone(), found.clone());
+        self.generated_first.insert(key.clone(), found.clone());
         Ok(found)
     }
 
     /// Drops what is cached about a table's columns, so both the layout and the position of its
-    /// first VIRTUAL column are read again: a DDL changed the table, or its layout did not match
+    /// first generated column are read again: a DDL changed the table, or its layout did not match
     /// the binlog. The built route goes with them — a DDL changes the columns a `Watched` decodes.
     fn forget_columns(&mut self, schema: &str, table: &str) {
         self.catalog.invalidate(schema, table);
         let key = self.norm(schema, table);
         if table == "*" {
-            self.virtual_first.retain(|(s, _), _| *s != key.0);
+            self.generated_first.retain(|(s, _), _| *s != key.0);
         } else {
-            self.virtual_first.remove(&key);
+            self.generated_first.remove(&key);
         }
         self.route_cache.forget(&key);
     }
@@ -3028,12 +3160,18 @@ impl Engine {
     /// that may keep running.
     ///
     /// On MariaDB 11.4+ an UPDATE or DELETE image holds one value less than the table map names
-    /// (the VIRTUAL generated columns are not written), and the reader pairs values with columns
-    /// by position, so the first VIRTUAL column and every column after it are read as their
-    /// neighbour's value. Such a trigger marks keys that do not describe the row, so it marks
-    /// nothing at all and carries the reason on `/status` the way an unknown column does.
-    /// Temporary, see [`maria_skips_virtual`].
-    async fn refuse_virtual_reads(
+    /// (its generated columns, VIRTUAL or STORED alike, are not written), and the reader pairs
+    /// values with columns by position, so the first generated column and every column after it
+    /// are read as their neighbour's value. Such a trigger marks keys that do not describe the
+    /// row, so it marks nothing at all and carries the reason on `/status` the way an unknown
+    /// column does. Every read of an image counts, not only the key: `changed_columns` (a
+    /// comparison of the two images that would compare shifted values), the columns a `Simple`
+    /// key names and the columns a `keys_sql` binds, and the whole row for a Handlebars key,
+    /// which may name any column of it and is therefore refused for a table that has a generated
+    /// column at all. The rule's own `selects` and its doc template read the selects' rows, not
+    /// the image, so they are not reads of it.
+    /// Temporary, see [`maria_skips_generated`].
+    async fn refuse_generated_reads(
         &mut self,
         key: &(String, String),
         layout: &Layout,
@@ -3041,14 +3179,16 @@ impl Engine {
         table: &str,
         triggers: Vec<(String, Arc<Rule>, usize)>,
     ) -> Result<Vec<(String, Arc<Rule>, usize)>> {
-        let Some((from, virtual_col)) = self.first_virtual_column(key, schema, table).await? else {
+        let Some((from, gen_col)) = self.first_generated_column(key, schema, table).await? else {
             return Ok(triggers);
         };
         let mut kept = Vec::with_capacity(triggers.len());
         for (name, rule, ti) in triggers {
             let t = &rule.triggers[ti];
-            // What the trigger reads of an image: the same columns `check_columns` looks at, and
-            // the whole row for a Full key.
+            // Every read of an image the trigger has: the same columns `check_columns` looks at
+            // (its `changed_columns`, its key's columns and the columns its `keys_sql` binds),
+            // and the whole row for a Full key. A Handlebars key is not scanned for names: it may
+            // read any column, so a table with a generated column refuses it outright.
             let mut reads: Vec<(&str, usize)> = Vec::new();
             for c in &t.def.changed_columns {
                 if let Some(i) = layout.index(c) {
@@ -3077,23 +3217,24 @@ impl Engine {
                 continue;
             };
             // Refused whether or not it was reported: what it would mark is wrong either way.
-            if self.virtual_refusals.insert((name.clone(), t.def.id)) {
+            if self.generated_refusals.insert((name.clone(), t.def.id)) {
                 let msg = match &read {
-                    VirtualRead::Col(c) => format!(
+                    ShortRead::Col(c) => format!(
                         "trigger {}: `{schema}`.`{table}` reads `{c}`; this MariaDB leaves the \
-                         VIRTUAL generated column `{virtual_col}` out of its UPDATE and DELETE \
-                         row images, and every column after it moves up a place, so lazywf \
-                         cannot read `{c}` and refuses the trigger (make `{virtual_col}` STORED, \
-                         or read only columns before it)",
+                         generated column `{gen_col}` (VIRTUAL or STORED) out of its UPDATE and \
+                         DELETE row images, and every column after it moves up a place, so \
+                         lazywf cannot read `{c}` and refuses the trigger (move `{gen_col}` \
+                         after every column this trigger reads, or read a plain column the \
+                         application keeps)",
                         t.def.id
                     ),
-                    VirtualRead::Full => format!(
+                    ShortRead::Full => format!(
                         "trigger {}: `{schema}`.`{table}` uses a Handlebars key template, which \
-                         can read any column of the row, including the VIRTUAL generated column \
-                         `{virtual_col}` and the columns after it that this MariaDB's UPDATE \
-                         and DELETE row images shift; lazywf refuses the trigger (make \
-                         `{virtual_col}` STORED, or use a plain {{{{new.col}}}} key over columns \
-                         before it)",
+                         can read any column of the row, including the generated column \
+                         `{gen_col}` and the columns after it that this MariaDB's UPDATE and \
+                         DELETE row images shift; lazywf refuses the trigger (move `{gen_col}` \
+                         after every column the template reads, or use a plain {{{{new.col}}}} \
+                         key over columns before it)",
                         t.def.id
                     ),
                 };
@@ -3105,6 +3246,81 @@ impl Engine {
             }
         }
         Ok(kept)
+    }
+
+    /// Refuses the triggers that build a key out of bytes no charset can turn into exact
+    /// text, and returns those that may keep running.
+    ///
+    /// The key text names the document at the target and in the buffer. A `binary`-charset
+    /// column — BINARY, VARBINARY, the BLOB family, a text type with the BINARY attribute —
+    /// and the geometry types come over the binlog as opaque bytes, and the lossy UTF-8
+    /// decode renders every impossible byte as U+FFFD: two rows can then share a key, and
+    /// the DELETE of one carries the other's key and removes its document (measured on both
+    /// test servers: a BINARY(16) key deleted a live row's document). The catalog answers
+    /// the charset and the data type that make this known when the route is built (see
+    /// [`Layout::key_unsafe`]), so such a trigger never marks at all, the way an unreadable
+    /// read does not (see [`Engine::refuse_generated_reads`]), and the rule carries the
+    /// reason on `/status`.
+    fn refuse_binary_keys(
+        &mut self,
+        layout: &Layout,
+        schema: &str,
+        table: &str,
+        triggers: Vec<(String, Arc<Rule>, usize)>,
+    ) -> Vec<(String, Arc<Rule>, usize)> {
+        let mut kept = Vec::with_capacity(triggers.len());
+        for (name, rule, ti) in triggers {
+            // `get`, not indexing: a route's trigger index is trusted, and the panic-site
+            // gate keeps the one allowlisted index to `refuse_generated_reads` alone.
+            let Some(t) = rule.triggers.get(ti) else {
+                kept.push((name, rule, ti));
+                continue;
+            };
+            let bad = key_column_reads(t, layout)
+                .into_iter()
+                .find_map(|i| layout.key_unsafe(i).map(|why| (i, why)));
+            let Some((i, why)) = bad else {
+                kept.push((name, rule, ti));
+                continue;
+            };
+            // Refused whether or not it was reported: the key it would mark is wrong either way.
+            if self.binary_refusals.insert((name.clone(), t.def.id)) {
+                let col = layout.column_name(i).unwrap_or("?");
+                let ty = layout.column_type(i).unwrap_or("binary");
+                // The workaround has to work on the server the rule runs on. A generated column
+                // projects the bytes exactly, but a MariaDB that leaves generated columns out of
+                // its UPDATE and DELETE images cannot key on one either (see
+                // `refuse_generated_reads`), so there the advice is the plain column the
+                // application keeps; both shapes carry `HEX`, which is the point of them.
+                let advice = if self.maria_skips_generated {
+                    format!(
+                        "key on a text or number column, or on a plain column the application \
+                         keeps, for example `{col}_hex CHAR(64)` written as HEX(`{col}`) and a \
+                         key over that column (a generated column cannot carry a key on this \
+                         server: its UPDATE and DELETE images leave generated columns out)"
+                    )
+                } else {
+                    format!(
+                        "key on a text or number column, or on a STORED generated column that \
+                         projects it, for example `AS (HEX(`{col}`)) STORED` and a key over \
+                         that column"
+                    )
+                };
+                let msg = format!(
+                    "rule `{name}` trigger {}: `{schema}`.`{table}` keys on column `{col}` \
+                     of type `{ty}` — {why}, so its key would be replacement characters, not \
+                     the row's value: the row marks nothing and its DELETE can remove another \
+                     row's document; lazy-wire-fire refuses the trigger ({advice})",
+                    t.def.id
+                );
+                warn!(rule = %name, "{msg}");
+                if let Some(st) = self.rules.get_mut(&name) {
+                    st.last_error = Some((msg, crate::time::unix_now_ms()));
+                    st.dirty = true;
+                }
+            }
+        }
+        kept
     }
 
     /// Reports (once) trigger columns the table does not have: such a trigger marks nothing.
@@ -3199,8 +3415,38 @@ impl Engine {
                 render_warnings: &mut *ctx.render_warnings,
                 invalid_keys: &mut *ctx.invalid_keys,
                 invalid: &mut *ctx.invalid,
+                lossy: &mut *ctx.lossy,
+                lossy_refusals: &mut *ctx.lossy_refusals,
             };
             Self::row_keys(w, kind, before, after, &mut row);
+        }
+        // The keys whose bytes no charset could be read as: the row marked nothing under them
+        // (see `row_keys`), and this is where that becomes visible — once per trigger, on the
+        // rule, the way a key that cannot be rendered is.
+        for (name, trigger, column) in std::mem::take(&mut *ctx.lossy) {
+            if !ctx.lossy_refusals.insert((name.clone(), trigger)) {
+                continue;
+            }
+            let ty = w
+                .layout
+                .index(&column)
+                .and_then(|i| w.layout.column_type(i))
+                .unwrap_or("?");
+            let msg = format!(
+                "trigger {trigger}: `{}`.`{column}` of type `{ty}` holds bytes its charset does \
+                 not make text of, so its key came out through the decoder's replacement \
+                 character: lazy-wire-fire marks no key it cannot read, and neither a lookup, a \
+                 document nor a delete goes out for such a row (key on a column in a charset \
+                 lazy-wire-fire decodes — utf8mb4 or latin1 — or on a plain column the \
+                 application keeps, for example `{column}_hex CHAR(64)` written as \
+                 HEX(`{column}`))",
+                w.table
+            );
+            warn!(rule = %name, "{msg}");
+            if let Some(st) = ctx.rules.get_mut(&name) {
+                st.last_error = Some((msg, crate::time::unix_now_ms()));
+                st.dirty = true;
+            }
         }
         for (name, trigger, k) in std::mem::take(&mut *ctx.invalid) {
             *ctx.invalid_keys += 1;
@@ -3304,6 +3550,7 @@ impl Engine {
             scratch,
             render_warnings,
             invalid,
+            lossy,
             ..
         } = ctx;
         for (name, rule, ti) in &w.triggers {
@@ -3352,10 +3599,23 @@ impl Engine {
                                 match seg {
                                     template::Seg::Lit(s) => k.push_str(s),
                                     template::Seg::Col(c) => {
-                                        match w.layout.index(c).map(|i| w.layout.value(img, i)) {
-                                            None | Some(Value::Null) => continue 'line,
-                                            Some(v) => template::push_text(&v, k),
+                                        let Some(i) = w.layout.index(c) else {
+                                            continue 'line;
+                                        };
+                                        let v = w.layout.value(img, i);
+                                        if v.is_null() {
+                                            continue 'line;
                                         }
+                                        // The decode-point guard: bytes no charset can be read
+                                        // as text make a key that does not describe this row —
+                                        // it would mark nothing and its DELETE could carry
+                                        // another row's key. Such a line marks nothing at all
+                                        // (see [`Layout::key_is_lossy`]).
+                                        if w.layout.key_is_lossy(img, i, &v) {
+                                            lossy.push((name.clone(), t.def.id, c.clone()));
+                                            continue 'line;
+                                        }
+                                        template::push_text(&v, k);
                                     }
                                 }
                             }
@@ -3391,6 +3651,27 @@ impl Engine {
                             match rule.templates.render(tpl, &ctx) {
                                 Ok(s) => {
                                     let k = s.trim();
+                                    // A rendered key holding a replacement character may hold
+                                    // the decoder's own: the columns the template names are
+                                    // asked, but only now — a key without one is never looked
+                                    // at (see [`Layout::key_is_lossy`]).
+                                    if k.contains(char::REPLACEMENT_CHARACTER) {
+                                        let bad = key_column_reads(t, &w.layout)
+                                            .into_iter()
+                                            .find(|&i| {
+                                                w.layout.key_is_lossy(
+                                                    img,
+                                                    i,
+                                                    &w.layout.value(img, i),
+                                                )
+                                            })
+                                            .and_then(|i| w.layout.column_name(i))
+                                            .map(str::to_string);
+                                        if let Some(col) = bad {
+                                            lossy.push((name.clone(), t.def.id, col));
+                                            continue;
+                                        }
+                                    }
                                     if template::valid_key(k) {
                                         let (s2, key) =
                                             rules.get_mut(name).expect("present").buffer.locate(k);
@@ -3422,15 +3703,28 @@ impl Engine {
                     None => {}
                 }
                 if let Some(ks) = &t.keys_sql {
-                    let params = ks
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            w.layout
-                                .index(c)
-                                .map_or(Value::Null, |i| w.layout.value(img, i))
-                        })
-                        .collect();
+                    // The bound values are the row's decoded text: one of them made of
+                    // replacement characters would answer the user's statement with another
+                    // row's `_key`, so the query does not go out at all.
+                    let mut params = Vec::with_capacity(ks.columns.len());
+                    let mut bad = None;
+                    for c in &ks.columns {
+                        match w.layout.index(c) {
+                            Some(i) => {
+                                let v = w.layout.value(img, i);
+                                if w.layout.key_is_lossy(img, i, &v) {
+                                    bad = Some(c.clone());
+                                    break;
+                                }
+                                params.push(v);
+                            }
+                            None => params.push(Value::Null),
+                        }
+                    }
+                    if let Some(col) = bad {
+                        lossy.push((name.clone(), t.def.id, col));
+                        continue;
+                    }
                     let q = KeyQuery {
                         trigger: t.def.id,
                         sql: ks.sql.clone(),
@@ -5237,6 +5531,12 @@ mod hotpath_alloc_tests;
 #[path = "tests/engine_flush_alloc_tests.rs"]
 mod flush_alloc_tests;
 
+#[cfg(test)]
+#[path = "tests/engine_binary_key_tests.rs"]
+mod binary_key_tests;
+#[cfg(test)]
+#[path = "tests/engine_lossy_key_tests.rs"]
+mod lossy_key_tests;
 #[cfg(test)]
 #[path = "tests/engine_skip_kinds_tests.rs"]
 mod skip_kinds_tests;
